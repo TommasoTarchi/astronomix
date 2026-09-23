@@ -101,10 +101,13 @@ class LoopState(NamedTuple):
         key: The PRNG key advanced by stochastic per-step modules (forcing, ...).
         forcing: The persistent OU forcing field ``f`` (shape (3, nx, ny, nz)),
             or ``None`` when OU forcing is inactive.
+        sinks: The sink-particle buffer (a ``SinkParticles``), or ``None``
+            when sink particles are disabled.
     """
     primitive_state: Any
     key: Any
     forcing: Any = None
+    sinks: Any = None
 
 
 def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig):
@@ -226,11 +229,13 @@ def time_integration(
             e.g. only the slice or summary statistics you need.
         sharding: The sharding to use for the padded helper data. If None,
                   no sharding is applied.
-        restart_state: An optional :class:`LoopState` providing the PRNG key
-            and persistent OU forcing field to resume from (typically obtained
-            from ``astronomix.setup_helpers.restart_from_latest_checkpoint``).
+        restart_state: An optional :class:`LoopState` providing the PRNG key,
+            persistent OU forcing field and sink-particle buffer to resume from
+            (typically obtained from
+            ``astronomix.setup_helpers.restart_from_latest_checkpoint``).
             Its ``primitive_state`` slot is ignored; pass the restored state as
-            the ``primitive_state`` argument. Mainly used together with
+            the ``primitive_state`` argument. Its sink buffer takes precedence
+            over the one in a passed ``StateStruct``. Mainly used together with
             ``snapshot_storage_mode == TO_DISK`` and ``params.t_start``.
 
     Returns:
@@ -506,6 +511,23 @@ def _prepare_padded_state(primitive_state, config, params, registered_variables)
     return primitive_state
 
 
+def _check_sink_shapes(sinks, config):
+    """Raise if the sink buffer does not have ``config.num_sink_slots`` slots."""
+    num_slots = config.num_sink_slots
+    expected_shapes = {
+        "mass": (num_slots,),
+        "position": (num_slots, 3),
+        "velocity": (num_slots, 3),
+    }
+    for name, expected_shape in expected_shapes.items():
+        shape = getattr(sinks, name).shape
+        if shape != expected_shape:
+            raise ValueError(
+                f"Sink field '{name}' has shape {shape}, expected "
+                f"{expected_shape} for num_sink_slots = {num_slots}."
+            )
+
+
 def _seed_key_and_forcing(config, params):
     """Seed the PRNG key and (when OU forcing is active) the persistent forcing
     field from ``config.random_seed`` for a fresh run."""
@@ -520,20 +542,29 @@ def _seed_key_and_forcing(config, params):
     return key0, forcing0
 
 
-def _build_initial_loop_state(primitive_state, config, params, restart_state=None):
+def _build_initial_loop_state(
+    primitive_state, config, params, sinks=None, restart_state=None
+):
     """Construct the initial loop carry for an (already padded) state.
 
-    When ``restart_state`` is given, its PRNG key and persistent OU forcing
-    field are reused so a resumed run continues the same stochastic realisation;
-    otherwise they are seeded from ``config.random_seed``. The OU forcing (when
-    active) needs a persistent solenoidal field; otherwise the forcing slot
-    stays ``None`` and costs nothing in the carry.
+    When ``restart_state`` is given, its PRNG key, persistent OU forcing field
+    and sink buffer are reused so a resumed run continues the same stochastic
+    realisation; otherwise the key and forcing are seeded from
+    ``config.random_seed`` and ``sinks`` is carried as given. The OU forcing
+    (when active) needs a persistent solenoidal field; otherwise the forcing
+    slot stays ``None`` and costs nothing in the carry, as does the sink slot
+    when sink particles are disabled.
     """
     if restart_state is not None:
-        return LoopState(primitive_state, restart_state.key, restart_state.forcing)
+        return LoopState(
+            primitive_state,
+            restart_state.key,
+            restart_state.forcing,
+            restart_state.sinks,
+        )
 
     key0, forcing0 = _seed_key_and_forcing(config, params)
-    return LoopState(primitive_state, key0, forcing0)
+    return LoopState(primitive_state, key0, forcing0, sinks)
 
 
 def _integrate_core(
@@ -673,7 +704,8 @@ def _integrate_core(
                 helper_data_pad, registered_variables,
             )
 
-        return dt, LoopState(primitive_state, key, forcing)
+        # the sink buffer rides through the step untouched
+        return dt, LoopState(primitive_state, key, forcing, state.sinks)
 
     def _record_snapshot(time, state, store, idx):
         """Record snapshot ``idx`` (the requested diagnostics)."""
@@ -816,13 +848,18 @@ def _time_integration(
         of snapshots of the time evolution.
     """
 
-    # in simulations, where we also follow e.g. star particles,
+    # in simulations, where we also follow e.g. sink particles,
     # the state may be a struct containing the primitive state
-    # and the star particle data
+    # and the sink particle data
     if config.state_struct:
         primitive_state = state.primitive_state
+        sinks = state.sinks
     else:
         primitive_state = state
+        sinks = None
+
+    if config.sink_particles:
+        _check_sink_shapes(sinks, config)
 
     # we must pad the state with ghost cells to account for the
     # boundary conditions (unless they are enforced by rolling)
@@ -833,7 +870,7 @@ def _time_integration(
 
     if initial_loop_state is None:
         initial_loop_state = _build_initial_loop_state(
-            primitive_state, config, params
+            primitive_state, config, params, sinks
         )
 
     _, loop_state, snapshot_store, num_iterations = _integrate_core(
@@ -870,7 +907,10 @@ def _time_integration(
         primitive_state = _unpad(primitive_state, config)
 
     if config.state_struct:
-        return StateStruct(primitive_state=primitive_state)
+        return StateStruct(
+            primitive_state=primitive_state,
+            sinks=loop_state.sinks,
+        )
 
     return primitive_state
 
@@ -887,6 +927,7 @@ def _run_segment(
     helper_data_pad: Union[HelperData, NoneType],
     init_key,
     init_forcing,
+    init_sinks,
 ):
     """Integrate one segment for the disk-checkpointing (TO_DISK) driver.
 
@@ -898,13 +939,19 @@ def _run_segment(
     left uninterrupted. ``config`` always has snapshots disabled here (each
     segment end is itself a checkpoint), so no snapshot buffers are allocated.
 
-    Returns ``(t_final, primitive_state_unpadded, key, forcing, num_iterations)``.
+    Returns ``(t_final, primitive_state_unpadded, key, forcing, sinks,
+    num_iterations)``.
     """
     original_shape = primitive_state.shape
     primitive_state = _prepare_padded_state(
         primitive_state, config, params, registered_variables
     )
-    initial_loop_state = LoopState(primitive_state, init_key, init_forcing)
+    initial_loop_state = LoopState(
+        primitive_state,
+        init_key,
+        init_forcing,
+        init_sinks,
+    )
     t_final, loop_state, _, num_iterations = _integrate_core(
         config,
         params,
@@ -922,6 +969,7 @@ def _run_segment(
         primitive_state,
         loop_state.key,
         loop_state.forcing,
+        loop_state.sinks,
         num_iterations,
     )
 
@@ -942,13 +990,14 @@ def _time_integration_to_disk(
     The run is split into ``config.num_snapshots`` segments spanning
     ``[params.t_start, params.t_end]``. Each segment is integrated by the JIT'd
     :func:`_run_segment`; afterwards the loop carry (primitive state, PRNG key,
-    OU forcing) plus the time and cumulative iteration count are written to
+    OU forcing, sink buffer) plus the time and cumulative iteration count are written to
     ``config.snapshot_storage_path`` via Orbax. The carry stays on device
     (sharded) between segments, and Orbax writes each device's shard
     independently, so this scales to multiple devices / nodes.
 
-    Returns the final (unpadded) primitive state, like the no-snapshot path of
-    :func:`_time_integration`; the per-snapshot data lives on disk.
+    Returns the final (unpadded) primitive state (or state struct), like the
+    no-snapshot path of :func:`_time_integration`; the per-snapshot data lives
+    on disk.
     """
     # local import keeps the (optional) orbax dependency out of the import path
     # for runs that never touch disk checkpointing.
@@ -960,15 +1009,22 @@ def _time_integration_to_disk(
 
     if config.state_struct:
         primitive_state = state.primitive_state
+        sinks = state.sinks
     else:
         primitive_state = state
+        sinks = None
 
     # The carry between segments is the unpadded state plus the stochastic
-    # bits (PRNG key, OU forcing). On a restart these come from the checkpoint.
+    # bits (PRNG key, OU forcing) and the sink buffer. On a restart these come
+    # from the checkpoint.
     if restart_state is not None:
         key, forcing = restart_state.key, restart_state.forcing
+        sinks = restart_state.sinks
     else:
         key, forcing = _seed_key_and_forcing(config, params)
+
+    if config.sink_particles:
+        _check_sink_shapes(sinks, config)
 
     # Segment config: snapshots stay off (each segment end *is* a checkpoint)
     # and ON_DEVICE so the segment runner does not recurse into this driver.
@@ -1028,7 +1084,14 @@ def _time_integration_to_disk(
                 )
 
             with mesh_ctx, pallas_mesh_context(pallas_mesh):
-                t_final, primitive_state, key, forcing, num_iterations = run_segment_jit(
+                (
+                    t_final,
+                    primitive_state,
+                    key,
+                    forcing,
+                    sinks,
+                    num_iterations,
+                ) = run_segment_jit(
                     primitive_state,
                     segment_config,
                     segment_params,
@@ -1036,6 +1099,7 @@ def _time_integration_to_disk(
                     helper_data_pad,
                     key,
                     forcing,
+                    sinks,
                 )
 
             cumulative_iterations = cumulative_iterations + num_iterations
@@ -1047,6 +1111,7 @@ def _time_integration_to_disk(
             # is a no-op data-movement-wise when already so placed).
             store_state = primitive_state
             store_forcing = forcing
+            store_sinks = sinks
             if sharding is not None:
                 store_state = jax.device_put(primitive_state, sharding)
                 if forcing is not None:
@@ -1060,6 +1125,9 @@ def _time_integration_to_disk(
                         else sharding
                     )
                     store_forcing = jax.device_put(forcing, forcing_sharding)
+                if sinks is not None:
+                    # Every device needs the whole (small) sink buffer.
+                    store_sinks = jax.device_put(sinks, replicated)
 
             save_loop_checkpoint(
                 checkpointer,
@@ -1068,10 +1136,11 @@ def _time_integration_to_disk(
                 primitive_state=store_state,
                 key=key,
                 forcing=store_forcing,
+                sinks=store_sinks,
                 num_iterations=cumulative_iterations,
             )
 
     if config.state_struct:
-        return StateStruct(primitive_state=primitive_state)
+        return StateStruct(primitive_state=primitive_state, sinks=sinks)
 
     return primitive_state

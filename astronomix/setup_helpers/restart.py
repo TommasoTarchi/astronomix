@@ -47,8 +47,8 @@ def restart_from_latest_checkpoint(
         is the restored (unpadded) state to pass as the first argument of
         :func:`~astronomix.time_stepping.time_integration.time_integration`,
         ``params`` has ``t_start`` set to the checkpoint time, and
-        ``restart_state`` is the :class:`LoopState` carrying the PRNG key and OU
-        forcing field to pass via ``restart_state=``.
+        ``restart_state`` is the :class:`LoopState` carrying the PRNG key, OU
+        forcing field and sink-particle buffer to pass via ``restart_state=``.
 
     Example::
 
@@ -67,6 +67,7 @@ def restart_from_latest_checkpoint(
         primitive_state=checkpoint.primitive_state,
         key=checkpoint.key,
         forcing=checkpoint.forcing,
+        sinks=checkpoint.sinks,
     )
     return checkpoint.primitive_state, params, restart_state
 

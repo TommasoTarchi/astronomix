@@ -459,6 +459,15 @@ class SimulationConfig(NamedTuple):
     #: Use a struct for the state.
     state_struct: bool = False
 
+    #: Carry a sink-particle buffer in the state struct
+    #: (requires ``state_struct``).
+    sink_particles: bool = False
+
+    #: Number of slots in the sink-particle buffer. It fixes
+    #: the buffer's array shapes, so changing it forces
+    #: recompilation; choose a generous value.
+    num_sink_slots: int = 0
+
     #: The geometry of the simulation.
     geometry: int = CARTESIAN
 
@@ -674,8 +683,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     Resolves the values that depend on the actual state shape or on
     cross-field consistency: the positivity-protection defaults, the number
     of cells per axis, the grid spacing, the geometry- and solver-specific
-    overrides, the master gravity switch, the boundary defaults, and the
-    disk-snapshot requirements.
+    overrides, the master gravity switch, the boundary defaults, the
+    disk-snapshot requirements, and the sink-particle requirements.
 
     Args:
         config: The user-supplied simulation configuration.
@@ -916,6 +925,20 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             raise ValueError(
                 "snapshot_storage_mode == TO_DISK is forward-mode only; "
                 "set differentiation_mode = FORWARDS."
+            )
+
+    # Sink particles travel in the state struct, and are only returned on the
+    # paths that return the final state.
+    if config.sink_particles:
+        if not config.state_struct:
+            raise ValueError(
+                "sink_particles requires state_struct = True; the sink buffer "
+                "is passed in and returned through the StateStruct."
+            )
+        if config.return_snapshots:
+            raise ValueError(
+                "at the moment, sink_particles is not supported together with "
+                "return_snapshots."
             )
 
     return config
