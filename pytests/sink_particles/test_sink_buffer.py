@@ -1,7 +1,7 @@
 """
 Sink-particle buffer round trip (stage 0 of the sink-particle plan).
 
-Runs the 2D Kelvin-Helmholtz example with a sink buffer carried alongside the
+Runs a 3D Kelvin-Helmholtz shear layer with a sink buffer carried alongside the
 fluid and checks that the buffer comes back unchanged from ``time_integration``
 and from an Orbax checkpoint restart, that the fluid is identical to the same
 run without the buffer, and that the disk-checkpointing segments compile only
@@ -51,7 +51,7 @@ from astronomix import (
 )
 
 
-NUM_CELLS = 64
+NUM_CELLS = 32
 NUM_SINK_SLOTS = 16
 T_HALF = 0.2
 T_END = 0.4
@@ -67,7 +67,8 @@ def _distinctive_sinks():
 
 
 def _khi_setup(with_sinks, checkpoint_path=None):
-    """The 2D Kelvin-Helmholtz example, optionally carrying the sink buffer.
+    """A 3D periodic Kelvin-Helmholtz shear layer, optionally carrying the sink
+    buffer.
 
     Returns ``(state, config, registered_variables)``; ``state`` is a
     ``StateStruct`` when ``with_sinks`` and a bare primitive state otherwise.
@@ -75,11 +76,12 @@ def _khi_setup(with_sinks, checkpoint_path=None):
     box_size = 1.0
 
     config = SimulationConfig(
-        dimensionality = 2,
+        dimensionality = 3,
         box_size = box_size,
         num_cells = NUM_CELLS,
         differentiation_mode = FORWARDS,
         boundary_settings = BoundarySettings(
+            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
             BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
             BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
         ),
@@ -98,11 +100,12 @@ def _khi_setup(with_sinks, checkpoint_path=None):
 
     grid_spacing = box_size / NUM_CELLS
     x = jnp.linspace(grid_spacing / 2, box_size - grid_spacing / 2, NUM_CELLS)
-    X, Y = jnp.meshgrid(x, x, indexing="ij")
+    X, Y, Z = jnp.meshgrid(x, x, x, indexing="ij")
 
     rho = jnp.where((Y > 0.25) & (Y < 0.75), 2.0, 1.0)
     u_x = jnp.where((Y > 0.25) & (Y < 0.75), -0.5, 0.5)
     u_y = 0.01 * jnp.sin(2 * jnp.pi * X)
+    u_z = 0.01 * jnp.sin(2 * jnp.pi * Z)
     p = 2.5 * jnp.ones_like(X)
 
     primitive_state = construct_primitive_state(
@@ -111,6 +114,7 @@ def _khi_setup(with_sinks, checkpoint_path=None):
         density = rho,
         velocity_x = u_x,
         velocity_y = u_y,
+        velocity_z = u_z,
         gas_pressure = p,
     )
 

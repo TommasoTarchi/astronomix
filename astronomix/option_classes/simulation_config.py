@@ -460,7 +460,7 @@ class SimulationConfig(NamedTuple):
     state_struct: bool = False
 
     #: Carry a sink-particle buffer in the state struct
-    #: (requires ``state_struct``).
+    #: (requires ``state_struct`` and ``dimensionality = 3``).
     sink_particles: bool = False
 
     #: Number of slots in the sink-particle buffer. It fixes
@@ -934,6 +934,11 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             raise ValueError(
                 "sink_particles requires state_struct = True; the sink buffer "
                 "is passed in and returned through the StateStruct."
+            )
+        if config.dimensionality != 3:
+            raise ValueError(
+                "sink_particles requires dimensionality = 3; sink formation "
+                "and the sink-gas coupling are defined for 3D only."
             )
         if config.return_snapshots:
             raise ValueError(
