@@ -45,6 +45,7 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._modules._gravity._gravity import _compute_total_potential
+from astronomix._geometry.boundaries import _boundary_handler
 
 #: Jeans number of the Truelove threshold: four cells per Jeans length.
 TRUELOVE_JEANS_NUMBER = 0.25
@@ -214,14 +215,13 @@ def _form_sinks(
     # ================= ↓ opening new slots ↓ =====================
     # -------------------------------------------------------------
 
-    phi_min = jnp.min(
-        jnp.stack([
-            _shifted(phi, offset)
-            for offset in _sphere_offsets(config.sink_accretion_radius)
-        ]),
-        axis=0,
-    )
-    candidate = (phi <= phi_min) & (checks == 1.0) & (rho > rho_thr)
+    # Lowest potential in each cell's control volume; a cell equal to it is
+    # the potential minimum
+    phi_min = phi
+    for offset in _sphere_offsets(config.sink_accretion_radius):
+        phi_min = jnp.minimum(phi_min, _shifted(phi, offset))
+
+    candidate = (phi == phi_min) & (checks == 1.0) & (rho > rho_thr)
 
     # At most num_slots slots can open in one step, which bounds the list.
     candidate_cell = jnp.nonzero(candidate.ravel(), size=num_slots, fill_value=-1)[0]
@@ -389,7 +389,7 @@ def _sink_formation(
     Form and feed sink particles on the (possibly padded) primitive state.
 
     Computes the gravitational potential, then runs :func:`_form_sinks` on the
-    interior cells.
+    interior cells and, with ghost cells, refills them from the new interior.
 
     Args:
         primitive_state: The primitive state, padded unless the boundaries are
@@ -427,4 +427,11 @@ def _sink_formation(
         registered_variables,
     )
 
-    return primitive_state.at[(slice(None),) + interior].set(state), sinks
+    primitive_state = primitive_state.at[(slice(None),) + interior].set(state)
+
+    # update ghost cells after sink formation
+    primitive_state = _boundary_handler(
+        primitive_state, config, registered_variables, params
+    )
+
+    return primitive_state, sinks
