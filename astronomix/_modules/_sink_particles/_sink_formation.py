@@ -6,12 +6,11 @@ sink-particle buffer. A cell ``c`` gives
 
     dm_c = min(0.25 m_c, F_c * max(rho_c - rho_thr, 0) * V)
 
-to the slot whose accretion sphere contains it and to which it is most strongly
-bound. ``F_c`` is the product of the enabled transfer checks (converging flow,
-Jeans instability, boundedness), each 0 or 1, evaluated on the control volume
-of the cell holding that slot: the sphere of radius
-``config.sink_accretion_radius`` (in cells) around it. ``rho_thr`` is the
-Truelove threshold.
+to the closest slot whose accretion sphere contains it. ``F_c`` is the product
+of the enabled transfer checks (converging flow, Jeans instability,
+boundedness), each 0 or 1, evaluated on the control volume of the cell holding
+that slot: the sphere of radius ``config.sink_accretion_radius`` (in cells)
+around it. ``rho_thr`` is the Truelove threshold.
 
 A slot opens at a cell that is the potential minimum of its control volume,
 passes every enabled check, lies above the threshold, has no occupied slot
@@ -231,7 +230,6 @@ def _form_sinks(
         jnp.stack(jnp.unravel_index(candidate_cell, shape), axis=-1) + 0.5
     ) * dx
     candidate_phi = phi.ravel()[candidate_cell]
-    candidate_velocity = u.reshape(3, num_cells)[:, candidate_cell].T
 
     # no occupied slot within the accretion radius
     occupied = sinks.mass > 0
@@ -270,7 +268,6 @@ def _form_sinks(
     active = occupied | opening
     centre = sinks.position.at[target].set(candidate_position, mode="drop")
     centre = jnp.where(active[:, None], centre, 0.0)
-    reference_velocity = sinks.velocity.at[target].set(candidate_velocity, mode="drop")
 
     # -------------------------------------------------------------
     # ================= ↑ opening new slots ↑ =====================
@@ -281,19 +278,16 @@ def _form_sinks(
     # -------------------------------------------------------------
 
     # Every cell whose centre can be within the accretion radius of a slot lies
-    # in this cube around the slot's cell.
-    half_width = int(math.floor(config.sink_accretion_radius + 0.5))
-    cube = jnp.array([
-        (i, j, k)
-        for i in range(-half_width, half_width + 1)
-        for j in range(-half_width, half_width + 1)
-        for k in range(-half_width, half_width + 1)
-    ])
+    # in this sphere around the slot's cell: the slot is at most sqrt(3)/2
+    # cells from its cell centre.
+    candidate_offsets = jnp.array(
+        _sphere_offsets(config.sink_accretion_radius + math.sqrt(3) / 2)
+    )
 
     # (num_slots, num_offsets, 3); positions are not wrapped, so they stay
     # continuous around the slot
     centre_cell = jnp.floor(centre / dx).astype(jnp.int32)
-    cell = centre_cell[:, None, :] + cube[None]
+    cell = centre_cell[:, None, :] + candidate_offsets[None]
     cell_position = (cell + 0.5) * dx
     flat_cell = jnp.ravel_multi_index(
         tuple(cell[..., axis] for axis in range(3)), shape, mode="wrap"
@@ -303,16 +297,12 @@ def _form_sinks(
 
     cell_velocity = jnp.moveaxis(u.reshape(3, num_cells)[:, flat_cell], 0, -1)
 
-    # A cell within the radius of several slots feeds the one it is most
-    # strongly bound to. Sink gravity is a point mass, softened to half a cell
-    # so the cell holding the sink stays finite.
-    binding = (
-        -G * sinks.mass[:, None] / jnp.sqrt(jnp.maximum(r_squared, (0.5 * dx) ** 2))
-        + 0.5 * jnp.sum((cell_velocity - reference_velocity[:, None]) ** 2, axis=-1)
-    )
-    binding = jnp.where(inside, binding, jnp.inf)
-    best_binding = jnp.full(num_cells, jnp.inf).at[flat_cell].min(binding)
-    winner = inside & (binding == best_binding[flat_cell])
+    # A cell within the radius of several slots feeds the closest one.
+    # TODO: once sinks move under gravity, feed the slot the cell is most
+    # strongly bound to instead.
+    distance = jnp.where(inside, r_squared, jnp.inf)
+    closest = jnp.full(num_cells, jnp.inf).at[flat_cell].min(distance)
+    winner = inside & (distance == closest[flat_cell])
     # ties go to the lower slot index
     slot_index = jnp.arange(num_slots)[:, None]
     first_winner = jnp.full(num_cells, num_slots).at[flat_cell].min(
