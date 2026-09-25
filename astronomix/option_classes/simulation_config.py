@@ -459,14 +459,32 @@ class SimulationConfig(NamedTuple):
     #: Use a struct for the state.
     state_struct: bool = False
 
-    #: Carry a sink-particle buffer in the state struct
-    #: (requires ``state_struct`` and ``dimensionality = 3``).
+    #: Form sink particles, carried in a buffer in the state struct
+    #: (requires ``state_struct``, ``dimensionality = 3``, self-gravity,
+    #: periodic boundaries and no MHD).
     sink_particles: bool = False
 
     #: Number of slots in the sink-particle buffer. It fixes
     #: the buffer's array shapes, so changing it forces
     #: recompilation; choose a generous value.
     num_sink_slots: int = 0
+
+    #: Sink accretion radius in units of cells. It sets the
+    #: control volume of the formation checks and the region
+    #: a sink takes gas from; it fixes stencil sizes, so it is
+    #: a configuration value.
+    sink_accretion_radius: float = 2.5
+
+    #: Sink formation check: gas converges along every axis.
+    sink_converging_flow_check: bool = True
+
+    #: Sink formation check: the control volume is Jeans unstable,
+    #: ``|E_grav| > 2 E_th``.
+    sink_jeans_check: bool = True
+
+    #: Sink formation check: the control volume is bound,
+    #: ``E_grav + E_th + E_kin < 0``.
+    sink_bound_check: bool = True
 
     #: The geometry of the simulation.
     geometry: int = CARTESIAN
@@ -945,6 +963,16 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 "at the moment, sink_particles is not supported together with "
                 "return_snapshots."
             )
+        if not config.gravity_config.self_gravity:
+            raise ValueError(
+                "sink_particles requires self_gravity; the formation checks "
+                "read the gravitational potential."
+            )
+        if config.mhd:
+            raise ValueError("sink_particles is not supported together with mhd.")
+        periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+        if config.boundary_settings != BoundarySettings(periodic, periodic, periodic):
+            raise ValueError("sink_particles requires periodic boundaries.")
 
     return config
 

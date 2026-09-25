@@ -57,6 +57,7 @@ from astronomix._finite_difference._timestep_estimation._timestep_estimator impo
     _cfl_time_step_fd_hydro
 )
 from astronomix._modules._iteration_level_updates import _iteration_level_updates
+from astronomix._modules._sink_particles._sink_formation import _sink_formation
 from astronomix._modules._turbulent_forcing._turbulent_forcing import _init_ou_forcing_state
 from astronomix._snapshotting._snapshot_diagnostics import (
     build_snapshot_store,
@@ -258,6 +259,9 @@ def time_integration(
     # active subsystems; the unpadded variant needed for snapshot
     # diagnostics is recovered by slicing the padded one inside the
     # update step (see _unpad_helper_data).
+    if config.sink_particles and sharding is not None:
+        raise ValueError("sink_particles is not supported on multiple devices yet.")
+
     requirements = _helper_data_requirements(config)
     helper_data_pad = get_helper_data(
         config,
@@ -704,8 +708,13 @@ def _integrate_core(
                 helper_data_pad, registered_variables,
             )
 
-        # the sink buffer rides through the step untouched
-        return dt, LoopState(primitive_state, key, forcing, state.sinks)
+        sinks = state.sinks
+        if config.sink_particles:
+            primitive_state, sinks = _sink_formation(
+                primitive_state, sinks, config, params, registered_variables,
+            )
+
+        return dt, LoopState(primitive_state, key, forcing, sinks)
 
     def _record_snapshot(time, state, store, idx):
         """Record snapshot ``idx`` (the requested diagnostics)."""
@@ -814,6 +823,15 @@ def _integrate_core(
         snapshots=snapshot_spec,
         progress=_show_progress if config.progress_bar else None,
     )
+
+    # An occupied slot is never emptied during the run, so the final occupied
+    # count is also the highest reached.
+    if config.sink_particles:
+        jax.debug.print(
+            "sink slots occupied: {} of {}",
+            jnp.sum(loop_state.sinks.mass > 0),
+            config.num_sink_slots,
+        )
 
     # -------------------------------------------------------------
     # =================== ↑ loop-level logic ↑ ====================
