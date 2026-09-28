@@ -45,6 +45,7 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 # astronomix functions
 from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._geometry.boundaries import _boundary_handler
+from astronomix._stencil_operations._stencil_operations import _stencil_add
 
 #: Jeans number of the Truelove threshold: four cells per Jeans length.
 TRUELOVE_JEANS_NUMBER = 0.25
@@ -79,13 +80,6 @@ def _shifted(field, offset):
     return jnp.roll(field, tuple(-o for o in offset), axis=(-3, -2, -1))
 
 
-def _unit(axis, sign):
-    """The offset of one cell along ``axis`` in direction ``sign``."""
-    offset = [0, 0, 0]
-    offset[axis] = sign
-    return tuple(offset)
-
-
 def _periodic_distance_squared(a, b, box):
     """Squared minimum-image distance between positions ``a`` and ``b`` (last
     axis 3)."""
@@ -115,7 +109,7 @@ def _transfer_checks(m, u, e_th, phi, config):
     # one axis and escaping along another (a shock) fails.
     if config.sink_converging_flow_check:
         for axis in range(3):
-            du = _shifted(u[axis], _unit(axis, 1)) - _shifted(u[axis], _unit(axis, -1))
+            du = _stencil_add(u[axis], indices=(1, -1), factors=(1.0, -1.0), axis=axis)
             checks = checks * (du < 0).astype(m.dtype)
 
     if config.sink_jeans_check or config.sink_bound_check:
@@ -130,27 +124,25 @@ def _transfer_checks(m, u, e_th, phi, config):
             e_th,
             m * phi,
         ])
-        sums = sum(_shifted(fields, offset) for offset in sphere)
-        mass, px, py, pz, kinetic, thermal, mass_phi = sums
+        mass, px, py, pz, kinetic, thermal, mass_phi = sum(
+            _shifted(fields, offset) for offset in sphere
+        )
 
         # The gas escapes the well over the lowest point of its rim, so the
         # potential energy is measured from the lowest potential in the layer
         # of cells just outside the control volume.
-        phi_edge = jnp.min(
-            jnp.stack([
-                _shifted(phi, offset)
-                for offset in _shell_offsets(config.sink_accretion_radius)
-            ]),
-            axis=0,
-        )
+        phi_edge = jnp.full_like(phi, jnp.inf)
+        for offset in _shell_offsets(config.sink_accretion_radius):
+            phi_edge = jnp.minimum(phi_edge, _shifted(phi, offset))
         e_grav = mass_phi - mass * phi_edge
-
-        # kinetic energy in the centre-of-mass frame of the control volume
-        e_kin = kinetic - 0.5 * (px**2 + py**2 + pz**2) / mass
 
         if config.sink_jeans_check:
             checks = checks * (-e_grav > 2.0 * thermal).astype(m.dtype)
+
         if config.sink_bound_check:
+            # kinetic energy in the centre-of-mass frame of the control volume
+            e_kin = kinetic - 0.5 * (px**2 + py**2 + pz**2) / mass
+
             checks = checks * (e_grav + thermal + e_kin < 0).astype(m.dtype)
 
     return checks
