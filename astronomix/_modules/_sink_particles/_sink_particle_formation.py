@@ -410,9 +410,50 @@ def _form_sink_particles(
         jnp.any(sink_within_accretion_radius, axis=-1)
     )
 
-    candidate_passes = jnp.logical_and(
-        candidate_is_valid,
-        far_from_existing_sinks,
+    # Jeans instability check (Section 2.2.5): the gravitational energy of the
+    # gas in the control volume must exceed twice its thermal energy plus its
+    # magnetic energy, |E_grav| > 2 E_th + E_mag.
+    #   - E_th = ½ Σ M c_s² (Eq. 5).
+    #   - E_grav = −Σ M (φ_max − φ), with φ_max the largest potential in the
+    #     control volume, as in Federrath's FLASH code. Measuring φ from its
+    #     maximum removes the part of the potential that is constant across
+    #     the volume, which the gas outside the control volume contributes.
+    #   - E_mag = ½ Σ |B|² ΔV (Eq. 9, with the magnetic energy density ½ B²
+    #     of astronomix's field units instead of the paper's B² / 8π).
+    sound_speed_squared_in_volume = sound_speed_squared[control_volume_indices]
+    thermal_energy = 0.5 * jnp.sum(
+        cell_mass_in_volume * sound_speed_squared_in_volume,
+        axis=-1,
+    )
+
+    potential_in_volume = gravitational_potential[control_volume_indices]
+    maximum_potential_in_volume = jnp.max(potential_in_volume, axis=-1, keepdims=True)
+    gravitational_energy_magnitude = jnp.sum(
+        cell_mass_in_volume * (maximum_potential_in_volume - potential_in_volume),
+        axis=-1,
+    )
+
+    if config.mhd:
+        magnetic_field_squared = (
+            primitive_state[registered_variables.magnetic_index.x] ** 2
+            + primitive_state[registered_variables.magnetic_index.y] ** 2
+            + primitive_state[registered_variables.magnetic_index.z] ** 2
+        )
+        magnetic_energy = 0.5 * jnp.sum(
+            magnetic_field_squared[control_volume_indices] * cell_volume,
+            axis=-1,
+        )
+    else:
+        magnetic_energy = jnp.zeros_like(thermal_energy)
+
+    jeans_unstable = (
+        gravitational_energy_magnitude > 2.0 * thermal_energy + magnetic_energy
+    )
+
+    candidate_passes = (
+        candidate_is_valid
+        & far_from_existing_sinks
+        & jeans_unstable
     )
 
     # -------------------------------------------------------------

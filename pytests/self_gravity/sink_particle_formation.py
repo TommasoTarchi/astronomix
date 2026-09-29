@@ -50,11 +50,12 @@ CELL_SIZE = 1.0 / NUM_CELLS
 # The clump is centred on the centre of cell (16, 16, 16), so that this cell is
 # the unique potential minimum. With c_s² = 1, G = 1 and r_acc = 2.5 cells on a
 # 32³ unit box, the density threshold (Eq. 32) is ρ_res = π / (4 r_acc²) ≈ 129.
-# A peak overdensity of 200 puts 19 cells above it: the centre cell, its 6 face
-# neighbours and its 12 edge neighbours.
+# A peak overdensity of 400 puts 57 cells above it, all within the centre
+# cell's control volume, and makes the control volume Jeans unstable
+# (|E_grav| ≈ 1.26 × 2 E_th).
 CLUMP_CENTER = 0.5 + 0.5 * CELL_SIZE
 SETTINGS = SinkFormationSettings(
-    peak_overdensity=200.0,
+    peak_overdensity=400.0,
     overdensity_center=(CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
 )
 
@@ -155,12 +156,12 @@ def test_density_threshold():
     # One sink, from the centre cell, the only potential minimum.
     assert _num_sinks(sink_particles) == 1
 
-    # The 19 cells above the threshold all lie in the centre cell's control
+    # The 57 cells above the threshold all lie in the centre cell's control
     # volume, so the sink carries the whole mass above the threshold.
     density = primitive_state[registered_variables.density_index]
     density_threshold = _density_threshold(config, params)
     cells_above_threshold = density > density_threshold
-    assert int(jnp.sum(cells_above_threshold)) == 19
+    assert int(jnp.sum(cells_above_threshold)) == 57
     mass_above_threshold = jnp.sum(
         jnp.where(cells_above_threshold, density - density_threshold, 0.0)
     ) * config.grid_spacing**3
@@ -305,7 +306,7 @@ def test_potential_minimum():
 
     # Add a narrow density spike in a single cell, 2 cells from the clump
     # centre along x (within r_acc). The spike cell becomes the densest cell
-    # (ρ ≈ 393 against ≈ 201 at the centre), but it holds too little mass to
+    # (ρ ≈ 484 against ≈ 401 at the centre), but it holds too little mass to
     # move the potential minimum away from the clump centre. The pressure is
     # raised with the density, keeping c_s² = 1.
     spike_index = (NUM_CELLS // 2 + 2, NUM_CELLS // 2, NUM_CELLS // 2)
@@ -328,6 +329,37 @@ def test_potential_minimum():
     # slightly toward the spike, but stays within half a cell of the centre.
     assert _num_sinks(sink_particles) == 1
     assert jnp.all(jnp.abs(sink_particles.position[0] - CLUMP_CENTER) < 0.5 * CELL_SIZE)
+
+
+@pytest.mark.parametrize(
+    "peak_overdensity, sound_speed_squared, expected_num_sinks",
+    [
+        # Cold and dense enough: |E_grav| ≈ 1.26 × 2 E_th, a sink forms.
+        (400.0, 1.0, 1),
+        # Above the density threshold, but not Jeans unstable:
+        # |E_grav| ≈ 0.63 × 2 E_th.
+        (200.0, 1.0, 0),
+        # Hot: doubling c_s² doubles E_th (|E_grav| ≈ 0.63 × 2 E_th). The
+        # threshold doubles too (ρ_res ≈ 257), but the centre (ρ ≈ 401) stays
+        # above it, so only the Jeans check fails.
+        (400.0, 2.0, 0),
+    ],
+)
+def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_sinks):
+    """A sink forms only if the gas in the control volume is Jeans unstable,
+    |E_grav| > 2 E_th + E_mag (Section 2.2.5)."""
+    settings = SETTINGS._replace(
+        peak_overdensity=peak_overdensity,
+        sound_speed_squared=sound_speed_squared,
+    )
+    state, config, params, registered_variables = _setup(
+        sink_particles=True,
+        settings=settings,
+    )
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    assert _num_sinks(sink_particles) == expected_num_sinks
 
 
 def test_sink_particle_slots_overflow(capfd):
@@ -387,3 +419,4 @@ if __name__ == "__main__":
     test_position_wrapping()
     test_converging_flow((-1.0, -1.0, -1.0), 1)
     test_potential_minimum()
+    test_jeans_instability(400.0, 1.0, 1)
