@@ -146,7 +146,8 @@ def _gas_totals(primitive_state, registered_variables):
 
 def test_single_transfer():
     """One formation call opens one slot, conserves mass and momentum, keeps
-    the energy books straight and removes no more than the 25% cap."""
+    the energy books straight and leaves every cell that gave mass at the
+    threshold."""
     state, config, registered_variables = _collapsing_blob()
     params = SimulationParams(gamma = GAMMA)
 
@@ -181,18 +182,15 @@ def test_single_transfer():
     sink_kinetic = jnp.sum(0.5 * sinks.mass * jnp.sum(sinks.velocity**2, axis=1))
     assert energy_1 + sink_kinetic <= energy_0
 
-    # No cell gives more than the cap. With the hard criteria, a cell that
-    # gives mass is left at exactly max(rho_thr, 0.75 rho); this does not
-    # hold once the criteria are smooth.
-    assert jnp.all(rho_1 >= 0.75 * rho_0 * (1 - 1e-12))
+    # With the hard criteria, a cell that gives mass is left at exactly
+    # rho_thr; this does not hold once the criteria are smooth.
     rho_thr = (
         TRUELOVE_JEANS_NUMBER**2 * jnp.pi * SOUND_SPEED_SQUARED
         / (params.gravitational_constant * DX**2)
     )
     gave = rho_1 < rho_0
     assert jnp.sum(gave) > 1
-    expected = jnp.maximum(rho_thr, 0.75 * rho_0)
-    assert jnp.allclose(rho_1[gave], expected[gave], rtol=1e-12)
+    assert jnp.allclose(rho_1[gave], rho_thr, rtol=1e-12)
 
 
 def test_shock_forms_no_sink():

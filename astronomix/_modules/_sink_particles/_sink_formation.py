@@ -4,7 +4,7 @@ Sink-particle formation.
 After every hydro step, gas is moved from the grid into the slots of the
 sink-particle buffer. A cell ``c`` gives
 
-    dm_c = min(0.25 m_c, F_c * max(rho_c - rho_thr, 0) * V)
+    dm_c = F_c * max(rho_c - rho_thr, 0) * V
 
 to the closest slot whose accretion sphere contains it. ``F_c`` is the product
 of the enabled transfer checks (converging flow, Jeans instability,
@@ -49,9 +49,6 @@ from astronomix._stencil_operations._stencil_operations import _stencil_add
 
 #: Jeans number of the Truelove threshold: four cells per Jeans length.
 TRUELOVE_JEANS_NUMBER = 0.25
-
-#: Largest fraction of its mass a cell may give in one step.
-MAX_REMOVED_FRACTION = 0.25
 
 
 def _sphere_offsets(radius):
@@ -315,12 +312,8 @@ def _form_sinks(
             tuple(centre_cell[:, axis] for axis in range(3)), shape, mode="wrap"
         )
     ]
-    dm = jnp.minimum(
-        MAX_REMOVED_FRACTION * m.ravel()[flat_cell],
-        slot_checks[:, None]
-        * jnp.maximum(rho - rho_thr, 0.0).ravel()[flat_cell] * volume,
-    )
-    dm = jnp.where(winner, dm, 0.0)
+    excess_mass = jnp.maximum(rho - rho_thr, 0.0).ravel() * volume
+    dm = jnp.where(winner, slot_checks[:, None] * excess_mass[flat_cell], 0.0)
 
     # The gas keeps its velocity and specific internal energy, so density and
     # pressure drop by the removed fraction.
