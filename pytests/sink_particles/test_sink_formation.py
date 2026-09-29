@@ -2,11 +2,13 @@
 Sink formation with hard criteria (stage 1a of the sink-particle plan).
 
 Uses a small periodic box with self-gravity holding a cold, infalling Gaussian
-overdensity, centred on a cell, whose centre exceeds the Truelove threshold
-tenfold. Checks a single formation call for conservation and for the density
-left behind, checks that a shock-compressed sheet forms no sink unless the
-transfer checks are switched off, and checks that a full run forms a single
-sink and survives a checkpoint restart.
+overdensity, centred on a cell, whose centre exceeds the density threshold
+many times over. Checks a single formation call for conservation and for the
+density left behind, checks that an existing sink takes no more gas, checks
+the control-volume energies against a direct sum, checks that a
+shock-compressed sheet forms no sink unless the formation checks are switched
+off, and checks that a full run forms a single sink and survives a checkpoint
+restart.
 """
 
 # ==== GPU selection ====
@@ -14,6 +16,9 @@ from autocvd import autocvd
 autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
+
+# numerics
+import numpy as np
 
 # jax
 import jax
@@ -50,8 +55,9 @@ from astronomix import (
     restart_from_latest_checkpoint,
 )
 from astronomix._modules._sink_particles._sink_formation import (
-    TRUELOVE_JEANS_NUMBER,
+    _control_volume_checks,
     _sink_formation,
+    _sphere_offsets,
 )
 
 
@@ -184,13 +190,78 @@ def test_single_transfer():
 
     # With the hard criteria, a cell that gives mass is left at exactly
     # rho_thr; this does not hold once the criteria are smooth.
+    accretion_radius = config.sink_accretion_radius * DX
     rho_thr = (
-        TRUELOVE_JEANS_NUMBER**2 * jnp.pi * SOUND_SPEED_SQUARED
-        / (params.gravitational_constant * DX**2)
+        jnp.pi * SOUND_SPEED_SQUARED
+        / (4.0 * params.gravitational_constant * accretion_radius**2)
     )
     gave = rho_1 < rho_0
     assert jnp.sum(gave) > 1
     assert jnp.allclose(rho_1[gave], rho_thr, rtol=1e-12)
+
+
+def test_existing_sink_takes_no_gas():
+    """A second formation call on the result of the first moves no gas and
+    leaves the existing sink as it is."""
+    state, config, registered_variables = _collapsing_blob()
+    params = SimulationParams(gamma = GAMMA)
+
+    state_1, sinks_1 = _sink_formation(
+        state, _empty_sinks(), config, params, registered_variables
+    )
+    state_2, sinks_2 = _sink_formation(
+        state_1, sinks_1, config, params, registered_variables
+    )
+
+    assert jnp.array_equal(state_2, state_1)
+    for name in SinkParticles._fields:
+        assert jnp.array_equal(getattr(sinks_2, name), getattr(sinks_1, name)), name
+
+
+def _direct_energies(centre, m, u, c_s2, G, radius):
+    """Eqs. 5, 6 and 11 of Federrath et al. (2010) by a direct loop."""
+    cells = [
+        tuple((c + o) % NUM_CELLS for c, o in zip(centre, offset))
+        for offset in _sphere_offsets(radius)
+    ]
+    offsets = np.array(_sphere_offsets(radius), dtype=float) * DX
+    mass = np.array([m[c] for c in cells])
+    velocity = np.array([u[(slice(None),) + c] for c in cells])
+    e_grav = 0.0
+    for a in range(len(cells)):
+        for b in range(len(cells)):
+            if a != b:
+                r = np.linalg.norm(offsets[a] - offsets[b])
+                e_grav -= G * mass[a] * mass[b] / r
+    e_th = 0.5 * sum(mass[a] * c_s2[cells[a]] for a in range(len(cells)))
+    v_cm = np.sum(mass[:, None] * velocity, axis=0) / np.sum(mass)
+    e_kin = 0.5 * np.sum(mass * np.sum((velocity - v_cm) ** 2, axis=1))
+    return e_grav, e_th, e_kin
+
+
+def test_control_volume_energies():
+    """The Jeans and bound checks agree with energies from a direct sum, on
+    random gas, for control volumes that wrap around the box and not."""
+    state, config, registered_variables = _collapsing_blob()
+    rng = np.random.default_rng(0)
+    m = rng.uniform(0.5, 2.0, (NUM_CELLS,) * 3)
+    u = rng.normal(0.0, 0.3, (3,) + (NUM_CELLS,) * 3)
+    c_s2 = rng.uniform(0.5, 2.0, (NUM_CELLS,) * 3)
+    centres = [(16, 16, 16), (0, 5, 31), (1, 30, 2)]
+
+    for G in (0.01, 1.0, 100.0):
+        for jeans, bound in ((True, False), (False, True)):
+            cfg = config._replace(sink_jeans_check=jeans, sink_bound_check=bound)
+            passed = _control_volume_checks(
+                jnp.array(centres), jnp.array(m), jnp.array(u), jnp.array(c_s2),
+                G, cfg,
+            )
+            for k, centre in enumerate(centres):
+                e_grav, e_th, e_kin = _direct_energies(
+                    centre, m, u, c_s2, G, config.sink_accretion_radius
+                )
+                expected = (-e_grav > 2 * e_th) if jeans else (e_grav + e_th + e_kin < 0)
+                assert bool(passed[k]) == bool(expected), (G, jeans, centre)
 
 
 def test_shock_forms_no_sink():

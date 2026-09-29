@@ -1,21 +1,28 @@
 """
-Sink-particle formation.
+Sink-particle formation, following Federrath et al. (2010), Sect. 2.2.
 
-After every hydro step, gas is moved from the grid into the slots of the
-sink-particle buffer. A cell ``c`` gives
+After every hydro step, a slot of the sink-particle buffer opens at a cell
+that
 
-    dm_c = F_c * max(rho_c - rho_thr, 0) * V
+- lies above the density threshold
+  ``rho_thr = pi c_s^2 / (4 G r_acc^2)`` (their Eq. 32), with ``r_acc`` the
+  accretion radius ``config.sink_accretion_radius`` (in cells),
+- is the potential minimum of its control volume, the sphere of radius
+  ``r_acc`` around it,
+- passes every enabled check (converging flow, Jeans instability,
+  boundedness),
+- has no occupied slot within the accretion radius, and
+- has no other candidate of the same step within the accretion radius with a
+  lower potential.
 
-to the closest slot whose accretion sphere contains it. ``F_c`` is the product
-of the enabled transfer checks (converging flow, Jeans instability,
-boundedness), each 0 or 1, evaluated on the control volume of the cell holding
-that slot: the sphere of radius ``config.sink_accretion_radius`` (in cells)
-around it. ``rho_thr`` is the Truelove threshold.
+The density threshold, converging-flow and potential-minimum checks are
+evaluated on the whole grid; the Jeans and bound-state checks, which need the
+self-gravity of the control volume, only on the cells that pass them.
 
-A slot opens at a cell that is the potential minimum of its control volume,
-passes every enabled check, lies above the threshold, has no occupied slot
-within the accretion radius, and has no other candidate of the same step within
-the accretion radius with a lower potential.
+A slot that opens takes ``max(rho_c - rho_thr, 0) * V`` from every cell ``c``
+within its accretion radius (a cell within the radius of several opening
+slots feeds the closest one). Occupied slots take no gas: there is no
+accretion yet.
 
 The grid is periodic: neighbours are reached by rolling the arrays and slot
 distances use the minimum image.
@@ -24,6 +31,9 @@ distances use the minimum image.
 # general
 from functools import partial
 import math
+
+# numerics
+import numpy as np
 
 # jax
 import jax
@@ -47,10 +57,6 @@ from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._geometry.boundaries import _boundary_handler
 from astronomix._stencil_operations._stencil_operations import _stencil_add
 
-#: Jeans number of the Truelove threshold: four cells per Jeans length.
-TRUELOVE_JEANS_NUMBER = 0.25
-
-
 def _sphere_offsets(radius):
     """Integer cell offsets whose centres lie within ``radius`` cells."""
     n = int(math.floor(radius))
@@ -60,14 +66,6 @@ def _sphere_offsets(radius):
         for j in range(-n, n + 1)
         for k in range(-n, n + 1)
         if i * i + j * j + k * k <= radius**2
-    ]
-
-
-def _shell_offsets(radius):
-    """The one-cell layer just outside :func:`_sphere_offsets`."""
-    return [
-        offset for offset in _sphere_offsets(radius + 1)
-        if sum(o * o for o in offset) > radius**2
     ]
 
 
@@ -85,64 +83,87 @@ def _periodic_distance_squared(a, b, box):
     return jnp.sum(d**2, axis=-1)
 
 
-def _transfer_checks(m, u, e_th, phi, config):
+def _converging_flow_check(u, config):
     """
-    Product of the enabled transfer checks, each 1.0 if it passes and 0.0 if
+    Converging-flow check, 1.0 where it passes (or is disabled) and 0.0 where
     not.
 
     Args:
-        m: Cell masses, shape (nx, ny, nz).
         u: Gas velocities, shape (3, nx, ny, nz).
-        e_th: Cell thermal energies, shape (nx, ny, nz).
-        phi: Gravitational potential, shape (nx, ny, nz).
         config: The simulation configuration.
 
     Returns:
-        ``F_c``, shape (nx, ny, nz).
+        The check, shape (nx, ny, nz).
     """
-    checks = jnp.ones_like(m)
+    checks = jnp.ones_like(u[0])
 
     # Gas must flow inward along each axis separately; a region squeezed along
     # one axis and escaping along another (a shock) fails.
     if config.sink_converging_flow_check:
         for axis in range(3):
             du = _stencil_add(u[axis], indices=(1, -1), factors=(1.0, -1.0), axis=axis)
-            checks = checks * (du < 0).astype(m.dtype)
-
-    if config.sink_jeans_check or config.sink_bound_check:
-        sphere = _sphere_offsets(config.sink_accretion_radius)
-
-        fields = jnp.stack([
-            m,
-            m * u[0],
-            m * u[1],
-            m * u[2],
-            0.5 * m * jnp.sum(u**2, axis=0),
-            e_th,
-            m * phi,
-        ])
-        mass, px, py, pz, kinetic, thermal, mass_phi = sum(
-            _shifted(fields, offset) for offset in sphere
-        )
-
-        # The gas escapes the well over the lowest point of its rim, so the
-        # potential energy is measured from the lowest potential in the layer
-        # of cells just outside the control volume.
-        phi_edge = jnp.full_like(phi, jnp.inf)
-        for offset in _shell_offsets(config.sink_accretion_radius):
-            phi_edge = jnp.minimum(phi_edge, _shifted(phi, offset))
-        e_grav = mass_phi - mass * phi_edge
-
-        if config.sink_jeans_check:
-            checks = checks * (-e_grav > 2.0 * thermal).astype(m.dtype)
-
-        if config.sink_bound_check:
-            # kinetic energy in the centre-of-mass frame of the control volume
-            e_kin = kinetic - 0.5 * (px**2 + py**2 + pz**2) / mass
-
-            checks = checks * (e_grav + thermal + e_kin < 0).astype(m.dtype)
+            checks = checks * (du < 0).astype(u.dtype)
 
     return checks
+
+
+def _control_volume_checks(centre_cell, m, u, c_s2, G, config):
+    """
+    Jeans-instability and bound-state checks on the control volumes of the
+    given cells, as boolean arrays that are True where the enabled checks
+    pass.
+
+    The energies follow Federrath et al. (2010), Eqs. 5, 6, 11 and 12. The
+    potential in Eq. 6 is the one of the gas inside the control volume, each
+    cell a point mass, so ``E_grav = -G sum_{a != b} M_a M_b / r_ab``.
+
+    Args:
+        centre_cell: Integer indices of the central cells, shape (K, 3).
+        m: Cell masses, shape (nx, ny, nz).
+        u: Gas velocities, shape (3, nx, ny, nz).
+        c_s2: Squared sound speeds, shape (nx, ny, nz).
+        G: The gravitational constant.
+        config: The simulation configuration.
+
+    Returns:
+        The combined check, shape (K,).
+    """
+    passed = jnp.ones(centre_cell.shape[0], dtype=bool)
+    if not (config.sink_jeans_check or config.sink_bound_check):
+        return passed
+
+    sphere = np.array(_sphere_offsets(config.sink_accretion_radius))
+
+    # inverse cell-cell distances in the control volume, without self-terms
+    separation = np.linalg.norm(sphere[:, None] - sphere[None], axis=-1)
+    inverse_separation = np.where(
+        separation > 0, 1.0 / np.where(separation > 0, separation, 1.0), 0.0
+    ) / config.grid_spacing
+
+    # (K, num_offsets)
+    cell = centre_cell[:, None, :] + sphere[None]
+    flat_cell = jnp.ravel_multi_index(
+        tuple(cell[..., axis] for axis in range(3)), m.shape, mode="wrap"
+    )
+    mass = m.ravel()[flat_cell]
+    velocity = jnp.moveaxis(u.reshape(3, m.size)[:, flat_cell], 0, -1)
+
+    e_grav = -G * jnp.einsum("ka,ab,kb->k", mass, inverse_separation, mass)
+    e_th = 0.5 * jnp.sum(mass * c_s2.ravel()[flat_cell], axis=1)
+
+    if config.sink_jeans_check:
+        passed = passed & (-e_grav > 2.0 * e_th)
+
+    if config.sink_bound_check:
+        # kinetic energy in the centre-of-mass frame of the control volume
+        momentum = jnp.sum(mass[..., None] * velocity, axis=1)
+        e_kin = (
+            0.5 * jnp.sum(mass * jnp.sum(velocity**2, axis=-1), axis=1)
+            - 0.5 * jnp.sum(momentum**2, axis=-1) / jnp.sum(mass, axis=1)
+        )
+        passed = passed & (e_grav + e_th + e_kin < 0)
+
+    return passed
 
 
 def _form_sinks(
@@ -189,15 +210,15 @@ def _form_sinks(
     m = rho * volume
     if config.equation_of_state == ISOTHERMAL:
         c_s2 = params.isothermal_sound_speed**2 * jnp.ones_like(rho)
-        e_th = 1.5 * m * c_s2
     else:
         c_s2 = params.gamma * p / rho
-        e_th = p * volume / (params.gamma - 1)
 
-    # Truelove threshold, per cell through the local sound speed
-    rho_thr = TRUELOVE_JEANS_NUMBER**2 * jnp.pi * c_s2 / (G * dx**2)
+    # Density threshold of Federrath et al. (2010), Eq. 32: the Jeans length
+    # is resolved by the accretion diameter. Per cell through the local sound
+    # speed.
+    rho_thr = jnp.pi * c_s2 / (4.0 * G * accretion_radius**2)
 
-    checks = _transfer_checks(m, u, e_th, phi, config)
+    converging = _converging_flow_check(u, config)
 
     # -------------------------------------------------------------
     # ================= ↓ opening new slots ↓ =====================
@@ -209,15 +230,19 @@ def _form_sinks(
     for offset in _sphere_offsets(config.sink_accretion_radius):
         phi_min = jnp.minimum(phi_min, _shifted(phi, offset))
 
-    candidate = (phi == phi_min) & (checks == 1.0) & (rho > rho_thr)
+    candidate = (phi == phi_min) & (converging == 1.0) & (rho > rho_thr)
 
-    # At most num_slots slots can open in one step, which bounds the list.
+    # At most num_slots slots can open in one step, which bounds the list. The
+    # Jeans and bound checks come after the list is filled, so if more cells
+    # pass the checks above than there are slots, the surplus is dropped for
+    # this step.
     candidate_cell = jnp.nonzero(candidate.ravel(), size=num_slots, fill_value=-1)[0]
     valid = candidate_cell >= 0
     candidate_cell = jnp.maximum(candidate_cell, 0)
-    candidate_position = (
-        jnp.stack(jnp.unravel_index(candidate_cell, shape), axis=-1) + 0.5
-    ) * dx
+    candidate_index = jnp.stack(jnp.unravel_index(candidate_cell, shape), axis=-1)
+    candidate_position = (candidate_index + 0.5) * dx
+
+    valid = valid & _control_volume_checks(candidate_index, m, u, c_s2, G, config)
     candidate_phi = phi.ravel()[candidate_cell]
 
     # no occupied slot within the accretion radius
@@ -254,9 +279,8 @@ def _form_sinks(
     target = jnp.where(slot >= 0, slot, num_slots)
 
     opening = jnp.zeros(num_slots, dtype=bool).at[target].set(True, mode="drop")
-    active = occupied | opening
     centre = sinks.position.at[target].set(candidate_position, mode="drop")
-    centre = jnp.where(active[:, None], centre, 0.0)
+    centre = jnp.where(opening[:, None], centre, 0.0)
 
     # -------------------------------------------------------------
     # ================= ↑ opening new slots ↑ =====================
@@ -282,7 +306,8 @@ def _form_sinks(
         tuple(cell[..., axis] for axis in range(3)), shape, mode="wrap"
     )
     r_squared = jnp.sum((cell_position - centre[:, None]) ** 2, axis=-1)
-    inside = active[:, None] & (r_squared <= accretion_radius**2)
+    # only opening slots take gas: there is no accretion yet
+    inside = opening[:, None] & (r_squared <= accretion_radius**2)
 
     cell_velocity = jnp.moveaxis(u.reshape(3, num_cells)[:, flat_cell], 0, -1)
 
@@ -307,13 +332,8 @@ def _form_sinks(
     # ===================== ↓ transfer ↓ ==========================
     # -------------------------------------------------------------
 
-    slot_checks = checks.ravel()[
-        jnp.ravel_multi_index(
-            tuple(centre_cell[:, axis] for axis in range(3)), shape, mode="wrap"
-        )
-    ]
     excess_mass = jnp.maximum(rho - rho_thr, 0.0).ravel() * volume
-    dm = jnp.where(winner, slot_checks[:, None] * excess_mass[flat_cell], 0.0)
+    dm = jnp.where(winner, excess_mass[flat_cell], 0.0)
 
     # The gas keeps its velocity and specific internal energy, so density and
     # pressure drop by the removed fraction.
@@ -324,11 +344,11 @@ def _form_sinks(
 
     # The slot sits at the centre of mass, and moves with the momentum, of
     # everything it has taken. At opening the old mass is zero, so the stale
-    # position and velocity drop out.
+    # position and velocity drop out; occupied slots are left untouched.
     m_old = sinks.mass
     m_new = m_old + jnp.sum(dm, axis=1)
     m_safe = jnp.where(m_new > 0, m_new, 1.0)[:, None]
-    grew = (m_new > 0)[:, None]
+    grew = (opening & (m_new > 0))[:, None]
     position = jnp.where(
         grew,
         jnp.mod(
