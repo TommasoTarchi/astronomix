@@ -52,11 +52,12 @@ NUM_TIMESTEPS = 3
 SETTINGS = SinkFormationSettings(peak_overdensity=200.0)
 
 
-def _setup(sink_particles: bool, **sink_particle_options):
+def _setup(sink_particles: bool, settings=SETTINGS, **sink_particle_options):
     """Set up the Gaussian overdensity with the given sink options.
 
     Args:
         sink_particles: Whether sink particle formation is switched on.
+        settings: The problem constants of the setup.
         **sink_particle_options: Further ``SinkParticleConfig`` fields.
 
     Returns:
@@ -72,7 +73,7 @@ def _setup(sink_particles: bool, **sink_particle_options):
             **sink_particle_options,
         ),
     )
-    state, config, params = setup_sink_formation(config, SimulationParams(), SETTINGS)
+    state, config, params = setup_sink_formation(config, SimulationParams(), settings)
     registered_variables = get_registered_variables(config)
     return state, config, params, registered_variables
 
@@ -87,15 +88,31 @@ def _density_threshold(config, params):
     )
 
 
-def _form_sinks_once(state, config, params, registered_variables):
-    """Apply one formation step, starting from no sinks."""
+def _form_sinks_once(state, config, params, registered_variables, sink_particles=None):
+    """Apply one formation step, by default starting from no sinks."""
+    if sink_particles is None:
+        sink_particles = _empty_sink_particles(config, state.primitive_state.dtype)
     return _form_sink_particles(
         state.primitive_state,
-        _empty_sink_particles(config, state.primitive_state.dtype),
+        sink_particles,
         config,
         params,
         registered_variables,
     )
+
+
+def _one_sink_at(position, config, dtype):
+    """Sink particles with a single (unit-mass) sink at ``position``."""
+    sink_particles = _empty_sink_particles(config, dtype)
+    return sink_particles._replace(
+        mass=sink_particles.mass.at[0].set(1.0),
+        position=sink_particles.position.at[0].set(jnp.array(position)),
+    )
+
+
+def _num_sinks(sink_particles):
+    """The number of filled sink slots."""
+    return int(jnp.sum(sink_particles.mass > 0.0))
 
 
 def test_sink_particles_do_not_change_the_fluid():
@@ -148,6 +165,67 @@ def test_density_threshold():
     assert jnp.allclose(sink_particles.velocity[:num_sinks], bulk_velocity, atol=1e-5)
 
 
+def test_proximity():
+    """No sink forms within r_acc of an existing sink (Section 2.2.7), with
+    distances taken across periodic boundaries."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+    dtype = state.primitive_state.dtype
+    box_length = SETTINGS.box_length
+
+    # Every candidate of the first call lies within r_acc of the sinks it
+    # created, so a second call on the same state adds none. The first call
+    # creates 8 sinks, one per cell above threshold: the proximity check only
+    # compares with sinks that already exist.
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+    assert _num_sinks(sink_particles) == 8
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, sink_particles
+    )
+    assert _num_sinks(sink_particles) == 8
+
+    # A sink far from the clump does not block formation.
+    far_sink = _one_sink_at((0.1, 0.1, 0.1), config, dtype)
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, far_sink
+    )
+    assert _num_sinks(sink_particles) == 1 + 8
+
+    # A sink one box length away from the clump centre is its own periodic
+    # copy, so it blocks formation.
+    periodic_copy_sink = _one_sink_at((0.5 + box_length, 0.5, 0.5), config, dtype)
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, periodic_copy_sink
+    )
+    assert _num_sinks(sink_particles) == 1
+
+    # A strong clump centred just across the x = 0 boundary. Candidates in the
+    # last cells along x have centres of mass past the box edge (up to about
+    # x = 1.008 for this clump) before they are wrapped; every sink must be
+    # stored inside the box, and the sinks must block a second formation
+    # across the boundary.
+    boundary_settings = SETTINGS._replace(
+        peak_overdensity=1000.0,
+        overdensity_center=(0.04, 0.5, 0.5),
+    )
+    state, config, params, registered_variables = _setup(
+        sink_particles=True,
+        settings=boundary_settings,
+        max_num_sinks=256,
+        max_num_candidates=256,
+    )
+    density = state.primitive_state[registered_variables.density_index]
+    num_cells_above_threshold = int(jnp.sum(density > _density_threshold(config, params)))
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+    assert _num_sinks(sink_particles) == num_cells_above_threshold
+    positions = sink_particles.position[:num_cells_above_threshold]
+    assert jnp.all((positions >= 0.0) & (positions < box_length))
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, sink_particles
+    )
+    assert _num_sinks(sink_particles) == num_cells_above_threshold
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When more sinks pass than there are free slots, the slots are filled,
     the rest is discarded and a warning is printed."""
@@ -197,3 +275,4 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape, exp
 if __name__ == "__main__":
     test_sink_particles_do_not_change_the_fluid()
     test_density_threshold()
+    test_proximity()

@@ -11,7 +11,8 @@ checks of Federrath et al. (2010), Section 2.2.
 """
 
 # typing
-from typing import NamedTuple
+from types import NoneType
+from typing import NamedTuple, Union
 
 # jax
 import jax.numpy as jnp
@@ -53,6 +54,10 @@ class SinkFormationSettings(NamedTuple):
 
     #: Width (standard deviation) of the Gaussian overdensity.
     overdensity_width: float = 0.05
+
+    #: Centre (x, y, z) of the Gaussian overdensity; ``None`` places it at
+    #: the centre of the box.
+    overdensity_center: Union[tuple, NoneType] = None
 
     #: Sound speed squared of the gas.
     sound_speed_squared: float = 1.0
@@ -118,11 +123,18 @@ def setup_sink_formation(
     registered_variables = get_registered_variables(config)
     helper_data = get_helper_data(config)
 
-    # Gaussian overdensity centred in the box, with the gas at rest and at a
-    # uniform sound speed (pressure proportional to density).
-    cell_centers = helper_data.geometric_centers
-    box_center = 0.5 * settings.box_length
-    distance_squared = jnp.sum((cell_centers - box_center) ** 2, axis=-1)
+    # Gaussian overdensity with the gas at rest and at a uniform sound speed
+    # (pressure proportional to density). Distances to the centre are taken to
+    # its nearest periodic copy, so a clump near the boundary wraps around it.
+    if settings.overdensity_center is None:
+        overdensity_center = jnp.full((3,), 0.5 * settings.box_length)
+    else:
+        overdensity_center = jnp.array(settings.overdensity_center)
+    separation = helper_data.geometric_centers - overdensity_center
+    separation = separation - settings.box_length * jnp.round(
+        separation / settings.box_length
+    )
+    distance_squared = jnp.sum(separation**2, axis=-1)
     density = settings.background_density + settings.peak_overdensity * jnp.exp(
         -0.5 * distance_squared / settings.overdensity_width**2
     )

@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
     IDEAL_GAS,
+    PERIODIC_BOUNDARY,
     STATE_TYPE,
 )
 
@@ -133,6 +134,37 @@ def _interior_mask(
         slice(num_ghost_cells, size - num_ghost_cells) for size in density.shape
     )
     return interior.at[interior_slices].set(True)
+
+
+def _periodic_box(config: SimulationConfig) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Which axes are periodic, and the box length along each axis.
+
+    Both only depend on the static configuration, so they are computed with
+    NumPy at trace time.
+
+    Args:
+        config: The simulation configuration.
+
+    Returns:
+        ``(is_periodic, box_length)``, two arrays of shape (3,).
+    """
+    boundary_settings = config.boundary_settings
+    is_periodic = np.array(
+        [
+            axis_settings.left_boundary == PERIODIC_BOUNDARY
+            and axis_settings.right_boundary == PERIODIC_BOUNDARY
+            for axis_settings in (
+                boundary_settings.x,
+                boundary_settings.y,
+                boundary_settings.z,
+            )
+        ]
+    )
+    box_length = np.array(
+        [config.box_size.x, config.box_size.y, config.box_size.z]
+    )
+    return is_periodic, box_length
 
 
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
@@ -257,6 +289,15 @@ def _form_sink_particles(
         velocity_in_volume,
     ) / gas_mass_in_volume[:, None]
 
+    # Next to a periodic boundary, the centre of mass can come out just past
+    # the edge of the box; it is wrapped back into the box along periodic axes.
+    is_periodic, box_length = _periodic_box(config)
+    center_of_mass = jnp.where(
+        is_periodic,
+        jnp.mod(center_of_mass, box_length),
+        center_of_mass,
+    )
+
     # Mass of a new sink: the gas above the density threshold in its control
     # volume, i.e. the mass the paper's accretion step would transfer.
     mass_above_threshold = jnp.sum(
@@ -264,7 +305,31 @@ def _form_sink_particles(
         axis=-1,
     )
 
-    candidate_passes = candidate_is_valid
+    # Proximity check (Section 2.2.7): no new sink within r_acc of an existing
+    # sink. Along periodic axes the separation is taken to the nearest
+    # periodic copy of the sink (minimum-image convention), as in Federrath's
+    # FLASH code. Only filled slots are compared: empty slots have zero mass
+    # and sit at the origin, where they would otherwise block candidates.
+    separation = candidate_positions[:, None, :] - sink_particles.position[None, :, :]
+    separation = jnp.where(
+        is_periodic,
+        separation - box_length * jnp.round(separation / box_length),
+        separation,
+    )
+    distance_to_sink = jnp.linalg.norm(separation, axis=-1)
+    sink_is_filled = sink_particles.mass > 0.0
+    sink_within_accretion_radius = jnp.logical_and(
+        distance_to_sink <= accretion_radius,
+        sink_is_filled[None, :],
+    )
+    far_from_existing_sinks = jnp.logical_not(
+        jnp.any(sink_within_accretion_radius, axis=-1)
+    )
+
+    candidate_passes = jnp.logical_and(
+        candidate_is_valid,
+        far_from_existing_sinks,
+    )
 
     # -------------------------------------------------------------
     # =========== ↑ Stage 2: control-volume checks ↑ ==============
