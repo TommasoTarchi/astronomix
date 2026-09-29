@@ -937,7 +937,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 "passed in and returned in the StateStruct."
             )
         if config.return_snapshots or config.snapshot_storage_mode == TO_DISK:
-            raise ValueError(
+            raise NotImplementedError(
                 "Sink particles are not yet supported together with "
                 "return_snapshots or snapshot_storage_mode == TO_DISK."
             )

@@ -4,8 +4,8 @@ Configuration container for sink particle formation.
 Sink particles are created following the checks of Federrath et al. (2010),
 ApJ 713, 269, Section 2.2. All options here are static (changing them triggers
 recompilation), because they fix array sizes and the shape of the control
-volume. The density threshold is not an option: it is derived from the Jeans
-length resolution (Eq. 32 of the paper).
+volume. The density threshold is derived from the Jeans length resolution
+(Eq. 32 of the paper).
 """
 
 # typing
