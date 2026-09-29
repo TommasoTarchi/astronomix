@@ -58,6 +58,10 @@ from astronomix._finite_difference._timestep_estimation._timestep_estimator impo
 )
 from astronomix._modules._iteration_level_updates import _iteration_level_updates
 from astronomix._modules._turbulent_forcing._turbulent_forcing import _init_ou_forcing_state
+from astronomix._modules._sink_particles._sink_particle_formation import (
+    _empty_sink_particles,
+    _form_sink_particles,
+)
 from astronomix._snapshotting._snapshot_diagnostics import (
     build_snapshot_store,
     record_snapshot,
@@ -101,10 +105,13 @@ class LoopState(NamedTuple):
         key: The PRNG key advanced by stochastic per-step modules (forcing, ...).
         forcing: The persistent OU forcing field ``f`` (shape (3, nx, ny, nz)),
             or ``None`` when OU forcing is inactive.
+        sink_particles: The sink particles, or ``None`` when sink particle
+            formation is inactive.
     """
     primitive_state: Any
     key: Any
     forcing: Any = None
+    sink_particles: Any = None
 
 
 def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig):
@@ -520,20 +527,32 @@ def _seed_key_and_forcing(config, params):
     return key0, forcing0
 
 
-def _build_initial_loop_state(primitive_state, config, params, restart_state=None):
+def _build_initial_loop_state(
+    primitive_state,
+    config,
+    params,
+    restart_state=None,
+    sink_particles=None,
+):
     """Construct the initial loop carry for an (already padded) state.
 
     When ``restart_state`` is given, its PRNG key and persistent OU forcing
     field are reused so a resumed run continues the same stochastic realisation;
     otherwise they are seeded from ``config.random_seed``. The OU forcing (when
     active) needs a persistent solenoidal field; otherwise the forcing slot
-    stays ``None`` and costs nothing in the carry.
+    stays ``None`` and costs nothing in the carry. The same holds for the sink
+    particles, which are only carried when sink particle formation is active.
     """
     if restart_state is not None:
-        return LoopState(primitive_state, restart_state.key, restart_state.forcing)
+        return LoopState(
+            primitive_state,
+            restart_state.key,
+            restart_state.forcing,
+            sink_particles,
+        )
 
     key0, forcing0 = _seed_key_and_forcing(config, params)
-    return LoopState(primitive_state, key0, forcing0)
+    return LoopState(primitive_state, key0, forcing0, sink_particles)
 
 
 def _integrate_core(
@@ -606,6 +625,7 @@ def _integrate_core(
         primitive_state = state.primitive_state
         key = state.key
         forcing = state.forcing
+        sink_particles = state.sink_particles
 
         # determine the time step size
         if not config.fixed_timestep:
@@ -673,7 +693,18 @@ def _integrate_core(
                 helper_data_pad, registered_variables,
             )
 
-        return dt, LoopState(primitive_state, key, forcing)
+        # Sink particle formation is checked on the updated state, so a sink
+        # forms from the gas as it is at the end of this step.
+        if config.sink_particle_config.sink_particles:
+            sink_particles = _form_sink_particles(
+                primitive_state,
+                sink_particles,
+                config,
+                params,
+                registered_variables,
+            )
+
+        return dt, LoopState(primitive_state, key, forcing, sink_particles)
 
     def _record_snapshot(time, state, store, idx):
         """Record snapshot ``idx`` (the requested diagnostics)."""
@@ -821,8 +852,15 @@ def _time_integration(
     # and the star particle data
     if config.state_struct:
         primitive_state = state.primitive_state
+        sink_particles = state.sink_particles
     else:
         primitive_state = state
+        sink_particles = None
+
+    # When sink particle formation is active but no sinks were passed in,
+    # the simulation starts without sinks: every slot is empty.
+    if config.sink_particle_config.sink_particles and sink_particles is None:
+        sink_particles = _empty_sink_particles(config, primitive_state.dtype)
 
     # we must pad the state with ghost cells to account for the
     # boundary conditions (unless they are enforced by rolling)
@@ -833,7 +871,10 @@ def _time_integration(
 
     if initial_loop_state is None:
         initial_loop_state = _build_initial_loop_state(
-            primitive_state, config, params
+            primitive_state,
+            config,
+            params,
+            sink_particles=sink_particles,
         )
 
     _, loop_state, snapshot_store, num_iterations = _integrate_core(
@@ -870,7 +911,10 @@ def _time_integration(
         primitive_state = _unpad(primitive_state, config)
 
     if config.state_struct:
-        return StateStruct(primitive_state=primitive_state)
+        return StateStruct(
+            primitive_state=primitive_state,
+            sink_particles=loop_state.sink_particles,
+        )
 
     return primitive_state
 
