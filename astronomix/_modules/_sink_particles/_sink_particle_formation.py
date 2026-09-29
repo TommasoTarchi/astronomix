@@ -40,6 +40,9 @@ from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
+# astronomix functions
+from astronomix._stencil_operations._stencil_operations import _shift
+
 
 def _empty_sink_particles(
     config: SimulationConfig,
@@ -136,6 +139,37 @@ def _interior_mask(
     return interior.at[interior_slices].set(True)
 
 
+def _converging_flow_mask(velocity: jax.Array) -> FIELD_TYPE:
+    """
+    Boolean mask of the cells toward which the flow converges along every axis.
+
+    Along each axis d, the neighbour at +1 must not move away from the cell,
+    v_d(+1) − v_d(0) ≤ 0, and the neighbour at −1 must not move away either,
+    v_d(−1) − v_d(0) ≥ 0 (Federrath et al. 2010, Section 2.2.3). The
+    inequalities are not strict, so that gas at rest or in uniform motion
+    passes, as in Federrath's FLASH code; only flow away from the cell fails.
+
+    Args:
+        velocity: The (padded) velocity field, with the three components on
+            the last axis.
+
+    Returns:
+        The converging-flow mask, with the shape of one field.
+    """
+    converging = jnp.ones(velocity.shape[:-1], dtype=bool)
+    for axis in range(3):
+        velocity_component = velocity[..., axis]
+        # _shift(field, -1, axis) holds the value of the neighbour at +1.
+        velocity_at_plus_one = _shift(velocity_component, -1, axis)
+        velocity_at_minus_one = _shift(velocity_component, 1, axis)
+        converging = (
+            converging
+            & (velocity_at_plus_one - velocity_component <= 0.0)
+            & (velocity_at_minus_one - velocity_component >= 0.0)
+        )
+    return converging
+
+
 def _periodic_box(config: SimulationConfig) -> tuple[np.ndarray, np.ndarray]:
     """
     Which axes are periodic, and the box length along each axis.
@@ -229,11 +263,13 @@ def _form_sink_particles(
     # =============== ↓ Stage 1: grid-wide checks ↓ ===============
     # -------------------------------------------------------------
 
-    # Density threshold check (Section 2.2.1). Ghost cells are excluded, as
-    # they only mirror physical cells or hold boundary values.
-    candidate_mask = jnp.logical_and(
-        density > density_threshold,
-        _interior_mask(density, config),
+    # Density threshold check (Section 2.2.1) and converging flow check
+    # (Section 2.2.3). Ghost cells are excluded, as they only mirror physical
+    # cells or hold boundary values.
+    candidate_mask = (
+        (density > density_threshold)
+        & _converging_flow_mask(velocity)
+        & _interior_mask(density, config)
     )
 
     # -------------------------------------------------------------

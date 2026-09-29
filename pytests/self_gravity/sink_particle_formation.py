@@ -226,6 +226,42 @@ def test_proximity():
     assert _num_sinks(sink_particles) == num_cells_above_threshold
 
 
+def _with_linear_velocity(state, registered_variables, velocity_gradient):
+    """Set the gas velocity to v_d = g_d (x_d − 0.5) along each axis d, a flow
+    that expands (g_d > 0) or contracts (g_d < 0) about the box centre."""
+    cell_centers = (jnp.arange(NUM_CELLS) + 0.5) * SETTINGS.box_length / NUM_CELLS
+    coordinates = jnp.meshgrid(cell_centers, cell_centers, cell_centers, indexing="ij")
+    primitive_state = state.primitive_state
+    for axis, velocity_index in enumerate(registered_variables.velocity_index):
+        primitive_state = primitive_state.at[velocity_index].set(
+            velocity_gradient[axis] * (coordinates[axis] - 0.5)
+        )
+    return state._replace(primitive_state=primitive_state)
+
+
+@pytest.mark.parametrize(
+    "velocity_gradient, expected_num_sinks",
+    [
+        # Contracting along every axis: the 8 cells above threshold pass.
+        ((-1.0, -1.0, -1.0), 8),
+        # Expanding along every axis: no sink.
+        ((1.0, 1.0, 1.0), 0),
+        # Contracting along y and z but expanding along x. The divergence is
+        # negative, but the flow must converge along each axis: no sink.
+        ((1.0, -2.0, -2.0), 0),
+    ],
+)
+def test_converging_flow(velocity_gradient, expected_num_sinks):
+    """Sinks only form where the flow converges along every axis (Section
+    2.2.3)."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+    state = _with_linear_velocity(state, registered_variables, velocity_gradient)
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    assert _num_sinks(sink_particles) == expected_num_sinks
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When more sinks pass than there are free slots, the slots are filled,
     the rest is discarded and a warning is printed."""
@@ -276,3 +312,4 @@ if __name__ == "__main__":
     test_sink_particles_do_not_change_the_fluid()
     test_density_threshold()
     test_proximity()
+    test_converging_flow((-1.0, -1.0, -1.0), 8)
