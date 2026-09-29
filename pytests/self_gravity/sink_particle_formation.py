@@ -45,11 +45,18 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
 
 NUM_CELLS = 32
 NUM_TIMESTEPS = 3
+CELL_SIZE = 1.0 / NUM_CELLS
 
-# With c_s² = 1, G = 1 and r_acc = 2.5 cells on a 32³ unit box, the density
-# threshold (Eq. 32) is ρ_res = π / (4 r_acc²) ≈ 129. A peak overdensity of 200
-# puts exactly the 8 central cells above it.
-SETTINGS = SinkFormationSettings(peak_overdensity=200.0)
+# The clump is centred on the centre of cell (16, 16, 16), so that this cell is
+# the unique potential minimum. With c_s² = 1, G = 1 and r_acc = 2.5 cells on a
+# 32³ unit box, the density threshold (Eq. 32) is ρ_res = π / (4 r_acc²) ≈ 129.
+# A peak overdensity of 200 puts 19 cells above it: the centre cell, its 6 face
+# neighbours and its 12 edge neighbours.
+CLUMP_CENTER = 0.5 + 0.5 * CELL_SIZE
+SETTINGS = SinkFormationSettings(
+    peak_overdensity=200.0,
+    overdensity_center=(CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
+)
 
 
 def _setup(sink_particles: bool, settings=SETTINGS, **sink_particle_options):
@@ -130,13 +137,13 @@ def test_sink_particles_do_not_change_the_fluid():
 
 
 def test_density_threshold():
-    """One sink forms per cell above the density threshold (Eq. 32), with the
-    mass above the threshold in its control volume and the centre-of-mass
-    velocity of the gas."""
+    """The sink carries the mass above the density threshold (Eq. 32) in its
+    control volume, sits at the centre of mass and moves with the
+    centre-of-mass velocity of the gas."""
     state, config, params, registered_variables = _setup(sink_particles=True)
 
-    # Give the gas a uniform bulk velocity, which every sink must inherit as
-    # its centre-of-mass velocity.
+    # Give the gas a uniform bulk velocity, which the sink must inherit as its
+    # centre-of-mass velocity.
     bulk_velocity = jnp.array([1.0, -2.0, 0.5])
     primitive_state = state.primitive_state
     for axis, velocity_index in enumerate(registered_variables.velocity_index):
@@ -145,24 +152,25 @@ def test_density_threshold():
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
 
+    # One sink, from the centre cell, the only potential minimum.
+    assert _num_sinks(sink_particles) == 1
+
+    # The 19 cells above the threshold all lie in the centre cell's control
+    # volume, so the sink carries the whole mass above the threshold.
     density = primitive_state[registered_variables.density_index]
     density_threshold = _density_threshold(config, params)
     cells_above_threshold = density > density_threshold
-    num_sinks = int(jnp.sum(sink_particles.mass > 0.0))
-    assert num_sinks == int(jnp.sum(cells_above_threshold)) == 8
-
-    # The 8 central cells lie in each other's control volumes, so every sink
-    # carries the whole mass above the threshold.
+    assert int(jnp.sum(cells_above_threshold)) == 19
     mass_above_threshold = jnp.sum(
         jnp.where(cells_above_threshold, density - density_threshold, 0.0)
     ) * config.grid_spacing**3
-    assert jnp.allclose(sink_particles.mass[:num_sinks], mass_above_threshold, rtol=1e-5)
+    assert jnp.allclose(sink_particles.mass[0], mass_above_threshold, rtol=1e-5)
 
-    # The sinks are placed symmetrically around the box centre.
-    mean_position = jnp.mean(sink_particles.position[:num_sinks], axis=0)
-    assert jnp.allclose(mean_position, 0.5, atol=1e-5)
+    # The control volume is symmetric about the clump centre, so the centre
+    # of mass is the clump centre.
+    assert jnp.allclose(sink_particles.position[0], CLUMP_CENTER, atol=1e-5)
 
-    assert jnp.allclose(sink_particles.velocity[:num_sinks], bulk_velocity, atol=1e-5)
+    assert jnp.allclose(sink_particles.velocity[0], bulk_velocity, atol=1e-5)
 
 
 def test_proximity():
@@ -172,69 +180,66 @@ def test_proximity():
     dtype = state.primitive_state.dtype
     box_length = SETTINGS.box_length
 
-    # Every candidate of the first call lies within r_acc of the sinks it
-    # created, so a second call on the same state adds none. The first call
-    # creates 8 sinks, one per cell above threshold: the proximity check only
-    # compares with sinks that already exist.
+    # The sink created by the first call blocks a second call on the same
+    # state.
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
-    assert _num_sinks(sink_particles) == 8
+    assert _num_sinks(sink_particles) == 1
     sink_particles = _form_sinks_once(
         state, config, params, registered_variables, sink_particles
     )
-    assert _num_sinks(sink_particles) == 8
+    assert _num_sinks(sink_particles) == 1
 
     # A sink far from the clump does not block formation.
     far_sink = _one_sink_at((0.1, 0.1, 0.1), config, dtype)
     sink_particles = _form_sinks_once(
         state, config, params, registered_variables, far_sink
     )
-    assert _num_sinks(sink_particles) == 1 + 8
+    assert _num_sinks(sink_particles) == 1 + 1
 
     # A sink one box length away from the clump centre is its own periodic
     # copy, so it blocks formation.
-    periodic_copy_sink = _one_sink_at((0.5 + box_length, 0.5, 0.5), config, dtype)
+    periodic_copy_sink = _one_sink_at(
+        (CLUMP_CENTER + box_length, CLUMP_CENTER, CLUMP_CENTER),
+        config,
+        dtype,
+    )
     sink_particles = _form_sinks_once(
         state, config, params, registered_variables, periodic_copy_sink
     )
     assert _num_sinks(sink_particles) == 1
 
-    # A strong clump centred just across the x = 0 boundary. Candidates in the
-    # last cells along x have centres of mass past the box edge (up to about
-    # x = 1.008 for this clump) before they are wrapped; every sink must be
-    # stored inside the box, and the sinks must block a second formation
-    # across the boundary.
+    # A clump centred on the first cell along x, next to the x = 0 boundary.
+    # An existing sink in the last cell along x is one cell away across the
+    # boundary, so it blocks formation.
     boundary_settings = SETTINGS._replace(
-        peak_overdensity=1000.0,
-        overdensity_center=(0.04, 0.5, 0.5),
+        overdensity_center=(0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
     state, config, params, registered_variables = _setup(
         sink_particles=True,
         settings=boundary_settings,
-        max_num_sinks=256,
-        max_num_candidates=256,
     )
-    density = state.primitive_state[registered_variables.density_index]
-    num_cells_above_threshold = int(jnp.sum(density > _density_threshold(config, params)))
-
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
-    assert _num_sinks(sink_particles) == num_cells_above_threshold
-    positions = sink_particles.position[:num_cells_above_threshold]
-    assert jnp.all((positions >= 0.0) & (positions < box_length))
-    sink_particles = _form_sinks_once(
-        state, config, params, registered_variables, sink_particles
+    assert _num_sinks(sink_particles) == 1
+    across_boundary_sink = _one_sink_at(
+        (box_length - 0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
+        config,
+        dtype,
     )
-    assert _num_sinks(sink_particles) == num_cells_above_threshold
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, across_boundary_sink
+    )
+    assert _num_sinks(sink_particles) == 1
 
 
 def _with_linear_velocity(state, registered_variables, velocity_gradient):
-    """Set the gas velocity to v_d = g_d (x_d − 0.5) along each axis d, a flow
-    that expands (g_d > 0) or contracts (g_d < 0) about the box centre."""
-    cell_centers = (jnp.arange(NUM_CELLS) + 0.5) * SETTINGS.box_length / NUM_CELLS
+    """Set the gas velocity to v_d = g_d (x_d − x_c) along each axis d, a flow
+    that expands (g_d > 0) or contracts (g_d < 0) about the clump centre x_c."""
+    cell_centers = (jnp.arange(NUM_CELLS) + 0.5) * CELL_SIZE
     coordinates = jnp.meshgrid(cell_centers, cell_centers, cell_centers, indexing="ij")
     primitive_state = state.primitive_state
     for axis, velocity_index in enumerate(registered_variables.velocity_index):
         primitive_state = primitive_state.at[velocity_index].set(
-            velocity_gradient[axis] * (coordinates[axis] - 0.5)
+            velocity_gradient[axis] * (coordinates[axis] - CLUMP_CENTER)
         )
     return state._replace(primitive_state=primitive_state)
 
@@ -242,8 +247,8 @@ def _with_linear_velocity(state, registered_variables, velocity_gradient):
 @pytest.mark.parametrize(
     "velocity_gradient, expected_num_sinks",
     [
-        # Contracting along every axis: the 8 cells above threshold pass.
-        ((-1.0, -1.0, -1.0), 8),
+        # Contracting along every axis: a sink forms.
+        ((-1.0, -1.0, -1.0), 1),
         # Expanding along every axis: no sink.
         ((1.0, 1.0, 1.0), 0),
         # Contracting along y and z but expanding along x. The divergence is
@@ -262,19 +267,55 @@ def test_converging_flow(velocity_gradient, expected_num_sinks):
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
-def test_sink_particle_slots_overflow(capfd):
-    """When more sinks pass than there are free slots, the slots are filled,
-    the rest is discarded and a warning is printed."""
-    state, config, params, registered_variables = _setup(
-        sink_particles=True,
-        max_num_sinks=4,
+def test_potential_minimum():
+    """A sink forms only where the potential is lowest in the control volume
+    (Section 2.2.4), which need not be the densest cell."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+
+    # Add a narrow density spike in a single cell, 2 cells from the clump
+    # centre along x (within r_acc). The spike cell becomes the densest cell
+    # (ρ ≈ 393 against ≈ 201 at the centre), but it holds too little mass to
+    # move the potential minimum away from the clump centre. The pressure is
+    # raised with the density, keeping c_s² = 1.
+    spike_index = (NUM_CELLS // 2 + 2, NUM_CELLS // 2, NUM_CELLS // 2)
+    density_index = registered_variables.density_index
+    pressure_index = registered_variables.pressure_index
+    primitive_state = state.primitive_state
+    primitive_state = primitive_state.at[(density_index, *spike_index)].add(300.0)
+    primitive_state = primitive_state.at[(pressure_index, *spike_index)].set(
+        primitive_state[(density_index, *spike_index)]
+        * SETTINGS.sound_speed_squared
+        / SETTINGS.gamma
     )
+    state = state._replace(primitive_state=primitive_state)
+    density = primitive_state[density_index]
+    assert density[spike_index] == jnp.max(density)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    # A single sink, formed from the centre cell: its centre of mass is pulled
+    # slightly toward the spike, but stays within half a cell of the centre.
+    assert _num_sinks(sink_particles) == 1
+    assert jnp.all(jnp.abs(sink_particles.position[0] - CLUMP_CENTER) < 0.5 * CELL_SIZE)
+
+
+def test_sink_particle_slots_overflow(capfd):
+    """When a new sink passes but every slot is taken, it is discarded and a
+    warning is printed."""
+    state, config, params, registered_variables = _setup(
+        sink_particles=True,
+        max_num_sinks=1,
+    )
+    far_sink = _one_sink_at((0.1, 0.1, 0.1), config, state.primitive_state.dtype)
+
+    sink_particles = _form_sinks_once(
+        state, config, params, registered_variables, far_sink
+    )
     sink_particles.mass.block_until_ready()
 
-    assert jnp.all(sink_particles.mass > 0.0)
-    assert "4 new sink particles discarded" in capfd.readouterr().out
+    assert _num_sinks(sink_particles) == 1
+    assert jnp.allclose(sink_particles.position[0], 0.1)
+    assert "1 new sink particles discarded" in capfd.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -312,4 +353,5 @@ if __name__ == "__main__":
     test_sink_particles_do_not_change_the_fluid()
     test_density_threshold()
     test_proximity()
-    test_converging_flow((-1.0, -1.0, -1.0), 8)
+    test_converging_flow((-1.0, -1.0, -1.0), 1)
+    test_potential_minimum()

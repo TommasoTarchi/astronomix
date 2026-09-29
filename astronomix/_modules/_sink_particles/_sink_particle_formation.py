@@ -41,6 +41,7 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
@@ -170,6 +171,39 @@ def _converging_flow_mask(velocity: jax.Array) -> FIELD_TYPE:
     return converging
 
 
+def _potential_minimum_mask(
+    gravitational_potential: FIELD_TYPE,
+    offsets: np.ndarray,
+) -> FIELD_TYPE:
+    """
+    Boolean mask of the cells where the potential is lowest in their control
+    volume.
+
+    A cell passes if its potential is not above the potential of any cell in
+    its control volume, φ(0) ≤ min φ (Federrath et al. 2010, Eq. 4).
+
+    Args:
+        gravitational_potential: The (padded) gravitational potential.
+        offsets: The control-volume offsets, shape (num_offsets, 3).
+
+    Returns:
+        The potential-minimum mask, with the shape of the potential.
+    """
+    minimum_in_volume = gravitational_potential
+    for offset in offsets:
+        # Shifting by −offset brings the value at cell + offset to each cell.
+        potential_at_offset = gravitational_potential
+        for axis in range(3):
+            if offset[axis] != 0:
+                potential_at_offset = _shift(
+                    potential_at_offset,
+                    -int(offset[axis]),
+                    axis,
+                )
+        minimum_in_volume = jnp.minimum(minimum_in_volume, potential_at_offset)
+    return gravitational_potential <= minimum_in_volume
+
+
 def _periodic_box(config: SimulationConfig) -> tuple[np.ndarray, np.ndarray]:
     """
     Which axes are periodic, and the box length along each axis.
@@ -259,16 +293,31 @@ def _form_sink_particles(
         / (4.0 * params.gravitational_constant * accretion_radius**2)
     )
 
+    # The gravitational potential of the gas (plus any external potential),
+    # from a Poisson solve on the updated density. The hydro update computes it
+    # internally but does not return it, and for intermediate states only.
+    gravitational_potential = _compute_total_potential(
+        density,
+        grid_spacing,
+        config,
+        params,
+        registered_variables,
+        params.gravitational_constant,
+    )
+    offsets = _control_volume_offsets(config)
+
     # -------------------------------------------------------------
     # =============== ↓ Stage 1: grid-wide checks ↓ ===============
     # -------------------------------------------------------------
 
-    # Density threshold check (Section 2.2.1) and converging flow check
-    # (Section 2.2.3). Ghost cells are excluded, as they only mirror physical
-    # cells or hold boundary values.
+    # Density threshold check (Section 2.2.1), converging flow check
+    # (Section 2.2.3) and gravitational potential minimum check (Section
+    # 2.2.4). Ghost cells are excluded, as they only mirror physical cells or
+    # hold boundary values.
     candidate_mask = (
         (density > density_threshold)
         & _converging_flow_mask(velocity)
+        & _potential_minimum_mask(gravitational_potential, offsets)
         & _interior_mask(density, config)
     )
 
@@ -294,7 +343,6 @@ def _form_sink_particles(
     # around the grid, which is the right neighbourhood for periodic
     # boundaries and never happens for ghost-cell boundaries, where the ghost
     # layer is wider than the control volume.
-    offsets = _control_volume_offsets(config)
     grid_shape = np.array(density.shape)
     control_volume_indices = tuple(
         (candidate_indices[:, None, axis] + offsets[None, :, axis]) % grid_shape[axis]
