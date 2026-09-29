@@ -470,9 +470,10 @@ class SimulationConfig(NamedTuple):
     num_sink_slots: int = 0
 
     #: Sink accretion radius in units of cells. It sets the
-    #: control volume of the formation checks and the region
-    #: a sink takes gas from; it fixes stencil sizes, so it is
-    #: a configuration value.
+    #: control volume of the formation checks, the density
+    #: threshold ``pi c_s^2 / (4 G r_acc^2)`` and the region a
+    #: sink takes gas from when it forms; it fixes stencil
+    #: sizes, so it is a configuration value.
     sink_accretion_radius: float = 2.5
 
     #: Sink formation check: gas converges along every axis.
