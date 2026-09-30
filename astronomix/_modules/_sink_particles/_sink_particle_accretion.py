@@ -253,9 +253,10 @@ def _accrete_gas(
     # The sink whose position lies in the cell comes first; among the other
     # sinks, the cell goes to the one it is most strongly bound to, the lowest
     # E_grav + E_kin (Section 2.3). This order follows FLASH; the paper states
-    # both rules but not their order. Both choices are made with a scatter-min
-    # onto a grid-shaped array, which handles several pairs pointing to the
-    # same cell.
+    # both rules but not their order. An exact tie goes to the lowest slot, as
+    # FLASH's loop order does; otherwise every tied sink would take the same
+    # ΔM. Each choice is made with a scatter-min onto a grid-shaped array,
+    # which handles several pairs pointing to the same cell.
     priority = jnp.where(is_inner_cell, 0, 1)
     no_priority = 2
     best_priority = jnp.full(density.shape, no_priority).at[cell_indices].min(
@@ -269,7 +270,13 @@ def _accrete_gas(
     best_key = jnp.full(density.shape, jnp.inf, dtype=distance.dtype).at[
         cell_indices
     ].min(jnp.where(has_best_priority, selection_key, jnp.inf))
-    accreted = has_best_priority & (selection_key == best_key[cell_indices])
+    has_best_key = has_best_priority & (selection_key == best_key[cell_indices])
+
+    slot = jnp.broadcast_to(jnp.arange(max_num_sinks)[:, None], distance.shape)
+    best_slot = jnp.full(density.shape, max_num_sinks).at[cell_indices].min(
+        jnp.where(has_best_key, slot, max_num_sinks)
+    )
+    accreted = has_best_key & (slot == best_slot[cell_indices])
 
     # -------------------------------------------------------------
     # ============= ↑ Choosing one sink per cell ↑ ================

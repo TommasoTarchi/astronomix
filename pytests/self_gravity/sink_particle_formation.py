@@ -687,6 +687,43 @@ def test_accretion_most_bound_sink():
     assert heavy_sink_gain > light_sink_gain > 0.0
 
 
+def test_accretion_tie_break():
+    """A cell for which several sinks tie exactly is accreted once, by the
+    sink in the lowest slot."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+    dtype = state.primitive_state.dtype
+
+    # Two equal sinks at rest at the same position: they share the inner cell
+    # and bind every other cell with exactly the same energy.
+    sink_mass = 0.5
+    sink_particles = _sink_at_clump_center(sink_mass, config, dtype)
+    sink_particles = sink_particles._replace(
+        mass=sink_particles.mass.at[1].set(sink_mass),
+        position=sink_particles.position.at[1].set(sink_particles.position[0]),
+    )
+
+    new_primitive_state, new_sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        sink_particles,
+    )
+
+    # Each cell is accreted once: the gas lost equals the mass gained.
+    gas_mass_before, _ = _gas_mass_and_momentum(
+        state.primitive_state,
+        registered_variables,
+    )
+    gas_mass_after, _ = _gas_mass_and_momentum(new_primitive_state, registered_variables)
+    sink_gain = new_sink_particles.mass[:2] - sink_mass
+    assert jnp.allclose(gas_mass_before - gas_mass_after, jnp.sum(sink_gain), rtol=1e-5)
+
+    # Every cell goes to the sink in the lower slot.
+    assert sink_gain[0] > 0.0
+    assert sink_gain[1] == 0.0
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When a new sink passes but every slot is taken, it is discarded and a
     warning is printed."""
