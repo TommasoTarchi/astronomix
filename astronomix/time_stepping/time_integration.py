@@ -200,21 +200,23 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
 
 # @jaxtyped(typechecker=typechecker)
 def time_integration(
-    primitive_state: STATE_TYPE,
+    primitive_state: Union[STATE_TYPE, StateStruct],
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
     snapshot_callable = None,
     sharding: Union[NoneType, jax.NamedSharding] = None,
     restart_state: Union[NoneType, "LoopState"] = None,
-) -> Union[STATE_TYPE, SnapshotData]:
+) -> Union[STATE_TYPE, StateStruct, SnapshotData]:
     """
     Integrate the fluid equations in time. For the options of
     the time integration see the simulation configuration and
     the simulation parameters.
 
     Args:
-        primitive_state: The primitive state array.
+        primitive_state: The primitive state array, or a
+            :class:`StateStruct` wrapping it when ``config.state_struct``
+            is set.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -243,7 +245,10 @@ def time_integration(
     Returns:
         Depending on the configuration (return_snapshots, num_snapshots)
         either the final state of the fluid after the time
-        integration of snapshots of the time evolution.
+        integration of snapshots of the time evolution. With
+        ``config.state_struct`` set, the final state is a
+        :class:`StateStruct` holding the primitive state and the sink
+        particles.
 
     """
 
@@ -847,9 +852,9 @@ def _time_integration(
         of snapshots of the time evolution.
     """
 
-    # in simulations, where we also follow e.g. star particles,
+    # in simulations, where we also follow e.g. sink particles,
     # the state may be a struct containing the primitive state
-    # and the star particle data
+    # and the sink particle data
     if config.state_struct:
         primitive_state = state.primitive_state
         sink_particles = state.sink_particles
