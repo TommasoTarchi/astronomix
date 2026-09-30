@@ -1,9 +1,12 @@
 """
-Sink particle formation pytest (fast).
+Sink particle formation and accretion pytest (fast).
 
-Checks the sink particle creation of Federrath et al. (2010) on the Gaussian
-overdensity setup in ``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``,
-and the configuration requirements checked by ``finalize_config``.
+Checks the sink particle creation and gas accretion of Federrath et al. (2010)
+on the Gaussian overdensity setup in
+``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``: each
+creation criterion, the accretion criteria, the choice of a single sink for
+each accreted cell, and the conservation of mass and momentum. Also checks the
+configuration requirements enforced by ``finalize_config``.
 """
 
 # ==== GPU selection ====
@@ -277,7 +280,7 @@ def test_accretion_by_existing_sink():
     )
 
 
-def test_density_threshold():
+def test_new_sink_properties():
     """A new sink accretes the mass above the density threshold (Eq. 32)
     within its accretion radius, and ends at the centre of mass and with the
     centre-of-mass velocity of the accreted gas."""
@@ -777,7 +780,7 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape, exp
 if __name__ == "__main__":
     test_accretion_conservation()
     test_accretion_by_existing_sink()
-    test_density_threshold()
+    test_new_sink_properties()
     test_proximity()
     test_position_wrapping()
     test_converging_flow((-1.0, -1.0, -1.0), 1)
