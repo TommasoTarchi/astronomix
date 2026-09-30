@@ -222,7 +222,20 @@ def _accrete_gas(
     total_energy = gravitational_energy + kinetic_energy
     bound = total_energy < 0.0
 
-    eligible_accretion = possible_accretion & (is_inner_cell | bound)
+    # Radial velocity check (Section 2.3): ΔM must move toward the sink,
+    # v_r = r · (v − v_n) / r, with r pointing from the sink to the cell. The
+    # paper asks for a negative v_r; as in Federrath's FLASH code, v_r up to
+    # 10⁻⁵ c_s is accepted. Gas moving with the sink has v_r = 0 only up to
+    # rounding (the sink velocity is a mass-weighted average of gas
+    # velocities), so a bound of exactly 0 would accept or reject it at
+    # random.
+    radial_velocity = jnp.sum(separation * relative_velocity, axis=-1) / safe_distance
+    radial_velocity_tolerance = 1e-5 * jnp.sqrt(sound_speed_squared[cell_indices])
+    moving_toward_sink = radial_velocity <= radial_velocity_tolerance
+
+    eligible_accretion = possible_accretion & (
+        is_inner_cell | (bound & moving_toward_sink)
+    )
 
     # -------------------------------------------------------------
     # ================= ↑ Accretion checks ↑ ======================

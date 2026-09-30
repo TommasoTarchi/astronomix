@@ -600,6 +600,45 @@ def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
     assert num_accreted_cells == expected_num_accreted_cells
 
 
+@pytest.mark.parametrize(
+    "velocity_gradient, expected_num_accreted_cells",
+    [
+        # Slowly expanding away from the sink: bound (as slow as the infall
+        # of test_accretion_bound), but moving away, so only the sink's own
+        # cell is accreted.
+        (1.0, 1),
+        # Slowly falling toward the sink: all 57 cells above the threshold.
+        (-1.0, 57),
+    ],
+)
+def test_accretion_radial_velocity(velocity_gradient, expected_num_accreted_cells):
+    """Gas is accreted only if it moves toward the sink, v_r ≤ 10⁻⁵ c_s
+    (Section 2.3, with FLASH's tolerance), except in the cell containing the
+    sink."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+    state = _with_linear_velocity(
+        state,
+        registered_variables,
+        (velocity_gradient, velocity_gradient, velocity_gradient),
+    )
+    existing_sink = _sink_at_clump_center(0.5, config, state.primitive_state.dtype)
+
+    new_primitive_state, _ = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        existing_sink,
+    )
+
+    num_accreted_cells = _num_accreted_cells(
+        state.primitive_state,
+        new_primitive_state,
+        registered_variables,
+    )
+    assert num_accreted_cells == expected_num_accreted_cells
+
+
 def test_accretion_most_bound_sink():
     """A cell within reach of several sinks is accreted once, by the sink it
     is most strongly bound to (Section 2.3)."""
@@ -709,4 +748,5 @@ if __name__ == "__main__":
     test_jeans_instability(400.0, 1.0, 1)
     test_bound_state(12.5, 1)
     test_accretion_bound(1.0, 57)
+    test_accretion_radial_velocity(1.0, 1)
     test_accretion_most_bound_sink()
