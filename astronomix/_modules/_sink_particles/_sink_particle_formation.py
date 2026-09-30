@@ -2,9 +2,10 @@
 Sink particle formation following Federrath et al. (2010), ApJ 713, 269.
 
 Once per time step, the gas is checked for regions that should turn into sink
-particles, using the creation checks of Section 2.2 of the paper. Only the
-creation of sinks is handled here: the sinks do not move, do not accrete and
-do not remove gas from the grid.
+particles, using the creation checks of Section 2.2 of the paper. A new sink is
+created with zero mass at the centre of its cell and gets its mass from the
+accretion step that follows in the same time step
+(``_sink_particle_accretion.py``), as in Federrath's FLASH code.
 
 The formation runs in two stages. First, cheap checks are evaluated on the
 whole grid, giving a mask of candidate cells. Then, for a fixed-size list of
@@ -242,14 +243,16 @@ def _form_sink_particles(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
-) -> SinkParticles:
+) -> tuple[SinkParticles, jax.Array]:
     """
     Create new sink particles where the gas passes all creation checks.
 
-    A new sink gets the mass above the density threshold in its control volume,
-    Σ (ρ − ρ_res) ΔV over the cells with ρ > ρ_res, and the centre of mass and
-    centre-of-mass velocity (Eq. 12) of all gas in the control volume. The gas
-    itself is left on the grid.
+    A new sink is placed at the centre of its cell with zero mass, and with the
+    centre-of-mass velocity (Eq. 12) of the gas in its control volume. It gets
+    its mass from the accretion step that follows. The starting velocity only
+    sets the frame of the first accretion checks; FLASH starts from zero
+    velocity, which would judge a clump moving as a whole in a different frame
+    than the creation checks below.
 
     Args:
         primitive_state: The (padded) primitive state after the hydro update.
@@ -259,7 +262,9 @@ def _form_sink_particles(
         registered_variables: The registered variables.
 
     Returns:
-        The sink particles, with any newly created sinks appended.
+        ``(sink_particles, num_active_sinks)``: the sink particles with the new
+        sinks appended, and the number of filled slots including the new
+        (still massless) sinks.
     """
 
     sink_particle_config = config.sink_particle_config
@@ -352,48 +357,25 @@ def _form_sink_particles(
     # Fields over the control volumes, shape (num_candidates, num_offsets),
     # with a trailing vector axis for the velocity.
     density_in_volume = density[control_volume_indices]
-    density_threshold_in_volume = density_threshold[control_volume_indices]
     velocity_in_volume = velocity[control_volume_indices]
     cell_mass_in_volume = density_in_volume * cell_volume
     gas_mass_in_volume = jnp.sum(cell_mass_in_volume, axis=-1)
 
-    # Centre of mass, measured from the candidate cell with the (unwrapped)
-    # offsets so that a control volume crossing a periodic boundary stays in
-    # one piece, and the centre-of-mass velocity (Eq. 12).
+    # Centre of the candidate cells, and the centre-of-mass velocity of the
+    # gas in their control volumes (Eq. 12).
     candidate_positions = (candidate_indices - config.num_ghost_cells + 0.5) * grid_spacing
-    offset_positions = offsets * grid_spacing
-    center_of_mass = candidate_positions + jnp.einsum(
-        "ck,kd->cd",
-        cell_mass_in_volume,
-        offset_positions,
-    ) / gas_mass_in_volume[:, None]
     center_of_mass_velocity = jnp.einsum(
         "ck,ckd->cd",
         cell_mass_in_volume,
         velocity_in_volume,
     ) / gas_mass_in_volume[:, None]
 
-    # Next to a periodic boundary, the centre of mass can come out just past
-    # the edge of the box; it is wrapped back into the box along periodic axes.
-    is_periodic, box_length = _periodic_box(config)
-    center_of_mass = jnp.where(
-        is_periodic,
-        jnp.mod(center_of_mass, box_length),
-        center_of_mass,
-    )
-
-    # Mass of a new sink: the gas above the density threshold in its control
-    # volume, i.e. the mass the paper's accretion step would transfer.
-    mass_above_threshold = jnp.sum(
-        jnp.maximum(density_in_volume - density_threshold_in_volume, 0.0) * cell_volume,
-        axis=-1,
-    )
-
     # Proximity check (Section 2.2.7): no new sink within r_acc of an existing
     # sink. Along periodic axes the separation is taken to the nearest
     # periodic copy of the sink (minimum-image convention), as in Federrath's
     # FLASH code. Only filled slots are compared: empty slots have zero mass
     # and sit at the origin, where they would otherwise block candidates.
+    is_periodic, box_length = _periodic_box(config)
     separation = candidate_positions[:, None, :] - sink_particles.position[None, :, :]
     separation = jnp.where(
         is_periodic,
@@ -489,7 +471,8 @@ def _form_sink_particles(
     # front. Each passing candidate gets the next free slot; failing
     # candidates get the out-of-range slot max_num_sinks. With mode="drop",
     # writes to an out-of-range slot are discarded, which also discards new
-    # sinks once every slot is taken.
+    # sinks once every slot is taken. New sinks are massless until the
+    # accretion step, so the filled slots are counted here and passed on.
     max_num_sinks = sink_particle_config.max_num_sinks
     num_existing_sinks = jnp.sum(sink_particles.mass > 0.0)
     slot = jnp.where(
@@ -499,16 +482,20 @@ def _form_sink_particles(
     )
 
     sink_particles = SinkParticles(
-        mass=sink_particles.mass.at[slot].set(mass_above_threshold, mode="drop"),
-        position=sink_particles.position.at[slot].set(center_of_mass, mode="drop"),
+        mass=sink_particles.mass.at[slot].set(0.0, mode="drop"),
+        position=sink_particles.position.at[slot].set(
+            candidate_positions,
+            mode="drop",
+        ),
         velocity=sink_particles.velocity.at[slot].set(
             center_of_mass_velocity,
             mode="drop",
         ),
     )
+    num_new_sinks = jnp.sum(candidate_passes)
+    num_active_sinks = jnp.minimum(num_existing_sinks + num_new_sinks, max_num_sinks)
 
     # Warn when a limit set by the configuration cut something off.
-    num_new_sinks = jnp.sum(candidate_passes)
     jax.lax.cond(
         num_candidates_found > max_num_candidates,
         lambda: jax.debug.print(
@@ -534,4 +521,4 @@ def _form_sink_particles(
     # ================= ↑ Appending new sinks ↑ ===================
     # -------------------------------------------------------------
 
-    return sink_particles
+    return sink_particles, num_active_sinks

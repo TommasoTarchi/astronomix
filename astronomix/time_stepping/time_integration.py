@@ -62,6 +62,7 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
     _form_sink_particles,
 )
+from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
 from astronomix._snapshotting._snapshot_diagnostics import (
     build_snapshot_store,
     record_snapshot,
@@ -698,12 +699,21 @@ def _integrate_core(
                 helper_data_pad, registered_variables,
             )
 
-        # Sink particle formation is checked on the updated state, so a sink
-        # forms from the gas as it is at the end of this step.
+        # Sink particle formation and accretion act on the updated state, so
+        # sinks form from and accrete the gas as it is at the end of this step.
+        # New sinks are created massless and get their mass from the accretion.
         if config.sink_particle_config.sink_particles:
-            sink_particles = _form_sink_particles(
+            sink_particles, num_active_sinks = _form_sink_particles(
                 primitive_state,
                 sink_particles,
+                config,
+                params,
+                registered_variables,
+            )
+            primitive_state, sink_particles = _accrete_gas(
+                primitive_state,
+                sink_particles,
+                num_active_sinks,
                 config,
                 params,
                 registered_variables,
