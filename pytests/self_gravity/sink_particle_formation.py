@@ -790,3 +790,4 @@ if __name__ == "__main__":
     test_accretion_bound(1.0, 57)
     test_accretion_radial_velocity(1.0, 1)
     test_accretion_most_bound_sink()
+    test_accretion_tie_break()
