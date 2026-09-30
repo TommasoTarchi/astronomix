@@ -1,12 +1,12 @@
 """
-3D self-gravitating slab advection correctness pytest (fast).
+3D self-gravitating slab advection pytest with sink particle formation on (fast).
 
-Advects a self-gravitating density slab across a periodic cubic box at a single
-low resolution and checks the final state against the analytic solution for the
-three finite-difference self-gravity treatments (simple source, flux-based
-source, corrected flux-based source). This is the fast correctness check; the
-resolution-sweep convergence figure lives in
-``examples/scripts/forward/self_gravity/slab_convergence.py``.
+Runs the slab advection test of ``slab_advection.py`` with sink particle
+formation switched on, for the three finite-difference self-gravity treatments
+(simple source, flux-based source, corrected flux-based source). The slab stays
+far below the sink density threshold, so the test checks that sink formation
+leaves an ordinary self-gravitating run undisturbed: the final state still
+matches the analytic solution, and no sink particle forms.
 """
 
 # ==== GPU selection ====
