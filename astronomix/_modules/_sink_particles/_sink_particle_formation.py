@@ -450,10 +450,31 @@ def _form_sink_particles(
         gravitational_energy_magnitude > 2.0 * thermal_energy + magnetic_energy
     )
 
+    # Bound state check (Section 2.2.6): the total energy of the gas in the
+    # control volume must be negative, E_grav + E_th + E_kin + E_mag < 0, with
+    # E_kin = ½ Σ M |v − v_cm|² the kinetic energy relative to the
+    # centre-of-mass motion (Eq. 11).
+    velocity_relative_to_center_of_mass = (
+        velocity_in_volume - center_of_mass_velocity[:, None, :]
+    )
+    kinetic_energy = 0.5 * jnp.sum(
+        cell_mass_in_volume
+        * jnp.sum(velocity_relative_to_center_of_mass**2, axis=-1),
+        axis=-1,
+    )
+    bound = (
+        -gravitational_energy_magnitude
+        + thermal_energy
+        + kinetic_energy
+        + magnetic_energy
+        < 0.0
+    )
+
     candidate_passes = (
         candidate_is_valid
         & far_from_existing_sinks
         & jeans_unstable
+        & bound
     )
 
     # -------------------------------------------------------------

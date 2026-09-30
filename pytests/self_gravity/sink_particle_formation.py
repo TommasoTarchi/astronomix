@@ -362,6 +362,44 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
+@pytest.mark.parametrize(
+    "angular_velocity, expected_num_sinks",
+    [
+        # At rest, |E_grav| − E_th ≈ 1.52 E_th, and the rotation becomes
+        # unbound at Ω ≈ 25.5 (where E_kin reaches |E_grav| − E_th).
+        # About half of that: bound, a sink forms.
+        (12.5, 1),
+        # About twice that: unbound, no sink.
+        (50.0, 0),
+    ],
+)
+def test_bound_state(angular_velocity, expected_num_sinks):
+    """A sink forms only if the gas in the control volume is bound,
+    E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6)."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+
+    # Solid-body rotation about the z axis through the clump centre. Along
+    # each axis, the velocity component along that axis does not change, so
+    # the converging-flow check still passes; the centre-of-mass velocity is
+    # zero by symmetry, so all the motion counts as kinetic energy.
+    cell_centers = (jnp.arange(NUM_CELLS) + 0.5) * CELL_SIZE
+    x, y, _ = jnp.meshgrid(cell_centers, cell_centers, cell_centers, indexing="ij")
+    velocity_index = registered_variables.velocity_index
+    primitive_state = state.primitive_state
+    primitive_state = primitive_state.at[velocity_index.x].set(
+        -angular_velocity * (y - CLUMP_CENTER)
+    )
+    primitive_state = primitive_state.at[velocity_index.y].set(
+        angular_velocity * (x - CLUMP_CENTER)
+    )
+    primitive_state = primitive_state.at[velocity_index.z].set(0.0)
+    state = state._replace(primitive_state=primitive_state)
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    assert _num_sinks(sink_particles) == expected_num_sinks
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When a new sink passes but every slot is taken, it is discarded and a
     warning is printed."""
@@ -420,3 +458,4 @@ if __name__ == "__main__":
     test_converging_flow((-1.0, -1.0, -1.0), 1)
     test_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)
+    test_bound_state(12.5, 1)
