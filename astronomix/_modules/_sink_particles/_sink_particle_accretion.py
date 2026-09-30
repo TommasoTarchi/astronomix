@@ -190,6 +190,45 @@ def _accrete_gas(
     )
 
     # -------------------------------------------------------------
+    # ================= ↓ Accretion checks ↓ ======================
+    # -------------------------------------------------------------
+
+    # The gas in the cell containing the sink is always accreted, with no
+    # further check (Section 2.3); this also avoids r = 0 below.
+    is_inner_cell = jnp.all(offsets == 0, axis=-1)[None, :]
+
+    # Bound check (Section 2.3): ΔM must be bound to the sink and the gas
+    # around it, E_grav + E_kin < 0, with E_kin = ½ ΔM |v − v_n|² in the sink's
+    # frame. The paper gives no formula for E_grav; as in Federrath's FLASH
+    # code, the gas within r_acc is a uniform sphere of density ρ_res and the
+    # sink a point mass M_n, both measured from the edge of the accretion
+    # sphere:
+    #   E_grav = −G (2π/3) ρ_res (r_acc² − r²) ΔM − G M_n ΔM (1/r − 1/r_acc).
+    gravitational_constant = params.gravitational_constant
+    safe_distance = jnp.where(distance > 0.0, distance, accretion_radius)
+    gravitational_energy = (
+        -gravitational_constant
+        * (2.0 * jnp.pi / 3.0)
+        * density_threshold_in_reach
+        * (accretion_radius**2 - distance**2)
+        * mass_increment
+        - gravitational_constant
+        * sink_particles.mass[:, None]
+        * mass_increment
+        * (1.0 / safe_distance - 1.0 / accretion_radius)
+    )
+    relative_velocity = velocity_in_reach - sink_particles.velocity[:, None, :]
+    kinetic_energy = 0.5 * mass_increment * jnp.sum(relative_velocity**2, axis=-1)
+    total_energy = gravitational_energy + kinetic_energy
+    bound = total_energy < 0.0
+
+    eligible_accretion = possible_accretion & (is_inner_cell | bound)
+
+    # -------------------------------------------------------------
+    # ================= ↑ Accretion checks ↑ ======================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
     # ================ ↑ Cells around each sink ↑ =================
     # -------------------------------------------------------------
 
@@ -199,18 +238,21 @@ def _accrete_gas(
 
     # A cell within reach of several sinks is accreted by one of them only.
     # The sink whose position lies in the cell comes first; among the other
-    # sinks, the closest one takes the cell. Both choices are made with a
-    # scatter-min onto a grid-shaped array, which handles several pairs
-    # pointing to the same cell.
-    is_inner_cell = jnp.all(offsets == 0, axis=-1)[None, :]
+    # sinks, the cell goes to the one it is most strongly bound to, the lowest
+    # E_grav + E_kin (Section 2.3). This order follows FLASH; the paper states
+    # both rules but not their order. Both choices are made with a scatter-min
+    # onto a grid-shaped array, which handles several pairs pointing to the
+    # same cell.
     priority = jnp.where(is_inner_cell, 0, 1)
     no_priority = 2
     best_priority = jnp.full(density.shape, no_priority).at[cell_indices].min(
-        jnp.where(possible_accretion, priority, no_priority)
+        jnp.where(eligible_accretion, priority, no_priority)
     )
-    has_best_priority = possible_accretion & (priority == best_priority[cell_indices])
+    has_best_priority = eligible_accretion & (priority == best_priority[cell_indices])
 
-    selection_key = distance
+    # The energy of the inner cell is not used (r may be 0 there); it only
+    # competes with other inner cells, which would need two sinks in one cell.
+    selection_key = jnp.where(is_inner_cell, -jnp.inf, total_energy)
     best_key = jnp.full(density.shape, jnp.inf, dtype=distance.dtype).at[
         cell_indices
     ].min(jnp.where(has_best_priority, selection_key, jnp.inf))

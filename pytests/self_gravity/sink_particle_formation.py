@@ -541,6 +541,113 @@ def test_bound_state(angular_velocity, expected_num_sinks):
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
+def _sink_at_clump_center(mass, config, dtype):
+    """Sink particles with a single sink of ``mass`` at the clump centre, at
+    rest."""
+    sink_particles = _one_sink_at(
+        (CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
+        config,
+        dtype,
+    )
+    return sink_particles._replace(mass=sink_particles.mass.at[0].set(mass))
+
+
+def _num_accreted_cells(primitive_state, new_primitive_state, registered_variables):
+    """The number of cells that lost gas."""
+    density_index = registered_variables.density_index
+    return int(jnp.sum(new_primitive_state[density_index] < primitive_state[density_index]))
+
+
+@pytest.mark.parametrize(
+    "contraction_rate, expected_num_accreted_cells",
+    [
+        # Slow infall: every cell above the threshold is bound, all 57 are
+        # accreted.
+        (1.0, 57),
+        # Fast infall: every cell except the sink's own one is unbound; the
+        # sink's own cell is accreted without checks.
+        (1000.0, 1),
+    ],
+)
+def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
+    """Gas is accreted only if it is bound to the sink, E_grav + E_kin < 0
+    (Section 2.3), except in the cell containing the sink."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+
+    # Gas falling toward the clump centre, where an existing sink of mass 0.5
+    # sits at rest, v = −g (x − x_c). The infall keeps the radial velocity
+    # negative, so only the bound check decides.
+    state = _with_linear_velocity(
+        state,
+        registered_variables,
+        (-contraction_rate, -contraction_rate, -contraction_rate),
+    )
+    existing_sink = _sink_at_clump_center(0.5, config, state.primitive_state.dtype)
+
+    new_primitive_state, _ = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        existing_sink,
+    )
+
+    num_accreted_cells = _num_accreted_cells(
+        state.primitive_state,
+        new_primitive_state,
+        registered_variables,
+    )
+    assert num_accreted_cells == expected_num_accreted_cells
+
+
+def test_accretion_most_bound_sink():
+    """A cell within reach of several sinks is accreted once, by the sink it
+    is most strongly bound to (Section 2.3)."""
+    state, config, params, registered_variables = _setup(sink_particles=True)
+    dtype = state.primitive_state.dtype
+
+    # Two sinks at rest, 2 cells on either side of the clump centre along x:
+    # their accretion radii overlap, and every cell in the plane x = x_c is
+    # equally far from both. The heavy sink binds those cells more strongly.
+    heavy_sink_mass = 5.0
+    light_sink_mass = 0.05
+    sink_particles = _empty_sink_particles(config, dtype)
+    sink_particles = sink_particles._replace(
+        mass=sink_particles.mass.at[0].set(heavy_sink_mass).at[1].set(light_sink_mass),
+        position=sink_particles.position.at[0].set(
+            jnp.array([CLUMP_CENTER - 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
+        ).at[1].set(
+            jnp.array([CLUMP_CENTER + 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
+        ),
+    )
+
+    new_primitive_state, new_sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        sink_particles,
+    )
+
+    # Each cell is accreted once: the gas lost equals the mass gained.
+    gas_mass_before, _ = _gas_mass_and_momentum(
+        state.primitive_state,
+        registered_variables,
+    )
+    gas_mass_after, _ = _gas_mass_and_momentum(new_primitive_state, registered_variables)
+    heavy_sink_gain = new_sink_particles.mass[0] - heavy_sink_mass
+    light_sink_gain = new_sink_particles.mass[1] - light_sink_mass
+    assert jnp.allclose(
+        gas_mass_before - gas_mass_after,
+        heavy_sink_gain + light_sink_gain,
+        rtol=1e-5,
+    )
+
+    # The overlap goes to the heavy sink; the light sink keeps at least its
+    # own cell.
+    assert heavy_sink_gain > light_sink_gain > 0.0
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When a new sink passes but every slot is taken, it is discarded and a
     warning is printed."""
@@ -601,3 +708,5 @@ if __name__ == "__main__":
     test_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)
     test_bound_state(12.5, 1)
+    test_accretion_bound(1.0, 57)
+    test_accretion_most_bound_sink()
