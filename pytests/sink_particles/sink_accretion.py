@@ -4,9 +4,8 @@ Sink particle accretion pytest (fast).
 Checks the gas accretion onto sink particles of Federrath et al. (2010),
 Section 2.3: the mass, position and velocity of a new sink after its first
 accretion, the conservation of mass and momentum (with and without a magnetic
-field), the bound and radial velocity checks, the wrapping of the sink
-position into a periodic box, and the choice of a single sink for each
-accreted cell.
+field), the bound and radial velocity checks, and the choice of a single sink
+for each accreted cell.
 """
 
 # ==== GPU selection ====
@@ -30,7 +29,6 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
 from _sink_helpers import (
     CELL_SIZE,
     CLUMP_CENTER,
-    NUM_CELLS,
     SETTINGS,
     _density_threshold,
     _gas_mass_and_momentum,

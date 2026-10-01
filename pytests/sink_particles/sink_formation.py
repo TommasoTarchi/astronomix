@@ -1,10 +1,11 @@
 """
 Sink particle formation pytest (fast).
 
-Checks the sink particle creation checks of Federrath et al. (2010), Section
-2.2: converging flow, potential minimum, Jeans instability (with and without a
-magnetic field), bound state and proximity to existing sinks, and the limit on
-the number of sink slots.
+Checks the sink particle creation of Federrath et al. (2010), Section 2.2:
+the creation checks (converging flow, potential minimum, Jeans instability
+with and without a magnetic field, bound state, proximity to existing sinks),
+the limit on the number of sink slots, and the wrapping of a new sink's
+position into a periodic box.
 """
 
 # ==== GPU selection ====

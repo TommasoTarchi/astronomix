@@ -1,9 +1,9 @@
 """
-Sink particles in the time loop pytest.
+Sink particles in whole simulations pytest.
 
-Checks full runs of the time loop with sinks forming, through the in-memory
-snapshots and through the disk snapshots and restart, and the configuration
-requirements enforced by ``finalize_config``.
+Checks the configuration requirements enforced by ``finalize_config``, a run
+of the time loop in which a sink forms (through the in-memory snapshots), and
+a restart from the disk snapshots.
 """
 
 # ==== GPU selection ====
@@ -67,10 +67,12 @@ from _sink_helpers import (
     [SIMPLE_SOURCE, SECOND_ORDER_CONSERVATIVE, FOURTH_ORDER_CONSERVATIVE],
     ids=["simple_source", "second_order_conservative", "fourth_order_conservative"],
 )
-def test_clump_collapse(self_gravity_version):
-    """A sink forms during a run of the time loop and total mass is conserved,
-    for each finite-difference self-gravity treatment. The run goes through
-    the in-memory snapshots, which record the sinks at every snapshot."""
+def test_mass_conservation_in_run(self_gravity_version):
+    """A sink forms during a run of the time loop, no second sink forms, and
+    gas plus sink mass is conserved at every snapshot, for each
+    finite-difference self-gravity treatment. The run goes through the
+    in-memory snapshots, which record the sinks. The physics of the collapse is
+    not checked: the gravity of the sinks on the gas is not implemented."""
     config = SimulationConfig(
         num_cells=StaticIntVector(NUM_CELLS, NUM_CELLS, NUM_CELLS),
         progress_bar=False,
@@ -111,9 +113,10 @@ def test_clump_collapse(self_gravity_version):
     assert jnp.allclose(gas_mass + sink_mass, initial_mass, rtol=1e-4)
 
 
-def test_disk_snapshots_with_sinks(tmp_path):
-    """Disk snapshots carry the sinks: a run restarted from a checkpoint ends
-    with the same gas state and the same sinks as the uninterrupted run."""
+def test_restart_from_disk(tmp_path):
+    """Disk snapshots carry the sinks: a run restarted from a disk checkpoint
+    starts with the sinks of that checkpoint and ends with the same gas state
+    and the same sinks as the uninterrupted run."""
     pytest.importorskip("orbax.checkpoint")
     state, config, params, registered_variables = _setup()
 
@@ -188,10 +191,10 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape):
 
 
 if __name__ == "__main__":
-    test_clump_collapse(SIMPLE_SOURCE)
-    test_clump_collapse(SECOND_ORDER_CONSERVATIVE)
-    test_clump_collapse(FOURTH_ORDER_CONSERVATIVE)
-    test_disk_snapshots_with_sinks(Path(tempfile.mkdtemp()))
+    test_mass_conservation_in_run(SIMPLE_SOURCE)
+    test_mass_conservation_in_run(SECOND_ORDER_CONSERVATIVE)
+    test_mass_conservation_in_run(FOURTH_ORDER_CONSERVATIVE)
+    test_restart_from_disk(Path(tempfile.mkdtemp()))
     test_sink_particle_config_requirements(dict(dimensionality=2), (4, 16, 16))
     test_sink_particle_config_requirements(
         dict(gravity_config=GravityConfig(self_gravity=False)),
