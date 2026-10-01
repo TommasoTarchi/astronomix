@@ -81,11 +81,10 @@ SETTINGS = SinkFormationSettings(
 )
 
 
-def _setup(sink_particles: bool, settings=SETTINGS, mhd=False, **sink_particle_options):
+def _setup(settings=SETTINGS, mhd=False, **sink_particle_options):
     """Set up the Gaussian overdensity with the given sink options.
 
     Args:
-        sink_particles: Whether sink particle formation is switched on.
         settings: The problem constants of the setup.
         mhd: Whether MHD is switched on (the field is ``settings.magnetic_field_z``).
         **sink_particle_options: Further ``SinkParticleConfig`` fields.
@@ -100,7 +99,7 @@ def _setup(sink_particles: bool, settings=SETTINGS, mhd=False, **sink_particle_o
         progress_bar=False,
         mhd=mhd,
         sink_particle_config=SinkParticleConfig(
-            sink_particles=sink_particles,
+            sink_particles=True,
             **sink_particle_options,
         ),
     )
@@ -183,127 +182,13 @@ def _gas_mass_and_momentum(primitive_state, registered_variables):
     return mass, momentum
 
 
-def test_accretion_conservation():
-    """Accretion moves mass and momentum from the gas to the sinks without
-    creating or destroying any, and leaves accreted cells at the density
-    threshold with an unchanged sound speed."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
-
-    # A bulk velocity makes the momentum transfer non-trivial.
-    bulk_velocity = jnp.array([1.0, -2.0, 0.5])
-    primitive_state = state.primitive_state
-    for axis, velocity_index in enumerate(registered_variables.velocity_index):
-        primitive_state = primitive_state.at[velocity_index].set(bulk_velocity[axis])
-    state = state._replace(primitive_state=primitive_state)
-
-    new_primitive_state, sink_particles = _update_sinks_once(
-        state,
-        config,
-        params,
-        registered_variables,
-    )
-
-    # One call: what the gas loses, the sink gains.
-    gas_mass_before, gas_momentum_before = _gas_mass_and_momentum(
-        primitive_state,
-        registered_variables,
-    )
-    gas_mass_after, gas_momentum_after = _gas_mass_and_momentum(
-        new_primitive_state,
-        registered_variables,
-    )
-    sink_mass = jnp.sum(sink_particles.mass)
-    sink_momentum = jnp.sum(sink_particles.mass[:, None] * sink_particles.velocity, axis=0)
-    assert sink_mass > 0.0
-    assert jnp.allclose(gas_mass_before, gas_mass_after + sink_mass, rtol=1e-6)
-    assert jnp.allclose(
-        gas_momentum_before,
-        gas_momentum_after + sink_momentum,
-        rtol=1e-6,
-    )
-
-    # Accreted cells end at the threshold with c_s² unchanged; the other cells
-    # are untouched.
-    density_index = registered_variables.density_index
-    pressure_index = registered_variables.pressure_index
-    density_threshold = _density_threshold(config, params)
-    accreted = primitive_state[density_index] > density_threshold
-    assert jnp.allclose(
-        new_primitive_state[density_index][accreted],
-        density_threshold,
-        rtol=1e-6,
-    )
-    sound_speed_squared_before = (
-        SETTINGS.gamma * primitive_state[pressure_index] / primitive_state[density_index]
-    )
-    sound_speed_squared_after = (
-        SETTINGS.gamma
-        * new_primitive_state[pressure_index]
-        / new_primitive_state[density_index]
-    )
-    assert jnp.allclose(sound_speed_squared_before, sound_speed_squared_after, rtol=1e-5)
-    assert jnp.array_equal(
-        new_primitive_state[:, ~accreted],
-        primitive_state[:, ~accreted],
-    )
-
-    # A full run: the total mass of gas and sinks stays constant.
-    initial_mass, _ = _gas_mass_and_momentum(state.primitive_state, registered_variables)
-    final_state = time_integration(state, config, params, registered_variables)
-    final_gas_mass, _ = _gas_mass_and_momentum(
-        final_state.primitive_state,
-        registered_variables,
-    )
-    final_sink_mass = jnp.sum(final_state.sink_particles.mass)
-    assert final_sink_mass > 0.0
-    assert jnp.allclose(initial_mass, final_gas_mass + final_sink_mass, rtol=1e-5)
-
-
-def test_accretion_by_existing_sink():
-    """An existing sink accretes the gas above the density threshold within
-    its accretion radius."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
-    sink_mass = 0.5
-    existing_sink = _one_sink_at(
-        (CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
-        config,
-        state.primitive_state.dtype,
-    )
-    existing_sink = existing_sink._replace(mass=existing_sink.mass.at[0].set(sink_mass))
-
-    new_primitive_state, sink_particles = _update_sinks_once(
-        state,
-        config,
-        params,
-        registered_variables,
-        existing_sink,
-    )
-
-    # No new sink: the existing sink blocks creation (proximity check).
-    assert _num_sinks(sink_particles) == 1
-
-    density = state.primitive_state[registered_variables.density_index]
-    density_threshold = _density_threshold(config, params)
-    cells_above_threshold = density > density_threshold
-    mass_above_threshold = jnp.sum(
-        jnp.where(cells_above_threshold, density - density_threshold, 0.0)
-    ) * config.grid_spacing**3
-    assert jnp.allclose(
-        sink_particles.mass[0],
-        sink_mass + mass_above_threshold,
-        rtol=1e-5,
-    )
-    assert jnp.all(
-        new_primitive_state[registered_variables.density_index]
-        <= density_threshold * (1.0 + 1e-6)
-    )
-
-
 def test_new_sink_properties():
     """A new sink accretes the mass above the density threshold (Eq. 32)
     within its accretion radius, and ends at the centre of mass and with the
-    centre-of-mass velocity of the accreted gas."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    centre-of-mass velocity of the accreted gas. The accreted cells are left at
+    the threshold with an unchanged sound speed; the other cells are
+    untouched."""
+    state, config, params, registered_variables = _setup()
 
     # Give the gas a uniform bulk velocity, which the sink must inherit as its
     # centre-of-mass velocity.
@@ -313,7 +198,12 @@ def test_new_sink_properties():
         primitive_state = primitive_state.at[velocity_index].set(bulk_velocity[axis])
     state = state._replace(primitive_state=primitive_state)
 
-    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+    new_primitive_state, sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+    )
 
     # One sink, from the centre cell, the only potential minimum.
     assert _num_sinks(sink_particles) == 1
@@ -321,7 +211,9 @@ def test_new_sink_properties():
     # The 57 cells above the threshold all lie within r_acc of the sink,
     # created at the centre cell, so it accretes the whole mass above the
     # threshold.
-    density = primitive_state[registered_variables.density_index]
+    density_index = registered_variables.density_index
+    pressure_index = registered_variables.pressure_index
+    density = primitive_state[density_index]
     density_threshold = _density_threshold(config, params)
     cells_above_threshold = density > density_threshold
     assert int(jnp.sum(cells_above_threshold)) == 57
@@ -336,11 +228,87 @@ def test_new_sink_properties():
 
     assert jnp.allclose(sink_particles.velocity[0], bulk_velocity, atol=1e-5)
 
+    # The accreted cells end at the threshold with c_s² unchanged; the other
+    # cells are untouched.
+    assert jnp.allclose(
+        new_primitive_state[density_index][cells_above_threshold],
+        density_threshold,
+        rtol=1e-6,
+    )
+    sound_speed_squared_before = (
+        SETTINGS.gamma * primitive_state[pressure_index] / primitive_state[density_index]
+    )
+    sound_speed_squared_after = (
+        SETTINGS.gamma
+        * new_primitive_state[pressure_index]
+        / new_primitive_state[density_index]
+    )
+    assert jnp.allclose(sound_speed_squared_before, sound_speed_squared_after, rtol=1e-5)
+    assert jnp.array_equal(
+        new_primitive_state[:, ~cells_above_threshold],
+        primitive_state[:, ~cells_above_threshold],
+    )
+
+
+def test_accretion_conservation():
+    """Accretion moves mass and momentum from the gas to the sink without
+    creating or destroying any."""
+    state, config, params, registered_variables = _setup()
+
+    # Gas falling toward the clump centre on top of a bulk motion, and an
+    # existing sink at the centre moving relative to the gas. The accreted gas
+    # has a different mean velocity than the sink, so the sink's velocity
+    # changes and the momentum check covers the velocity update.
+    bulk_velocity = jnp.array([1.0, -2.0, 0.5])
+    state = _with_linear_velocity(state, registered_variables, (-1.0, -1.0, -1.0))
+    primitive_state = state.primitive_state
+    for axis, velocity_index in enumerate(registered_variables.velocity_index):
+        primitive_state = primitive_state.at[velocity_index].add(bulk_velocity[axis])
+    state = state._replace(primitive_state=primitive_state)
+
+    sink_mass = 0.5
+    sink_velocity = bulk_velocity + jnp.array([0.05, -0.02, 0.01])
+    existing_sink = _sink_at_clump_center(sink_mass, config, primitive_state.dtype)
+    existing_sink = existing_sink._replace(
+        velocity=existing_sink.velocity.at[0].set(sink_velocity)
+    )
+
+    new_primitive_state, sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        existing_sink,
+    )
+    assert _num_sinks(sink_particles) == 1
+    assert not jnp.allclose(sink_particles.velocity[0], sink_velocity)
+
+    # What the gas loses, the sink gains.
+    gas_mass_before, gas_momentum_before = _gas_mass_and_momentum(
+        primitive_state,
+        registered_variables,
+    )
+    gas_mass_after, gas_momentum_after = _gas_mass_and_momentum(
+        new_primitive_state,
+        registered_variables,
+    )
+    sink_mass_gain = sink_particles.mass[0] - sink_mass
+    sink_momentum_gain = (
+        sink_particles.mass[0] * sink_particles.velocity[0] - sink_mass * sink_velocity
+    )
+    assert sink_mass_gain > 0.0
+    assert jnp.allclose(gas_mass_before, gas_mass_after + sink_mass_gain, rtol=1e-6)
+    assert jnp.allclose(
+        gas_momentum_before,
+        gas_momentum_after + sink_momentum_gain,
+        rtol=1e-6,
+    )
+
 
 def test_proximity():
     """No sink forms within r_acc of an existing sink (Section 2.2.7), with
     distances taken across periodic boundaries."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
     dtype = state.primitive_state.dtype
     box_length = SETTINGS.box_length
 
@@ -378,10 +346,7 @@ def test_proximity():
     boundary_settings = SETTINGS._replace(
         overdensity_center=(0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    state, config, params, registered_variables = _setup(
-        sink_particles=True,
-        settings=boundary_settings,
-    )
+    state, config, params, registered_variables = _setup(settings=boundary_settings)
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
     assert _num_sinks(sink_particles) == 1
     across_boundary_sink = _one_sink_at(
@@ -407,10 +372,7 @@ def test_position_wrapping():
         peak_overdensity=400.0,
         overdensity_center=(1.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    state, config, params, registered_variables = _setup(
-        sink_particles=True,
-        settings=boundary_settings,
-    )
+    state, config, params, registered_variables = _setup(settings=boundary_settings)
     config = config._replace(
         gravity_config=config.gravity_config._replace(external_potential=True)
     )
@@ -454,7 +416,7 @@ def _with_linear_velocity(state, registered_variables, velocity_gradient):
 def test_converging_flow(velocity_gradient, expected_num_sinks):
     """Sinks only form where the flow converges along every axis (Section
     2.2.3)."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
     state = _with_linear_velocity(state, registered_variables, velocity_gradient)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
@@ -465,7 +427,7 @@ def test_converging_flow(velocity_gradient, expected_num_sinks):
 def test_potential_minimum():
     """A sink forms only where the potential is lowest in the control volume
     (Section 2.2.4), which need not be the densest cell."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
 
     # Add a narrow density spike in a single cell, 2 cells from the clump
     # centre along x (within r_acc). The spike cell becomes the densest cell
@@ -515,10 +477,7 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
         peak_overdensity=peak_overdensity,
         sound_speed_squared=sound_speed_squared,
     )
-    state, config, params, registered_variables = _setup(
-        sink_particles=True,
-        settings=settings,
-    )
+    state, config, params, registered_variables = _setup(settings=settings)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
 
@@ -539,7 +498,7 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
 def test_bound_state(angular_velocity, expected_num_sinks):
     """A sink forms only if the gas in the control volume is bound,
     E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6)."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
 
     # Solid-body rotation about the z axis through the clump centre. Along
     # each axis, the velocity component along that axis does not change, so
@@ -579,7 +538,6 @@ def test_magnetic_energy(magnetic_field, expected_num_sinks):
     against sink formation in the Jeans check, |E_grav| > 2 E_th + E_mag
     (Section 2.2.5)."""
     state, config, params, registered_variables = _setup(
-        sink_particles=True,
         settings=SETTINGS._replace(magnetic_field_z=magnetic_field),
         mhd=True,
     )
@@ -593,7 +551,6 @@ def test_accretion_with_magnetic_field():
     """Accretion leaves the magnetic field unchanged, and still moves mass and
     momentum from the gas to the sink without creating or destroying any."""
     state, config, params, registered_variables = _setup(
-        sink_particles=True,
         settings=SETTINGS._replace(magnetic_field_z=1.0),
         mhd=True,
     )
@@ -667,8 +624,9 @@ def _num_accreted_cells(primitive_state, new_primitive_state, registered_variabl
 )
 def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
     """Gas is accreted only if it is bound to the sink, E_grav + E_kin < 0
-    (Section 2.3), except in the cell containing the sink."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    (Section 2.3), except in the cell containing the sink. The existing sink
+    gains the mass above the threshold of the accreted cells."""
+    state, config, params, registered_variables = _setup()
 
     # Gas falling toward the clump centre, where an existing sink of mass 0.5
     # sits at rest, v = −g (x − x_c). The infall keeps the radial velocity
@@ -678,9 +636,10 @@ def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
         registered_variables,
         (-contraction_rate, -contraction_rate, -contraction_rate),
     )
-    existing_sink = _sink_at_clump_center(0.5, config, state.primitive_state.dtype)
+    sink_mass = 0.5
+    existing_sink = _sink_at_clump_center(sink_mass, config, state.primitive_state.dtype)
 
-    new_primitive_state, _ = _update_sinks_once(
+    new_primitive_state, sink_particles = _update_sinks_once(
         state,
         config,
         params,
@@ -688,12 +647,23 @@ def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
         existing_sink,
     )
 
+    # No new sink: the existing sink blocks creation (proximity check).
+    assert _num_sinks(sink_particles) == 1
+
     num_accreted_cells = _num_accreted_cells(
         state.primitive_state,
         new_primitive_state,
         registered_variables,
     )
     assert num_accreted_cells == expected_num_accreted_cells
+
+    density_index = registered_variables.density_index
+    density = state.primitive_state[density_index]
+    accreted = new_primitive_state[density_index] < density
+    accreted_mass = jnp.sum(
+        jnp.where(accreted, density - _density_threshold(config, params), 0.0)
+    ) * config.grid_spacing**3
+    assert jnp.allclose(sink_particles.mass[0], sink_mass + accreted_mass, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -711,7 +681,7 @@ def test_accretion_radial_velocity(velocity_gradient, expected_num_accreted_cell
     """Gas is accreted only if it moves toward the sink, v_r ≤ 10⁻⁵ c_s
     (Section 2.3, with FLASH's tolerance), except in the cell containing the
     sink."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
     state = _with_linear_velocity(
         state,
         registered_variables,
@@ -738,7 +708,7 @@ def test_accretion_radial_velocity(velocity_gradient, expected_num_accreted_cell
 def test_accretion_most_bound_sink():
     """A cell within reach of several sinks is accreted once, by the sink it
     is most strongly bound to (Section 2.3)."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
     dtype = state.primitive_state.dtype
 
     # Two sinks at rest, 2 cells on either side of the clump centre along x:
@@ -778,15 +748,15 @@ def test_accretion_most_bound_sink():
         rtol=1e-5,
     )
 
-    # The overlap goes to the heavy sink; the light sink keeps at least its
-    # own cell.
+    # The overlap goes to the heavy sink; the light sink still gains the cells
+    # within its reach only.
     assert heavy_sink_gain > light_sink_gain > 0.0
 
 
 def test_accretion_tie_break():
     """A cell for which several sinks tie exactly is accreted once, by the
     sink in the lowest slot."""
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
     dtype = state.primitive_state.dtype
 
     # Two equal sinks at rest at the same position: they share the inner cell
@@ -872,7 +842,7 @@ def test_disk_snapshots_with_sinks(tmp_path):
     """Disk snapshots carry the sinks: a run restarted from a checkpoint ends
     with the same gas state and the same sinks as the uninterrupted run."""
     pytest.importorskip("orbax.checkpoint")
-    state, config, params, registered_variables = _setup(sink_particles=True)
+    state, config, params, registered_variables = _setup()
 
     # Two segments of adaptive steps; each ends exactly on its snapshot time
     # and writes a checkpoint. The sink forms in the first step.
@@ -917,10 +887,7 @@ def test_disk_snapshots_with_sinks(tmp_path):
 def test_sink_particle_slots_overflow(capfd):
     """When a new sink passes but every slot is taken, it is discarded and a
     warning is printed."""
-    state, config, params, registered_variables = _setup(
-        sink_particles=True,
-        max_num_sinks=1,
-    )
+    state, config, params, registered_variables = _setup(max_num_sinks=1)
     far_sink = _one_sink_at((0.1, 0.1, 0.1), config, state.primitive_state.dtype)
 
     sink_particles = _form_sinks_once(
@@ -963,9 +930,8 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape):
 
 
 if __name__ == "__main__":
-    test_accretion_conservation()
-    test_accretion_by_existing_sink()
     test_new_sink_properties()
+    test_accretion_conservation()
     test_proximity()
     test_position_wrapping()
     test_converging_flow((-1.0, -1.0, -1.0), 1)
