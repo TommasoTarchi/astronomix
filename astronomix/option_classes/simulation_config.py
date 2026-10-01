@@ -924,8 +924,6 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
 
     # Sink particle formation requirements. The formation checks of Federrath
     # et al. (2010) are formulated in 3D and need the self-gravity potential.
-    # The sinks are returned in the final StateStruct only, so snapshot and
-    # disk-checkpointing modes (which do not carry them) are not supported.
     if config.sink_particle_config.sink_particles:
         if config.dimensionality != 3:
             raise ValueError("Sink particles are only supported in 3D.")
@@ -935,11 +933,6 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             raise ValueError(
                 "Sink particles require state_struct = True; the sinks are "
                 "passed in and returned in the StateStruct."
-            )
-        if config.return_snapshots or config.snapshot_storage_mode == TO_DISK:
-            raise NotImplementedError(
-                "Sink particles are not yet supported together with "
-                "return_snapshots or snapshot_storage_mode == TO_DISK."
             )
 
     return config

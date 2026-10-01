@@ -15,11 +15,18 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
+# general
+import tempfile
+from pathlib import Path
+
 # testing
 import pytest
 
 # jax
 import jax.numpy as jnp
+
+# astronomix constants
+from astronomix import TO_DISK
 
 # astronomix containers
 from astronomix import (
@@ -27,12 +34,14 @@ from astronomix import (
     SimulationConfig,
     SimulationParams,
 )
+from astronomix.data_classes.simulation_state_struct import StateStruct
 from astronomix.option_classes.simulation_config import StaticIntVector
 from astronomix._modules._sink_particles._sink_particle_options import SinkParticleConfig
 
 # astronomix functions
 from astronomix import (
     get_registered_variables,
+    restart_from_latest_checkpoint,
     time_integration,
 )
 from astronomix.option_classes.simulation_config import finalize_config
@@ -803,6 +812,52 @@ def test_accretion_tie_break():
     assert sink_gain[1] == 0.0
 
 
+def test_disk_snapshots_with_sinks(tmp_path):
+    """Disk snapshots carry the sinks: a run restarted from a checkpoint ends
+    with the same gas state and the same sinks as the uninterrupted run."""
+    pytest.importorskip("orbax.checkpoint")
+    state, config, params, registered_variables = _setup(sink_particles=True)
+
+    # Two segments of adaptive steps; each ends exactly on its snapshot time
+    # and writes a checkpoint. The sink forms in the first step.
+    uninterrupted_path = str(tmp_path / "uninterrupted")
+    config = config._replace(
+        fixed_timestep=False,
+        snapshot_storage_mode=TO_DISK,
+        snapshot_storage_path=uninterrupted_path,
+        num_snapshots=2,
+    )
+    final_state = time_integration(state, config, params, registered_variables)
+    assert _num_sinks(final_state.sink_particles) == 1
+
+    # Restart from the checkpoint of the first segment and run the second
+    # segment again, writing to a separate directory.
+    primitive_state, restart_params, restart_state = restart_from_latest_checkpoint(
+        uninterrupted_path,
+        params,
+        step=1,
+    )
+    assert _num_sinks(restart_state.sink_particles) == 1
+    restart_config = config._replace(
+        snapshot_storage_path=str(tmp_path / "restarted"),
+        num_snapshots=1,
+    )
+    restarted_state = time_integration(
+        StateStruct(primitive_state=primitive_state),
+        restart_config,
+        restart_params,
+        registered_variables,
+        restart_state=restart_state,
+    )
+
+    assert jnp.array_equal(restarted_state.primitive_state, final_state.primitive_state)
+    for restarted_field, final_field in zip(
+        restarted_state.sink_particles,
+        final_state.sink_particles,
+    ):
+        assert jnp.array_equal(restarted_field, final_field)
+
+
 def test_sink_particle_slots_overflow(capfd):
     """When a new sink passes but every slot is taken, it is discarded and a
     warning is printed."""
@@ -823,15 +878,14 @@ def test_sink_particle_slots_overflow(capfd):
 
 
 @pytest.mark.parametrize(
-    "unsupported_options, state_shape, expected_error",
+    "unsupported_options, state_shape",
     [
-        (dict(dimensionality=2), (4, 16, 16), ValueError),
-        (dict(gravity_config=GravityConfig(self_gravity=False)), (5, 16, 16, 16), ValueError),
-        (dict(state_struct=False), (5, 16, 16, 16), ValueError),
-        (dict(return_snapshots=True), (5, 16, 16, 16), NotImplementedError),
+        (dict(dimensionality=2), (4, 16, 16)),
+        (dict(gravity_config=GravityConfig(self_gravity=False)), (5, 16, 16, 16)),
+        (dict(state_struct=False), (5, 16, 16, 16)),
     ],
 )
-def test_sink_particle_config_requirements(unsupported_options, state_shape, expected_error):
+def test_sink_particle_config_requirements(unsupported_options, state_shape):
     """``finalize_config`` must reject each configuration that sink particle
     formation does not support.
 
@@ -839,7 +893,6 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape, exp
         unsupported_options: The config fields that make the configuration
             unsupported, on top of an otherwise valid one.
         state_shape: The primitive state shape matching the dimensionality.
-        expected_error: The exception ``finalize_config`` must raise.
     """
     supported_options = dict(
         dimensionality=3,
@@ -849,7 +902,7 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape, exp
     )
     config = SimulationConfig(**{**supported_options, **unsupported_options})
 
-    with pytest.raises(expected_error):
+    with pytest.raises(ValueError):
         finalize_config(config, state_shape)
 
 
@@ -869,3 +922,4 @@ if __name__ == "__main__":
     test_accretion_radial_velocity(1.0, 1)
     test_accretion_most_bound_sink()
     test_accretion_tie_break()
+    test_disk_snapshots_with_sinks(Path(tempfile.mkdtemp()))

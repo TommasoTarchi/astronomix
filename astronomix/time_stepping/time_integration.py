@@ -605,6 +605,16 @@ def _integrate_core(
         snapshot_data = build_snapshot_store(
             config, config.num_snapshots, original_shape
         )
+        # The sink particles get one buffer slot per snapshot, like the states.
+        if config.sink_particle_config.sink_particles:
+            snapshot_data = snapshot_data._replace(
+                sink_particles=jax.tree.map(
+                    lambda field: jnp.zeros(
+                        (config.num_snapshots, *field.shape), dtype=field.dtype
+                    ),
+                    initial_loop_state.sink_particles,
+                )
+            )
     elif config.activate_snapshot_callback:
         snapshot_data = SnapshotData(current_checkpoint=0)
 
@@ -733,7 +743,7 @@ def _integrate_core(
         # Recover the unpadded helper data by slicing — free under jit.
         helper_data_unpad = _unpad_helper_data(helper_data_pad, config)
 
-        return record_snapshot(
+        store = record_snapshot(
             store,
             idx,
             time,
@@ -743,6 +753,17 @@ def _integrate_core(
             config,
             registered_variables,
         )
+
+        if config.sink_particle_config.sink_particles:
+            store = store._replace(
+                sink_particles=jax.tree.map(
+                    lambda buffer, field: buffer.at[idx].set(field),
+                    store.sink_particles,
+                    state.sink_particles,
+                )
+            )
+
+        return store
 
     def _should_record_snapshot(time, idx):
         """Whether snapshot ``idx`` is due at the start of a step at ``time``."""
@@ -946,6 +967,7 @@ def _run_segment(
     helper_data_pad: Union[HelperData, NoneType],
     init_key,
     init_forcing,
+    init_sink_particles=None,
 ):
     """Integrate one segment for the disk-checkpointing (TO_DISK) driver.
 
@@ -957,13 +979,19 @@ def _run_segment(
     left uninterrupted. ``config`` always has snapshots disabled here (each
     segment end is itself a checkpoint), so no snapshot buffers are allocated.
 
-    Returns ``(t_final, primitive_state_unpadded, key, forcing, num_iterations)``.
+    Returns ``(t_final, primitive_state_unpadded, key, forcing, sink_particles,
+    num_iterations)``; ``sink_particles`` is ``None`` when sink particles are off.
     """
     original_shape = primitive_state.shape
     primitive_state = _prepare_padded_state(
         primitive_state, config, params, registered_variables
     )
-    initial_loop_state = LoopState(primitive_state, init_key, init_forcing)
+    initial_loop_state = LoopState(
+        primitive_state,
+        init_key,
+        init_forcing,
+        init_sink_particles,
+    )
     t_final, loop_state, _, num_iterations = _integrate_core(
         config,
         params,
@@ -981,6 +1009,7 @@ def _run_segment(
         primitive_state,
         loop_state.key,
         loop_state.forcing,
+        loop_state.sink_particles,
         num_iterations,
     )
 
@@ -1001,12 +1030,13 @@ def _time_integration_to_disk(
     The run is split into ``config.num_snapshots`` segments spanning
     ``[params.t_start, params.t_end]``. Each segment is integrated by the JIT'd
     :func:`_run_segment`; afterwards the loop carry (primitive state, PRNG key,
-    OU forcing) plus the time and cumulative iteration count are written to
-    ``config.snapshot_storage_path`` via Orbax. The carry stays on device
-    (sharded) between segments, and Orbax writes each device's shard
+    OU forcing, sink particles) plus the time and cumulative iteration count
+    are written to ``config.snapshot_storage_path`` via Orbax. The carry stays
+    on device (sharded) between segments, and Orbax writes each device's shard
     independently, so this scales to multiple devices / nodes.
 
-    Returns the final (unpadded) primitive state, like the no-snapshot path of
+    Returns the final (unpadded) primitive state, or the state struct with the
+    final sink particles, like the no-snapshot path of
     :func:`_time_integration`; the per-snapshot data lives on disk.
     """
     # local import keeps the (optional) orbax dependency out of the import path
@@ -1019,15 +1049,25 @@ def _time_integration_to_disk(
 
     if config.state_struct:
         primitive_state = state.primitive_state
+        sink_particles = state.sink_particles
     else:
         primitive_state = state
+        sink_particles = None
 
     # The carry between segments is the unpadded state plus the stochastic
-    # bits (PRNG key, OU forcing). On a restart these come from the checkpoint.
+    # bits (PRNG key, OU forcing) and the sink particles. On a restart these
+    # come from the checkpoint.
     if restart_state is not None:
         key, forcing = restart_state.key, restart_state.forcing
+        if restart_state.sink_particles is not None:
+            sink_particles = restart_state.sink_particles
     else:
         key, forcing = _seed_key_and_forcing(config, params)
+
+    # As in the in-memory path, a run with sink particles but none passed in
+    # starts with every slot empty.
+    if config.sink_particle_config.sink_particles and sink_particles is None:
+        sink_particles = _empty_sink_particles(config, primitive_state.dtype)
 
     # Segment config: snapshots stay off (each segment end *is* a checkpoint)
     # and ON_DEVICE so the segment runner does not recurse into this driver.
@@ -1087,7 +1127,14 @@ def _time_integration_to_disk(
                 )
 
             with mesh_ctx, pallas_mesh_context(pallas_mesh):
-                t_final, primitive_state, key, forcing, num_iterations = run_segment_jit(
+                (
+                    t_final,
+                    primitive_state,
+                    key,
+                    forcing,
+                    sink_particles,
+                    num_iterations,
+                ) = run_segment_jit(
                     primitive_state,
                     segment_config,
                     segment_params,
@@ -1095,6 +1142,7 @@ def _time_integration_to_disk(
                     helper_data_pad,
                     key,
                     forcing,
+                    sink_particles,
                 )
 
             cumulative_iterations = cumulative_iterations + num_iterations
@@ -1119,6 +1167,10 @@ def _time_integration_to_disk(
                         else sharding
                     )
                     store_forcing = jax.device_put(forcing, forcing_sharding)
+            # The sink particles are small and replicated on every device.
+            store_sink_particles = sink_particles
+            if sharding is not None and sink_particles is not None:
+                store_sink_particles = jax.device_put(sink_particles, replicated)
 
             save_loop_checkpoint(
                 checkpointer,
@@ -1128,9 +1180,13 @@ def _time_integration_to_disk(
                 key=key,
                 forcing=store_forcing,
                 num_iterations=cumulative_iterations,
+                sink_particles=store_sink_particles,
             )
 
     if config.state_struct:
-        return StateStruct(primitive_state=primitive_state)
+        return StateStruct(
+            primitive_state=primitive_state,
+            sink_particles=sink_particles,
+        )
 
     return primitive_state
