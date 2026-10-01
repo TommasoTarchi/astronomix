@@ -109,10 +109,24 @@ def test_new_sink_properties():
     )
 
 
-def test_accretion_conservation():
+@pytest.mark.parametrize(
+    "mhd",
+    [
+        pytest.param(False, id="without_magnetic_field"),
+        pytest.param(True, id="with_magnetic_field"),
+    ],
+)
+def test_accretion_conservation(mhd):
     """Accretion moves mass and momentum from the gas to the sink without
-    creating or destroying any."""
-    state, config, params, registered_variables = _setup()
+    creating or destroying any, and leaves the magnetic field unchanged.
+
+    Args:
+        mhd: Whether MHD is switched on, with a uniform field B_z = 1.
+    """
+    state, config, params, registered_variables = _setup(
+        settings=SETTINGS._replace(magnetic_field_z=1.0),
+        mhd=mhd,
+    )
 
     # Gas falling toward the clump centre on top of a bulk motion, and an
     # existing sink at the centre moving relative to the gas. The accreted gas
@@ -163,78 +177,31 @@ def test_accretion_conservation():
         rtol=1e-6,
     )
 
-
-def test_accretion_with_magnetic_field():
-    """Accretion leaves the magnetic field unchanged, and still moves mass and
-    momentum from the gas to the sink without creating or destroying any."""
-    state, config, params, registered_variables = _setup(
-        settings=SETTINGS._replace(magnetic_field_z=1.0),
-        mhd=True,
-    )
-
-    # A bulk velocity makes the momentum transfer non-trivial.
-    bulk_velocity = jnp.array([1.0, -2.0, 0.5])
-    primitive_state = state.primitive_state
-    for axis, velocity_index in enumerate(registered_variables.velocity_index):
-        primitive_state = primitive_state.at[velocity_index].set(bulk_velocity[axis])
-    state = state._replace(primitive_state=primitive_state)
-
-    new_primitive_state, sink_particles = _update_sinks_once(
-        state,
-        config,
-        params,
-        registered_variables,
-    )
-
-    assert _num_sinks(sink_particles) == 1
-    magnetic_index = jnp.array(registered_variables.magnetic_index)
-    assert jnp.array_equal(
-        new_primitive_state[magnetic_index],
-        state.primitive_state[magnetic_index],
-    )
-
-    gas_mass_before, gas_momentum_before = _gas_mass_and_momentum(
-        state.primitive_state,
-        registered_variables,
-    )
-    gas_mass_after, gas_momentum_after = _gas_mass_and_momentum(
-        new_primitive_state,
-        registered_variables,
-    )
-    sink_mass = jnp.sum(sink_particles.mass)
-    sink_momentum = jnp.sum(sink_particles.mass[:, None] * sink_particles.velocity, axis=0)
-    assert jnp.allclose(gas_mass_before, gas_mass_after + sink_mass, rtol=1e-6)
-    assert jnp.allclose(
-        gas_momentum_before,
-        gas_momentum_after + sink_momentum,
-        rtol=1e-6,
-    )
+    if mhd:
+        magnetic_index = jnp.array(registered_variables.magnetic_index)
+        assert jnp.array_equal(
+            new_primitive_state[magnetic_index],
+            primitive_state[magnetic_index],
+        )
 
 
-@pytest.mark.parametrize(
-    "contraction_rate, expected_num_accreted_cells",
-    [
-        # Slow infall: every cell above the threshold is bound, all 57 are
-        # accreted.
-        (1.0, 57),
-        # Fast infall: every cell except the sink's own one is unbound; the
-        # sink's own cell is accreted without checks.
-        (1000.0, 1),
-    ],
-)
-def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
-    """Gas is accreted only if it is bound to the sink, E_grav + E_kin < 0
-    (Section 2.3), except in the cell containing the sink. The existing sink
-    gains the mass above the threshold of the accreted cells."""
+def _accrete_around_sink_at_rest(velocity_gradient):
+    """Apply one formation and accretion step with an existing sink of mass 0.5
+    at rest at the clump centre, and check that no new sink forms and that the
+    sink gains exactly the mass above the threshold of the cells that lost gas.
+
+    Args:
+        velocity_gradient: The gradient g of the gas velocity
+            v = g (x − x_c) along every axis, about the sink at x_c.
+
+    Returns:
+        The number of cells that lost gas.
+    """
     state, config, params, registered_variables = _setup()
-
-    # Gas falling toward the clump centre, where an existing sink of mass 0.5
-    # sits at rest, v = −g (x − x_c). The infall keeps the radial velocity
-    # negative, so only the bound check decides.
     state = _with_linear_velocity(
         state,
         registered_variables,
-        (-contraction_rate, -contraction_rate, -contraction_rate),
+        (velocity_gradient, velocity_gradient, velocity_gradient),
     )
     sink_mass = 0.5
     existing_sink = _sink_at_clump_center(sink_mass, config, state.primitive_state.dtype)
@@ -247,15 +214,8 @@ def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
         existing_sink,
     )
 
-    # No new sink: the existing sink blocks creation (proximity check).
-    assert _num_sinks(sink_particles) == 1
-
-    num_accreted_cells = _num_accreted_cells(
-        state.primitive_state,
-        new_primitive_state,
-        registered_variables,
-    )
-    assert num_accreted_cells == expected_num_accreted_cells
+    # The existing sink blocks creation (proximity check).
+    assert _num_sinks(sink_particles) == 1, "a new sink formed next to the existing one"
 
     density_index = registered_variables.density_index
     density = state.primitive_state[density_index]
@@ -263,46 +223,52 @@ def test_accretion_bound(contraction_rate, expected_num_accreted_cells):
     accreted_mass = jnp.sum(
         jnp.where(accreted, density - _density_threshold(config, params), 0.0)
     ) * config.grid_spacing**3
-    assert jnp.allclose(sink_particles.mass[0], sink_mass + accreted_mass, rtol=1e-5)
-
-
-@pytest.mark.parametrize(
-    "velocity_gradient, expected_num_accreted_cells",
-    [
-        # Slowly expanding away from the sink: bound (as slow as the infall
-        # of test_accretion_bound), but moving away, so only the sink's own
-        # cell is accreted.
-        (1.0, 1),
-        # Slowly falling toward the sink: all 57 cells above the threshold.
-        (-1.0, 57),
-    ],
-)
-def test_accretion_radial_velocity(velocity_gradient, expected_num_accreted_cells):
-    """Gas is accreted only if it moves toward the sink, v_r ≤ 10⁻⁵ c_s
-    (Section 2.3, with FLASH's tolerance), except in the cell containing the
-    sink."""
-    state, config, params, registered_variables = _setup()
-    state = _with_linear_velocity(
-        state,
-        registered_variables,
-        (velocity_gradient, velocity_gradient, velocity_gradient),
-    )
-    existing_sink = _sink_at_clump_center(0.5, config, state.primitive_state.dtype)
-
-    new_primitive_state, _ = _update_sinks_once(
-        state,
-        config,
-        params,
-        registered_variables,
-        existing_sink,
+    assert jnp.allclose(sink_particles.mass[0], sink_mass + accreted_mass, rtol=1e-5), (
+        "the sink's mass gain differs from the mass above the threshold of the "
+        "accreted cells"
     )
 
-    num_accreted_cells = _num_accreted_cells(
+    return _num_accreted_cells(
         state.primitive_state,
         new_primitive_state,
         registered_variables,
     )
-    assert num_accreted_cells == expected_num_accreted_cells
+
+
+def test_accretion_of_bound_infalling_gas():
+    """Gas that is bound to the sink, E_grav + E_kin < 0, and moves toward it,
+    v_r ≤ 10⁻⁵ c_s (Section 2.3, with FLASH's tolerance on v_r), is accreted.
+    With slow infall, all 57 cells above the threshold pass both checks."""
+    num_accreted_cells = _accrete_around_sink_at_rest(velocity_gradient=-1.0)
+
+    assert num_accreted_cells == 57, (
+        f"{num_accreted_cells} of the 57 cells above the threshold were accreted"
+    )
+
+
+def test_no_accretion_of_unbound_gas():
+    """Gas that is not bound to the sink is not accreted (Section 2.3), except
+    in the cell containing the sink, which is accreted without checks. Fast
+    infall keeps the radial velocity negative, so only the bound check fails."""
+    num_accreted_cells = _accrete_around_sink_at_rest(velocity_gradient=-1000.0)
+
+    assert num_accreted_cells == 1, (
+        f"{num_accreted_cells} cells were accreted; unbound gas must leave only "
+        "the sink's own cell"
+    )
+
+
+def test_no_accretion_of_gas_moving_away():
+    """Gas moving away from the sink is not accreted (Section 2.3), except in
+    the cell containing the sink, which is accreted without checks. Slow
+    expansion, as slow as the infall of the bound case, keeps the gas bound, so
+    only the radial velocity check fails."""
+    num_accreted_cells = _accrete_around_sink_at_rest(velocity_gradient=1.0)
+
+    assert num_accreted_cells == 1, (
+        f"{num_accreted_cells} cells were accreted; gas moving away must leave "
+        "only the sink's own cell"
+    )
 
 
 def test_accretion_most_bound_sink():
@@ -392,9 +358,10 @@ def test_accretion_tie_break():
 
 if __name__ == "__main__":
     test_new_sink_properties()
-    test_accretion_conservation()
-    test_accretion_with_magnetic_field()
-    test_accretion_bound(1.0, 57)
-    test_accretion_radial_velocity(1.0, 1)
+    test_accretion_conservation(False)
+    test_accretion_conservation(True)
+    test_accretion_of_bound_infalling_gas()
+    test_no_accretion_of_unbound_gas()
+    test_no_accretion_of_gas_moving_away()
     test_accretion_most_bound_sink()
     test_accretion_tie_break()
