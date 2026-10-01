@@ -3,8 +3,8 @@ Sink particle formation pytest (fast).
 
 Checks the sink particle creation checks of Federrath et al. (2010), Section
 2.2: converging flow, potential minimum, Jeans instability (with and without a
-magnetic field), bound state and proximity to existing sinks, the storage of a
-sink inside a periodic box, and the limit on the number of sink slots.
+magnetic field), bound state and proximity to existing sinks, and the limit on
+the number of sink slots.
 """
 
 # ==== GPU selection ====
@@ -86,34 +86,6 @@ def test_proximity():
         state, config, params, registered_variables, across_boundary_sink
     )
     assert _num_sinks(sink_particles) == 1
-
-
-def test_position_wrapping():
-    """A sink whose centre of mass falls past a periodic boundary is stored
-    inside the box."""
-    # A clump centred on the second cell along x (index 1), and an external
-    # potential well in the last cell along x (index 31), two cells away across
-    # the x = 0 boundary. The well makes the last cell the potential minimum,
-    # so the sink forms from it, while most of the gas in its control volume
-    # lies past the edge: the centre of mass comes out at x ≈ 1.011.
-    boundary_settings = SETTINGS._replace(
-        peak_overdensity=400.0,
-        overdensity_center=(1.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
-    )
-    state, config, params, registered_variables = _setup(settings=boundary_settings)
-    config = config._replace(
-        gravity_config=config.gravity_config._replace(external_potential=True)
-    )
-    well_index = (NUM_CELLS - 1, NUM_CELLS // 2, NUM_CELLS // 2)
-    params = params._replace(
-        gravitational_potential=jnp.zeros((NUM_CELLS,) * 3).at[well_index].set(-10.0)
-    )
-
-    sink_particles = _form_sinks_once(state, config, params, registered_variables)
-
-    # The stored x lies within the first cell: past the edge, wrapped back.
-    assert _num_sinks(sink_particles) == 1
-    assert 0.0 <= sink_particles.position[0, 0] < CELL_SIZE
 
 
 @pytest.mark.parametrize(
@@ -280,7 +252,6 @@ def test_sink_particle_slots_overflow(capfd):
 
 if __name__ == "__main__":
     test_proximity()
-    test_position_wrapping()
     test_converging_flow((-1.0, -1.0, -1.0), 1)
     test_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)

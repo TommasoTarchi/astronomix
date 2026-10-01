@@ -47,7 +47,8 @@ SETTINGS = SinkFormationSettings(
 
 
 def _setup(settings=SETTINGS, mhd=False, **sink_particle_options):
-    """Set up the Gaussian overdensity with the given sink options.
+    """Set up the Gaussian overdensity with sink particles on and the given
+    sink options.
 
     Args:
         settings: The problem constants of the setup.
