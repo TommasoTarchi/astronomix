@@ -4,8 +4,10 @@ Sink particle formation and accretion pytest (fast).
 Checks the sink particle creation and gas accretion of Federrath et al. (2010)
 on the Gaussian overdensity setup in
 ``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``: each
-creation criterion, the accretion criteria, the choice of a single sink for
-each accreted cell, and the conservation of mass and momentum. Also checks the
+creation criterion (with and without MHD), the accretion criteria, the choice
+of a single sink for each accreted cell, and the conservation of mass and
+momentum. Also checks full runs of the time loop with sinks forming, through
+the in-memory snapshots and through the disk snapshots and restart, and the
 configuration requirements enforced by ``finalize_config``.
 """
 
@@ -27,12 +29,18 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix import TO_DISK
+from astronomix.option_classes.simulation_config import (
+    FOURTH_ORDER_CONSERVATIVE,
+    SECOND_ORDER_CONSERVATIVE,
+    SIMPLE_SOURCE,
+)
 
 # astronomix containers
 from astronomix import (
     GravityConfig,
     SimulationConfig,
     SimulationParams,
+    SnapshotSettings,
 )
 from astronomix.data_classes.simulation_state_struct import StateStruct
 from astronomix.option_classes.simulation_config import StaticIntVector
@@ -812,6 +820,54 @@ def test_accretion_tie_break():
     assert sink_gain[1] == 0.0
 
 
+@pytest.mark.parametrize(
+    "self_gravity_version",
+    [SIMPLE_SOURCE, SECOND_ORDER_CONSERVATIVE, FOURTH_ORDER_CONSERVATIVE],
+)
+def test_clump_collapse(self_gravity_version):
+    """A sink forms during a run of the time loop and total mass is conserved,
+    for each finite-difference self-gravity treatment. The run goes through
+    the in-memory snapshots, which record the sinks at every snapshot."""
+    config = SimulationConfig(
+        num_cells=StaticIntVector(NUM_CELLS, NUM_CELLS, NUM_CELLS),
+        progress_bar=False,
+        gravity_config=GravityConfig(
+            self_gravity=True,
+            self_gravity_version=self_gravity_version,
+        ),
+        return_snapshots=True,
+        num_snapshots=5,
+        snapshot_settings=SnapshotSettings(return_states=True),
+        sink_particle_config=SinkParticleConfig(sink_particles=True),
+    )
+    # About 30 adaptive steps, a few free-fall times of the clump peak.
+    state, config, params = setup_sink_formation(
+        config,
+        SimulationParams(),
+        SETTINGS._replace(t_end=0.06),
+    )
+    registered_variables = get_registered_variables(config)
+
+    snapshots = time_integration(state, config, params, registered_variables)
+
+    # No sink at t = 0 (recorded before the first formation call); one sink
+    # from the next snapshot on.
+    num_sinks = jnp.sum(snapshots.sink_particles.mass > 0.0, axis=1)
+    assert num_sinks[0] == 0
+    assert jnp.all(num_sinks[1:] == 1)
+
+    # Gas plus sink mass at every snapshot equals the initial gas mass.
+    cell_volume = CELL_SIZE**3
+    initial_mass = jnp.sum(state.primitive_state[registered_variables.density_index])
+    initial_mass = initial_mass * cell_volume
+    gas_mass = jnp.sum(
+        snapshots.states[:, registered_variables.density_index],
+        axis=(1, 2, 3),
+    ) * cell_volume
+    sink_mass = jnp.sum(snapshots.sink_particles.mass, axis=1)
+    assert jnp.allclose(gas_mass + sink_mass, initial_mass, rtol=1e-4)
+
+
 def test_disk_snapshots_with_sinks(tmp_path):
     """Disk snapshots carry the sinks: a run restarted from a checkpoint ends
     with the same gas state and the same sinks as the uninterrupted run."""
@@ -922,4 +978,5 @@ if __name__ == "__main__":
     test_accretion_radial_velocity(1.0, 1)
     test_accretion_most_bound_sink()
     test_accretion_tie_break()
+    test_clump_collapse(SIMPLE_SOURCE)
     test_disk_snapshots_with_sinks(Path(tempfile.mkdtemp()))
