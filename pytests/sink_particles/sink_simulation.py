@@ -63,19 +63,38 @@ from _sink_helpers import (
 
 
 @pytest.mark.parametrize(
-    "self_gravity_version",
-    [SIMPLE_SOURCE, SECOND_ORDER_CONSERVATIVE, FOURTH_ORDER_CONSERVATIVE],
-    ids=["simple_source", "second_order_conservative", "fourth_order_conservative"],
+    "self_gravity_version, mhd",
+    [
+        (SIMPLE_SOURCE, False),
+        (SECOND_ORDER_CONSERVATIVE, False),
+        (FOURTH_ORDER_CONSERVATIVE, False),
+        (FOURTH_ORDER_CONSERVATIVE, True),
+    ],
+    ids=[
+        "simple_source",
+        "second_order_conservative",
+        "fourth_order_conservative",
+        "fourth_order_conservative_mhd",
+    ],
 )
-def test_mass_conservation_in_run(self_gravity_version):
+def test_conservation_in_run(self_gravity_version, mhd):
     """A sink forms during a run of the time loop, no second sink forms, and
-    gas plus sink mass is conserved at every snapshot, for each
-    finite-difference self-gravity treatment. The run goes through the
-    in-memory snapshots, which record the sinks. The physics of the collapse is
-    not checked: the gravity of the sinks on the gas is not implemented."""
+    gas plus sink mass and momentum are conserved at every snapshot, for each
+    finite-difference self-gravity treatment and, for one treatment, with MHD.
+    The gas moves with a small uniform bulk velocity, so the momentum is not
+    zero. The run goes through the in-memory snapshots, which record the
+    sinks. Not checked: the physics of the collapse (the gravity of the sinks
+    on the gas is not implemented), total energy (accretion removes the energy
+    of the accreted gas) and angular momentum (sinks have no spin).
+
+    Args:
+        self_gravity_version: The finite-difference self-gravity treatment.
+        mhd: Whether MHD is switched on, with a uniform field B_z = 1.
+    """
     config = SimulationConfig(
         num_cells=StaticIntVector(NUM_CELLS, NUM_CELLS, NUM_CELLS),
         progress_bar=False,
+        mhd=mhd,
         gravity_config=GravityConfig(
             self_gravity=True,
             self_gravity_version=self_gravity_version,
@@ -89,9 +108,18 @@ def test_mass_conservation_in_run(self_gravity_version):
     state, config, params = setup_sink_formation(
         config,
         SimulationParams(),
-        SETTINGS._replace(t_end=0.06),
+        SETTINGS._replace(t_end=0.06, magnetic_field_z=1.0),
     )
     registered_variables = get_registered_variables(config)
+
+    # A uniform bulk velocity makes the total momentum non-zero. Over the run
+    # the gas moves less than half a cell, so it stays around the sink, which
+    # does not move yet.
+    bulk_velocity = jnp.array([0.1, -0.2, 0.05])
+    primitive_state = state.primitive_state
+    for axis, velocity_index in enumerate(registered_variables.velocity_index):
+        primitive_state = primitive_state.at[velocity_index].set(bulk_velocity[axis])
+    state = state._replace(primitive_state=primitive_state)
 
     snapshots = time_integration(state, config, params, registered_variables)
 
@@ -101,16 +129,28 @@ def test_mass_conservation_in_run(self_gravity_version):
     assert num_sinks[0] == 0
     assert jnp.all(num_sinks[1:] == 1)
 
-    # Gas plus sink mass at every snapshot equals the initial gas mass.
+    # Gas plus sink mass and momentum at every snapshot equal the initial gas
+    # mass and momentum.
     cell_volume = CELL_SIZE**3
-    initial_mass = jnp.sum(state.primitive_state[registered_variables.density_index])
-    initial_mass = initial_mass * cell_volume
-    gas_mass = jnp.sum(
-        snapshots.states[:, registered_variables.density_index],
+    density_index = registered_variables.density_index
+    velocity_indices = jnp.array(registered_variables.velocity_index)
+    initial_density = primitive_state[density_index]
+    initial_mass = jnp.sum(initial_density) * cell_volume
+    initial_momentum = jnp.sum(
+        initial_density * primitive_state[velocity_indices],
         axis=(1, 2, 3),
     ) * cell_volume
-    sink_mass = jnp.sum(snapshots.sink_particles.mass, axis=1)
+
+    density = snapshots.states[:, density_index]
+    velocity = snapshots.states[:, velocity_indices]
+    gas_mass = jnp.sum(density, axis=(1, 2, 3)) * cell_volume
+    gas_momentum = jnp.sum(density[:, None] * velocity, axis=(2, 3, 4)) * cell_volume
+    sinks = snapshots.sink_particles
+    sink_mass = jnp.sum(sinks.mass, axis=1)
+    sink_momentum = jnp.sum(sinks.mass[..., None] * sinks.velocity, axis=1)
+
     assert jnp.allclose(gas_mass + sink_mass, initial_mass, rtol=1e-4)
+    assert jnp.allclose(gas_momentum + sink_momentum, initial_momentum, rtol=1e-4)
 
 
 def test_restart_from_disk(tmp_path):
@@ -191,9 +231,10 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape):
 
 
 if __name__ == "__main__":
-    test_mass_conservation_in_run(SIMPLE_SOURCE)
-    test_mass_conservation_in_run(SECOND_ORDER_CONSERVATIVE)
-    test_mass_conservation_in_run(FOURTH_ORDER_CONSERVATIVE)
+    test_conservation_in_run(SIMPLE_SOURCE, False)
+    test_conservation_in_run(SECOND_ORDER_CONSERVATIVE, False)
+    test_conservation_in_run(FOURTH_ORDER_CONSERVATIVE, False)
+    test_conservation_in_run(FOURTH_ORDER_CONSERVATIVE, True)
     test_restart_from_disk(Path(tempfile.mkdtemp()))
     test_sink_particle_config_requirements(dict(dimensionality=2), (4, 16, 16))
     test_sink_particle_config_requirements(
