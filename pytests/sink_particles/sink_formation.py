@@ -33,6 +33,34 @@ from _sink_helpers import (
 )
 
 
+def test_position_wrapping():
+    """A sink whose centre of mass falls past a periodic boundary is stored
+    inside the box."""
+    # A clump centred on the second cell along x (index 1), and an external
+    # potential well in the last cell along x (index 31), two cells away across
+    # the x = 0 boundary. The well makes the last cell the potential minimum,
+    # so the sink forms from it, while most of the gas in its control volume
+    # lies past the edge: the centre of mass comes out at x ≈ 1.011.
+    boundary_settings = SETTINGS._replace(
+        peak_overdensity=400.0,
+        overdensity_center=(1.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
+    )
+    state, config, params, registered_variables = _setup(settings=boundary_settings)
+    config = config._replace(
+        gravity_config=config.gravity_config._replace(external_potential=True)
+    )
+    well_index = (NUM_CELLS - 1, NUM_CELLS // 2, NUM_CELLS // 2)
+    params = params._replace(
+        gravitational_potential=jnp.zeros((NUM_CELLS,) * 3).at[well_index].set(-10.0)
+    )
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    # The stored x lies within the first cell: past the edge, wrapped back.
+    assert _num_sinks(sink_particles) == 1
+    assert 0.0 <= sink_particles.position[0, 0] < CELL_SIZE
+
+
 def test_proximity():
     """No sink forms within r_acc of an existing sink (Section 2.2.7), with
     distances taken across periodic boundaries."""
@@ -54,7 +82,7 @@ def test_proximity():
     sink_particles = _form_sinks_once(
         state, config, params, registered_variables, far_sink
     )
-    assert _num_sinks(sink_particles) == 1 + 1
+    assert _num_sinks(sink_particles) == 2
 
     # A sink one box length away from the clump centre is its own periodic
     # copy, so it blocks formation.
@@ -99,6 +127,7 @@ def test_proximity():
         # negative, but the flow must converge along each axis: no sink.
         ((1.0, -2.0, -2.0), 0),
     ],
+    ids=["contracting", "expanding", "expanding_along_x_only"],
 )
 def test_converging_flow(velocity_gradient, expected_num_sinks):
     """Sinks only form where the flow converges along every axis (Section
@@ -156,6 +185,7 @@ def test_potential_minimum():
         # above it, so only the Jeans check fails.
         (400.0, 2.0, 0),
     ],
+    ids=["jeans_unstable", "not_dense_enough", "too_hot"],
 )
 def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_sinks):
     """A sink forms only if the gas in the control volume is Jeans unstable,
@@ -181,6 +211,7 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
         # About twice that: unbound, no sink.
         (50.0, 0),
     ],
+    ids=["slow_rotation_bound", "fast_rotation_unbound"],
 )
 def test_bound_state(angular_velocity, expected_num_sinks):
     """A sink forms only if the gas in the control volume is bound,
@@ -219,6 +250,7 @@ def test_bound_state(angular_velocity, expected_num_sinks):
         # About 10 times the threshold magnetic energy: no sink.
         (30.0, 0),
     ],
+    ids=["weak_field", "strong_field"],
 )
 def test_magnetic_energy(magnetic_field, expected_num_sinks):
     """The magnetic energy E_mag = ½ Σ |B|² ΔV of the control volume counts
@@ -251,9 +283,16 @@ def test_sink_particle_slots_overflow(capfd):
 
 
 if __name__ == "__main__":
+    test_position_wrapping()
     test_proximity()
     test_converging_flow((-1.0, -1.0, -1.0), 1)
+    test_converging_flow((1.0, 1.0, 1.0), 0)
+    test_converging_flow((1.0, -2.0, -2.0), 0)
     test_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)
+    test_jeans_instability(200.0, 1.0, 0)
+    test_jeans_instability(400.0, 2.0, 0)
     test_bound_state(12.5, 1)
+    test_bound_state(50.0, 0)
+    test_magnetic_energy(1.0, 1)
     test_magnetic_energy(30.0, 0)

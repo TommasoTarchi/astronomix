@@ -33,7 +33,6 @@ from _sink_helpers import (
     NUM_CELLS,
     SETTINGS,
     _density_threshold,
-    _form_sinks_once,
     _gas_mass_and_momentum,
     _num_accreted_cells,
     _num_sinks,
@@ -44,7 +43,7 @@ from _sink_helpers import (
 )
 
 
-def test_new_sink_properties():
+def test_new_sink_accretion():
     """A new sink accretes the mass above the density threshold (Eq. 32)
     within its accretion radius, and ends at the centre of mass and with the
     centre-of-mass velocity of the accreted gas. The accreted cells are left at
@@ -274,34 +273,6 @@ def test_no_accretion_of_gas_moving_away():
     )
 
 
-def test_position_wrapping():
-    """A sink whose centre of mass falls past a periodic boundary is stored
-    inside the box."""
-    # A clump centred on the second cell along x (index 1), and an external
-    # potential well in the last cell along x (index 31), two cells away across
-    # the x = 0 boundary. The well makes the last cell the potential minimum,
-    # so the sink forms from it, while most of the gas in its control volume
-    # lies past the edge: the centre of mass comes out at x ≈ 1.011.
-    boundary_settings = SETTINGS._replace(
-        peak_overdensity=400.0,
-        overdensity_center=(1.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
-    )
-    state, config, params, registered_variables = _setup(settings=boundary_settings)
-    config = config._replace(
-        gravity_config=config.gravity_config._replace(external_potential=True)
-    )
-    well_index = (NUM_CELLS - 1, NUM_CELLS // 2, NUM_CELLS // 2)
-    params = params._replace(
-        gravitational_potential=jnp.zeros((NUM_CELLS,) * 3).at[well_index].set(-10.0)
-    )
-
-    sink_particles = _form_sinks_once(state, config, params, registered_variables)
-
-    # The stored x lies within the first cell: past the edge, wrapped back.
-    assert _num_sinks(sink_particles) == 1
-    assert 0.0 <= sink_particles.position[0, 0] < CELL_SIZE
-
-
 def test_accretion_most_bound_sink():
     """A cell within reach of several sinks is accreted once, by the sink it
     is most strongly bound to (Section 2.3)."""
@@ -388,12 +359,11 @@ def test_accretion_tie_break():
 
 
 if __name__ == "__main__":
-    test_new_sink_properties()
+    test_new_sink_accretion()
     test_accretion_conservation(False)
     test_accretion_conservation(True)
     test_accretion_of_bound_infalling_gas()
     test_no_accretion_of_unbound_gas()
     test_no_accretion_of_gas_moving_away()
-    test_position_wrapping()
     test_accretion_most_bound_sink()
     test_accretion_tie_break()

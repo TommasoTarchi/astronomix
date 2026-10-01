@@ -65,6 +65,7 @@ from _sink_helpers import (
 @pytest.mark.parametrize(
     "self_gravity_version",
     [SIMPLE_SOURCE, SECOND_ORDER_CONSERVATIVE, FOURTH_ORDER_CONSERVATIVE],
+    ids=["simple_source", "second_order_conservative", "fourth_order_conservative"],
 )
 def test_clump_collapse(self_gravity_version):
     """A sink forms during a run of the time loop and total mass is conserved,
@@ -163,6 +164,7 @@ def test_disk_snapshots_with_sinks(tmp_path):
         (dict(gravity_config=GravityConfig(self_gravity=False)), (5, 16, 16, 16)),
         (dict(state_struct=False), (5, 16, 16, 16)),
     ],
+    ids=["2d", "no_self_gravity", "no_state_struct"],
 )
 def test_sink_particle_config_requirements(unsupported_options, state_shape):
     """``finalize_config`` must reject each configuration that sink particle
@@ -187,4 +189,12 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape):
 
 if __name__ == "__main__":
     test_clump_collapse(SIMPLE_SOURCE)
+    test_clump_collapse(SECOND_ORDER_CONSERVATIVE)
+    test_clump_collapse(FOURTH_ORDER_CONSERVATIVE)
     test_disk_snapshots_with_sinks(Path(tempfile.mkdtemp()))
+    test_sink_particle_config_requirements(dict(dimensionality=2), (4, 16, 16))
+    test_sink_particle_config_requirements(
+        dict(gravity_config=GravityConfig(self_gravity=False)),
+        (5, 16, 16, 16),
+    )
+    test_sink_particle_config_requirements(dict(state_struct=False), (5, 16, 16, 16))
