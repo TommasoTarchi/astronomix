@@ -62,6 +62,9 @@ class SinkFormationSettings(NamedTuple):
     #: Sound speed squared of the gas.
     sound_speed_squared: float = 1.0
 
+    #: Uniform magnetic field along z, used when ``config.mhd`` is on.
+    magnetic_field_z: float = 0.0
+
     #: Adiabatic index of the gas.
     gamma: float = 5.0 / 3.0
 
@@ -82,9 +85,11 @@ def setup_sink_formation(
 
     Enforces the geometry (3D Cartesian), a cubic box with periodic boundaries,
     self-gravity, and the state struct (which carries the sink particles). The
-    gas is at rest with a uniform sound speed. The number of cells, the sink
-    particle configuration and the time-stepping options are left to the
-    caller; the number of cells must be the same along every axis.
+    gas is at rest with a uniform sound speed. With ``config.mhd`` on, the gas
+    is threaded by the uniform field ``settings.magnetic_field_z`` along z,
+    which has zero divergence. The number of cells, the sink particle
+    configuration, MHD and the time-stepping options are left to the caller;
+    the number of cells must be the same along every axis.
 
     Args:
         config: Simulation configuration.
@@ -110,7 +115,6 @@ def setup_sink_formation(
             y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
             z=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
         ),
-        mhd=False,
         gravity_config=config.gravity_config._replace(self_gravity=True),
         state_struct=True,
     )
@@ -141,6 +145,15 @@ def setup_sink_formation(
     pressure = density * settings.sound_speed_squared / settings.gamma
     zero_velocity = jnp.zeros_like(density)
 
+    if config.mhd:
+        magnetic_field = dict(
+            magnetic_field_x=jnp.zeros_like(density),
+            magnetic_field_y=jnp.zeros_like(density),
+            magnetic_field_z=jnp.full_like(density, settings.magnetic_field_z),
+        )
+    else:
+        magnetic_field = {}
+
     primitive_state = construct_primitive_state(
         config=config,
         registered_variables=registered_variables,
@@ -149,6 +162,7 @@ def setup_sink_formation(
         velocity_y=zero_velocity,
         velocity_z=zero_velocity,
         gas_pressure=pressure,
+        **magnetic_field,
     )
 
     config = finalize_config(config, primitive_state.shape)

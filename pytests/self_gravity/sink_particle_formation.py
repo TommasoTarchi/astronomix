@@ -64,12 +64,13 @@ SETTINGS = SinkFormationSettings(
 )
 
 
-def _setup(sink_particles: bool, settings=SETTINGS, **sink_particle_options):
+def _setup(sink_particles: bool, settings=SETTINGS, mhd=False, **sink_particle_options):
     """Set up the Gaussian overdensity with the given sink options.
 
     Args:
         sink_particles: Whether sink particle formation is switched on.
         settings: The problem constants of the setup.
+        mhd: Whether MHD is switched on (the field is ``settings.magnetic_field_z``).
         **sink_particle_options: Further ``SinkParticleConfig`` fields.
 
     Returns:
@@ -80,6 +81,7 @@ def _setup(sink_particles: bool, settings=SETTINGS, **sink_particle_options):
         fixed_timestep=True,
         num_timesteps=NUM_TIMESTEPS,
         progress_bar=False,
+        mhd=mhd,
         sink_particle_config=SinkParticleConfig(
             sink_particles=sink_particles,
             **sink_particle_options,
@@ -544,6 +546,80 @@ def test_bound_state(angular_velocity, expected_num_sinks):
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
+@pytest.mark.parametrize(
+    "magnetic_field, expected_num_sinks",
+    [
+        # The control volume stops being Jeans unstable between B = 9 and
+        # B = 10, and E_mag grows as B².
+        # About 1% of the threshold magnetic energy: a sink forms.
+        (1.0, 1),
+        # About 10 times the threshold magnetic energy: no sink.
+        (30.0, 0),
+    ],
+)
+def test_magnetic_energy(magnetic_field, expected_num_sinks):
+    """The magnetic energy E_mag = ½ Σ |B|² ΔV of the control volume counts
+    against sink formation in the Jeans check, |E_grav| > 2 E_th + E_mag
+    (Section 2.2.5)."""
+    state, config, params, registered_variables = _setup(
+        sink_particles=True,
+        settings=SETTINGS._replace(magnetic_field_z=magnetic_field),
+        mhd=True,
+    )
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    assert _num_sinks(sink_particles) == expected_num_sinks
+
+
+def test_accretion_with_magnetic_field():
+    """Accretion leaves the magnetic field unchanged, and still moves mass and
+    momentum from the gas to the sink without creating or destroying any."""
+    state, config, params, registered_variables = _setup(
+        sink_particles=True,
+        settings=SETTINGS._replace(magnetic_field_z=1.0),
+        mhd=True,
+    )
+
+    # A bulk velocity makes the momentum transfer non-trivial.
+    bulk_velocity = jnp.array([1.0, -2.0, 0.5])
+    primitive_state = state.primitive_state
+    for axis, velocity_index in enumerate(registered_variables.velocity_index):
+        primitive_state = primitive_state.at[velocity_index].set(bulk_velocity[axis])
+    state = state._replace(primitive_state=primitive_state)
+
+    new_primitive_state, sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+    )
+
+    assert _num_sinks(sink_particles) == 1
+    magnetic_index = jnp.array(registered_variables.magnetic_index)
+    assert jnp.array_equal(
+        new_primitive_state[magnetic_index],
+        state.primitive_state[magnetic_index],
+    )
+
+    gas_mass_before, gas_momentum_before = _gas_mass_and_momentum(
+        state.primitive_state,
+        registered_variables,
+    )
+    gas_mass_after, gas_momentum_after = _gas_mass_and_momentum(
+        new_primitive_state,
+        registered_variables,
+    )
+    sink_mass = jnp.sum(sink_particles.mass)
+    sink_momentum = jnp.sum(sink_particles.mass[:, None] * sink_particles.velocity, axis=0)
+    assert jnp.allclose(gas_mass_before, gas_mass_after + sink_mass, rtol=1e-6)
+    assert jnp.allclose(
+        gas_momentum_before,
+        gas_momentum_after + sink_momentum,
+        rtol=1e-6,
+    )
+
+
 def _sink_at_clump_center(mass, config, dtype):
     """Sink particles with a single sink of ``mass`` at the clump centre, at
     rest."""
@@ -787,6 +863,8 @@ if __name__ == "__main__":
     test_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)
     test_bound_state(12.5, 1)
+    test_magnetic_energy(30.0, 0)
+    test_accretion_with_magnetic_field()
     test_accretion_bound(1.0, 57)
     test_accretion_radial_velocity(1.0, 1)
     test_accretion_most_bound_sink()
