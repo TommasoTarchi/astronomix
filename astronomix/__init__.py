@@ -2,9 +2,10 @@
 astronomix: a differentiable finite-volume / finite-difference (magneto)hydrodynamics code.
 
 This top-level package re-exports the most commonly used entry points — the
-configuration and parameter containers, the variable registry, the initial
-condition helpers and the ``time_integration`` driver — so that user scripts can
-import them directly from ``astronomix``.
+configuration and parameter containers, the state struct and the sink particle
+containers, the variable registry, the initial condition helpers and the
+``time_integration`` driver — so that user scripts can import them directly
+from ``astronomix``.
 """
 
 # astronomix constants
@@ -43,6 +44,11 @@ from astronomix.option_classes.simulation_config import (
 )
 from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix._modules._stellar_wind.stellar_wind_options import WindParams
+from astronomix._modules._sink_particles._sink_particle_options import SinkParticleConfig
+from astronomix.data_classes.simulation_state_struct import (
+    SinkParticles,
+    StateStruct,
+)
 from astronomix.units import CodeUnits
 
 # astronomix functions

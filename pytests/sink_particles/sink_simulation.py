@@ -35,11 +35,11 @@ from astronomix import (
     GravityConfig,
     SimulationConfig,
     SimulationParams,
+    SinkParticleConfig,
     SnapshotSettings,
+    StateStruct,
 )
-from astronomix.data_classes.simulation_state_struct import StateStruct
 from astronomix.option_classes.simulation_config import StaticIntVector
-from astronomix._modules._sink_particles._sink_particle_options import SinkParticleConfig
 
 # astronomix functions
 from astronomix import (
