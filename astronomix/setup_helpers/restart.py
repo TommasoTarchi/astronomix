@@ -57,7 +57,7 @@ def restart_from_latest_checkpoint(
             path, params, sharding=sharding
         )
         final = time_integration(
-            ps, config, params, registered_variables,
+            finalize_state(config, ps), config, params, registered_variables,
             sharding=sharding, restart_state=restart,
         )
     """

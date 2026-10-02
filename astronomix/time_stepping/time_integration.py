@@ -218,7 +218,7 @@ def time_integration(
     Args:
         primitive_state: The primitive state array, or a
             :class:`StateStruct` wrapping it when ``config.state_struct``
-            is set.
+            is set; ``finalize_state`` gives the right form for ``config``.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.

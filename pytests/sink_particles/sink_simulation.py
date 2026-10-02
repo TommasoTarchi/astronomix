@@ -43,6 +43,7 @@ from astronomix.option_classes.simulation_config import StaticIntVector
 
 # astronomix functions
 from astronomix import (
+    finalize_state,
     get_registered_variables,
     restart_from_latest_checkpoint,
     time_integration,
@@ -58,6 +59,7 @@ from _sink_helpers import (
     NUM_CELLS,
     SETTINGS,
     _num_sinks,
+    _one_sink_at,
     _setup,
 )
 
@@ -201,7 +203,7 @@ def test_restart_from_disk(tmp_path, slots_factor):
         ),
     )
     restarted_state = time_integration(
-        StateStruct(primitive_state=primitive_state),
+        finalize_state(restart_config, primitive_state),
         restart_config,
         restart_params,
         registered_variables,
@@ -218,6 +220,26 @@ def test_restart_from_disk(tmp_path, slots_factor):
         assert restarted_field.shape[0] == slots_factor * max_num_sinks
         assert jnp.array_equal(restarted_field[:max_num_sinks], final_field)
         assert jnp.all(restarted_field[max_num_sinks:] == 0.0)
+
+
+def test_finalize_state():
+    """``finalize_state`` puts the state in the form ``time_integration``
+    expects: a ``StateStruct`` holding the primitive state and the given sinks
+    when ``config.state_struct`` is set, otherwise the primitive state itself.
+    Sinks without ``state_struct`` are rejected."""
+    state, config, _, _ = _setup()
+    primitive_state = state.primitive_state
+    sink_particles = _one_sink_at((0.1, 0.1, 0.1), config, primitive_state.dtype)
+
+    finalized_state = finalize_state(config, primitive_state, sink_particles)
+    assert isinstance(finalized_state, StateStruct)
+    assert finalized_state.primitive_state is primitive_state
+    assert finalized_state.sink_particles is sink_particles
+
+    config = config._replace(state_struct=False)
+    assert finalize_state(config, primitive_state) is primitive_state
+    with pytest.raises(ValueError, match="state_struct"):
+        finalize_state(config, primitive_state, sink_particles)
 
 
 @pytest.mark.parametrize(
@@ -257,6 +279,7 @@ if __name__ == "__main__":
     test_conservation_in_run(FOURTH_ORDER_CONSERVATIVE, True)
     test_restart_from_disk(Path(tempfile.mkdtemp()), 1)
     test_restart_from_disk(Path(tempfile.mkdtemp()), 2)
+    test_finalize_state()
     test_sink_particle_config_requirements(dict(dimensionality=2), (4, 16, 16))
     test_sink_particle_config_requirements(
         dict(gravity_config=GravityConfig(self_gravity=False)),

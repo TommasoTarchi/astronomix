@@ -22,7 +22,7 @@ from astronomix import CARTESIAN
 from astronomix.option_classes.simulation_config import PERIODIC_BOUNDARY
 
 # astronomix containers
-from astronomix.data_classes.simulation_state_struct import StateStruct
+from astronomix.data_classes.simulation_state_struct import StateStruct, finalize_state
 from astronomix.option_classes.simulation_config import (
     BoundarySettings,
     BoundarySettings1D,
@@ -167,4 +167,4 @@ def setup_sink_formation(
 
     config = finalize_config(config, primitive_state.shape)
 
-    return StateStruct(primitive_state=primitive_state), config, params
+    return finalize_state(config, primitive_state), config, params

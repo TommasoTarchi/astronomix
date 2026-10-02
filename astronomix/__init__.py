@@ -55,6 +55,7 @@ from astronomix.units import CodeUnits
 from astronomix.data_classes.simulation_helper_data import get_helper_data
 from astronomix.variable_registry.registered_variables import get_registered_variables
 from astronomix.option_classes.simulation_config import finalize_config
+from astronomix.data_classes.simulation_state_struct import finalize_state
 from astronomix.initial_condition_generation.construct_primitive_state import construct_primitive_state
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     initialize_interface_fields,
