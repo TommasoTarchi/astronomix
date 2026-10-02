@@ -267,20 +267,19 @@ def test_magnetic_energy(magnetic_field, expected_num_sinks):
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
-def test_sink_particle_slots_overflow(capfd):
-    """When a new sink passes but every slot is taken, it is discarded and a
-    warning is printed."""
+def test_error_when_sink_slots_full():
+    """When a new sink passes every check but all slots are taken, the run
+    stops with an error, since the sink and its gas would otherwise be lost."""
     state, config, params, registered_variables = _setup(max_num_sinks=1)
     far_sink = _one_sink_at((0.1, 0.1, 0.1), config, state.primitive_state.dtype)
 
-    sink_particles = _form_sinks_once(
-        state, config, params, registered_variables, far_sink
-    )
-    sink_particles.mass.block_until_ready()
-
-    assert _num_sinks(sink_particles) == 1
-    assert jnp.allclose(sink_particles.position[0], 0.1)
-    assert "1 new sink particles discarded" in capfd.readouterr().out
+    # JAX wraps the RuntimeError raised in the host callback in its own
+    # runtime error type, which keeps the message.
+    with pytest.raises(Exception, match="Increase max_num_sinks"):
+        sink_particles = _form_sinks_once(
+            state, config, params, registered_variables, far_sink
+        )
+        sink_particles.mass.block_until_ready()
 
 
 if __name__ == "__main__":
@@ -297,3 +296,4 @@ if __name__ == "__main__":
     test_bound_state(50.0, 0)
     test_magnetic_energy(1.0, 1)
     test_magnetic_energy(30.0, 0)
+    test_error_when_sink_slots_full()

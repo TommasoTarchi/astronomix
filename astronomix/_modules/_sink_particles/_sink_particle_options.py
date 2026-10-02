@@ -19,8 +19,8 @@ class SinkParticleConfig(NamedTuple):
     sink_particles: bool = False
 
     #: Size of the sink particle arrays. JIT requires fixed array sizes, so
-    #: this many slots are allocated up front; sinks beyond this number are
-    #: discarded (with a warning).
+    #: this many slots are allocated up front. When a new sink would need
+    #: more slots, the run stops with an error.
     max_num_sinks: int = 64
 
     #: Maximum number of cells that can be examined per time step with the

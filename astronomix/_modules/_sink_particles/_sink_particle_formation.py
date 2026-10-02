@@ -46,6 +46,26 @@ from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
+def _raise_sink_slots_full(num_discarded, max_num_sinks):
+    """Stop the run when new sinks do not fit in the sink particle slots.
+
+    Called from inside the jitted formation step through
+    ``jax.debug.callback``; the raised error aborts the jitted computation.
+
+    Args:
+        num_discarded: The number of new sinks without a free slot.
+        max_num_sinks: The number of sink particle slots.
+
+    Raises:
+        RuntimeError: Always.
+    """
+    raise RuntimeError(
+        f"{int(num_discarded)} new sink particles cannot be stored: all "
+        f"{int(max_num_sinks)} sink particle slots are taken. Increase "
+        "max_num_sinks in SinkParticleConfig."
+    )
+
+
 def _empty_sink_particles(
     config: SimulationConfig,
     dtype,
@@ -495,7 +515,12 @@ def _form_sink_particles(
     num_new_sinks = jnp.sum(candidate_passes)
     num_active_sinks = jnp.minimum(num_existing_sinks + num_new_sinks, max_num_sinks)
 
-    # Warn when a limit set by the configuration cut something off.
+    # Candidates beyond max_num_candidates are only skipped for this step:
+    # they are still above the threshold at the next step and are checked
+    # then, so a warning is enough. A new sink without a free slot would be
+    # lost, leaving its gas above the threshold on the grid, so the run stops
+    # with an error instead (a host callback that raises aborts the jitted
+    # computation).
     jax.lax.cond(
         num_candidates_found > max_num_candidates,
         lambda: jax.debug.print(
@@ -508,9 +533,8 @@ def _form_sink_particles(
     )
     jax.lax.cond(
         num_existing_sinks + num_new_sinks > max_num_sinks,
-        lambda: jax.debug.print(
-            "WARNING: {} new sink particles discarded, all {} slots are taken "
-            "(increase max_num_sinks).",
+        lambda: jax.debug.callback(
+            _raise_sink_slots_full,
             num_existing_sinks + num_new_sinks - max_num_sinks,
             max_num_sinks,
         ),
