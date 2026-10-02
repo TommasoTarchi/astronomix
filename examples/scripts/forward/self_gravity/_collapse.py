@@ -37,6 +37,7 @@ from astronomix import (
     PositivityConfig,
     SnapshotSettings,
     BackendConfig,
+    SinkParticleConfig,
 )
 
 # astronomix functions
@@ -46,6 +47,7 @@ from astronomix import (
     time_integration,
     construct_primitive_state,
     finalize_config,
+    finalize_state,
 )
 
 
@@ -79,6 +81,7 @@ def collapse_config(
     want_states,
     backend=PALLAS,
     solver_mode=FINITE_DIFFERENCE,
+    sink_particles=False
 ):
     """Build the ``SimulationConfig`` for the Evrard collapse.
 
@@ -90,6 +93,7 @@ def collapse_config(
         backend: The compute backend for the finite-difference path.
         solver_mode: Either ``FINITE_DIFFERENCE`` (the paper default) or
             ``FINITE_VOLUME`` for the MUSCL-Hancock baseline comparison.
+        sink_particles: Whether sink particle formation should be enabled.
 
     Returns:
         The (not yet finalized) ``SimulationConfig`` for the collapse run.
@@ -122,6 +126,8 @@ def collapse_config(
             return_gravitational_energy=True,
         ),
         num_snapshots=NUM_SNAPSHOTS,
+        state_struct=sink_particles,
+        sink_particle_config=SinkParticleConfig(sink_particles=sink_particles),
     )
 
     if solver_mode == FINITE_VOLUME:
@@ -154,6 +160,7 @@ def run_collapse(
     backend=PALLAS,
     solver_mode=FINITE_DIFFERENCE,
     initial_energy=0.05,
+    sink_particles=False,
 ):
     """Run the Evrard collapse.
 
@@ -170,6 +177,7 @@ def run_collapse(
         solver_mode: Either ``FINITE_DIFFERENCE`` or ``FINITE_VOLUME``.
         initial_energy: Initial thermal energy per unit mass (0.05 = cold
             Evrard, 0.20 = warm/mild collapse).
+        sink_particles: Whether sink particle formation should be enabled.
 
     Returns:
         ``(snapshots, helper_data, registered_variables)`` for the completed run.
@@ -180,6 +188,7 @@ def run_collapse(
         want_states,
         backend=backend,
         solver_mode=solver_mode,
+        sink_particles=sink_particles,
     )
 
     params = SimulationParams(
@@ -218,6 +227,7 @@ def run_collapse(
         gas_pressure=p,
     )
     config = finalize_config(config, initial_state.shape)
+    initial_state = finalize_state(config, initial_state)
 
     snapshots = jax.block_until_ready(
         time_integration(initial_state, config, params, registered_variables)
