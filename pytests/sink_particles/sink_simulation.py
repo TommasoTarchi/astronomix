@@ -153,10 +153,22 @@ def test_conservation_in_run(self_gravity_version, mhd):
     assert jnp.allclose(gas_momentum + sink_momentum, initial_momentum, rtol=1e-4)
 
 
-def test_restart_from_disk(tmp_path):
+@pytest.mark.parametrize(
+    "slots_factor",
+    [1, 2],
+    ids=["same_slots", "more_slots"],
+)
+def test_restart_from_disk(tmp_path, slots_factor):
     """Disk snapshots carry the sinks: a run restarted from a disk checkpoint
     starts with the sinks of that checkpoint and ends with the same gas state
-    and the same sinks as the uninterrupted run."""
+    and the same sinks as the uninterrupted run. A restart with more sink
+    slots gets empty slots appended to the restored sinks.
+
+    Args:
+        tmp_path: pytest's temporary directory, for the checkpoints.
+        slots_factor: The ratio of the restarted run's max_num_sinks to the
+            uninterrupted run's.
+    """
     pytest.importorskip("orbax.checkpoint")
     state, config, params, registered_variables = _setup()
 
@@ -180,9 +192,13 @@ def test_restart_from_disk(tmp_path):
         step=1,
     )
     assert _num_sinks(restart_state.sink_particles) == 1
+    max_num_sinks = config.sink_particle_config.max_num_sinks
     restart_config = config._replace(
         snapshot_storage_path=str(tmp_path / "restarted"),
         num_snapshots=1,
+        sink_particle_config=config.sink_particle_config._replace(
+            max_num_sinks=slots_factor * max_num_sinks
+        ),
     )
     restarted_state = time_integration(
         StateStruct(primitive_state=primitive_state),
@@ -193,11 +209,15 @@ def test_restart_from_disk(tmp_path):
     )
 
     assert jnp.array_equal(restarted_state.primitive_state, final_state.primitive_state)
+    # The restored sinks fill the first slots; the slots added in a restart
+    # with more slots stay empty.
     for restarted_field, final_field in zip(
         restarted_state.sink_particles,
         final_state.sink_particles,
     ):
-        assert jnp.array_equal(restarted_field, final_field)
+        assert restarted_field.shape[0] == slots_factor * max_num_sinks
+        assert jnp.array_equal(restarted_field[:max_num_sinks], final_field)
+        assert jnp.all(restarted_field[max_num_sinks:] == 0.0)
 
 
 @pytest.mark.parametrize(
@@ -235,7 +255,8 @@ if __name__ == "__main__":
     test_conservation_in_run(SECOND_ORDER_CONSERVATIVE, False)
     test_conservation_in_run(FOURTH_ORDER_CONSERVATIVE, False)
     test_conservation_in_run(FOURTH_ORDER_CONSERVATIVE, True)
-    test_restart_from_disk(Path(tempfile.mkdtemp()))
+    test_restart_from_disk(Path(tempfile.mkdtemp()), 1)
+    test_restart_from_disk(Path(tempfile.mkdtemp()), 2)
     test_sink_particle_config_requirements(dict(dimensionality=2), (4, 16, 16))
     test_sink_particle_config_requirements(
         dict(gravity_config=GravityConfig(self_gravity=False)),

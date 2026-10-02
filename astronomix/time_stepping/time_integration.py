@@ -61,6 +61,7 @@ from astronomix._modules._turbulent_forcing._turbulent_forcing import _init_ou_f
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
     _form_sink_particles,
+    _pad_sink_particles,
 )
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
 from astronomix._snapshotting._snapshot_diagnostics import (
@@ -894,9 +895,12 @@ def _time_integration(
         sink_particles = None
 
     # When sink particle formation is active but no sinks were passed in,
-    # the simulation starts without sinks: every slot is empty.
-    if config.sink_particle_config.sink_particles and sink_particles is None:
-        sink_particles = _empty_sink_particles(config, primitive_state.dtype)
+    # the simulation starts without sinks: every slot is empty. Sinks passed
+    # in with fewer slots than max_num_sinks get empty slots appended.
+    if config.sink_particle_config.sink_particles:
+        if sink_particles is None:
+            sink_particles = _empty_sink_particles(config, primitive_state.dtype)
+        sink_particles = _pad_sink_particles(sink_particles, config)
 
     # we must pad the state with ghost cells to account for the
     # boundary conditions (unless they are enforced by rolling)
@@ -1065,9 +1069,13 @@ def _time_integration_to_disk(
         key, forcing = _seed_key_and_forcing(config, params)
 
     # As in the in-memory path, a run with sink particles but none passed in
-    # starts with every slot empty.
-    if config.sink_particle_config.sink_particles and sink_particles is None:
-        sink_particles = _empty_sink_particles(config, primitive_state.dtype)
+    # starts with every slot empty, and sinks passed in or restored with fewer
+    # slots than max_num_sinks (e.g. from a checkpoint of a run with fewer
+    # slots) get empty slots appended.
+    if config.sink_particle_config.sink_particles:
+        if sink_particles is None:
+            sink_particles = _empty_sink_particles(config, primitive_state.dtype)
+        sink_particles = _pad_sink_particles(sink_particles, config)
 
     # Segment config: snapshots stay off (each segment end *is* a checkpoint)
     # and ON_DEVICE so the segment runner does not recurse into this driver.

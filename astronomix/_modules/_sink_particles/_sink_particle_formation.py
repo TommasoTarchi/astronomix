@@ -88,6 +88,43 @@ def _empty_sink_particles(
     )
 
 
+def _pad_sink_particles(
+    sink_particles: SinkParticles,
+    config: SimulationConfig,
+) -> SinkParticles:
+    """
+    Append empty slots (zero mass) to sink particles with fewer slots than
+    ``max_num_sinks``, e.g. sinks restored from a checkpoint of a run with
+    fewer slots. Filled slots stay at the front.
+
+    Args:
+        sink_particles: The sink particles passed into the run.
+        config: The simulation configuration; supplies the number of slots.
+
+    Returns:
+        Sink particles with ``max_num_sinks`` slots.
+
+    Raises:
+        ValueError: If the sink particles have more slots than
+            ``max_num_sinks``; dropping slots could drop filled ones.
+    """
+    max_num_sinks = config.sink_particle_config.max_num_sinks
+    num_slots = sink_particles.mass.shape[0]
+    if num_slots > max_num_sinks:
+        raise ValueError(
+            f"{num_slots} sink particle slots passed in, but max_num_sinks is "
+            f"{max_num_sinks}. Increase max_num_sinks in SinkParticleConfig."
+        )
+    num_missing_slots = max_num_sinks - num_slots
+    return jax.tree.map(
+        lambda field: jnp.pad(
+            field,
+            [(0, num_missing_slots)] + [(0, 0)] * (field.ndim - 1),
+        ),
+        sink_particles,
+    )
+
+
 def _control_volume_offsets(config: SimulationConfig) -> np.ndarray:
     """
     Integer cell offsets (i, j, k) of the control volume around a cell.
