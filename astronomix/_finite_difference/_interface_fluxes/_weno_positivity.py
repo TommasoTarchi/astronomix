@@ -224,7 +224,13 @@ def positivity_preserving_interface_flux(
 
     plus_flux = 0.5 * alpha * (plus_owner + plus_theta[None] * plus_step)
     minus_flux = -0.5 * alpha * (minus_owner + minus_theta[None] * minus_step)
-    return plus_flux + minus_flux
+    interface_flux = plus_flux + minus_flux
+    if config.mhd:
+        # The normal field has no flux in the unlimited scheme (neither F nor
+        # any right eigenvector has a B_normal component); unequal scalings of
+        # the two split states would otherwise diffuse it. CT owns B_normal.
+        interface_flux = interface_flux.at[registered_variables.magnetic_index.x].set(0.0)
+    return interface_flux
 
 
 # -----------------------------------------------------------------------------
@@ -245,12 +251,15 @@ def _local_gas_pressure(state, gm1):
     return gm1 * (state[-1] - 0.5 * momentum_squared / density)
 
 
-def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin):
-    """``_admissible_scaling`` for local tuples of an ideal gas."""
+def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin, ideal_gas=True):
+    """``_admissible_scaling`` for local tuples (density only when not an
+    ideal gas)."""
     owner_density = owner_state[0]
     density_floor = jnp.minimum(rhomin, 0.5 * owner_density)
     theta = (owner_density - density_floor) / jnp.maximum(jnp.abs(step[0]), 1e-30)
     theta = jnp.clip(jnp.where(owner_density > 0.0, theta, 0.0), 0.0, 1.0)
+    if not ideal_gas:
+        return theta
 
     owner_pressure = _local_gas_pressure(owner_state, gm1)
     pressure_floor = jnp.minimum(pgmin, 0.5 * jnp.maximum(owner_pressure, 0.0))
@@ -276,9 +285,10 @@ def positivity_preserving_flux_local(
     gm1,
     rhomin,
     pgmin,
+    ideal_gas=True,
 ):
-    """``positivity_preserving_interface_flux`` for one interface of the
-    Pallas hydro kernel.
+    """``positivity_preserving_interface_flux`` for one interface of a
+    Pallas WENO kernel (hydro: density and pressure; isothermal: density).
 
     Args:
         left_state, right_state: Local conserved tuples of cells i and i + 1.
@@ -288,8 +298,9 @@ def positivity_preserving_flux_local(
         plus_owner_shift, minus_owner_shift: Split-state shifts from the
             fields on their own splitting speed.
         common_speed: The common splitting speed.
-        gm1: gamma - 1.
+        gm1: gamma - 1 (unused when not an ideal gas).
         rhomin, pgmin: The density and pressure floors.
+        ideal_gas: Whether the pressure constraint applies.
 
     Returns:
         The interface flux as a list of local components.
@@ -305,8 +316,8 @@ def positivity_preserving_flux_local(
     plus_step = tuple(2.0 * plus_face_flux[slot] / alpha - plus_owner[slot] for slot in range(ncomp))
     minus_step = tuple(-2.0 * minus_face_flux[slot] / alpha - minus_owner[slot] for slot in range(ncomp))
 
-    plus_theta = _local_admissible_scaling(plus_owner, plus_step, gm1, rhomin, pgmin)
-    minus_theta = _local_admissible_scaling(minus_owner, minus_step, gm1, rhomin, pgmin)
+    plus_theta = _local_admissible_scaling(plus_owner, plus_step, gm1, rhomin, pgmin, ideal_gas)
+    minus_theta = _local_admissible_scaling(minus_owner, minus_step, gm1, rhomin, pgmin, ideal_gas)
     return [
         0.5 * alpha * (plus_owner[slot] + plus_theta * plus_step[slot])
         - 0.5 * alpha * (minus_owner[slot] + minus_theta * minus_step[slot])
