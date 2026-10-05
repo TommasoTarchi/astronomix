@@ -922,25 +922,30 @@ class SimulationConfig(NamedTuple):
     weno_admissible_face_state: bool = False
 
     #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
-    #: 2245). Every characteristic field that carries mass is split with ONE
-    #: speed alpha (the stencil's spectral radius), so the two split fluxes
-    #: are f^+- = +-(alpha/2) w^+- with w^+- = q +- F/alpha physically
-    #: admissible states. The WENO face value of each split state is then
-    #: pulled toward its upwind cell's w by the largest theta in [0, 1] that
-    #: keeps both the face value and its mirror 2w - w_face admissible
-    #: (positive density; positive pressure for an ideal gas) -- equivalently,
-    #: the WENO weights acquire a first-order candidate whose weight is set by
-    #: admissibility rather than smoothness. theta = 1 in smooth flow, so the
-    #: scheme stays fifth order; the update is then positivity preserving
-    #: for C_cfl <= 1/2 per forward-Euler stage (sum-of-speeds CFL), and in
-    #: practice robust well beyond. Fields that carry no mass (hydrodynamic
-    #: shear waves, isothermal Alfven waves) keep their own splitting speed:
-    #: their split-state correction leaves the density unchanged and only
-    #: RAISES the pressure, so the proof survives and vortical modes keep the
-    #: default dissipation. The price is in low-Mach ENTROPY waves (contacts),
-    #: whose dissipation coefficient grows from |v| to |v| + c. Implies
-    #: ``weno_admissible_face_state``. Native and Pallas (not the fused
-    #: WENO+divergence kernel, which is then skipped).
+    #: 2245), inside the reconstruction. With alpha the largest wave speed on
+    #: the stencil, each split flux is f^+- = +-(alpha/2) w^+- with
+    #: w^+- = q +- F/alpha - sum_s (1 - alpha_s/alpha) R_s L_s q, where alpha_s
+    #: is field s's own splitting speed. Two scalings in [0, 1] keep the
+    #: update a convex combination of admissible states (positive density;
+    #: positive pressure for an ideal gas):
+    #:   * the per-field speeds are moved toward alpha only as far as needed
+    #:     for both upwind split states w to be admissible. In smooth subsonic
+    #:     flow nothing moves, i.e. this is the ordinary per-field splitting;
+    #:   * each WENO face value is pulled toward its upwind split state by the
+    #:     largest theta keeping it, and its mirror about q +- F/alpha,
+    #:     admissible. theta < 1 is a first-order candidate entering the WENO
+    #:     combination with a weight set by admissibility instead of
+    #:     smoothness. theta = 1 in smooth flow.
+    #: Both use closed forms (density is linear and pressure concave along the
+    #: scaling segments). Smooth-flow results are unchanged (fifth order, the
+    #: same errors as the default on advected entropy, shear and sound waves).
+    #: Each forward-Euler stage is positivity preserving for C_cfl <= 1/2
+    #: (sum-of-speeds CFL), i.e. 0.75 with SSPRK4. MHD is in practice robust
+    #: well beyond that. The proof is for hydrodynamics and isothermal MHD;
+    #: for ideal MHD the Lax-Friedrichs states are admissible only up to
+    #: div B terms (Wu 2018). Implies ``weno_admissible_face_state``. Native
+    #: and Pallas (not the fused WENO+divergence kernel, which is then
+    #: skipped).
     weno_positivity_preserving: bool = False
 
     #: If > 0, ADD a relative contribution ``weno_epsilon_relative * (amx*|q|)^2``
