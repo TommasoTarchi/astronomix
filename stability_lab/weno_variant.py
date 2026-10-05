@@ -1,7 +1,7 @@
 """Map the WENO_VARIANT environment variable onto SimulationConfig options.
 
-    baseline  current scheme
-    face      weno_admissible_face_state
+    baseline  the scheme before this branch (weno_admissible_face_state off)
+    face      weno_admissible_face_state (now the default)
     pp        weno_positivity_preserving (implies the face state)
 """
 
@@ -11,9 +11,9 @@ import os
 def weno_variant_kwargs():
     variant = os.environ.get("WENO_VARIANT", "baseline")
     if variant == "baseline":
-        return {}
+        return dict(weno_admissible_face_state=False)
     if variant == "face":
-        return dict(weno_admissible_face_state=True)
+        return {}
     if variant == "pp":
         return dict(weno_positivity_preserving=True)
     raise ValueError(f"unknown WENO_VARIANT {variant!r}")

@@ -23,6 +23,7 @@ parser.add_argument("--tag", default="")
 parser.add_argument("--save-states", action="store_true")
 parser.add_argument("--num-snapshots", type=int, default=25)
 parser.add_argument("--dual", type=int, default=0)
+parser.add_argument("--limit-work", type=int, default=0)
 args = parser.parse_args()
 
 if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
@@ -79,6 +80,7 @@ config = SimulationConfig(
         self_gravity=True,
         self_gravity_version=GRAVITY[args.gravity],
         poisson_manual_open_boundaries=True,
+        limit_internal_energy_work=bool(args.limit_work),
     ),
     dimensionality=3,
     box_size=4.0,
@@ -145,7 +147,7 @@ energy_drift = float(np.nanmax(np.abs(total[finite_mask] - total[0])) / np.abs(t
 face = weno_variant_name()
 print(
     f"EVRARD face={face} tag={args.tag} n={args.n} x{args.precision} grav={args.gravity} "
-    f"pos={args.positivity} dual={args.dual} lab={os.environ.get('ASTX_LAB', '')} e0={args.e0}: {'COMPLETE' if ok else 'FAILED'} "
+    f"pos={args.positivity} dual={args.dual} limit={args.limit_work} lab={os.environ.get('ASTX_LAB', '')} e0={args.e0}: {'COMPLETE' if ok else 'FAILED'} "
     f"t_reached={t_reached:.3f} max|dE|/|E0|={energy_drift:.3e} "
     f"min rho={np.nanmin(final[0]):.3e} min p={np.nanmin(final[registered_variables.pressure_index]):.3e} "
     f"wall={elapsed:.0f}s",

@@ -322,6 +322,19 @@ class GravityConfig(NamedTuple):
     #: Manual open boundary conditions in the Poisson solver.
     poisson_manual_open_boundaries: bool = False
 
+    #: Limit the energy-conserving coupling's internal-energy change (finite
+    #: difference, SECOND/FOURTH_ORDER_CONSERVATIVE). The conservative energy
+    #: source W charges the work done on mass crossing each half-cell to the
+    #: receiving cell, while the momentum source acts on the cell's own
+    #: momentum; the difference D = W - rho v.a is not kinetic and lands in the
+    #: internal energy. It is a truncation error where the pressure scale
+    #: height is resolved (e / rho >~ |g| dx / 2) and digs negative-pressure
+    #: holes where it is not (cold collapse, cloud edges). With this on, D is
+    #: applied with the largest weight in [0, 1] that removes at most half of
+    #: the cell's internal energy per stage, so conservation is exact wherever
+    #: the limiter is idle and the energy it rejects is the only violation.
+    limit_internal_energy_work: bool = False
+
     #: Master gravity switch. Set automatically in ``finalize_config`` to
     #: ``self_gravity or external_potential``; gates the gravity source-term
     #: machinery so an external potential works without self-gravity. Not set
@@ -908,18 +921,17 @@ class SimulationConfig(NamedTuple):
     #: Evaluate the characteristic basis of the WENO projection at an
     #: ADMISSIBLE interface state: the interface sound speed comes from the
     #: averaged pressure, c^2 = gamma <p> / <rho>, and the enthalpy is rebuilt
-    #: from it. The default recovers c^2 = (gamma - 1)(<h> - v^2/2) from an
-    #: UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that combination
-    #: is not the state of any gas, is not Galilean invariant, and at a density
-    #: jump (ratio >~ 10) carrying a velocity jump of a few sound speeds its
-    #: c^2 is negative -- the clamp then zeroes the acoustic upwind correction
-    #: exactly at the strongest jumps (a cold dense slab rammed at Mach ~800
-    #: into tenuous gas blows up in two steps with the default, and is correct
-    #: with this on). Changes smooth-flow results only at the level of the
-    #: WENO dissipation (the basis moves by O(dx^2)). Ideal gas only (the
-    #: isothermal basis has a fixed sound speed). Native and Pallas (not the
-    #: fused WENO+divergence kernel, which is then skipped).
-    weno_admissible_face_state: bool = False
+    #: from it. ``False`` restores the previous c^2 = (gamma - 1)(<h> - v^2/2)
+    #: from an UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that
+    #: combination is not the state of any gas, is not Galilean invariant, and
+    #: at a density jump (ratio >~ 10) carrying a velocity jump of a few sound
+    #: speeds its c^2 is negative -- the clamp then zeroes the acoustic upwind
+    #: correction exactly at the strongest jumps (a cold dense slab rammed at
+    #: Mach ~800 into tenuous gas blows up in two steps with it). Smooth-flow
+    #: results agree with the old basis to the WENO dissipation level (the
+    #: basis moves by O(dx^2)). Ideal gas only (the isothermal basis has a fixed
+    #: sound speed). Native and Pallas.
+    weno_admissible_face_state: bool = True
 
     #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
     #: 2245), inside the reconstruction. With alpha the largest wave speed on
@@ -1277,6 +1289,18 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
 
     # Finite-difference-specific checks.
     if config.solver_mode == FINITE_DIFFERENCE:
+
+        # The WENO5 stencil reaches three cells beyond each interface, so the
+        # default ghost-cell count (reconstruction_order + 1 = 2) is too few:
+        # 1D runs then read wrapped / stale values at the edges, and smooth
+        # periodic problems converged at first order. Same rule as 2D/3D.
+        if config.dimensionality == 1:
+            if config.boundary_settings == BoundarySettings1D(
+                left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
+            ):
+                config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
+            elif config.boundary_handling == GHOST_CELLS:
+                config = config._replace(num_ghost_cells=max(config.num_ghost_cells, 4))
 
         if config.dimensionality == 3 and config.boundary_settings == BoundarySettings(
             BoundarySettings1D(

@@ -48,8 +48,6 @@ for speed in speeds:
             dimensionality=1,
             num_cells=n,
             numerical_precision=DOUBLE_PRECISION,
-            boundary_handling=PERIODIC_ROLL,
-            num_ghost_cells=0,
             **weno_variant_kwargs(),
             boundary_settings=BoundarySettings1D(
                 left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
@@ -66,7 +64,7 @@ for speed in speeds:
             velocity_x=jnp.full_like(x, speed),
             gas_pressure=jnp.ones_like(x),
         )
-        config = finalize_config(config, state.shape)._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
+        config = finalize_config(config, state.shape)
         final = np.asarray(time_integration(state, config, params, registered_variables))
         errors.append(float(np.mean(np.abs(final[0] - np.asarray(rho)))))
     orders = [np.log2(errors[k] / errors[k + 1]) for k in range(len(errors) - 1)]

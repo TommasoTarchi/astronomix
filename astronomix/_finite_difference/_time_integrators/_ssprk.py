@@ -400,9 +400,6 @@ def _hydro_step_rhs(
         and not config.positivity_config.deepvoid_blend
         and not config.positivity_config.preserving_flux
         and not config.positivity_config.coldcrush_blend
-        # the fused kernel carries neither WENO option
-        and not config.weno_positivity_preserving
-        and not config.weno_admissible_face_state
     )
 
     if use_fused_pallas:
@@ -660,8 +657,6 @@ def _lsrk4_hydro(
             and not config.positivity_config.deepvoid_blend
             and not config.positivity_config.preserving_flux
             and not config.positivity_config.coldcrush_blend
-            and not config.weno_positivity_preserving
-            and not config.weno_admissible_face_state
         )
 
         if use_fused_pallas:
@@ -814,11 +809,23 @@ def _lsrk4_with_ct(
         mz = registered_variables.magnetic_index.z
         di = registered_variables.density_index
 
+        # Unified flux blending, exactly as in the SSPRK4-with-CT path: applied
+        # to the full interface flux BEFORE the magnetic-flux slices are
+        # extracted, so CT consumes the blended induction flux. This path used
+        # to skip it, which silently switched every blend option off for MHD
+        # under RK4_LSRK. The low-storage stage increment is dt * L(q), so the
+        # admissibility checks use the full-step dt / dx (as _lsrk4_hydro does).
+        blend = (config.positivity_config.deepvoid_blend
+                 or config.positivity_config.preserving_flux
+                 or config.positivity_config.coldcrush_blend)
+
         # x-axis: fold the LSRK4 ``a_coef * dq + ...`` step into the
         # first axis's div kernel via ``scale_in`` so ``rhs_q`` is never
         # materialised; subsequent axes accumulate (scale_in = 1.0).  The
         # native fallback path keeps the explicit ``rhs_q`` register.
         dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+        if blend:
+            dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
         By_flux_x = dF_x[my]
         Bz_flux_x = dF_x[mz]
         density_flux_x = dF_x[di]
@@ -853,6 +860,8 @@ def _lsrk4_with_ct(
         if config.dimensionality >= 2:
             mx = registered_variables.magnetic_index.x
             dF_y = _weno_flux_y(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            if blend:
+                dF_y = _blend_interface_flux(dF_y, current_q, 1, dtdy, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_y = dF_y[mx]
             Bz_flux_y = dF_y[mz]
             density_flux_y = dF_y[di]
@@ -878,6 +887,8 @@ def _lsrk4_with_ct(
         if config.dimensionality == 3:
             mx = registered_variables.magnetic_index.x
             dF_z = _weno_flux_z(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            if blend:
+                dF_z = _blend_interface_flux(dF_z, current_q, 2, dtdz, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_z = dF_z[mx]
             By_flux_z = dF_z[my]
             density_flux_z = dF_z[di]

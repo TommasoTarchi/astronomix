@@ -269,7 +269,65 @@ def _fd_gravity_source(
     else:
         raise NotImplementedError("This scheme is not implemented.")
 
+    if config.gravity_config.limit_internal_energy_work and \
+            config.gravity_config.self_gravity_version != SIMPLE_SOURCE:
+        S = _limit_internal_energy_work(
+            S, primitive_state, gravitational_potential, dt, config, params, registered_variables
+        )
+
     return S
+
+
+def _limit_internal_energy_work(
+    S,
+    primitive_state,
+    gravitational_potential,
+    dt,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+):
+    """Apply the non-kinetic part of the conservative energy source only as
+    far as the cell's internal energy can absorb it.
+
+    The kinetic part of the gravitational work is v . (rho a) dt, the change
+    the momentum source makes to the kinetic energy; the rest,
+    D = S_E - v . (rho a) dt, changes the internal energy. Where D < 0 it is
+    scaled by the largest theta in [0, 1] with theta |D| <= e / 2, i.e. at most
+    half of the internal energy per stage (the other half is the hydrodynamic
+    update's budget).
+
+    Args:
+        S: The full-state gravity source over the stage time step.
+        primitive_state: The primitive state of the stage.
+        gravitational_potential: The total potential.
+        dt: The stage time step.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The source with the limited energy component.
+    """
+    del gravitational_potential, dt  # the kinetic part is read off S itself
+    energy_index = registered_variables.energy_index
+    rho = primitive_state[registered_variables.density_index]
+
+    kinetic_work = jnp.zeros_like(rho)
+    for axis in range(1, config.dimensionality + 1):
+        # S[axis] = rho a dt for this axis; v . (rho a) dt is its kinetic work
+        kinetic_work = kinetic_work + primitive_state[axis] * S[axis]
+
+    internal_energy = jnp.maximum(
+        primitive_state[registered_variables.pressure_index], 0.0
+    ) / (params.gamma - 1.0)
+    internal_work = S[energy_index] - kinetic_work
+    theta = jnp.where(
+        internal_work < 0.0,
+        jnp.clip(0.5 * internal_energy / jnp.maximum(-internal_work, 1e-30), 0.0, 1.0),
+        1.0,
+    )
+    return S.at[energy_index].set(kinetic_work + theta * internal_work)
 
 # @jaxtyped(typechecker=typechecker)
 @partial(

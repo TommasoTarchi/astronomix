@@ -73,7 +73,11 @@ def _eigenvector_building_blocks(
     registered_variables: RegisteredVariables,
 ):
     rho = conserved_state[registered_variables.density_index]
-    momentum_x = conserved_state[registered_variables.momentum_index.x]
+    # in 1D the registry stores the single momentum index as a plain int
+    if config.dimensionality == 1:
+        momentum_x = conserved_state[registered_variables.momentum_index]
+    else:
+        momentum_x = conserved_state[registered_variables.momentum_index.x]
 
     if config.dimensionality == 1:
         momentum_y = 0.0
