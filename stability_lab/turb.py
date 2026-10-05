@@ -33,6 +33,9 @@ parser.add_argument("--vacuum-rest", type=int, default=0)
 parser.add_argument("--blend", type=int, default=0)
 parser.add_argument("--pp", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--save-every", type=int, default=0,
+                    help="dump the full state every this many snapshots (0 = never)")
+parser.add_argument("--state-dir", default="/export/data/lstorcks/weno_stability")
 parser.add_argument("--tag", required=True)
 args = parser.parse_args()
 
@@ -189,6 +192,11 @@ def diagnostics(time, state, registered_variables):
         else:
             last_good["state"] = np.asarray(full_state)
             last_good["t"] = t
+            snapshot_index = len(records) - 1
+            if args.save_every and snapshot_index % args.save_every == 0:
+                os.makedirs(args.state_dir, exist_ok=True)
+                np.save(os.path.join(args.state_dir, f"{args.tag}_snap{snapshot_index:03d}.npy"),
+                        last_good["state"].astype(np.float32))
         print(f"[{label}] t/tc={t/t_cross:.3f} min_rho={rho_min:.3e} max_rho={rho_max:.3e} "
               f"max|v|={v_max:.3f} v_rms={v_rms:.3f} bad={int(nan > 0 or rho_min <= 0)}", flush=True)
 

@@ -45,11 +45,6 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
-#: Bisection steps for the pressure scaling factor (2^-14 ~ 6e-5 resolution in
-#: theta, below which the difference to the exact root is immaterial).
-PRESSURE_BISECTION_STEPS = 14
-
-
 def mass_free_modes(config: SimulationConfig) -> tuple:
     """Indices of the characteristic fields whose right eigenvector has no
     density component, in the mode order of the eigensystem modules.
@@ -115,9 +110,8 @@ def _admissible_scaling(
     """Largest theta in [0, 1] keeping ``owner_state +- theta * step``
     admissible.
 
-    Density is linear along the segment, so its bound is closed form. The
-    pressure is concave along any line in conserved space, so the admissible
-    theta form an interval ``[0, theta_max]`` that a short bisection finds.
+    Density is linear along the segment, so its bound is closed form; the
+    pressure bound uses the concavity of the pressure along the segment.
     The floors are the configured minima, capped at half the owner's own
     value so a cell sitting below a floor is not forced to first order.
 
@@ -141,26 +135,25 @@ def _admissible_scaling(
     if config.equation_of_state != IDEAL_GAS:
         return theta
 
+    # The pressure is concave along any line in conserved space, so on
+    # [0, theta] it lies above the chord between its end values. Where the
+    # density-limited theta leaves the pressure (of the face value or of its
+    # mirror) below the floor, the chord's root is therefore admissible: one
+    # closed-form step, no iteration, slightly cautious only where the
+    # limiter acts anyway.
     gamma = params.gamma
     owner_pressure = _gas_pressure(owner_state, gamma, config, registered_variables)
     pressure_floor = jnp.minimum(params.minimum_pressure, 0.5 * jnp.maximum(owner_pressure, 0.0))
+    owner_margin = owner_pressure - pressure_floor
 
-    def admissible(scale):
-        forward = _gas_pressure(owner_state + scale[None] * step, gamma, config, registered_variables)
-        mirror = _gas_pressure(owner_state - scale[None] * step, gamma, config, registered_variables)
-        return (forward >= pressure_floor) & (mirror >= pressure_floor)
+    for direction in (1.0, -1.0):
+        end_margin = _gas_pressure(
+            owner_state + direction * theta[None] * step, gamma, config, registered_variables
+        ) - pressure_floor
+        chord_root = theta * owner_margin / jnp.maximum(owner_margin - end_margin, 1e-30)
+        theta = jnp.where(end_margin >= 0.0, theta, chord_root)
 
-    def bisect(_, bounds):
-        lower, upper = bounds
-        middle = 0.5 * (lower + upper)
-        middle_ok = admissible(middle)
-        return jnp.where(middle_ok, middle, lower), jnp.where(middle_ok, upper, middle)
-
-    lower, _ = jax.lax.fori_loop(
-        0, PRESSURE_BISECTION_STEPS, bisect, (jnp.zeros_like(theta), theta)
-    )
-    theta = jnp.where(admissible(theta), theta, lower)
-    return jnp.where(owner_pressure > 0.0, theta, 0.0)
+    return jnp.where(owner_margin > 0.0, theta, 0.0)
 
 
 def positivity_preserving_interface_flux(
@@ -224,6 +217,10 @@ def positivity_preserving_interface_flux(
 
     plus_theta = _admissible_scaling(plus_owner, plus_step, params, config, registered_variables)
     minus_theta = _admissible_scaling(minus_owner, minus_step, params, config, registered_variables)
+    if config.weno_ad_frozen_weights:
+        # theta is a nonlinear weight like the WENO omegas: freeze it with them
+        plus_theta = jax.lax.stop_gradient(plus_theta)
+        minus_theta = jax.lax.stop_gradient(minus_theta)
 
     plus_flux = 0.5 * alpha * (plus_owner + plus_theta[None] * plus_step)
     minus_flux = -0.5 * alpha * (minus_owner + minus_theta[None] * minus_step)

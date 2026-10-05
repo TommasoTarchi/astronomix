@@ -3,9 +3,9 @@
 while true; do
   done_all=1
   for j in "$@"; do
-    if ! pq log "$j" 2>&1 | grep -qE "^RESULT|Traceback|Error:"; then done_all=0; fi
+    if ! pq log "$j" 2>&1 | grep -qE "^RESULT|^EVRARD|relative to baseline|Traceback|Error:"; then done_all=0; fi
   done
   [ $done_all = 1 ] && break
   sleep 30
 done
-for j in "$@"; do pq log "$j" 2>&1 | grep -E "^RESULT|Traceback|Error:" | tail -1; done
+for j in "$@"; do pq log "$j" 2>&1 | grep -E "^RESULT|^EVRARD|relative to baseline|Traceback|Error:" | tail -1; done
