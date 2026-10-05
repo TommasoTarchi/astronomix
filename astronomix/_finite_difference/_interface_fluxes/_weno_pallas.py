@@ -1247,22 +1247,20 @@ def _weno_flux_hydro_pallas_local(
             plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
             minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-            # Pre-pass: the shift of the two upwind split states with every
+            # Pre-pass: the shifts of every stencil cell's split states with every
             # field on its own speed, and the largest fraction eta of the way
-            # there that keeps them admissible (see _weno_positivity.py).
-            full_plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
-            full_minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+            # there that keeps all of them admissible (see _weno_positivity.py).
+            stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
             for mode in range(num_modes):
                 relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-                full_plus_shift = add_right_correction(
-                    full_plus_shift, mode, relative_offset * left_project(mode, q_stencil[2])
-                )
-                full_minus_shift = add_right_correction(
-                    full_minus_shift, mode, relative_offset * left_project(mode, q_stencil[3])
-                )
+                stencil_shifts = [
+                    add_right_correction(
+                        stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
+                    )
+                    for k in range(6)
+                ]
             speed_fraction = admissible_speed_fraction_local(
-                q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3], common_speed,
-                full_plus_shift, full_minus_shift, gm1, rhomin, pgmin,
+                q_stencil, f_stencil, common_speed, stencil_shifts, gm1, rhomin, pgmin,
                 ideal_gas=True, magnetic_slots=(),
             )
 
@@ -2139,22 +2137,20 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
         minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-        # Pre-pass: the shift of the two upwind split states with every
+        # Pre-pass: the shifts of every stencil cell's split states with every
         # field on its own speed, and the largest fraction eta of the way
-        # there that keeps them admissible (see _weno_positivity.py).
-        full_plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
-        full_minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+        # there that keeps all of them admissible (see _weno_positivity.py).
+        stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
         for mode in range(num_modes):
             relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-            full_plus_shift = add_right_correction(
-                full_plus_shift, mode, relative_offset * left_project(mode, q_stencil[2])
-            )
-            full_minus_shift = add_right_correction(
-                full_minus_shift, mode, relative_offset * left_project(mode, q_stencil[3])
-            )
+            stencil_shifts = [
+                add_right_correction(
+                    stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
+                )
+                for k in range(6)
+            ]
         speed_fraction = admissible_speed_fraction_local(
-            q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3], common_speed,
-            full_plus_shift, full_minus_shift, gm1, rhomin, pgmin,
+            q_stencil, f_stencil, common_speed, stencil_shifts, gm1, rhomin, pgmin,
             ideal_gas=True, magnetic_slots=(4, 5, 6),
         )
 
@@ -4189,22 +4185,20 @@ def _weno_flux_mhd_iso_pallas_local(
             plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
             minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-            # Pre-pass: the shift of the two upwind split states with every
+            # Pre-pass: the shifts of every stencil cell's split states with every
             # field on its own speed, and the largest fraction eta of the way
-            # there that keeps them admissible (see _weno_positivity.py).
-            full_plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
-            full_minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+            # there that keeps all of them admissible (see _weno_positivity.py).
+            stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
             for mode in range(num_modes):
                 relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-                full_plus_shift = add_right_correction(
-                    full_plus_shift, mode, relative_offset * left_project(mode, q_stencil[2])
-                )
-                full_minus_shift = add_right_correction(
-                    full_minus_shift, mode, relative_offset * left_project(mode, q_stencil[3])
-                )
+                stencil_shifts = [
+                    add_right_correction(
+                        stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
+                    )
+                    for k in range(6)
+                ]
             speed_fraction = admissible_speed_fraction_local(
-                q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3], common_speed,
-                full_plus_shift, full_minus_shift, 0.0, rhomin, 0.0,
+                q_stencil, f_stencil, common_speed, stencil_shifts, 0.0, rhomin, 0.0,
                 ideal_gas=False, magnetic_slots=(4, 5, 6),
             )
 

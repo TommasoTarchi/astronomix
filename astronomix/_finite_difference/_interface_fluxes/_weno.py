@@ -276,33 +276,37 @@ def _weno_flux_x_native(
             common_speed = jax.lax.stop_gradient(common_speed)
         safe_common_speed = jnp.maximum(common_speed, 1e-30)
 
-        # Pre-pass: the shift z of the two upwind split states if every field
-        # kept its own speed. The largest fraction eta of the way from the
-        # common to the per-field speeds that keeps both states admissible is
-        # fixed here, before the reconstruction, because the speeds enter the
-        # WENO weights (see _weno_positivity.py).
+        # Pre-pass: the shift z_m of every stencil cell's split states if
+        # every field kept its own speed. The largest fraction eta of the way
+        # from the common to the per-field speeds that keeps all of them
+        # admissible is fixed here, before the reconstruction, because the
+        # speeds enter the WENO weights (see _weno_positivity.py).
         right_neighbour = _shift(conserved_state, -1, axis=1)
+        stencil_offsets = (2, 1, 0, -1, -2, -3)
+        stencil_states = tuple(_shift(conserved_state, k, axis=1) for k in stencil_offsets)
 
-        def accumulate_full_shift(mode, shifts):
-            plus_shift, minus_shift = shifts
+        def accumulate_full_shifts(mode, shifts):
             left_row = mode_left_row(mode)
             right_column = mode_right_column(mode)
             own_speed = stencil_maximum(jnp.abs(mode_eigenvalues(mode)))
             relative_offset = ((own_speed - common_speed) / safe_common_speed)[None]
-            left_projection = jnp.sum(left_row * conserved_state, axis=0)[None]
-            right_projection = jnp.sum(left_row * right_neighbour, axis=0)[None]
-            return (
-                plus_shift + relative_offset * right_column * left_projection,
-                minus_shift + relative_offset * right_column * right_projection,
+            return tuple(
+                shift + relative_offset * right_column * jnp.sum(left_row * state, axis=0)[None]
+                for shift, state in zip(shifts, stencil_states)
             )
 
         zero = jnp.zeros_like(F_interface)
-        full_plus_shift, full_minus_shift = jax.lax.fori_loop(
-            0, num_modes, accumulate_full_shift, (zero, zero)
+        full_shifts = jax.lax.fori_loop(
+            0, num_modes, accumulate_full_shifts, (zero,) * len(stencil_offsets)
         )
         speed_fraction = admissible_speed_fraction(
-            conserved_state, F, common_speed, full_plus_shift, full_minus_shift,
-            params, config, registered_variables,
+            stencil_states,
+            tuple(_shift(F, k, axis=1) for k in stencil_offsets),
+            common_speed,
+            full_shifts,
+            params,
+            config,
+            registered_variables,
         )
         if config.weno_ad_frozen_weights:
             speed_fraction = jax.lax.stop_gradient(speed_fraction)

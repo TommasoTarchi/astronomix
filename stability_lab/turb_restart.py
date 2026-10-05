@@ -18,7 +18,11 @@ parser.add_argument("--rhomin", type=float, default=1e-10)
 parser.add_argument("--pp", type=int, default=0)
 parser.add_argument("--blend-factor", type=float, default=0.0)
 parser.add_argument("--precision", type=int, default=32)
+parser.add_argument("--backend", choices=["native", "pallas"], default="native")
 args = parser.parse_args()
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+    autocvd(num_gpus=1)
 if args.precision == 64:
     os.environ["JAX_ENABLE_X64"] = "1"
 
@@ -36,6 +40,7 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     NATIVE_JAX,
+    PALLAS,
     PERIODIC_BOUNDARY,
     PositivityConfig,
     SimulationConfig,
@@ -63,7 +68,7 @@ config = SimulationConfig(
     box_size=1.0,
     mhd=bool(args.mhd),
     numerical_precision=DOUBLE_PRECISION if args.precision == 64 else SINGLE_PRECISION,
-    backend_config=BackendConfig(backend=NATIVE_JAX),
+    backend_config=BackendConfig(backend=NATIVE_JAX if args.backend == "native" else PALLAS),
     boundary_settings=BoundarySettings(periodic, periodic, periodic),
     positivity_config=PositivityConfig(
         preserving_flux=bool(args.pp),
@@ -97,4 +102,19 @@ for k in range(len(times)):
     if bad:
         break
 tag = "_" + weno_variant_name()
-np.savez(args.state_file.replace(".npz", f"_restart{tag}.npz"), states=states, times=times)
+finite = [k for k in range(len(times)) if np.all(np.isfinite(states[k])) and times[k] > 0 or k == 0]
+last = max(finite)
+# keep only the snapshots around the end (full 128^3 series are tens of GB)
+keep = slice(max(0, last - 3), min(last + 2, len(times)))
+np.savez(args.state_file.replace(".npz", f"_restart{tag}.npz"), states=states[keep], times=times[keep])
+for k in range(max(0, last - 3), min(last + 2, len(times))):
+    s = states[k]
+    if not np.all(np.isfinite(s)):
+        bad = np.argwhere(~np.isfinite(s).all(axis=0))
+        print(f"snapshot {k}: {len(bad)} non-finite cells, first at {tuple(bad[0])}")
+        continue
+    rho = s[0]; speed = np.sqrt((s[1:4] ** 2).sum(0)); b = np.sqrt((s[4:7] ** 2).sum(0))
+    i = np.unravel_index(np.argmax(speed), speed.shape)
+    j = np.unravel_index(np.argmin(rho), rho.shape)
+    print(f"snapshot {k} t0+{times[k]:.5f}: max|v|={speed.max():.3f} at {i} (rho={rho[i]:.3e}, |B|={b[i]:.3f}); "
+          f"min rho={rho.min():.3e} at {j} (|v|={speed[j]:.3f}); max|B|={b.max():.3f}")
