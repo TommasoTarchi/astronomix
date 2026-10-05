@@ -45,6 +45,7 @@ from astronomix._pallas_helpers import (
     pltriton,
 )
 from astronomix._finite_difference._interface_fluxes._weno_positivity import (
+    local_admissible_speed,
     mass_free_modes,
     positivity_preserving_flux_local,
 )
@@ -2114,6 +2115,17 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         common_speed = alpha_for_mode(0)
         for mode in range(1, num_modes):
             common_speed = jnp.maximum(common_speed, alpha_for_mode(mode))
+
+        # ideal-MHD split states can need more than the fast speed
+        def cell_admissible_speed(k):
+            radius = jnp.abs(lambda_from_floored_cell(floored_stencil[k], 0))
+            for mode in range(1, num_modes):
+                radius = jnp.maximum(radius, jnp.abs(lambda_from_floored_cell(floored_stencil[k], mode)))
+            return local_admissible_speed(q_stencil[k], f_stencil[k], radius, gm1)
+
+        common_speed = jnp.maximum(
+            common_speed, jnp.maximum(cell_admissible_speed(2), cell_admissible_speed(3))
+        )
         central_state = [
             (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot]
              + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)

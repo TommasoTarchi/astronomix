@@ -143,6 +143,7 @@ from astronomix._finite_difference._interface_fluxes._weno_weights import (
 from astronomix._finite_difference._interface_fluxes._weno_positivity import (
     mass_free_modes,
     positivity_preserving_interface_flux,
+    admissible_splitting_speed,
     stencil_maximum,
 )
 
@@ -272,6 +273,11 @@ def _weno_flux_x_native(
             jnp.stack([jnp.abs(mode_eigenvalues(mode)) for mode in range(num_modes)]), axis=0
         )
         common_speed = stencil_maximum(spectral_radius)
+        if config.mhd and config.equation_of_state == IDEAL_GAS:
+            # ideal-MHD split states can need more than the fast speed
+            common_speed = admissible_splitting_speed(
+                conserved_state, F, spectral_radius, common_speed, gamma, registered_variables
+            )
         if config.weno_ad_frozen_weights:
             common_speed = jax.lax.stop_gradient(common_speed)
         safe_common_speed = jnp.maximum(common_speed, 1e-30)

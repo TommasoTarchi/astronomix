@@ -39,12 +39,16 @@ parser.add_argument("--pmin", type=float, default=1e-10)
 parser.add_argument("--save-every", type=int, default=0,
                     help="dump the full state every this many snapshots (0 = never)")
 parser.add_argument("--state-dir", default="/export/data/lstorcks/weno_stability")
+parser.add_argument("--gpus", type=int, default=1, help="devices to shard the x axis over")
+parser.add_argument("--donate", type=int, default=0, help="config.donate_state")
 parser.add_argument("--tag", required=True)
 args = parser.parse_args()
 
 if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
     from autocvd import autocvd
-    autocvd(num_gpus=1)
+    autocvd(num_gpus=args.gpus)
+# NVLS multicast hangs collectives on these nodes (see casa multi-GPU notes)
+os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 if args.precision == 64:
     os.environ["JAX_ENABLE_X64"] = "1"
 
@@ -128,6 +132,7 @@ config = SimulationConfig(
     return_snapshots=False,
     activate_snapshot_callback=True,
     num_snapshots=args.nsnap,
+    donate_state=bool(args.donate),
     **weno_variant_kwargs(),
 )
 t_cross = 0.5
@@ -166,6 +171,14 @@ if adiabatic:
     initial["gas_pressure"] = jnp.full_like(density, pressure0)
 initial_state = construct_primitive_state(**initial)
 config = finalize_config(config, initial_state.shape)
+sharding = None
+if args.gpus > 1:
+    from jax.sharding import AxisType, PartitionSpec
+    # Auto axes: the solver's with_sharding_constraint rejects jax 0.10's Explicit default
+    mesh = jax.make_mesh((args.gpus,), ("x",), axis_types=(AxisType.Auto,))
+    sharding = jax.sharding.NamedSharding(mesh, PartitionSpec(None, "x"))
+    jax.config.update("jax_use_shardy_partitioner", False)
+    initial_state = jax.device_put(initial_state, sharding)
 
 density_index = registered_variables.density_index
 vx, vy, vz = (registered_variables.velocity_index.x, registered_variables.velocity_index.y,
@@ -219,7 +232,7 @@ def diagnostics(time, state, registered_variables):
 
 
 start = walltime.time()
-time_integration(initial_state, config, params, registered_variables, diagnostics)
+time_integration(initial_state, config, params, registered_variables, diagnostics, sharding=sharding)
 elapsed = walltime.time() - start
 records = np.array(sorted(records))
 np.savetxt(os.path.join(OUT_DIR, f"diag_{args.tag}.txt"), records,

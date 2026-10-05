@@ -10,7 +10,9 @@ makes each split flux a scaled vector
     w~^+- = q +- F(q) / alpha,      z^+- = sum_s (alpha_s / alpha - 1) R_s (L_s q).
 
 ``w~`` is a physically admissible state (positive density, and pressure for
-an ideal gas) whenever ``alpha >= |v_n| + c``. Write ``theta`` for the
+an ideal gas) whenever ``alpha >= |v_n| + c`` for the Euler equations; ideal
+MHD needs a larger, state-dependent speed (see the admissible-splitting-speed
+section at the end of this module). Write ``theta`` for the
 scaling of the WENO face value toward its upwind cell. Following Zhang & Shu
 (2012, J. Comput. Phys. 231, 2245), the forward-Euler update of a cell is a
 convex combination of admissible states if all of these hold:
@@ -353,3 +355,143 @@ def positivity_preserving_flux_local(
         # no normal-field flux (see positivity_preserving_interface_flux)
         interface_flux[magnetic_slots[0]] = interface_flux[0] * 0.0
     return interface_flux
+
+
+# -----------------------------------------------------------------------------
+# ↓ Admissible splitting speed (ideal MHD) ↓
+# -----------------------------------------------------------------------------
+# For the Euler equations the split states q +- F / alpha are admissible as
+# soon as alpha >= |v_n| + c. For ideal MHD they are not, at any multiple of
+# the fast speed (Wu 2018, SIAM J. Numer. Anal. 56, 2124): with B along the
+# normal and v = 0,
+#
+#     p(q + F / alpha) / (gamma - 1) = p / (gamma - 1) - (p - B^2 / 2)^2 / (2 rho alpha^2),
+#
+# negative at low beta for alpha = c_f. The theta-scaling then has no
+# admissible base, returns theta = 0, and the face falls back to first-order
+# Rusanov in smooth flow (CP Alfven wave: order 0.2-0.6 instead of 5).
+#
+# The remedy inside the same argument is a larger splitting speed. The
+# pressure of q + s F is concave in s, so {s : p(q + s F) >= kappa p(q)} is an
+# interval [0, s*]: every alpha >= 1 / s* keeps both split states admissible,
+# with a fraction kappa of the cell's pressure left as room for the WENO step.
+# s* is bracketed between the chord root from s = 0 (admissible, as the chord
+# of a concave function lies below it) and 1 / spectral radius, and the
+# bracket is closed by geometric bisection (it can span many decades at low
+# beta) plus a final chord; the lower end is admissible throughout. The proof's CFL
+# condition lambda (alpha_left + alpha_right) <= 1 then holds with these
+# speeds, so the time step uses them too. At low beta and slow flow
+# alpha ~ 0.58 v_A / sqrt(beta) (kappa = 1/2): the price of provable positivity.
+
+ADMISSIBLE_PRESSURE_FRACTION = 0.5
+ADMISSIBLE_SPEED_ITERATIONS = 12
+MHD_MAGNETIC_SLOTS = (4, 5, 6)
+
+
+def local_mhd_normal_flux(state, gm1):
+    """Ideal-MHD flux along the normal of a local (rho, m_n, m_t1, m_t2, B_n,
+    B_t1, B_t2, E) tuple (no floors)."""
+    density, mn, mt1, mt2, bn, bt1, bt2, energy = state
+    inverse_density = 1.0 / density
+    vn, vt1, vt2 = mn * inverse_density, mt1 * inverse_density, mt2 * inverse_density
+    total_pressure = (
+        _local_gas_pressure(state, gm1, MHD_MAGNETIC_SLOTS) + 0.5 * (bn * bn + bt1 * bt1 + bt2 * bt2)
+    )
+    v_dot_b = vn * bn + vt1 * bt1 + vt2 * bt2
+    return (
+        mn,
+        mn * vn + total_pressure - bn * bn,
+        mt1 * vn - bn * bt1,
+        mt2 * vn - bn * bt2,
+        0.0 * bn,
+        vn * bt1 - bn * vt1,
+        vn * bt2 - bn * vt2,
+        (energy + total_pressure) * vn - bn * v_dot_b,
+    )
+
+
+def local_admissible_speed(state, flux, spectral_radius, gm1, magnetic_slots=MHD_MAGNETIC_SLOTS):
+    """Splitting speed of a cell, at least its spectral radius, at which both
+    split states ``q +- F / alpha`` keep ``ADMISSIBLE_PRESSURE_FRACTION`` of the
+    cell's gas pressure (``state`` and ``flux`` are local tuples, energy last).
+    A cell without positive pressure keeps its spectral radius."""
+    pressure = _local_gas_pressure(state, gm1, magnetic_slots)
+    target = ADMISSIBLE_PRESSURE_FRACTION * jnp.maximum(pressure, 0.0)
+    s_radius = 1.0 / jnp.maximum(spectral_radius, 1e-30)
+
+    def margin(s, sign):
+        moved = tuple(state[slot] + (sign * s) * flux[slot] for slot in range(len(state)))
+        return _local_gas_pressure(moved, gm1, magnetic_slots) - target
+
+    speed = spectral_radius
+    for sign in (1.0, -1.0):
+        g_radius = margin(s_radius, sign)
+        g_zero = pressure - target
+        # bracket [s_lower, s_upper] of the root: the chord from s = 0 is
+        # admissible by concavity, s_radius is not
+        s_lower = s_radius * jnp.clip(g_zero / jnp.maximum(g_zero - g_radius, 1e-30), 0.0, 1.0)
+        s_upper = s_radius
+        for _ in range(ADMISSIBLE_SPEED_ITERATIONS):
+            # geometric bisection: the bracket ratio can be many decades
+            s_middle = jnp.sqrt(s_lower * s_upper)
+            admissible = margin(s_middle, sign) >= 0.0
+            s_lower = jnp.where(admissible, s_middle, s_lower)
+            s_upper = jnp.where(admissible, s_upper, s_middle)
+        # final chord across the bracket, admissible by concavity
+        g_lower = margin(s_lower, sign)
+        g_upper = margin(s_upper, sign)
+        s_final = s_lower + (s_upper - s_lower) * jnp.clip(
+            g_lower / jnp.maximum(g_lower - g_upper, 1e-30), 0.0, 1.0
+        )
+        needs_raise = (g_radius < 0.0) & (pressure > 0.0)
+        s_admissible = jnp.where(needs_raise, s_final, s_radius)
+        speed = jnp.maximum(speed, 1.0 / jnp.maximum(s_admissible, 1e-30))
+    return speed
+
+
+def _mhd_local_tuple(state, registered_variables: RegisteredVariables):
+    """(rho, m_x, m_y, m_z, B_x, B_y, B_z, E) of an x-normal conserved array."""
+    return (
+        state[registered_variables.density_index],
+        state[registered_variables.momentum_index.x],
+        state[registered_variables.momentum_index.y],
+        state[registered_variables.momentum_index.z],
+        state[registered_variables.magnetic_index.x],
+        state[registered_variables.magnetic_index.y],
+        state[registered_variables.magnetic_index.z],
+        state[registered_variables.energy_index],
+    )
+
+
+def admissible_splitting_speed(
+    conserved_state,
+    cell_flux,
+    spectral_radius,
+    common_speed,
+    gamma,
+    registered_variables: RegisteredVariables,
+):
+    """Raise the common splitting speed of each interface (ideal MHD, x normal)
+    to the admissible speeds of its two upwind cells, i and i + 1."""
+    cell_speed = local_admissible_speed(
+        _mhd_local_tuple(conserved_state, registered_variables),
+        _mhd_local_tuple(cell_flux, registered_variables),
+        spectral_radius,
+        gamma - 1.0,
+    )
+    return jnp.maximum(common_speed, jnp.maximum(cell_speed, _shift(cell_speed, -1, axis=0)))
+
+
+def mhd_admissible_signal_speed(density, velocity, magnetic, pressure, spectral_radius, gamma, axis):
+    """Per-cell admissible splitting speed along ``axis`` from primitives, for
+    the time step (``velocity`` and ``magnetic`` are (x, y, z) triples)."""
+    order = (axis,) + tuple(k for k in range(3) if k != axis)
+    momentum = tuple(density * velocity[k] for k in order)
+    field = tuple(magnetic[k] for k in order)
+    energy = (
+        pressure / (gamma - 1.0)
+        + 0.5 * density * sum(velocity[k] * velocity[k] for k in range(3))
+        + 0.5 * sum(magnetic[k] * magnetic[k] for k in range(3))
+    )
+    state = (density,) + momentum + field + (energy,)
+    return local_admissible_speed(state, local_mhd_normal_flux(state, gamma - 1.0), spectral_radius, gamma - 1.0)

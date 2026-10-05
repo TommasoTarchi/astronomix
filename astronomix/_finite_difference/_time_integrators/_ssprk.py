@@ -22,6 +22,7 @@ from astronomix.option_classes.simulation_config import (
     AD_REMAT_NONE,
     CONSERVATIVE_GAS_STATE,
     GHOST_CELLS,
+    IDEAL_GAS,
     MAGNETIC_FIELD_ONLY,
     SIMPLE_SOURCE,
 )
@@ -339,9 +340,26 @@ def _ssprk4_with_ct(
         )
         return (q, bx, by, bz)
 
+    def post_stage(u):
+        # The increment of a stage is evaluated at the state with its
+        # cell-centred B rebuilt from the faces (start of ``rhs``) but is
+        # added to the stored state, whose B and E are the previous stage's
+        # WENO update. The two have the same pressure, yet the sum moves it by
+        # (gamma - 1) lambda dF_B . (B_stored - B_faces), of no definite sign
+        # and large at low beta. Rebuilding the stored stage state (pressure
+        # held) makes every increment start from the state it was evaluated
+        # at, which the positivity-preserving WENO proof needs.
+        q, bx, by, bz = u
+        q = update_cell_center_fields(q, bx, by, bz, config, registered_variables)
+        return (q, bx, by, bz)
+
+    resync_stages = (
+        config.weno_positivity_preserving and config.equation_of_state == IDEAL_GAS
+    )
     return ssprk4(
         (conserved_state, bx_interface, by_interface, bz_interface),
         dt, rhs=rhs, pre_stage=_stage_remat(pre_stage, config),
+        post_stage=_stage_remat(post_stage, config) if resync_stages else (lambda u: u),
         finalize=_stage_remat(finalize, config),
     )
 

@@ -47,6 +47,9 @@ from astronomix._fluid_equations._eigen_hydro_iso import _eigen_all_lambdas_hydr
 from astronomix._fluid_equations._eigen_mhd import _eigen_all_lambdas
 from astronomix._fluid_equations._eigen_mhd_iso import _eigen_all_lambdas_iso
 from astronomix._fluid_equations._equations import conserved_state_from_primitive
+from astronomix._finite_difference._interface_fluxes._weno_positivity import (
+    mhd_admissible_signal_speed,
+)
 from astronomix._fluid_equations._equations_mhd import (
     conserved_state_from_primitive_isothermal,
     conserved_state_from_primitive_mhd,
@@ -124,6 +127,21 @@ def _cfl_time_step_fd_mhd_fast(
     lambda_x = jnp.max(jnp.abs(vx) + cfast(Bx))
     lambda_y = jnp.max(jnp.abs(vy) + cfast(By)) if config.dimensionality >= 2 else 0.0
     lambda_z = jnp.max(jnp.abs(vz) + cfast(Bz)) if config.dimensionality == 3 else 0.0
+
+    if config.weno_positivity_preserving and config.equation_of_state == IDEAL_GAS:
+        # the PP-WENO splitting speeds (see _weno_positivity.py) enter the
+        # positivity proof's CFL condition, so the step must respect them
+        velocity, magnetic = (vx, vy, vz), (Bx, By, Bz)
+        lambda_x, lambda_y, lambda_z = (
+            jnp.maximum(
+                speed,
+                jnp.max(mhd_admissible_signal_speed(
+                    rho, velocity, magnetic, pressure,
+                    jnp.abs(velocity[axis]) + cfast(magnetic[axis]), gamma, axis,
+                )),
+            ) if axis < config.dimensionality else speed
+            for axis, speed in enumerate((lambda_x, lambda_y, lambda_z))
+        )
 
     dt_cfl = C_CFL * grid_spacing / (lambda_x + lambda_y + lambda_z)
 
@@ -226,7 +244,10 @@ def _cfl_time_step_fd(
     Returns:
         The CFL-limited time step.
     """
-    if _mhd_fast_cfl_supported(config, registered_variables):
+    if _mhd_fast_cfl_supported(config, registered_variables) or (
+        config.mhd and config.weno_positivity_preserving and config.equation_of_state == IDEAL_GAS
+    ):
+        # (the fast path also carries the PP-WENO admissible splitting speeds)
         return _cfl_time_step_fd_mhd_fast(
             primitive_state, grid_spacing, dt_max, gamma,
             config, params, registered_variables, C_CFL,
