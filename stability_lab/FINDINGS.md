@@ -38,6 +38,40 @@ grid does not resolve the pressure scale height. The WENO fixes make those
 runs complete and conserve energy, but only resolution or a different
 coupling removes the holes.
 
+## Status of the options
+
+* `weno_admissible_face_state` is **on by default** (bug fix; smooth-flow
+  results agree with the old basis to the WENO dissipation level).
+* `weno_positivity_preserving` is opt-in: switch it on for supersonic and
+  self-gravity runs. Its price is low-Mach contact accuracy (see Costs).
+
+## Relation to the existing Hu-Adams-Shu limiter (`preserving_flux`)
+
+Both come from the same positivity framework (Zhang & Shu 2010-12; Hu, Adams
+& Shu 2013), but they act at different places.
+
+* **Where.** `preserving_flux` limits the *finished* WENO flux. It blends the
+  flux toward a separately computed two-cell Lax-Friedrichs flux, with `theta`
+  chosen from Zalesak sums of the *updated cell values* at the current stage
+  `dt`. PP-WENO scales each *split flux's face value* toward its upwind split
+  state inside the reconstruction. Its constraint (face value and mirror
+  admissible) does not involve `dt`.
+* **Why that matters.** `preserving_flux` checks each axis on its own, with no
+  dimensional factor, so three admissible directional updates can still sum to
+  a negative density in 3D (seen: rho = -4.9e3). And because the bound is on
+  the update, it loosens as `dt` shrinks, which lets a one-cell minimum drain
+  over many steps. The face-value bound forbids reversing the inflow at every
+  step.
+* **Splitting speed.** `preserving_flux` keeps the per-field (Roe-like)
+  splitting in the high-order flux. PP-WENO splits every mass-carrying field
+  with the stencil's spectral radius, so the frozen-basis splitting is
+  monotone for every stencil cell. Without that (commit 96a191f) Mach-10 MHD
+  still blows up.
+* **History.** A density-only Hu-Adams-Shu limiter was added in June
+  (320d383) and removed (2d1301c) because 1D tests never needed it. That is
+  consistent with the findings here: the failures are multi-D one-cell minima,
+  which 1D Riemann problems do not produce.
+
 ## Defect 1: the characteristic basis is evaluated at a non-state
 
 `_eigenvector_building_blocks` averaged `rho` and `m`, so `v = <m>/<rho>` is
@@ -139,6 +173,37 @@ Admissibility of the split states is not the monotonicity that the common
 speed provides. The rigorous per-field bound (Gershgorin on `L A_m R` over
 the stencil) needs a Jacobian product per cell and field.
 
+## Why the CFL limit is 0.75
+
+* **The bound.** The forward-Euler stage is a convex combination of
+  admissible states if `2 dt sum_d alpha_d / dx <= 1`. In the code's
+  sum-of-speeds CFL (`dt = C dx / sum_d max lambda_d`) that is C <= 1/2.
+  SSPRK(5,4) multiplies this by its SSP coefficient 1.508, giving
+  **C <= 0.754**. The code's three-register final stage carries a -0.0208
+  weight on u0, but it is algebraically identical to Spiteri-Ruuth's
+  all-positive Shu-Osher form (the L(u3) term was eliminated via u4), so the
+  SSP property holds.
+* **Two caveats.**
+  * In floating point, that subtraction can round a nearly emptied cell
+    slightly negative; the Shu-Osher form would not, at the cost of extra
+    registers.
+  * `dt` is set from the speeds at the start of the step, and near-vacuum
+    velocities can grow during the stages.
+* **Measured**, deep-void isothermal hydro, Mach 10, 128³ (density reaches
+  1e-8 to 1e-10):
+
+  | C | 0.5 | 0.6 | 0.75 | 0.9 | 1.0 | 1.5 |
+  |---|---|---|---|---|---|---|
+  | result | complete | complete | complete | NaN 3.46 | complete | NaN 3.37 |
+
+  Below the bound, every run completes. Above it, the outcome depends on the
+  trajectory, like the non-monotonic CFL behaviour recorded before this work.
+* **Why MHD survives C = 1.5.** The bound is sufficient, not necessary: it
+  only bites when a cell is nearly emptied within one step. At beta = 0.1 the
+  field keeps the voids near 1e-3 (min rho 9e-4 at 256³), far from that.
+  Mach-10 isothermal hydro genuinely evacuates cells, since an isothermal
+  rarefaction gives rho ~ exp(-dv / 2c).
+
 ## Results
 
 ### Driven Mach-10 turbulence, beta = 0.1, CFL 1.5, no floors / prot / blending
@@ -214,7 +279,23 @@ This is why the conservative schemes were known to NaN below 128³, and why
 warm Evrard (e0 = 0.2) is fine at 32³. Late in the collapse g ~ 5 at r ~ 0.45,
 which violates the criterion again at 64³, exactly where the holes are.
 
-The remedies are coupling-level, not WENO-level:
+Measured with `GravityConfig.limit_internal_energy_work` (implemented,
+opt-in). The non-kinetic part `D = W - v.(rho a)` of the conservative energy
+source is applied with the largest weight that removes at most half of the
+cell's internal energy per stage. That gives exact conservation where the
+limiter is idle and positivity everywhere. Cold Evrard, PP-WENO hydro:
+
+| N | conservative | conservative + limit | KE-only source |
+|---|---|---|---|
+| 32 | dE/E 1.2e-5, min p -0.046 | **dE/E 7 %, p > 0 at every snapshot** | (70 %) |
+| 64 | dE/E 3e-5, min p -0.015 | **dE/E 0.9 %, p > 0** | 41 % |
+| 128 | dE/E 7e-5, min p -6e-4 | **dE/E 2e-4, p > 0** | 20 % |
+
+At 32³ the conservative scheme "conserves" energy only by storing ~7 % of
+the budget as negative internal energy. There, conservation and positivity
+are incompatible, and the limited coupling makes the trade visible and local.
+
+Other remedies (coupling-level, not WENO-level):
 
 * KE-only source `rho v.g`: positive, but energy error 41 % at 64³ and 20 % at 128³.
 * Conservative + dual energy: positive, but dE/E ~ 5 % at 32³, because the
@@ -238,25 +319,24 @@ The remedies are coupling-level, not WENO-level:
   * Pallas, end to end: 128³ isothermal MHD in 133-136 s, *faster* than the
     recipe's 179 s, because no velocity spikes collapse dt.
 
-## Side findings
+## Side findings (fixed)
 
-* 1D finite-difference runs with periodic boundaries converge at **first
-  order**: the 1D config keeps too few ghost cells, while 2D/3D switch to
-  `PERIODIC_ROLL`. `smooth1d.py` forces the roll.
-* Isothermal hydro in 1D does not run (`momentum_index.x` on an int).
-* `_lsrk4_with_ct` never calls the flux blending (survey).
+* 1D finite difference converged at **first order** on periodic problems:
+  1D kept the default 2 ghost cells, short of the WENO5 stencil. Fully
+  periodic 1D runs now use `PERIODIC_ROLL`, and other 1D runs get >= 4 ghost
+  cells, as in 2D/3D. Measured orders are now 4.93 / 5.00 / 5.00.
+* Isothermal hydro crashed in 1D (`momentum_index.x` on an int). It now runs
+  and matches the exact isothermal Riemann solutions.
+* `_lsrk4_with_ct` never applied the flux blending, so for MHD under
+  `RK4_LSRK` every blend option was silently off. It now blends exactly like
+  the SSPRK path: the deep-void blend changes rho by 0.142 under both
+  integrators.
 
 ## Open
 
-* Default switches: `weno_admissible_face_state` is a bug fix worth making
-  the default (identical smooth-flow results). PP-WENO trades low-Mach
-  contact accuracy for robustness, so it should be on for supersonic and
-  self-gravity runs.
 * A cheap, rigorous per-field monotonicity bound would remove the low-Mach
   contact cost.
 * The gravity coupling (above).
-* The fused Pallas WENO+divergence kernel carries neither option and is
-  skipped when they are on.
 
 ## Reproduce
 
