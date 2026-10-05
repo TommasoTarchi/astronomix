@@ -269,6 +269,13 @@ def _fd_gravity_source(
     else:
         raise NotImplementedError("This scheme is not implemented.")
 
+    if config.gravity_config.work_flux_correction and \
+            config.gravity_config.self_gravity_version != SIMPLE_SOURCE:
+        S = _flux_correct_gravitational_work(
+            S, primitive_state, gravitational_potential, density_fluxes, dt,
+            config, params, registered_variables,
+        )
+
     if config.gravity_config.limit_internal_energy_work and \
             config.gravity_config.self_gravity_version != SIMPLE_SOURCE:
         S = _limit_internal_energy_work(
@@ -276,6 +283,141 @@ def _fd_gravity_source(
         )
 
     return S
+
+
+def _flux_correct_gravitational_work(
+    S,
+    primitive_state,
+    gravitational_potential,
+    density_fluxes,
+    dt,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+):
+    """Flux-corrected transport of the potential-energy flux.
+
+    The conservative energy source already in ``S`` corresponds to the
+    scheme's high-order potential-energy flux. Writing the face's low-order
+    (donor) flux q_low = F phi_downwind, the difference A = q_high - q_low is
+    an antidiffusive flux: replacing q_high by q_low + psi A changes the
+    energy source by + d/dx [(1 - psi) A], which keeps total energy exactly
+    conserved for any psi. psi follows Zalesak: per cell, the antidiffusive
+    contributions that LOWER its internal energy are scaled so that, together
+    with the low-order coupling's own internal-energy change, the loss rate
+    stays below half the internal energy per wave-crossing time
+    dx / (|v| + c). All quantities are rates, so psi is independent of dt.
+
+    Args:
+        S: The full-state gravity source over the stage time step.
+        primitive_state: The primitive state of the stage.
+        gravitational_potential: The total potential at the cell centres.
+        density_fluxes: The per-axis density fluxes at the faces i + 1/2.
+        dt: The stage time step.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The source with the flux-corrected energy component.
+    """
+    energy_index = registered_variables.energy_index
+    dx = config.grid_spacing
+    gamma = params.gamma
+    rho = primitive_state[registered_variables.density_index]
+    pressure = jnp.maximum(primitive_state[registered_variables.pressure_index], 0.0)
+    internal_energy = pressure / (gamma - 1.0)
+    speed = jnp.sqrt(sum(primitive_state[axis] ** 2 for axis in range(1, config.dimensionality + 1)))
+    wave_speed = speed + jnp.sqrt(gamma * pressure / jnp.maximum(rho, 1e-30))
+    safe_dt = jnp.maximum(dt, 1e-30)
+
+    # kinetic part of the gravitational work (rate): v . (rho a)
+    kinetic_rate = sum(
+        primitive_state[axis] * S[axis] for axis in range(1, config.dimensionality + 1)
+    ) / safe_dt
+
+    # antidiffusive potential-energy fluxes and their effect on each cell
+    antidiffusive_fluxes = []
+    low_order_extra_rate = jnp.zeros_like(rho)
+    lowering_rate = jnp.zeros_like(rho)
+    for axis in range(1, config.dimensionality + 1):
+        spatial_axis = axis - 1
+        mass_flux = density_fluxes[spatial_axis]
+        phi_left = gravitational_potential
+        phi_right = _shift(gravitational_potential, -1, axis=spatial_axis)
+        phi_face = _stencil_add(
+            gravitational_potential,
+            indices=(-2, -1, 0, 1, 2, 3),
+            factors=(3.0, -25.0, 150.0, 150.0, -25.0, 3.0),
+            axis=spatial_axis,
+        ) / 256.0
+        q_high = mass_flux * phi_face
+        if config.gravity_config.self_gravity_version == FOURTH_ORDER_CONSERVATIVE:
+            q_high = q_high - (dx**2 / 24.0) * _fourth_order_work_correction(
+                primitive_state, gravitational_potential, axis, dx, registered_variables
+            )
+        q_low = jnp.where(mass_flux > 0.0, mass_flux * phi_right, mass_flux * phi_left)
+        antidiffusive = q_high - q_low
+        antidiffusive_fluxes.append(antidiffusive)
+        # replacing q_high by q_low adds + (A_{i+1/2} - A_{i-1/2}) / dx
+        low_order_extra_rate = low_order_extra_rate + (
+            antidiffusive - _shift(antidiffusive, 1, axis=spatial_axis)
+        ) / dx
+        # with psi = 1, face i+1/2 lowers cell i by A/dx when A > 0 and cell
+        # i+1 by -A/dx when A < 0
+        lowering_rate = lowering_rate + jnp.maximum(antidiffusive, 0.0) / dx + jnp.maximum(
+            -_shift(antidiffusive, 1, axis=spatial_axis), 0.0
+        ) / dx
+
+    high_order_rate = S[energy_index] / safe_dt
+    low_order_internal_rate = high_order_rate + low_order_extra_rate - kinetic_rate
+    # The budget deliberately ignores the hydrodynamic rate: crediting the
+    # per-stage (linearised) heating estimate lets through high-order splits
+    # whose heating does not materialise (32^3 cold Evrard: min p -5e-4 with
+    # the credit, -2e-6 without), and debiting expansion cooling makes the
+    # backstop reject 10x more energy at 64^3.
+    budget = jnp.maximum(
+        0.5 * internal_energy * wave_speed / dx + low_order_internal_rate, 0.0
+    )
+    cell_fraction = jnp.where(
+        lowering_rate > budget, budget / jnp.maximum(lowering_rate, 1e-30), 1.0
+    )
+
+    correction = jnp.zeros_like(rho)
+    for axis in range(1, config.dimensionality + 1):
+        spatial_axis = axis - 1
+        antidiffusive = antidiffusive_fluxes[axis - 1]
+        psi = jnp.where(
+            antidiffusive > 0.0,
+            cell_fraction,
+            _shift(cell_fraction, -1, axis=spatial_axis),
+        )
+        rejected = (1.0 - psi) * antidiffusive
+        correction = correction + (rejected - _shift(rejected, 1, axis=spatial_axis)) / dx
+    return S.at[energy_index].add(correction * dt)
+
+
+def _fourth_order_work_correction(primitive_state, gravitational_potential, axis, dx, registered_variables):
+    """The face correction term of the fourth-order product flux (as in
+    ``_fd_gravity_source``): average of phi'' f + 2 phi' f' to the face."""
+    spatial_axis = axis - 1
+    momentum = primitive_state[registered_variables.density_index] * primitive_state[axis]
+    potential_slope = _stencil_add(
+        gravitational_potential,
+        indices=(3, 2, 1, -1, -2, -3),
+        factors=(1.0, -9.0, 45.0, -45.0, 9.0, -1.0),
+        axis=spatial_axis,
+    ) / (60.0 * dx)
+    potential_curvature = (
+        _shift(gravitational_potential, -1, axis=spatial_axis)
+        - 2.0 * gravitational_potential
+        + _shift(gravitational_potential, 1, axis=spatial_axis)
+    ) / dx**2
+    momentum_slope = (
+        _shift(momentum, -1, axis=spatial_axis) - _shift(momentum, 1, axis=spatial_axis)
+    ) / (2.0 * dx)
+    centre = potential_curvature * momentum + 2.0 * potential_slope * momentum_slope
+    return 0.5 * (centre + _shift(centre, -1, axis=spatial_axis))
 
 
 def _limit_internal_energy_work(
@@ -287,15 +429,17 @@ def _limit_internal_energy_work(
     params: SimulationParams,
     registered_variables: RegisteredVariables,
 ):
-    """Apply the non-kinetic part of the conservative energy source only as
-    far as the cell's internal energy can absorb it.
+    """Apply the non-kinetic part of the gravitational energy source only as
+    far as the cell's internal energy can absorb it (non-conservative backstop).
 
-    The kinetic part of the gravitational work is v . (rho a) dt, the change
-    the momentum source makes to the kinetic energy; the rest,
-    D = S_E - v . (rho a) dt, changes the internal energy. Where D < 0 it is
-    scaled by the largest theta in [0, 1] with theta |D| <= e / 2, i.e. at most
-    half of the internal energy per stage (the other half is the hydrodynamic
-    update's budget).
+    The kinetic part of the gravitational work is v . (rho a), the change the
+    momentum source makes to the kinetic energy; the rest, D, changes the
+    internal energy. Where D drains internal energy faster than half of it per
+    wave-crossing time dx / (|v| + c), it is scaled down to that rate. The
+    budget is a RATE, so the limiter does not depend on dt. With
+    ``work_flux_correction`` this only sees what no conservative split of the
+    work can supply (mass lifted by numerical diffusion in cold gas), so the
+    energy it rejects is confined to those cells.
 
     Args:
         S: The full-state gravity source over the stage time step.
@@ -309,22 +453,24 @@ def _limit_internal_energy_work(
     Returns:
         The source with the limited energy component.
     """
-    del gravitational_potential, dt  # the kinetic part is read off S itself
+    del gravitational_potential
     energy_index = registered_variables.energy_index
     rho = primitive_state[registered_variables.density_index]
+    gamma = params.gamma
+    pressure = jnp.maximum(primitive_state[registered_variables.pressure_index], 0.0)
+    internal_energy = pressure / (gamma - 1.0)
+    speed = jnp.sqrt(sum(primitive_state[axis] ** 2 for axis in range(1, config.dimensionality + 1)))
+    wave_speed = speed + jnp.sqrt(gamma * pressure / jnp.maximum(rho, 1e-30))
 
-    kinetic_work = jnp.zeros_like(rho)
-    for axis in range(1, config.dimensionality + 1):
-        # S[axis] = rho a dt for this axis; v . (rho a) dt is its kinetic work
-        kinetic_work = kinetic_work + primitive_state[axis] * S[axis]
-
-    internal_energy = jnp.maximum(
-        primitive_state[registered_variables.pressure_index], 0.0
-    ) / (params.gamma - 1.0)
+    kinetic_work = sum(
+        primitive_state[axis] * S[axis] for axis in range(1, config.dimensionality + 1)
+    )
     internal_work = S[energy_index] - kinetic_work
+    internal_rate = internal_work / jnp.maximum(dt, 1e-30)
+    budget = 0.5 * internal_energy * wave_speed / config.grid_spacing
     theta = jnp.where(
-        internal_work < 0.0,
-        jnp.clip(0.5 * internal_energy / jnp.maximum(-internal_work, 1e-30), 0.0, 1.0),
+        internal_rate < -budget,
+        budget / jnp.maximum(-internal_rate, 1e-30),
         1.0,
     )
     return S.at[energy_index].set(kinetic_work + theta * internal_work)

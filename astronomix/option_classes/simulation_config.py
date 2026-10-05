@@ -322,18 +322,34 @@ class GravityConfig(NamedTuple):
     #: Manual open boundary conditions in the Poisson solver.
     poisson_manual_open_boundaries: bool = False
 
-    #: Limit the energy-conserving coupling's internal-energy change (finite
-    #: difference, SECOND/FOURTH_ORDER_CONSERVATIVE). The conservative energy
-    #: source W charges the work done on mass crossing each half-cell to the
-    #: receiving cell, while the momentum source acts on the cell's own
-    #: momentum; the difference D = W - rho v.a is not kinetic and lands in the
-    #: internal energy. It is a truncation error where the pressure scale
-    #: height is resolved (e / rho >~ |g| dx / 2) and digs negative-pressure
-    #: holes where it is not (cold collapse, cloud edges). With this on, D is
-    #: applied with the largest weight in [0, 1] that removes at most half of
-    #: the cell's internal energy per stage, so conservation is exact wherever
-    #: the limiter is idle and the energy it rejects is the only violation.
+    #: Non-conservative backstop for the energy-conserving coupling (finite
+    #: difference, SECOND/FOURTH_ORDER_CONSERVATIVE): the part of the energy
+    #: source that is not the kinetic work of the momentum source is scaled
+    #: down wherever it would drain the internal energy faster than half of it
+    #: per wave-crossing time (a dt-independent rate budget). Use it together
+    #: with ``work_flux_correction``: that conservative correction removes the
+    #: dominant failure (half the climb of mass entering a cold or tenuous cell
+    #: charged to the receiver), and this backstop then only catches the work
+    #: no conservative split can pay for -- mass lifted against gravity by
+    #: numerical diffusion in cold gas -- so the energy it rejects is confined
+    #: to those cells.
     limit_internal_energy_work: bool = False
+
+    #: Flux-corrected gravitational work (finite difference,
+    #: SECOND/FOURTH_ORDER_CONSERVATIVE). Every conservative energy coupling
+    #: is a choice of the potential-energy flux q at each face,
+    #: S_E,i = -(1/dx) sum [(q - F phi_i)_{i+1/2} - (q - F phi_i)_{i-1/2}],
+    #: and conserves total energy for ANY q. The scheme's high-order q charges
+    #: half the climb of mass crossing a face to each side, so a cold or
+    #: tenuous receiver can be driven to negative pressure; the low-order
+    #: q = F phi_downwind charges the whole climb to the donor (the cell the
+    #: mass leaves). This option blends them face by face,
+    #: q = q_low + psi (q_high - q_low), with the largest psi in [0, 1] that
+    #: keeps every cell's internal-energy loss rate within half its internal
+    #: energy per wave-crossing time (Zalesak limiting with RATE budgets, so
+    #: psi does not depend on dt). Exactly conservative; high order wherever
+    #: psi = 1.
+    work_flux_correction: bool = False
 
     #: Master gravity switch. Set automatically in ``finalize_config`` to
     #: ``self_gravity or external_potential``; gates the gravity source-term
