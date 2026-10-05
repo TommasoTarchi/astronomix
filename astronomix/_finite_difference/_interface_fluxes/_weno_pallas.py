@@ -1562,8 +1562,6 @@ def _mhd_pallas_flux_supported(conserved_state, config: SimulationConfig) -> boo
         return False
     if not config.mhd:
         return False
-    if config.weno_positivity_preserving or config.weno_admissible_face_state:
-        return False  # not ported to the MHD kernels yet: native WENO
     if config.equation_of_state != IDEAL_GAS:
         return False  # isothermal MHD WENO Pallas kernel still TODO (guide §4.2)
     ndim = int(config.dimensionality)
@@ -1651,7 +1649,8 @@ def _weno_flux_mhd_pallas(
 
 def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
                               ncomp, num_modes, use_approx_rsqrt=False,
-                              g_stencil=None, dual_eta=None):
+                              g_stencil=None, dual_eta=None,
+                              admissible_face_state=False, positivity_preserving=False):
     """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
 
     ``q_stencil`` is the tuple ``(q[-2], q[-1], q[0], q[+1], q[+2], q[+3])`` where
@@ -1817,6 +1816,11 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
     bn2_over_rho_face = (Bn_face * Bn_face) / rho_face
 
     c_sq_face = gm1 * (h_face - 0.5 * (v2_face + b2_over_rho_face))
+    if admissible_face_state:
+        # sound speed from the averaged pressure (see the native
+        # _eigenvector_building_blocks): positive and frame independent
+        c_sq_face = gamma * (0.5 * (cell_l[13] + cell_r[13])) / rho_face
+        h_face = c_sq_face / gm1 + 0.5 * (v2_face + b2_over_rho_face)
     c_sq_face = jnp.maximum(c_sq_face, 0.0)
     c_face = jnp.sqrt(jnp.maximum(c_sq_face, sqrt_floor))
     c_sq_safe = jnp.where(c_sq_face > 0.0, c_sq_face, one_typed)
@@ -2103,6 +2107,20 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         for slot in range(ncomp)
     ]
 
+    if positivity_preserving:
+        # One splitting speed (the stencil's spectral radius) for every field
+        # (all ideal-MHD fields carry mass or energy); split fluxes kept apart.
+        common_speed = alpha_for_mode(0)
+        for mode in range(1, num_modes):
+            common_speed = jnp.maximum(common_speed, alpha_for_mode(mode))
+        central_state = [
+            (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot]
+             + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
+            for slot in range(ncomp)
+        ]
+        plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
+        minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
+
     for mode in range(num_modes):
         s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
         qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
@@ -2113,7 +2131,7 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
         dq4 = qproj[5] - qproj[4]
 
-        amx = alpha_for_mode(mode)
+        amx = common_speed if positivity_preserving else alpha_for_mode(mode)
 
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
@@ -2137,8 +2155,21 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
                  + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
+        if positivity_preserving:
+            plus_acc = add_right_correction(plus_acc, mode, -second)
+            minus_acc = add_right_correction(minus_acc, mode, third)
+            continue
+
         Fs = -second + third
         flux_acc = add_right_correction(flux_acc, mode, Fs)
+
+    if positivity_preserving:
+        no_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+        flux_acc = positivity_preserving_flux_local(
+            q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
+            plus_acc, minus_acc, no_shift, no_shift,
+            common_speed, gm1, rhomin, pgmin, ideal_gas=True, magnetic_slots=(4, 5, 6),
+        )
 
     return flux_acc
 
@@ -3448,6 +3479,8 @@ def _weno_flux_mhd_pallas_local(
             q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
             ncomp, num_modes,
             use_approx_rsqrt=config.backend_config.use_approximate_rsqrt,
+            admissible_face_state=config.weno_admissible_face_state,
+            positivity_preserving=config.weno_positivity_preserving,
             **window_kwargs,
         )
 
@@ -4165,10 +4198,8 @@ def _weno_flux_mhd_iso_pallas_local(
             flux_acc = positivity_preserving_flux_local(
                 q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
                 plus_acc, minus_acc, plus_shift, minus_shift,
-                common_speed, 0.0, rhomin, 0.0, ideal_gas=False,
+                common_speed, 0.0, rhomin, 0.0, ideal_gas=False, magnetic_slots=(4, 5, 6),
             )
-            # the normal-field slot carries no flux (CT owns B_normal)
-            flux_acc[4] = flux_acc[0] * 0.0
 
         zero = flux_acc[0] * 0.0
         for var in range(nvars):

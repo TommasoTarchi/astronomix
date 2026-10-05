@@ -242,16 +242,21 @@ def positivity_preserving_interface_flux(
 # operation for operation.
 
 
-def _local_gas_pressure(state, gm1):
-    """Ideal-gas pressure of a local (rho, m_n, m_t..., E) tuple (no floors)."""
+def _local_gas_pressure(state, gm1, magnetic_slots=()):
+    """Ideal-gas pressure of a local (rho, m_n, m_t..., [B...], E) tuple (no
+    floors); the magnetic components sit in ``magnetic_slots``."""
     density = jnp.maximum(state[0], 1e-30)
-    momentum_squared = state[1] * state[1]
-    for slot in range(2, len(state) - 1):
+    momentum_slots = [slot for slot in range(1, len(state) - 1) if slot not in magnetic_slots]
+    momentum_squared = state[momentum_slots[0]] * state[momentum_slots[0]]
+    for slot in momentum_slots[1:]:
         momentum_squared = momentum_squared + state[slot] * state[slot]
-    return gm1 * (state[-1] - 0.5 * momentum_squared / density)
+    internal_energy = state[-1] - 0.5 * momentum_squared / density
+    for slot in magnetic_slots:
+        internal_energy = internal_energy - 0.5 * state[slot] * state[slot]
+    return gm1 * internal_energy
 
 
-def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin, ideal_gas=True):
+def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin, ideal_gas=True, magnetic_slots=()):
     """``_admissible_scaling`` for local tuples (density only when not an
     ideal gas)."""
     owner_density = owner_state[0]
@@ -261,12 +266,12 @@ def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin, ideal_gas=T
     if not ideal_gas:
         return theta
 
-    owner_pressure = _local_gas_pressure(owner_state, gm1)
+    owner_pressure = _local_gas_pressure(owner_state, gm1, magnetic_slots)
     pressure_floor = jnp.minimum(pgmin, 0.5 * jnp.maximum(owner_pressure, 0.0))
     owner_margin = owner_pressure - pressure_floor
     for direction in (1.0, -1.0):
         end_state = tuple(owner_state[slot] + direction * theta * step[slot] for slot in range(len(step)))
-        end_margin = _local_gas_pressure(end_state, gm1) - pressure_floor
+        end_margin = _local_gas_pressure(end_state, gm1, magnetic_slots) - pressure_floor
         chord_root = theta * owner_margin / jnp.maximum(owner_margin - end_margin, 1e-30)
         theta = jnp.where(end_margin >= 0.0, theta, chord_root)
     return jnp.where(owner_margin > 0.0, theta, 0.0)
@@ -286,6 +291,7 @@ def positivity_preserving_flux_local(
     rhomin,
     pgmin,
     ideal_gas=True,
+    magnetic_slots=(),
 ):
     """``positivity_preserving_interface_flux`` for one interface of a
     Pallas WENO kernel (hydro: density and pressure; isothermal: density).
@@ -301,6 +307,8 @@ def positivity_preserving_flux_local(
         gm1: gamma - 1 (unused when not an ideal gas).
         rhomin, pgmin: The density and pressure floors.
         ideal_gas: Whether the pressure constraint applies.
+        magnetic_slots: Local slots of the magnetic field (MHD); the first is
+            the normal field, whose flux is set to zero.
 
     Returns:
         The interface flux as a list of local components.
@@ -316,10 +324,14 @@ def positivity_preserving_flux_local(
     plus_step = tuple(2.0 * plus_face_flux[slot] / alpha - plus_owner[slot] for slot in range(ncomp))
     minus_step = tuple(-2.0 * minus_face_flux[slot] / alpha - minus_owner[slot] for slot in range(ncomp))
 
-    plus_theta = _local_admissible_scaling(plus_owner, plus_step, gm1, rhomin, pgmin, ideal_gas)
-    minus_theta = _local_admissible_scaling(minus_owner, minus_step, gm1, rhomin, pgmin, ideal_gas)
-    return [
+    plus_theta = _local_admissible_scaling(plus_owner, plus_step, gm1, rhomin, pgmin, ideal_gas, magnetic_slots)
+    minus_theta = _local_admissible_scaling(minus_owner, minus_step, gm1, rhomin, pgmin, ideal_gas, magnetic_slots)
+    interface_flux = [
         0.5 * alpha * (plus_owner[slot] + plus_theta * plus_step[slot])
         - 0.5 * alpha * (minus_owner[slot] + minus_theta * minus_step[slot])
         for slot in range(ncomp)
     ]
+    if magnetic_slots:
+        # no normal-field flux (see positivity_preserving_interface_flux)
+        interface_flux[magnetic_slots[0]] = interface_flux[0] * 0.0
+    return interface_flux
