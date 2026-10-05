@@ -258,6 +258,8 @@ def _weno_flux_x_native(
         if config.weno_ad_frozen_weights:
             common_speed = jax.lax.stop_gradient(common_speed)
         keeps_own_speed = jnp.array([mode in mass_free_modes(config) for mode in range(num_modes)])
+        # the split-state shifts only exist when some field keeps its own speed
+        carries_shifts = len(mass_free_modes(config)) > 0
 
     def mode_flux(mode, F_current):
 
@@ -417,6 +419,9 @@ def _weno_flux_x_native(
             # Keep the two split fluxes apart. A field on its own (smaller)
             # speed also shifts the central part and the upwind cells' split
             # states along its eigenvector, by (own - common) speed.
+            if not carries_shifts:
+                plus_correction, minus_correction = F_current
+                return (plus_correction - R_col * second[None], minus_correction + R_col * third[None])
             plus_correction, minus_correction, plus_owner_shift, minus_owner_shift = F_current
             speed_offset = (amx - common_speed)[None]
             central_projection = (1.0 / 12.0) * (-q1 + 7.0 * q2 + 7.0 * q3 - q4)
@@ -438,9 +443,15 @@ def _weno_flux_x_native(
 
     if positivity_preserving:
         zero = jnp.zeros_like(F_interface)
-        plus_correction, minus_correction, plus_owner_shift, minus_owner_shift = jax.lax.fori_loop(
-            0, num_modes, mode_flux, (zero, zero, zero, zero)
-        )
+        if carries_shifts:
+            plus_correction, minus_correction, plus_owner_shift, minus_owner_shift = jax.lax.fori_loop(
+                0, num_modes, mode_flux, (zero, zero, zero, zero)
+            )
+        else:
+            plus_correction, minus_correction = jax.lax.fori_loop(
+                0, num_modes, mode_flux, (zero, zero)
+            )
+            plus_owner_shift = minus_owner_shift = 0.0
         return positivity_preserving_interface_flux(
             conserved_state,
             F,

@@ -400,6 +400,9 @@ def _hydro_step_rhs(
         and not config.positivity_config.deepvoid_blend
         and not config.positivity_config.preserving_flux
         and not config.positivity_config.coldcrush_blend
+        # the fused kernel carries neither WENO option
+        and not config.weno_positivity_preserving
+        and not config.weno_admissible_face_state
     )
 
     if use_fused_pallas:
@@ -657,6 +660,8 @@ def _lsrk4_hydro(
             and not config.positivity_config.deepvoid_blend
             and not config.positivity_config.preserving_flux
             and not config.positivity_config.coldcrush_blend
+            and not config.weno_positivity_preserving
+            and not config.weno_admissible_face_state
         )
 
         if use_fused_pallas:

@@ -225,3 +225,90 @@ def positivity_preserving_interface_flux(
     plus_flux = 0.5 * alpha * (plus_owner + plus_theta[None] * plus_step)
     minus_flux = -0.5 * alpha * (minus_owner + minus_theta[None] * minus_step)
     return plus_flux + minus_flux
+
+
+# -----------------------------------------------------------------------------
+# ↓ Pallas-kernel form (per-cell local component tuples) ↓
+# -----------------------------------------------------------------------------
+# The Pallas hydro kernel works on tuples of the LOCAL components
+# (rho, m_normal, m_tangential..., E) of one cell column; these mirror
+# _gas_pressure / _admissible_scaling / positivity_preserving_interface_flux
+# operation for operation.
+
+
+def _local_gas_pressure(state, gm1):
+    """Ideal-gas pressure of a local (rho, m_n, m_t..., E) tuple (no floors)."""
+    density = jnp.maximum(state[0], 1e-30)
+    momentum_squared = state[1] * state[1]
+    for slot in range(2, len(state) - 1):
+        momentum_squared = momentum_squared + state[slot] * state[slot]
+    return gm1 * (state[-1] - 0.5 * momentum_squared / density)
+
+
+def _local_admissible_scaling(owner_state, step, gm1, rhomin, pgmin):
+    """``_admissible_scaling`` for local tuples of an ideal gas."""
+    owner_density = owner_state[0]
+    density_floor = jnp.minimum(rhomin, 0.5 * owner_density)
+    theta = (owner_density - density_floor) / jnp.maximum(jnp.abs(step[0]), 1e-30)
+    theta = jnp.clip(jnp.where(owner_density > 0.0, theta, 0.0), 0.0, 1.0)
+
+    owner_pressure = _local_gas_pressure(owner_state, gm1)
+    pressure_floor = jnp.minimum(pgmin, 0.5 * jnp.maximum(owner_pressure, 0.0))
+    owner_margin = owner_pressure - pressure_floor
+    for direction in (1.0, -1.0):
+        end_state = tuple(owner_state[slot] + direction * theta * step[slot] for slot in range(len(step)))
+        end_margin = _local_gas_pressure(end_state, gm1) - pressure_floor
+        chord_root = theta * owner_margin / jnp.maximum(owner_margin - end_margin, 1e-30)
+        theta = jnp.where(end_margin >= 0.0, theta, chord_root)
+    return jnp.where(owner_margin > 0.0, theta, 0.0)
+
+
+def positivity_preserving_flux_local(
+    left_state,
+    right_state,
+    left_flux,
+    right_flux,
+    plus_face_flux,
+    minus_face_flux,
+    plus_owner_shift,
+    minus_owner_shift,
+    common_speed,
+    gm1,
+    rhomin,
+    pgmin,
+):
+    """``positivity_preserving_interface_flux`` for one interface of the
+    Pallas hydro kernel.
+
+    Args:
+        left_state, right_state: Local conserved tuples of cells i and i + 1.
+        left_flux, right_flux: Their physical fluxes.
+        plus_face_flux, minus_face_flux: The reconstructed split fluxes
+            (central part included).
+        plus_owner_shift, minus_owner_shift: Split-state shifts from the
+            fields on their own splitting speed.
+        common_speed: The common splitting speed.
+        gm1: gamma - 1.
+        rhomin, pgmin: The density and pressure floors.
+
+    Returns:
+        The interface flux as a list of local components.
+    """
+    ncomp = len(left_state)
+    alpha = jnp.maximum(common_speed, 1e-30)
+    plus_owner = tuple(
+        left_state[slot] + left_flux[slot] / alpha + plus_owner_shift[slot] for slot in range(ncomp)
+    )
+    minus_owner = tuple(
+        right_state[slot] - right_flux[slot] / alpha + minus_owner_shift[slot] for slot in range(ncomp)
+    )
+    plus_step = tuple(2.0 * plus_face_flux[slot] / alpha - plus_owner[slot] for slot in range(ncomp))
+    minus_step = tuple(-2.0 * minus_face_flux[slot] / alpha - minus_owner[slot] for slot in range(ncomp))
+
+    plus_theta = _local_admissible_scaling(plus_owner, plus_step, gm1, rhomin, pgmin)
+    minus_theta = _local_admissible_scaling(minus_owner, minus_step, gm1, rhomin, pgmin)
+    return [
+        0.5 * alpha * (plus_owner[slot] + plus_theta * plus_step[slot])
+        - 0.5 * alpha * (minus_owner[slot] + minus_theta * minus_step[slot])
+        for slot in range(ncomp)
+    ]

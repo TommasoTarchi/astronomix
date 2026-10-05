@@ -917,7 +917,8 @@ class SimulationConfig(NamedTuple):
     #: into tenuous gas blows up in two steps with the default, and is correct
     #: with this on). Changes smooth-flow results only at the level of the
     #: WENO dissipation (the basis moves by O(dx^2)). Ideal gas only (the
-    #: isothermal basis has a fixed sound speed); NATIVE_JAX backend only.
+    #: isothermal basis has a fixed sound speed). Pallas: hydro kernel; the
+    #: MHD WENO flux falls back to the native kernel.
     weno_admissible_face_state: bool = False
 
     #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
@@ -938,7 +939,8 @@ class SimulationConfig(NamedTuple):
     #: RAISES the pressure, so the proof survives and vortical modes keep the
     #: default dissipation. The price is in low-Mach ENTROPY waves (contacts),
     #: whose dissipation coefficient grows from |v| to |v| + c. Implies
-    #: ``weno_admissible_face_state``. NATIVE_JAX backend only.
+    #: ``weno_admissible_face_state``. Pallas: hydro kernel; the MHD WENO
+    #: flux falls back to the native kernel.
     weno_positivity_preserving: bool = False
 
     #: If > 0, ADD a relative contribution ``weno_epsilon_relative * (amx*|q|)^2``
@@ -1077,15 +1079,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
 
     # The positivity-preserving reconstruction evaluates its characteristic
     # basis at the admissible interface state, so it switches that on too.
-    # Both live in the native kernel only: an OPTIMAL_BACKEND request resolves
-    # to NATIVE_JAX, an explicit PALLAS request is refused below.
     if config.weno_positivity_preserving and not config.weno_admissible_face_state:
         config = config._replace(weno_admissible_face_state=True)
-    native_only_weno = config.weno_positivity_preserving or config.weno_admissible_face_state
-    if native_only_weno and config.backend_config.backend == OPTIMAL_BACKEND:
-        print("OPTIMAL_BACKEND: using the NATIVE_JAX backend "
-              "(weno_positivity_preserving / weno_admissible_face_state are native-only).")
-        config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
 
     # Resolve the OPTIMAL_BACKEND request into a concrete backend before any
     # downstream code inspects ``config.backend_config.backend``. PALLAS needs an Ampere-class
@@ -1149,12 +1144,12 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             "weno_epsilon_relative is implemented for the NATIVE_JAX backend "
             "only; pass BackendConfig(backend=NATIVE_JAX)."
         )
-    if native_only_weno and config.backend_config.backend == PALLAS:
-        raise ValueError(
-            "weno_positivity_preserving and weno_admissible_face_state are "
-            "implemented for the NATIVE_JAX backend only; pass "
-            "BackendConfig(backend=NATIVE_JAX) or leave the backend at "
-            "OPTIMAL_BACKEND."
+    if (config.weno_positivity_preserving or config.weno_admissible_face_state) \
+            and config.mhd and config.backend_config.backend == PALLAS:
+        print(
+            "NOTE: weno_positivity_preserving / weno_admissible_face_state are "
+            "ported to the Pallas HYDRO kernel only; the MHD WENO flux runs on "
+            "the native kernel (the rest of the step stays on Pallas)."
         )
     if config.weno_z and config.backend_config.backend == PALLAS:
         print(
