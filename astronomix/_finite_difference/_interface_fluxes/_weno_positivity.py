@@ -10,9 +10,9 @@ makes each split flux a scaled vector
     w~^+- = q +- F(q) / alpha,      z^+- = sum_s (alpha_s / alpha - 1) R_s (L_s q).
 
 ``w~`` is a physically admissible state (positive density, and pressure for
-an ideal gas) whenever ``alpha >= |v_n| + c`` for the Euler equations; ideal
-MHD needs a larger, state-dependent speed (see the admissible-splitting-speed
-section at the end of this module). Write ``theta`` for the
+an ideal gas) whenever ``alpha >= |v_n| + c`` for the Euler equations. For
+ideal MHD it is not (Wu 2018), and the scalings act on pairs of states
+instead (see ``_paired_scalings``). Write ``theta`` for the
 scaling of the WENO face value toward its upwind cell. Following Zhang & Shu
 (2012, J. Comput. Phys. 231, 2245), the forward-Euler update of a cell is a
 convex combination of admissible states if all of these hold:
@@ -167,14 +167,72 @@ def _admissible_fraction(
     return jnp.where(base_margin > 0.0, fraction, 0.0)
 
 
-def _upwind_split_states(conserved_state, cell_flux, common_speed):
+def _upwind_split_states(conserved_state, cell_flux, common_speed, axis=0):
     """The unshifted split states ``w~`` of the two upwind cells of each
     interface: ``q_i + F_i / alpha`` (for f^+) and ``q_{i+1} - F_{i+1} / alpha``
-    (for f^-)."""
+    (for f^-); ``axis`` is the spatial sweep axis."""
     alpha = jnp.maximum(common_speed, 1e-30)[None]
     plus_state = conserved_state + cell_flux / alpha
-    minus_state = _shift(conserved_state, -1, axis=1) - _shift(cell_flux, -1, axis=1) / alpha
+    minus_state = (
+        _shift(conserved_state, -1, axis=axis + 1) - _shift(cell_flux, -1, axis=axis + 1) / alpha
+    )
     return plus_state, minus_state
+
+
+# Ideal MHD: the split states q +- F / alpha of one cell are often not
+# admissible at the fast speed (Wu 2018), but the per-cell decomposition of
+# the forward-Euler update only needs two weighted PAIRS to be:
+#
+#   q_i^{n+1} = (1 - lambda S) q_i + (lambda S / 2) (own_i + in_i),   S = alpha_L + alpha_R,
+#   own_i = q_i - (alpha_R theta+_{i+1/2} d+_{i+1/2} + alpha_L theta-_{i-1/2} d-_{i-1/2}) / S,
+#   in_i  = (alpha_L w+_{i-1} + alpha_R w-_{i+1}) / S
+#           + (alpha_L theta+_{i-1/2} d+_{i-1/2} + alpha_R theta-_{i+1/2} d-_{i+1/2}) / S.
+#
+# The cell's own flux cancels in own_i, whose base is q_i itself; in_i's base is
+# the first-order Lax-Friedrichs inflow, in which the magnetic-tension terms of
+# the two neighbours cancel up to their B_n difference (Wu's generalized
+# splitting property; random low-beta pairs fail at the fast speed in ~1e-4
+# of cases, single split states in ~70 %). Each theta enters one pair of each
+# of its two cells; a pair is admissible for every theta in [0, t]^2 once the
+# corners (t, 0), (0, t), (t, t) are (convexity), and a face takes the
+# smaller t of its two pairs.
+
+
+def _pair_fraction(base, first, second, params, config, registered_variables):
+    """Largest t with base + a first + b second admissible for all a, b in [0, t]."""
+    return jnp.minimum(
+        jnp.minimum(
+            _admissible_fraction(base, first, params, config, registered_variables),
+            _admissible_fraction(base, second, params, config, registered_variables),
+        ),
+        _admissible_fraction(base, first + second, params, config, registered_variables),
+    )
+
+
+def _paired_scalings(
+    conserved_state, common_speed, plus_unshifted, minus_unshifted, plus_step, minus_step,
+    params, config, registered_variables, axis=0,
+):
+    """theta+ and theta- per interface (aligned with cell i) from the own and
+    inflow pairs of the cells on both sides."""
+    alpha_right = jnp.maximum(common_speed, 1e-30)
+    alpha_left = _shift(alpha_right, 1, axis=axis)
+    weight_sum = alpha_left + alpha_right
+    left_weight = (alpha_left / weight_sum)[None]
+    right_weight = (alpha_right / weight_sum)[None]
+
+    own_plus = -right_weight * plus_step
+    own_minus = -left_weight * _shift(minus_step, 1, axis=axis + 1)
+    own_fraction = _pair_fraction(conserved_state, own_plus, own_minus, params, config, registered_variables)
+
+    inflow_base = left_weight * _shift(plus_unshifted, 1, axis=axis + 1) + right_weight * minus_unshifted
+    inflow_plus = left_weight * _shift(plus_step, 1, axis=axis + 1)
+    inflow_minus = right_weight * minus_step
+    inflow_fraction = _pair_fraction(inflow_base, inflow_plus, inflow_minus, params, config, registered_variables)
+
+    plus_theta = jnp.minimum(own_fraction, _shift(inflow_fraction, -1, axis=axis))
+    minus_theta = jnp.minimum(inflow_fraction, _shift(own_fraction, -1, axis=axis))
+    return plus_theta, minus_theta
 
 
 def positivity_preserving_interface_flux(
@@ -188,11 +246,12 @@ def positivity_preserving_interface_flux(
     params: SimulationParams,
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
+    axis: int = 0,
 ):
     """Assemble the interface flux from admissibility-scaled split fluxes.
 
     Args:
-        conserved_state: Conserved state, the active axis leading the spatial axes.
+        conserved_state: Conserved state (variables first).
         cell_flux: Physical flux at the cell centres.
         common_speed: The largest wave speed on each interface's stencil.
         plus_face_flux: The reconstructed ``f_hat^+`` (central part included).
@@ -202,13 +261,15 @@ def positivity_preserving_interface_flux(
         params: The simulation parameters.
         config: The simulation configuration.
         registered_variables: The registered variables.
+        axis: The spatial sweep axis (0 for the native kernel, which moves the
+            active axis to the front).
 
     Returns:
         The interface flux at i + 1/2, aligned with cell i.
     """
 
     alpha = jnp.maximum(common_speed, 1e-30)[None]
-    plus_unshifted, minus_unshifted = _upwind_split_states(conserved_state, cell_flux, common_speed)
+    plus_unshifted, minus_unshifted = _upwind_split_states(conserved_state, cell_flux, common_speed, axis)
     plus_owner = plus_unshifted + plus_shift
     minus_owner = minus_unshifted + minus_shift
     plus_step = 2.0 * plus_face_flux / alpha - plus_owner
@@ -220,8 +281,14 @@ def positivity_preserving_interface_flux(
             _admissible_fraction(unshifted, -step, params, config, registered_variables),
         )
 
-    plus_theta = face_scaling(plus_owner, plus_unshifted, plus_step)
-    minus_theta = face_scaling(minus_owner, minus_unshifted, minus_step)
+    if config.mhd and config.equation_of_state == IDEAL_GAS:
+        plus_theta, minus_theta = _paired_scalings(
+            conserved_state, common_speed, plus_unshifted, minus_unshifted, plus_step, minus_step,
+            params, config, registered_variables, axis,
+        )
+    else:
+        plus_theta = face_scaling(plus_owner, plus_unshifted, plus_step)
+        minus_theta = face_scaling(minus_owner, minus_unshifted, minus_step)
     if config.weno_ad_frozen_weights:
         # theta is a nonlinear weight like the WENO omegas: freeze it with them
         plus_theta = jax.lax.stop_gradient(plus_theta)
@@ -229,13 +296,12 @@ def positivity_preserving_interface_flux(
 
     plus_flux = 0.5 * alpha * (plus_owner + plus_theta[None] * plus_step)
     minus_flux = -0.5 * alpha * (minus_owner + minus_theta[None] * minus_step)
-    interface_flux = plus_flux + minus_flux
-    if config.mhd:
-        # The normal field has no flux in the unlimited scheme (neither F nor
-        # any right eigenvector has a B_normal component); unequal scalings of
-        # the two split states would otherwise diffuse it. CT owns B_normal.
-        interface_flux = interface_flux.at[registered_variables.magnetic_index.x].set(0.0)
-    return interface_flux
+    # MHD: the normal-field component is the Lax-Friedrichs diffusion of B_n.
+    # It must stay: the convex decomposition behind positivity includes it,
+    # and with B_n held the energy would carry the magnetic energy of a B_n
+    # never applied (at low beta enough to make p negative). CT ignores this
+    # component and the cell-centred B is rebuilt from the faces, pressure held.
+    return plus_flux + minus_flux
 
 
 # -----------------------------------------------------------------------------
@@ -351,147 +417,29 @@ def positivity_preserving_flux_local(
         - 0.5 * alpha * (minus_owner[slot] + minus_theta * minus_step[slot])
         for slot in range(ncomp)
     ]
-    if magnetic_slots:
-        # no normal-field flux (see positivity_preserving_interface_flux)
-        interface_flux[magnetic_slots[0]] = interface_flux[0] * 0.0
+    # (the normal-field component stays; see positivity_preserving_interface_flux)
     return interface_flux
 
 
-# -----------------------------------------------------------------------------
-# ↓ Admissible splitting speed (ideal MHD) ↓
-# -----------------------------------------------------------------------------
-# For the Euler equations the split states q +- F / alpha are admissible as
-# soon as alpha >= |v_n| + c. For ideal MHD they are not, at any multiple of
-# the fast speed (Wu 2018, SIAM J. Numer. Anal. 56, 2124): with B along the
-# normal and v = 0,
-#
-#     p(q + F / alpha) / (gamma - 1) = p / (gamma - 1) - (p - B^2 / 2)^2 / (2 rho alpha^2),
-#
-# negative at low beta for alpha = c_f. The theta-scaling then has no
-# admissible base, returns theta = 0, and the face falls back to first-order
-# Rusanov in smooth flow (CP Alfven wave: order 0.2-0.6 instead of 5).
-#
-# The remedy inside the same argument is a larger splitting speed. The
-# pressure of q + s F is concave in s, so {s : p(q + s F) >= kappa p(q)} is an
-# interval [0, s*]: every alpha >= 1 / s* keeps both split states admissible,
-# with a fraction kappa of the cell's pressure left as room for the WENO step.
-# s* is bracketed between the chord root from s = 0 (admissible, as the chord
-# of a concave function lies below it) and 1 / spectral radius, and the
-# bracket is closed by geometric bisection (it can span many decades at low
-# beta) plus a final chord; the lower end is admissible throughout. The proof's CFL
-# condition lambda (alpha_left + alpha_right) <= 1 then holds with these
-# speeds, so the time step uses them too. At low beta and slow flow
-# alpha ~ 0.58 v_A / sqrt(beta) (kappa = 1/2): the price of provable positivity.
-
-ADMISSIBLE_PRESSURE_FRACTION = 0.5
-ADMISSIBLE_SPEED_ITERATIONS = 12
-MHD_MAGNETIC_SLOTS = (4, 5, 6)
-
-
-def local_mhd_normal_flux(state, gm1):
-    """Ideal-MHD flux along the normal of a local (rho, m_n, m_t1, m_t2, B_n,
-    B_t1, B_t2, E) tuple (no floors)."""
-    density, mn, mt1, mt2, bn, bt1, bt2, energy = state
-    inverse_density = 1.0 / density
-    vn, vt1, vt2 = mn * inverse_density, mt1 * inverse_density, mt2 * inverse_density
-    total_pressure = (
-        _local_gas_pressure(state, gm1, MHD_MAGNETIC_SLOTS) + 0.5 * (bn * bn + bt1 * bt1 + bt2 * bt2)
+def mhd_physical_flux(conserved_state, gamma, registered_variables: RegisteredVariables, axis: int):
+    """Ideal-MHD flux along spatial ``axis`` in the registered variable layout
+    (no floors, like the Pallas kernel's cell fluxes)."""
+    density = conserved_state[registered_variables.density_index]
+    momentum = [conserved_state[index] for index in registered_variables.momentum_index]
+    field = [conserved_state[index] for index in registered_variables.magnetic_index]
+    energy = conserved_state[registered_variables.energy_index]
+    velocity = [component / density for component in momentum]
+    magnetic_pressure = 0.5 * sum(component * component for component in field)
+    total_pressure = (gamma - 1.0) * (
+        energy - 0.5 * sum(m * v for m, v in zip(momentum, velocity)) - magnetic_pressure
+    ) + magnetic_pressure
+    v_dot_b = sum(v * b for v, b in zip(velocity, field))
+    flux = jnp.zeros_like(conserved_state)
+    flux = flux.at[registered_variables.density_index].set(momentum[axis])
+    for k, (m_index, b_index) in enumerate(zip(registered_variables.momentum_index, registered_variables.magnetic_index)):
+        momentum_flux = momentum[k] * velocity[axis] - field[axis] * field[k]
+        flux = flux.at[m_index].set(momentum_flux + total_pressure if k == axis else momentum_flux)
+        flux = flux.at[b_index].set(velocity[axis] * field[k] - field[axis] * velocity[k])
+    return flux.at[registered_variables.energy_index].set(
+        (energy + total_pressure) * velocity[axis] - field[axis] * v_dot_b
     )
-    v_dot_b = vn * bn + vt1 * bt1 + vt2 * bt2
-    return (
-        mn,
-        mn * vn + total_pressure - bn * bn,
-        mt1 * vn - bn * bt1,
-        mt2 * vn - bn * bt2,
-        0.0 * bn,
-        vn * bt1 - bn * vt1,
-        vn * bt2 - bn * vt2,
-        (energy + total_pressure) * vn - bn * v_dot_b,
-    )
-
-
-def local_admissible_speed(state, flux, spectral_radius, gm1, magnetic_slots=MHD_MAGNETIC_SLOTS):
-    """Splitting speed of a cell, at least its spectral radius, at which both
-    split states ``q +- F / alpha`` keep ``ADMISSIBLE_PRESSURE_FRACTION`` of the
-    cell's gas pressure (``state`` and ``flux`` are local tuples, energy last).
-    A cell without positive pressure keeps its spectral radius."""
-    pressure = _local_gas_pressure(state, gm1, magnetic_slots)
-    target = ADMISSIBLE_PRESSURE_FRACTION * jnp.maximum(pressure, 0.0)
-    s_radius = 1.0 / jnp.maximum(spectral_radius, 1e-30)
-
-    def margin(s, sign):
-        moved = tuple(state[slot] + (sign * s) * flux[slot] for slot in range(len(state)))
-        return _local_gas_pressure(moved, gm1, magnetic_slots) - target
-
-    speed = spectral_radius
-    for sign in (1.0, -1.0):
-        g_radius = margin(s_radius, sign)
-        g_zero = pressure - target
-        # bracket [s_lower, s_upper] of the root: the chord from s = 0 is
-        # admissible by concavity, s_radius is not
-        s_lower = s_radius * jnp.clip(g_zero / jnp.maximum(g_zero - g_radius, 1e-30), 0.0, 1.0)
-        s_upper = s_radius
-        for _ in range(ADMISSIBLE_SPEED_ITERATIONS):
-            # geometric bisection: the bracket ratio can be many decades
-            s_middle = jnp.sqrt(s_lower * s_upper)
-            admissible = margin(s_middle, sign) >= 0.0
-            s_lower = jnp.where(admissible, s_middle, s_lower)
-            s_upper = jnp.where(admissible, s_upper, s_middle)
-        # final chord across the bracket, admissible by concavity
-        g_lower = margin(s_lower, sign)
-        g_upper = margin(s_upper, sign)
-        s_final = s_lower + (s_upper - s_lower) * jnp.clip(
-            g_lower / jnp.maximum(g_lower - g_upper, 1e-30), 0.0, 1.0
-        )
-        needs_raise = (g_radius < 0.0) & (pressure > 0.0)
-        s_admissible = jnp.where(needs_raise, s_final, s_radius)
-        speed = jnp.maximum(speed, 1.0 / jnp.maximum(s_admissible, 1e-30))
-    return speed
-
-
-def _mhd_local_tuple(state, registered_variables: RegisteredVariables):
-    """(rho, m_x, m_y, m_z, B_x, B_y, B_z, E) of an x-normal conserved array."""
-    return (
-        state[registered_variables.density_index],
-        state[registered_variables.momentum_index.x],
-        state[registered_variables.momentum_index.y],
-        state[registered_variables.momentum_index.z],
-        state[registered_variables.magnetic_index.x],
-        state[registered_variables.magnetic_index.y],
-        state[registered_variables.magnetic_index.z],
-        state[registered_variables.energy_index],
-    )
-
-
-def admissible_splitting_speed(
-    conserved_state,
-    cell_flux,
-    spectral_radius,
-    common_speed,
-    gamma,
-    registered_variables: RegisteredVariables,
-):
-    """Raise the common splitting speed of each interface (ideal MHD, x normal)
-    to the admissible speeds of its two upwind cells, i and i + 1."""
-    cell_speed = local_admissible_speed(
-        _mhd_local_tuple(conserved_state, registered_variables),
-        _mhd_local_tuple(cell_flux, registered_variables),
-        spectral_radius,
-        gamma - 1.0,
-    )
-    return jnp.maximum(common_speed, jnp.maximum(cell_speed, _shift(cell_speed, -1, axis=0)))
-
-
-def mhd_admissible_signal_speed(density, velocity, magnetic, pressure, spectral_radius, gamma, axis):
-    """Per-cell admissible splitting speed along ``axis`` from primitives, for
-    the time step (``velocity`` and ``magnetic`` are (x, y, z) triples)."""
-    order = (axis,) + tuple(k for k in range(3) if k != axis)
-    momentum = tuple(density * velocity[k] for k in order)
-    field = tuple(magnetic[k] for k in order)
-    energy = (
-        pressure / (gamma - 1.0)
-        + 0.5 * density * sum(velocity[k] * velocity[k] for k in range(3))
-        + 0.5 * sum(magnetic[k] * magnetic[k] for k in range(3))
-    )
-    state = (density,) + momentum + field + (energy,)
-    return local_admissible_speed(state, local_mhd_normal_flux(state, gamma - 1.0), spectral_radius, gamma - 1.0)

@@ -359,7 +359,7 @@ def _ssprk4_with_ct(
     return ssprk4(
         (conserved_state, bx_interface, by_interface, bz_interface),
         dt, rhs=rhs, pre_stage=_stage_remat(pre_stage, config),
-        post_stage=_stage_remat(post_stage, config) if resync_stages else (lambda u: u),
+        **({"post_stage": _stage_remat(post_stage, config)} if resync_stages else {}),
         finalize=_stage_remat(finalize, config),
     )
 

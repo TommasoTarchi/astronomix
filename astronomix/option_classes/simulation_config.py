@@ -960,15 +960,18 @@ class SimulationConfig(NamedTuple):
     #: upwind split state by the largest theta in [0, 1] keeping it, and its
     #: mirror about q +- F/alpha, admissible (positive density; positive
     #: pressure for an ideal gas; closed form, as pressure is concave). theta = 1
-    #: in smooth flow. For ideal MHD q +- F/alpha is NOT admissible at the fast
-    #: speed when beta is low (Wu 2018, SIAM J. Numer. Anal. 56, 2124); alpha is
-    #: then raised per cell until both split states keep half the cell's
-    #: pressure (~0.58 v_A / sqrt(beta) in slow field-aligned flow), and the
-    #: time step uses the raised speeds. Without that raise theta = 0 and the
-    #: face is first-order Rusanov in smooth flow. Each forward-Euler stage is
-    #: then positivity preserving for C_cfl <= 1/2 (sum-of-speeds CFL), i.e.
-    #: 0.75 with SSPRK4. Implies ``weno_admissible_face_state``. Native and
-    #: Pallas (not the fused WENO+divergence kernel, which is then skipped).
+    #: in smooth flow. For ideal MHD a single q +- F/alpha is often NOT
+    #: admissible at the fast speed when beta is low (Wu 2018, SIAM J. Numer.
+    #: Anal. 56, 2124), so theta acts on the two weighted pairs of each cell's
+    #: update instead: its own two mirror states (the cell's flux cancels; base
+    #: q_i) and its two inflow states (Wu's generalized splitting: the
+    #: magnetic-tension terms of the neighbours cancel). The SSPRK stages then
+    #: rebuild the cell-centred B from the faces, pressure held, so each
+    #: increment starts from the state it was evaluated at. Each forward-Euler
+    #: stage is positivity preserving for C_cfl <= 1/2 (sum-of-speeds CFL),
+    #: i.e. 0.75 with SSPRK4 (ideal MHD: up to the rare inadmissible inflow
+    #: base, where theta = 0). Implies ``weno_admissible_face_state``. Native
+    #: and Pallas (not the fused WENO+divergence kernel, which is then skipped).
     weno_positivity_preserving: bool = False
 
     #: If > 0, ADD a relative contribution ``weno_epsilon_relative * (amx*|q|)^2``

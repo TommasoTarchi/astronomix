@@ -108,12 +108,19 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, post_stage=_identity, finalize=_
         u_formed = jax.tree_util.tree_map(
             lambda q0_, c_, r_: k0 * q0_ + kcurr * c_ + r_, u0, u_curr, du
         )
-        u_curr = post_stage(u_formed)
-        # u_final <- u_final + ff * u_curr (the raw share on u as formed)
-        ff_raw = final_raw_s[stage_idx]
-        u_final = jax.tree_util.tree_map(
-            lambda f_, c_, r_: f_ + (ff - ff_raw) * c_ + ff_raw * r_, u_final, u_curr, u_formed
-        )
+        if post_stage is _identity:
+            u_curr = u_formed
+            # u_final <- u_final + ff * u_curr
+            u_final = jax.tree_util.tree_map(
+                lambda f_, c_: f_ + ff * c_, u_final, u_curr
+            )
+        else:
+            u_curr = post_stage(u_formed)
+            # u_final <- u_final + ff * u_curr (the raw share on u as formed)
+            ff_raw = final_raw_s[stage_idx]
+            u_final = jax.tree_util.tree_map(
+                lambda f_, c_, r_: f_ + (ff - ff_raw) * c_ + ff_raw * r_, u_final, u_curr, u_formed
+            )
 
         return (u_curr, u_final)
 
