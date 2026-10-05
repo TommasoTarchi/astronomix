@@ -279,31 +279,77 @@ This is why the conservative schemes were known to NaN below 128³, and why
 warm Evrard (e0 = 0.2) is fine at 32³. Late in the collapse g ~ 5 at r ~ 0.45,
 which violates the criterion again at 64³, exactly where the holes are.
 
-Measured with `GravityConfig.limit_internal_energy_work` (implemented,
-opt-in). The non-kinetic part `D = W - v.(rho a)` of the conservative energy
-source is applied with the largest weight that removes at most half of the
-cell's internal energy per stage. That gives exact conservation where the
-limiter is idle and positivity everywhere. Cold Evrard, PP-WENO hydro:
+### A principled conservative fix: flux-corrected gravitational work
 
-| N | conservative | conservative + limit | KE-only source |
-|---|---|---|---|
-| 32 | dE/E 1.2e-5, min p -0.046 | **dE/E 7 %, p > 0 at every snapshot** | (70 %) |
-| 64 | dE/E 3e-5, min p -0.015 | **dE/E 0.9 %, p > 0** | 41 % |
-| 128 | dE/E 7e-5, min p -6e-4 | **dE/E 2e-4, p > 0** | 20 % |
+Every conservative energy coupling is a choice of **potential-energy flux**
+`q` at the faces:
 
-At 32³ the conservative scheme "conserves" energy only by storing ~7 % of
-the budget as negative internal energy. There, conservation and positivity
-are incompatible, and the limited coupling makes the trade visible and local.
+    S_E,i = -(1/dx) sum_axes [ (q - F phi_i)_{i+1/2} - (q - F phi_i)_{i-1/2} ].
 
-Other remedies (coupling-level, not WENO-level):
+The face's total work is always `-F (phi_R - phi_L)`, so total energy is
+conserved for *any* `q`. The scheme's fourth-order `q ~ F phi_face` (plus its
+correction) charges half the climb to each side. **Donor accounting is exactly
+`q = F phi_downwind`**: the donor pays the whole climb, at first order.
 
-* KE-only source `rho v.g`: positive, but energy error 41 % at 64³ and 20 % at 128³.
-* Conservative + dual energy: positive, but dE/E ~ 5 % at 32³, because the
-  primitive state carried between steps resets E from g.
-* Charge the work to the kinetic energy along g (solve for the momentum
-  increment), falling back to internal energy only when that budget is
-  exhausted. This changes the momentum source at unresolved edges, so it is a
-  physics decision.
+`GravityConfig.work_flux_correction` blends the two face by face with
+flux-corrected transport:
+
+    q = q_low + psi (q_high - q_low).
+
+* **Conservation:** exact for every `psi`.
+* **Order:** high wherever `psi = 1`.
+* **Limiter:** `psi` comes from Zalesak budgets on the internal-energy loss
+  *rate* (half the internal energy per wave-crossing time `dx / (|v| + c)`).
+  `psi` therefore depends on the state only, never on `dt`.
+
+**The residual no conservative split can fix.** The remaining drain is
+`D = W - v.(rho a) ~ (F - m) . g`. Here `F - m` is the Lax-Friedrichs mass
+diffusion at unresolved density gradients. In the failing cells (cloud
+surface, density x4.5 per cell, cold infall) the face mass fluxes point
+outward while the gas falls inward. `GravityConfig.limit_internal_energy_work`
+is a **non-conservative** backstop for exactly this. It uses the same
+dt-independent rate budget and is confined to those cells.
+
+Cold Evrard (e0 = 0.05, PP-WENO hydro, fp32), dE/E and pressure:
+
+| N | conservative | + flux-corrected work | + backstop | KE-only source |
+|---|---|---|---|---|
+| 32 | 1.2e-5, min p -0.046 (~1000 cells from t = 0.05) | **1.0e-5**, no p < 0 before t ~ 0.5, then <= 168 cells at -2e-6 | 3 %, p > 0 at every snapshot | 70 % (default WENO) |
+| 64 | 3e-5, min p -0.015 | **2.9e-5, p > 0** at the end | 3e-4, p > 0 | 41 % |
+| 128 | 7e-5, min p -6e-4 | **6.8e-5, p > 0** | 7.0e-5 (idle) | 20 % |
+
+Tried and dropped: crediting the hydrodynamic stage heating in the budgets.
+With the flux correction it let through splits whose heating did not
+materialise (min p -5e-4). In the backstop, debiting expansion cooling made
+it reject 10x more energy at 64³.
+
+### Temporal convergence of conservation (fixed dt)
+
+Mild Evrard (e0 = 0.2), 32³, float64, fourth-order coupling, dE/E for
+250 / 500 / 1000 / 2000 / 4000 steps (`evrard_dt.py`). The repository's
+`evrard_timestep_convergence` setup:
+
+| scheme | dE/E | observed orders |
+|---|---|---|
+| legacy | 3.2e-9 ... 2.5e-13 | 2.8, 3.5, 5.0 (then round-off) |
+| face state (default) | 4.8e-9 ... 1.0e-13 | 2.6, 3.1, 3.7, 6.0 |
+| face + flux-corrected work | 5.1e-9 ... 5.5e-14 | 2.6, 3.2, 3.8, 6.9 |
+| PP-WENO | 2.4e-9 ... 8.0e-13 | 2.3, 2.6, 2.9, 3.8 |
+| PP + flux-corrected work | 4.0e-9 ... 1.1e-12 | 2.4, 2.7, 3.0, 3.7 |
+| PP + flux-corrected + backstop | 4.7e-5 at every dt | plateau |
+| first (per-stage, dt-dependent) limiter | 2.1e-3 at every dt | plateau |
+
+What the table shows:
+
+* **Flux correction:** the dt-independent flux correction leaves temporal
+  convergence untouched.
+* **PP-WENO:** its theta and speeds are also dt-independent. The scheme still
+  conserves energy exactly in the dt -> 0 limit, but at ~3rd rather than ~4th
+  order: theta's clipping makes the right-hand side only Lipschitz, which
+  costs RK4 order at switching events.
+* **Backstops:** any non-conservative backstop plateaus by construction. Use
+  one only where strict positivity at unresolved resolution matters more than
+  conservation.
 
 ## Costs
 
