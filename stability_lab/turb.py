@@ -1,0 +1,216 @@
+"""Driven supersonic turbulence (HOW-MHD ISM case) with every protection switchable.
+
+Mirrors ``examples/scripts/forward/mhd/turbulence/paper_turbulence.py`` (OU
+forcing, v_rms ~ 1 normalisation, a = 1 / M_turb, B along z), but defaults to
+NO stabilisation at all and records min(rho), max|v| and the first NaN through
+a snapshot callback. The last finite state before a blow-up is written to disk
+for forensics.
+
+    PYTHONPATH=. python stability_lab/turb.py --N 64 --tag bare
+"""
+
+# general
+import argparse
+import os
+import time as walltime
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--N", type=int, default=64)
+parser.add_argument("--mturb", type=float, default=10.0)
+parser.add_argument("--beta", type=float, default=0.1)
+parser.add_argument("--eos", choices=["iso", "adiabatic"], default="iso")
+parser.add_argument("--mhd", type=int, default=1)
+parser.add_argument("--cfl", type=float, default=1.5)
+parser.add_argument("--rhomin", type=float, default=1e-10)
+parser.add_argument("--tcross", type=float, default=5.0)
+parser.add_argument("--nsnap", type=int, default=100)
+parser.add_argument("--backend", choices=["native", "pallas"], default="native")
+parser.add_argument("--precision", type=int, default=32)
+parser.add_argument("--prot", type=int, default=0)
+parser.add_argument("--stage", choices=["none", "floor", "redist"], default="none")
+parser.add_argument("--step", choices=["none", "floor", "redist"], default="none")
+parser.add_argument("--vacuum-rest", type=int, default=0)
+parser.add_argument("--blend", type=int, default=0)
+parser.add_argument("--pp", type=int, default=0)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--tag", required=True)
+args = parser.parse_args()
+
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+    autocvd(num_gpus=1)
+if args.precision == 64:
+    os.environ["JAX_ENABLE_X64"] = "1"
+
+# ruff: noqa: E402
+# numerics
+import numpy as np
+
+import sys as _sys
+_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+from weno_variant import weno_variant_kwargs, weno_variant_name
+
+# jax
+import jax
+import jax.numpy as jnp
+
+# astronomix
+from astronomix import (
+    BackendConfig,
+    BoundarySettings,
+    BoundarySettings1D,
+    NATIVE_JAX,
+    PALLAS,
+    PERIODIC_BOUNDARY,
+    PositivityConfig,
+    SimulationConfig,
+    SimulationParams,
+    construct_primitive_state,
+    finalize_config,
+    get_registered_variables,
+    initialize_interface_fields,
+    time_integration,
+)
+from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
+    TurbulentForcingConfig,
+    TurbulentForcingParams,
+)
+from astronomix.option_classes.simulation_config import (
+    DOUBLE_PRECISION,
+    IDEAL_GAS,
+    ISOTHERMAL,
+    POSITIVITY_HARD_FLOOR,
+    POSITIVITY_NONE,
+    POSITIVITY_REDISTRIBUTE,
+    SINGLE_PRECISION,
+)
+
+POSITIVITY_MODES = dict(none=POSITIVITY_NONE, floor=POSITIVITY_HARD_FLOOR, redist=POSITIVITY_REDISTRIBUTE)
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "turb")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+rho0 = 1.0
+gamma = 5.0 / 3.0
+sound_speed = 1.0 / args.mturb
+adiabatic = args.eos == "adiabatic"
+pressure0 = rho0 * sound_speed**2 / gamma if adiabatic else None
+thermal_pressure = pressure0 if adiabatic else sound_speed**2 * rho0
+magnetic_field0 = float(np.sqrt(2.0 * thermal_pressure / args.beta))
+periodic = BoundarySettings1D(left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY)
+
+config = SimulationConfig(
+    equation_of_state=IDEAL_GAS if adiabatic else ISOTHERMAL,
+    dimensionality=3,
+    num_cells=args.N,
+    box_size=1.0,
+    mhd=bool(args.mhd),
+    random_seed=args.seed,
+    numerical_precision=DOUBLE_PRECISION if args.precision == 64 else SINGLE_PRECISION,
+    backend_config=BackendConfig(backend=NATIVE_JAX if args.backend == "native" else PALLAS),
+    boundary_settings=BoundarySettings(periodic, periodic, periodic),
+    turbulent_forcing_config=TurbulentForcingConfig(
+        turbulent_forcing=True, ou_forcing=True, vacuum_protection=bool(args.prot),
+    ),
+    positivity_config=PositivityConfig(
+        per_stage_mode=POSITIVITY_MODES[args.stage],
+        per_step_mode=POSITIVITY_MODES[args.step],
+        vacuum_rest=bool(args.vacuum_rest),
+        deepvoid_blend=bool(args.blend),
+        preserving_flux=bool(args.pp),
+    ),
+    return_snapshots=False,
+    activate_snapshot_callback=True,
+    num_snapshots=args.nsnap,
+    **weno_variant_kwargs(),
+)
+t_cross = 0.5
+params = SimulationParams(
+    C_cfl=args.cfl,
+    gamma=gamma,
+    isothermal_sound_speed=sound_speed,
+    t_end=args.tcross * t_cross,
+    turbulent_forcing_params=TurbulentForcingParams(
+        forcing_amplitude=3.5,
+        correlation_time=0.5,
+        forcing_wavenumber=3.0 * np.pi,
+        protection_density_threshold=args.rhomin,
+        protection_max_velocity=50.0,
+    ),
+    minimum_density=args.rhomin,
+    minimum_pressure=1e-10,
+)
+
+registered_variables = get_registered_variables(config)
+density = jnp.full((args.N,) * 3, rho0, dtype=jnp.float32)
+zero = jnp.zeros_like(density)
+initial = dict(
+    config=config, registered_variables=registered_variables, density=density,
+    velocity_x=zero, velocity_y=zero, velocity_z=zero,
+)
+if args.mhd:
+    magnetic_z = jnp.full_like(density, magnetic_field0)
+    bx_face, by_face, bz_face = initialize_interface_fields(zero, zero, magnetic_z)
+    initial.update(
+        magnetic_field_x=zero, magnetic_field_y=zero, magnetic_field_z=magnetic_z,
+        interface_magnetic_field_x=bx_face, interface_magnetic_field_y=by_face,
+        interface_magnetic_field_z=bz_face,
+    )
+if adiabatic:
+    initial["gas_pressure"] = jnp.full_like(density, pressure0)
+initial_state = construct_primitive_state(**initial)
+config = finalize_config(config, initial_state.shape)
+
+density_index = registered_variables.density_index
+vx, vy, vz = (registered_variables.velocity_index.x, registered_variables.velocity_index.y,
+              registered_variables.velocity_index.z)
+face = weno_variant_name()
+lab = os.environ.get("ASTX_LAB", "")
+label = f"{args.tag} face={face} lab={lab}"
+records = []
+last_good = {"state": None, "t": None}
+first_nan = {"t": None}
+
+
+def diagnostics(time, state, registered_variables):
+    rho = state[density_index]
+    speed = jnp.sqrt(state[vx] ** 2 + state[vy] ** 2 + state[vz] ** 2)
+    stats = jnp.stack([
+        time, jnp.min(rho), jnp.max(rho), jnp.max(speed),
+        jnp.sqrt(jnp.mean(speed**2)),
+        jnp.any(~jnp.isfinite(state)).astype(jnp.float32),
+    ])
+
+    def host(stats_array, full_state):
+        t, rho_min, rho_max, v_max, v_rms, nan = [float(x) for x in np.asarray(stats_array)]
+        records.append((t, rho_min, rho_max, v_max, v_rms, nan))
+        if nan > 0 or rho_min <= 0:
+            if first_nan["t"] is None:
+                first_nan["t"] = t
+        else:
+            last_good["state"] = np.asarray(full_state)
+            last_good["t"] = t
+        print(f"[{label}] t/tc={t/t_cross:.3f} min_rho={rho_min:.3e} max_rho={rho_max:.3e} "
+              f"max|v|={v_max:.3f} v_rms={v_rms:.3f} bad={int(nan > 0 or rho_min <= 0)}", flush=True)
+
+    jax.debug.callback(host, stats, state)
+
+
+start = walltime.time()
+time_integration(initial_state, config, params, registered_variables, diagnostics)
+elapsed = walltime.time() - start
+records = np.array(sorted(records))
+np.savetxt(os.path.join(OUT_DIR, f"diag_{args.tag}.txt"), records,
+           header="t min_rho max_rho max_v v_rms bad")
+t_last = float(np.nanmax(records[:, 0])) if len(records) else 0.0
+if first_nan["t"] is not None:
+    verdict = f"FAILED (NaN) after t/tc={t_last / t_cross:.3f}"
+elif t_last < 0.999 * params.t_end:
+    verdict = f"ABORTED (dt collapse) at t/tc={t_last / t_cross:.3f}"
+else:
+    verdict = "COMPLETE"
+print(f"RESULT [{label}] N={args.N} M={args.mturb} beta={args.beta} eos={args.eos} cfl={args.cfl} "
+      f"rhomin={args.rhomin}: {verdict}; min rho over run={np.nanmin(records[:,1]):.3e} "
+      f"max|v|={np.nanmax(records[:,3]):.2f} wall={elapsed:.0f}s", flush=True)
+if first_nan["t"] is not None and last_good["state"] is not None:
+    np.savez(os.path.join(OUT_DIR, f"lastgood_{args.tag}.npz"), state=last_good["state"],
+             t=last_good["t"])

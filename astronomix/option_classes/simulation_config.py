@@ -905,6 +905,42 @@ class SimulationConfig(NamedTuple):
     #: Absolute floor in the WENO smoothness denominators (JS and Z).
     weno_epsilon: float = 1e-7
 
+    #: Evaluate the characteristic basis of the WENO projection at an
+    #: ADMISSIBLE interface state: the interface sound speed comes from the
+    #: averaged pressure, c^2 = gamma <p> / <rho>, and the enthalpy is rebuilt
+    #: from it. The default recovers c^2 = (gamma - 1)(<h> - v^2/2) from an
+    #: UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that combination
+    #: is not the state of any gas, is not Galilean invariant, and at a density
+    #: jump (ratio >~ 10) carrying a velocity jump of a few sound speeds its
+    #: c^2 is negative -- the clamp then zeroes the acoustic upwind correction
+    #: exactly at the strongest jumps (a cold dense slab rammed at Mach ~800
+    #: into tenuous gas blows up in two steps with the default, and is correct
+    #: with this on). Changes smooth-flow results only at the level of the
+    #: WENO dissipation (the basis moves by O(dx^2)). Ideal gas only (the
+    #: isothermal basis has a fixed sound speed); NATIVE_JAX backend only.
+    weno_admissible_face_state: bool = False
+
+    #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
+    #: 2245). Every characteristic field that carries mass is split with ONE
+    #: speed alpha (the stencil's spectral radius), so the two split fluxes
+    #: are f^+- = +-(alpha/2) w^+- with w^+- = q +- F/alpha physically
+    #: admissible states. The WENO face value of each split state is then
+    #: pulled toward its upwind cell's w by the largest theta in [0, 1] that
+    #: keeps both the face value and its mirror 2w - w_face admissible
+    #: (positive density; positive pressure for an ideal gas) -- equivalently,
+    #: the WENO weights acquire a first-order candidate whose weight is set by
+    #: admissibility rather than smoothness. theta = 1 in smooth flow, so the
+    #: scheme stays fifth order; the update is then positivity preserving
+    #: for C_cfl <= 1/2 per forward-Euler stage (sum-of-speeds CFL), and in
+    #: practice robust well beyond. Fields that carry no mass (hydrodynamic
+    #: shear waves, isothermal Alfven waves) keep their own splitting speed:
+    #: their split-state correction leaves the density unchanged and only
+    #: RAISES the pressure, so the proof survives and vortical modes keep the
+    #: default dissipation. The price is in low-Mach ENTROPY waves (contacts),
+    #: whose dissipation coefficient grows from |v| to |v| + c. Implies
+    #: ``weno_admissible_face_state``. NATIVE_JAX backend only.
+    weno_positivity_preserving: bool = False
+
     #: If > 0, ADD a relative contribution ``weno_epsilon_relative * (amx*|q|)^2``
     #: to the WENO epsilon, where ``q`` is the local characteristic variable and
     #: ``amx`` the family's dissipation coefficient — i.e. compare the
@@ -1039,6 +1075,18 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         The finalized simulation configuration.
     """
 
+    # The positivity-preserving reconstruction evaluates its characteristic
+    # basis at the admissible interface state, so it switches that on too.
+    # Both live in the native kernel only: an OPTIMAL_BACKEND request resolves
+    # to NATIVE_JAX, an explicit PALLAS request is refused below.
+    if config.weno_positivity_preserving and not config.weno_admissible_face_state:
+        config = config._replace(weno_admissible_face_state=True)
+    native_only_weno = config.weno_positivity_preserving or config.weno_admissible_face_state
+    if native_only_weno and config.backend_config.backend == OPTIMAL_BACKEND:
+        print("OPTIMAL_BACKEND: using the NATIVE_JAX backend "
+              "(weno_positivity_preserving / weno_admissible_face_state are native-only).")
+        config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
+
     # Resolve the OPTIMAL_BACKEND request into a concrete backend before any
     # downstream code inspects ``config.backend_config.backend``. PALLAS needs an Ampere-class
     # (compute capability >= 8.0) GPU for its Triton kernels; anywhere else we
@@ -1100,6 +1148,13 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         raise ValueError(
             "weno_epsilon_relative is implemented for the NATIVE_JAX backend "
             "only; pass BackendConfig(backend=NATIVE_JAX)."
+        )
+    if native_only_weno and config.backend_config.backend == PALLAS:
+        raise ValueError(
+            "weno_positivity_preserving and weno_admissible_face_state are "
+            "implemented for the NATIVE_JAX backend only; pass "
+            "BackendConfig(backend=NATIVE_JAX) or leave the backend at "
+            "OPTIMAL_BACKEND."
         )
     if config.weno_z and config.backend_config.backend == PALLAS:
         print(
