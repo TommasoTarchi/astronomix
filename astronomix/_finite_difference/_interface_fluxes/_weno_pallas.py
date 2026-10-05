@@ -45,7 +45,7 @@ from astronomix._pallas_helpers import (
     pltriton,
 )
 from astronomix._finite_difference._interface_fluxes._weno_positivity import (
-    admissible_speed_fraction_local,
+    mass_free_modes,
     positivity_preserving_flux_local,
 )
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
@@ -940,6 +940,8 @@ def _weno_flux_hydro_pallas_local(
     tiny = 1e-14
     admissible_face_state = config.weno_admissible_face_state
     positivity_preserving = config.weno_positivity_preserving
+    # fields that carry no mass keep their own splitting speed
+    own_speed_modes = mass_free_modes(config) if positivity_preserving else ()
 
     # Output block specs keep the conserved-variable axis complete and block only
     # the spatial dimensions.
@@ -1247,22 +1249,6 @@ def _weno_flux_hydro_pallas_local(
             plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
             minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-            # Pre-pass: the shifts of every stencil cell's split states with every
-            # field on its own speed, and the largest fraction eta of the way
-            # there that keeps all of them admissible (see _weno_positivity.py).
-            stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
-            for mode in range(num_modes):
-                relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-                stencil_shifts = [
-                    add_right_correction(
-                        stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
-                    )
-                    for k in range(6)
-                ]
-            speed_fraction = admissible_speed_fraction_local(
-                q_stencil, f_stencil, common_speed, stencil_shifts, gm1, rhomin, pgmin,
-                ideal_gas=True, magnetic_slots=(),
-            )
 
         for mode in range(num_modes):
             s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
@@ -1281,8 +1267,8 @@ def _weno_flux_hydro_pallas_local(
             dq4 = qproj[5] - qproj[4]
 
             amx = alpha_for_mode(mode)
-            if positivity_preserving:
-                amx = common_speed - speed_fraction * (common_speed - amx)
+            if positivity_preserving and mode not in own_speed_modes:
+                amx = common_speed
 
             aterm_p = 0.5 * (d0 + amx * dq0)
             bterm_p = 0.5 * (d1 + amx * dq1)
@@ -1318,16 +1304,17 @@ def _weno_flux_hydro_pallas_local(
                 minus_acc = add_right_correction(minus_acc, mode, third)
                 # a field on its own speed also shifts the central part and
                 # the upwind cells' split states along its eigenvector
-                speed_offset = amx - common_speed
-                central_projection = (
-                    -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
-                ) * (1.0 / 12.0)
-                central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
-                plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
-                minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
-                relative_offset = speed_offset / safe_speed
-                plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
-                minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+                if mode in own_speed_modes:
+                    speed_offset = amx - common_speed
+                    central_projection = (
+                        -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                    ) * (1.0 / 12.0)
+                    central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                    plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                    minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                    relative_offset = speed_offset / safe_speed
+                    plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                    minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
                 continue
 
             Fs = -second + third
@@ -2120,6 +2107,7 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         for slot in range(ncomp)
     ]
 
+    own_speed_modes = ()  # every ideal-MHD field carries mass or energy
     if positivity_preserving:
         # The reference splitting speed (the stencil's spectral radius) and
         # the two split fluxes kept apart, as in the native kernel.
@@ -2137,22 +2125,6 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
         minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-        # Pre-pass: the shifts of every stencil cell's split states with every
-        # field on its own speed, and the largest fraction eta of the way
-        # there that keeps all of them admissible (see _weno_positivity.py).
-        stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
-        for mode in range(num_modes):
-            relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-            stencil_shifts = [
-                add_right_correction(
-                    stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
-                )
-                for k in range(6)
-            ]
-        speed_fraction = admissible_speed_fraction_local(
-            q_stencil, f_stencil, common_speed, stencil_shifts, gm1, rhomin, pgmin,
-            ideal_gas=True, magnetic_slots=(4, 5, 6),
-        )
 
     for mode in range(num_modes):
         s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
@@ -2165,8 +2137,8 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         dq4 = qproj[5] - qproj[4]
 
         amx = alpha_for_mode(mode)
-        if positivity_preserving:
-            amx = common_speed - speed_fraction * (common_speed - amx)
+        if positivity_preserving and mode not in own_speed_modes:
+            amx = common_speed
 
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
@@ -2194,16 +2166,17 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
             zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
             plus_acc = add_right_correction(plus_acc, mode, -second)
             minus_acc = add_right_correction(minus_acc, mode, third)
-            speed_offset = amx - common_speed
-            central_projection = (
-                -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
-            ) * (1.0 / 12.0)
-            central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
-            plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
-            minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
-            relative_offset = speed_offset / safe_speed
-            plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
-            minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+            if mode in own_speed_modes:
+                speed_offset = amx - common_speed
+                central_projection = (
+                    -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                ) * (1.0 / 12.0)
+                central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                relative_offset = speed_offset / safe_speed
+                plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
             continue
 
         Fs = -second + third
@@ -3860,6 +3833,8 @@ def _weno_flux_mhd_iso_pallas_local(
     tiny = 1e-14
     b_eps_value = 1e-20
     positivity_preserving = config.weno_positivity_preserving
+    # fields that carry no mass keep their own splitting speed
+    own_speed_modes = mass_free_modes(config) if positivity_preserving else ()
 
     block_shape_out = (nvars, bx_, by_, bz_)
     out_spec = pl.BlockSpec(block_shape_out, lambda bi, bj, bk: (0, bi, bj, bk))
@@ -4185,22 +4160,6 @@ def _weno_flux_mhd_iso_pallas_local(
             plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
             minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
-            # Pre-pass: the shifts of every stencil cell's split states with every
-            # field on its own speed, and the largest fraction eta of the way
-            # there that keeps all of them admissible (see _weno_positivity.py).
-            stencil_shifts = [[flux_acc[0] * 0.0 for _ in range(ncomp)] for _ in range(6)]
-            for mode in range(num_modes):
-                relative_offset = (alpha_for_mode(mode) - common_speed) / safe_speed
-                stencil_shifts = [
-                    add_right_correction(
-                        stencil_shifts[k], mode, relative_offset * left_project(mode, q_stencil[k])
-                    )
-                    for k in range(6)
-                ]
-            speed_fraction = admissible_speed_fraction_local(
-                q_stencil, f_stencil, common_speed, stencil_shifts, 0.0, rhomin, 0.0,
-                ideal_gas=False, magnetic_slots=(4, 5, 6),
-            )
 
         for mode in range(num_modes):
             s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
@@ -4213,8 +4172,8 @@ def _weno_flux_mhd_iso_pallas_local(
             dq4 = qproj[5] - qproj[4]
 
             amx = alpha_for_mode(mode)
-            if positivity_preserving:
-                amx = common_speed - speed_fraction * (common_speed - amx)
+            if positivity_preserving and mode not in own_speed_modes:
+                amx = common_speed
 
             aterm_p = 0.5 * (d0 + amx * dq0); bterm_p = 0.5 * (d1 + amx * dq1)
             cterm_p = 0.5 * (d2 + amx * dq2); dterm_p = 0.5 * (d3 + amx * dq3)
@@ -4238,16 +4197,17 @@ def _weno_flux_mhd_iso_pallas_local(
                 zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
                 plus_acc = add_right_correction(plus_acc, mode, -second)
                 minus_acc = add_right_correction(minus_acc, mode, third)
-                speed_offset = amx - common_speed
-                central_projection = (
-                    -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
-                ) * (1.0 / 12.0)
-                central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
-                plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
-                minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
-                relative_offset = speed_offset / safe_speed
-                plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
-                minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+                if mode in own_speed_modes:
+                    speed_offset = amx - common_speed
+                    central_projection = (
+                        -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                    ) * (1.0 / 12.0)
+                    central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                    plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                    minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                    relative_offset = speed_offset / safe_speed
+                    plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                    minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
                 continue
 
             Fs = -second + third

@@ -3,8 +3,8 @@
 The finite-difference WENO flux at an interface is the sum of two
 reconstructed split fluxes, ``F_hat = f_hat^+ + f_hat^-``, upwinded from the
 left and from the right. Take ``alpha`` = the largest wave speed on the
-stencil. Splitting every characteristic field ``s`` with its own speed
-``alpha_s <= alpha`` makes each split flux a scaled vector
+stencil. Splitting characteristic field ``s`` with speed ``alpha_s <= alpha``
+makes each split flux a scaled vector
 
     f^+- = +-(alpha / 2) w^+-,      w^+- = w~^+- + z^+-,
     w~^+- = q +- F(q) / alpha,      z^+- = sum_s (alpha_s / alpha - 1) R_s (L_s q).
@@ -23,16 +23,16 @@ with ``d = w_hat - w``. The cell's own flux cancels between the two faces, so
 face-local speeds are allowed. Two scalings in [0, 1] enforce this, both
 inside the reconstruction:
 
-* the fraction ``eta`` of the way from the common speed ``alpha`` to the
-  per-field speeds ``alpha_s`` (``alpha_s -> alpha - eta (alpha - alpha_s)``)
-  is the largest for which every split state on the stencil,
-  ``q_m +- F_m / alpha + eta z_m``, is admissible. That includes the two
-  upwind states the proof needs. It also covers cells whose state the
-  interface's characteristic basis misrepresents: for those the per-field
-  splitting is not monotone, and the common speed, which is monotone for every
-  stencil state, is required. eta is fixed per interface before the
-  reconstruction because the speeds enter the WENO weights. In smooth
-  subsonic flow ``eta = 1``, i.e. the ordinary per-field splitting;
+* every field that carries mass is split with the common speed ``alpha``,
+  the stencil's spectral radius. That makes the frozen-basis splitting
+  monotone for every cell of the stencil, however differently the basis
+  represents it (a low-density cell with a large fast speed next to dense
+  gas). Per-field speeds chosen only to keep the split states admissible
+  are positive but not robust: Mach-10 MHD turbulence still blows up
+  (commit 96a191f). Fields that carry no mass (hydrodynamic shear waves,
+  isothermal-MHD Alfven waves) keep their own speed. Their ``z`` leaves the
+  density unchanged and only raises the pressure, so vortical modes keep the
+  default dissipation;
 * the face value is pulled toward its upwind state, ``w_hat -> w + theta d``,
   by the largest ``theta`` meeting the two conditions above. ``theta < 1``
   mixes the first-order candidate into the WENO combination with a weight set
@@ -49,7 +49,7 @@ import jax
 import jax.numpy as jnp
 
 # astronomix constants
-from astronomix.option_classes.simulation_config import IDEAL_GAS
+from astronomix.option_classes.simulation_config import IDEAL_GAS, ISOTHERMAL
 
 # astronomix containers
 from astronomix.option_classes.simulation_config import SimulationConfig
@@ -58,6 +58,25 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._stencil_operations._stencil_operations import _shift
+
+
+def mass_free_modes(config: SimulationConfig) -> tuple:
+    """Indices of the characteristic fields that carry no mass and no
+    energy-coupled density, in the mode order of the eigensystem modules: the
+    shear waves of the Euler equations (both equations of state) and the
+    Alfven waves of isothermal MHD. They keep their own splitting speed.
+
+    Args:
+        config: The simulation configuration.
+
+    Returns:
+        A tuple of mode indices.
+    """
+    if config.mhd:
+        return (1, 4) if config.equation_of_state == ISOTHERMAL else ()
+    if config.equation_of_state == ISOTHERMAL:
+        return tuple(range(1, config.dimensionality))
+    return tuple(range(2, config.dimensionality + 1))
 
 
 def stencil_maximum(cell_field):
@@ -154,50 +173,6 @@ def _upwind_split_states(conserved_state, cell_flux, common_speed):
     plus_state = conserved_state + cell_flux / alpha
     minus_state = _shift(conserved_state, -1, axis=1) - _shift(cell_flux, -1, axis=1) / alpha
     return plus_state, minus_state
-
-
-def admissible_speed_fraction(
-    stencil_states,
-    stencil_fluxes,
-    common_speed,
-    stencil_shifts,
-    params: SimulationParams,
-    config: SimulationConfig,
-    registered_variables: RegisteredVariables,
-):
-    """The fraction eta of the way from the common splitting speed to the
-    per-field speeds that keeps EVERY split state on the stencil admissible.
-
-    Each cell m of the six-point stencil enters the reconstruction through its
-    split fluxes +-(alpha/2) (q_m +- F_m / alpha + eta z_m), with z_m its
-    shift at eta = 1 in the interface's characteristic basis. Requiring all
-    twelve to be admissible covers the two upwind states the positivity proof
-    needs, and also the cells whose state the frozen basis misrepresents (a
-    void next to dense gas): their decompositions are unphysical, which pulls
-    eta toward the common speed, the splitting that is monotone for every
-    stencil state. In smooth flow eta = 1.
-
-    Args:
-        stencil_states: Conserved states of cells i - 2 ... i + 3 (aligned with i).
-        stencil_fluxes: Their physical fluxes.
-        common_speed: The largest wave speed on each interface's stencil.
-        stencil_shifts: Their shifts z_m with every field on its own speed.
-        params: The simulation parameters.
-        config: The simulation configuration.
-        registered_variables: The registered variables.
-
-    Returns:
-        eta in [0, 1], one per interface.
-    """
-    alpha = jnp.maximum(common_speed, 1e-30)[None]
-    fraction = jnp.ones_like(common_speed)
-    for state, flux, shift in zip(stencil_states, stencil_fluxes, stencil_shifts):
-        for sign in (1.0, -1.0):
-            fraction = jnp.minimum(
-                fraction,
-                _admissible_fraction(state + sign * flux / alpha, shift, params, config, registered_variables),
-            )
-    return fraction
 
 
 def positivity_preserving_interface_flux(
@@ -313,23 +288,6 @@ def _local_upwind_split_states(left_state, right_state, left_flux, right_flux, c
     plus_state = tuple(left_state[slot] + left_flux[slot] / alpha for slot in range(len(left_state)))
     minus_state = tuple(right_state[slot] - right_flux[slot] / alpha for slot in range(len(right_state)))
     return plus_state, minus_state
-
-
-def admissible_speed_fraction_local(
-    stencil_states, stencil_fluxes, common_speed, stencil_shifts,
-    gm1, rhomin, pgmin, ideal_gas=True, magnetic_slots=(),
-):
-    """``admissible_speed_fraction`` for one interface of a Pallas kernel."""
-    alpha = jnp.maximum(common_speed, 1e-30)
-    fraction = common_speed * 0.0 + 1.0
-    for state, flux, shift in zip(stencil_states, stencil_fluxes, stencil_shifts):
-        for sign in (1.0, -1.0):
-            split_state = tuple(state[slot] + sign * flux[slot] / alpha for slot in range(len(state)))
-            fraction = jnp.minimum(
-                fraction,
-                _local_admissible_fraction(split_state, shift, gm1, rhomin, pgmin, ideal_gas, magnetic_slots),
-            )
-    return fraction
 
 
 def positivity_preserving_flux_local(
