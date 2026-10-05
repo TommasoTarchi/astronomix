@@ -39,9 +39,11 @@ from astronomix._modules._turbulent_forcing._turbulent_forcing_options import Tu
 NATIVE_JAX = 0
 PALLAS = 1
 #: OPTIMAL_BACKEND is not a backend of its own: it is a request to pick the
-#: fastest available one at ``finalize_config`` time.  It resolves to PALLAS on
-#: GPUs new enough to run the Triton kernels (compute capability >= 8.0) and
-#: falls back to NATIVE_JAX everywhere else (older GPUs, CPU, no ``nvidia-smi``).
+#: fastest available one at ``finalize_config`` time.  It resolves to PALLAS
+#: when JAX's default backend is a GPU new enough to run the Triton kernels
+#: (compute capability >= 8.0, read from ``jax.devices()``) and falls back to
+#: NATIVE_JAX everywhere else (older GPUs, CPU -- including ``JAX_PLATFORMS=cpu``
+#: on a GPU node).
 OPTIMAL_BACKEND = 2
 
 # positivity-enforcement modes (used by ``PositivityConfig.per_stage_mode`` /
@@ -71,6 +73,34 @@ FINITE_DIFFERENCE = 1
 # differentiation modes
 FORWARDS = 0
 BACKWARDS = 1
+
+# Passive-scalar sub-cycling loop (``SimulationConfig.passive_scalar_substep_loop``).
+#   SUBSTEPS_AUTO     - DYNAMIC under FORWARDS, MASKED under BACKWARDS (default)
+#   SUBSTEPS_DYNAMIC  - a traced trip count (lowers to a while loop): exactly the
+#                       flow-derived number of sub-steps runs; forward-mode AD
+#                       only (reverse mode cannot differentiate a while loop)
+#   SUBSTEPS_MASKED   - a static loop over ``max_passive_scalar_substeps`` in
+#                       which sub-steps beyond the flow-derived count are masked
+#                       out (``lax.cond``): reverse-mode differentiable, same
+#                       primal
+SUBSTEPS_AUTO = 0
+SUBSTEPS_DYNAMIC = 1
+SUBSTEPS_MASKED = 2
+
+# Rematerialisation in reverse mode (``SimulationConfig.ad_remat``).
+#   "none"  - store every residual of the step (fastest backward, most memory)
+#   "stage" - ``jax.checkpoint`` around every Runge-Kutta-stage RHS (hydro WENO
+#             fluxes + blends + divergence + sources, and the passive-scalar
+#             advection RHS): the backward keeps only the stage inputs and
+#             recomputes each stage's internals (about one extra forward)
+#   "axis"  - "stage" plus nested checkpoints: each axis' flux + blend +
+#             divergence inside the hydro RHS (non-fused flux path), and in the
+#             passive-scalar RHS each axis and each scalar separately, so the
+#             backward holds one axis' (one scalar's) internals at a time
+AD_REMAT_NONE = "none"
+AD_REMAT_STAGE = "stage"
+AD_REMAT_AXIS = "axis"
+AD_REMAT_MODES = (AD_REMAT_NONE, AD_REMAT_STAGE, AD_REMAT_AXIS)
 
 # limiter types
 MINMOD = 0
@@ -579,6 +609,24 @@ class SimulationConfig(NamedTuple):
     #: ``passive_scalar_bounds`` are the backstop for that.
     max_passive_scalar_substeps: int = 8
 
+    #: How the sub-cycling loop is built (``SUBSTEPS_AUTO`` / ``_DYNAMIC`` /
+    #: ``_MASKED``, see the constants). The flow-derived count is a traced
+    #: integer, and a loop with a traced trip count is a while loop, which
+    #: reverse-mode AD cannot differentiate. The MASKED loop runs to the static
+    #: cap ``max_passive_scalar_substeps`` and skips (``lax.cond``) the sub-steps
+    #: beyond the flow-derived count, so its primal is the same computation. The
+    #: default AUTO keeps the dynamic loop under ``differentiation_mode ==
+    #: FORWARDS`` (forward results unchanged, bit for bit) and switches to the
+    #: masked one under BACKWARDS. In the masked loop every sub-step (the first
+    #: included) is one iteration of a scan whose body is ``jax.checkpoint``-ed
+    #: (its RHS too, whatever ``ad_remat`` says), so the backward stores one
+    #: scalar-stack copy per iteration and recomputes the rest: reverse-mode
+    #: memory grows only mildly with the cap, compute by one extra advection
+    #: evaluation. A cap of 1 is a straight-line single sub-step (no loop).
+    #: Lower ``max_passive_scalar_substeps`` in reverse-mode runs whose flow
+    #: never needs more than one or two sub-steps.
+    passive_scalar_substep_loop: int = SUBSTEPS_AUTO
+
     #: Track when each parcel was shocked, adding three further library-managed
     #: scalars (``entropy_initial``, ``time_since_shock``, ``density_time``)
     #: after the user's. ``density_time`` is the ionization age up to a unit
@@ -610,6 +658,43 @@ class SimulationConfig(NamedTuple):
     #: no ionization. Lower it if weak shocks matter for the problem at hand.
     shock_entropy_jump: float = 0.6931471805599453
 
+    #: Give the shock-history latch a derivative (straight-through estimator).
+    #: The primal is UNCHANGED: a parcel is still flagged by the boolean test
+    #: ``entropy rise > shock_entropy_jump AND div v < 0``. With the switch off
+    #: that boolean has zero derivative, so d(shocked_fraction, time_since_shock,
+    #: density_time)/d(state) only transports the existing history, and an
+    #: adjoint cannot see that moving a shock changes which parcels are freshly
+    #: shocked. With it on, the tangent (and cotangent) of the latch is taken
+    #: through the smooth surrogate
+    #:
+    #:     soft = sigmoid((ds - shock_entropy_jump) / ad_shock_latch_entropy_width)
+    #:          * sigmoid(-div_v / (ad_shock_latch_compression_width * c_s))
+    #:
+    #: (the same two criteria; ``div_v`` is the undivided central difference
+    #: the latch uses and ``c_s`` the local sound speed, held constant), merged
+    #: with the carried fraction as a probabilistic OR:
+    #: ``d sf = (1 - latch) d sf_old + (1 - sf_old) d soft``. Away from the
+    #: threshold soft saturates and the derivative reduces to transport -- but
+    #: only if the entropy sigmoid is narrow enough: quiescent, never-shocked
+    #: gas (entropy rise 0, div_v = 0) sits at the steepest point of the
+    #: compression sigmoid, so its leak is set by sigmoid(-jump / width) alone,
+    #: and it ACCUMULATES step after step in the carried fraction. Measured
+    #: (review 2026-09-25, 16^3 blast, 1 % pressure tangent): width 0.25 leaks
+    #: 22 % of the at-threshold response per step into every ambient cell,
+    #: width 0.1 (the default) 0.4 %. This is a surrogate gradient, not the
+    #: derivative of the primal (which is zero almost everywhere); check it
+    #: with a finite-difference Taylor test at the amplitudes the optimiser
+    #: uses.
+    ad_smooth_shock_latch: bool = False
+
+    #: Width in nats of the entropy-rise sigmoid of the smooth latch. Keep it
+    #: well below ``shock_entropy_jump`` (see the leak above).
+    ad_shock_latch_entropy_width: float = 0.1
+
+    #: Width of the compression sigmoid of the smooth latch, in units of the
+    #: local sound speed (``div_v`` is an undivided difference, i.e. a velocity).
+    ad_shock_latch_compression_width: float = 0.05
+
     #: Self-gravity / external-potential configuration (see GravityConfig).
     gravity_config: GravityConfig = GravityConfig()
 
@@ -619,6 +704,11 @@ class SimulationConfig(NamedTuple):
 
     #: Viscosity type - either kinematic or dynamic viscosity.
     viscosity_type: int = DYNAMIC_VISCOSITY
+
+    #: Explicit ohmic resistivity ``params.resistivity`` in the induction
+    #: equation, applied to the interface fields as the curl of an edge EMF
+    #: (finite-difference CT MHD, isothermal EOS only: no ohmic heating term).
+    resistivity: bool = False
 
     #: Explicit thermal conduction term div(kappa grad T) in the energy
     #: equation (constant conductivity params.thermal_conductivity,
@@ -726,6 +816,48 @@ class SimulationConfig(NamedTuple):
     #: time stepping.
     num_checkpoints: int = 100
 
+    #: Rematerialisation for reverse-mode AD: ``"none"`` (default), ``"stage"``
+    #: or ``"axis"`` (see ``AD_REMAT_*``). Changes only what the backward pass
+    #: stores versus recomputes; the primal is the same computation, and under
+    #: forward-only evaluation or forward-mode AD ``jax.checkpoint`` is inlined
+    #: (no cost). Measured for the casa_xfit configuration (FD/WENO, dual
+    #: energy, 5 scalars + shock history, max_passive_scalar_substeps = 8),
+    #: temp memory of one BACKWARDS gradient in units of the state:
+    #:
+    #: ==========================================  ======  =======  ======
+    #: setting                                     none    stage    axis
+    #: ==========================================  ======  =======  ======
+    #: XLA:CPU, f32 32^3, 1 fixed step (no FCT)    290x    159x     77x
+    #: XLA:CPU, f32 32^3, equinox K = 4 (no FCT)   295x    173x     87x
+    #: A100, f64 64^3, equinox K = 8, FCT, Pallas  --      92x      62x
+    #: ==========================================  ======  =======  ======
+    #:
+    #: Each costs roughly one more forward evaluation of the rematerialised
+    #: pieces in the backward pass ("axis": two).
+    ad_remat: str = AD_REMAT_NONE
+
+    #: ``ad_remat == "axis"`` only: split each axis' flux + blend + divergence
+    #: into this many slabs along a PERPENDICULAR axis (z for the x / y fluxes,
+    #: y for the z flux; never the first spatial axis, the one a multi-GPU run
+    #: splits), a ``lax.map`` with one ``jax.checkpoint`` per slab. The
+    #: backward then holds one slab's WENO / blend internals at a time. Exact
+    #: (every piece is a stencil along the flux axis only); 1 = off; a count
+    #: that does not divide the slab axis falls back to 1.
+    ad_remat_chunks: int = 1
+
+    #: Reverse-mode memory of the passive-scalar block (``ad_remat != "none"``
+    #: only; default False = unchanged). The scalar advection's backward was the
+    #: peak of a Cas A 4D-Var gradient (xprof memory viewer, 128^3: 45 % of the
+    #: live set): the masked sub-step scan's stack of ``max_passive_scalar_substeps``
+    #: scalar-stack copies, the tie-preserving clips' mask residuals of the ratio
+    #: recovery and of the shock history. With True: the sub-steps run in an
+    #: equinox checkpointed while loop over the flow-derived count (two scalar-
+    #: stack checkpoints instead of the cap's), and the ratio recovery / bounds
+    #: and the shock-history update are ``jax.checkpoint``-ed (their masks are
+    #: recomputed, not stored). Same arithmetic in the primal; derivatives equal
+    #: up to rounding (a different XLA program).
+    ad_scalar_lean: bool = False
+
     #: Return intermediate snapshots of the time evolution
     #: instead of only the final fluid state.
     return_snapshots: bool = False
@@ -782,6 +914,24 @@ class SimulationConfig(NamedTuple):
     #: smooth the solution is. NATIVE backend only.
     weno_epsilon_relative: float = 0.0
 
+    #: Differentiate through the WENO reconstruction with its nonlinear
+    #: weights, characteristic eigenvectors and Lax-Friedrichs splitting speed
+    #: FROZEN (``stop_gradient``): the tangent / adjoint is then that of the
+    #: linear scheme the primal step actually used, the usual linearisation for
+    #: WENO adjoints. The primal is unchanged. Needed for
+    #: forward-mode derivatives through long runs with cold, near-uniform gas:
+    #: there IS_k << weno_epsilon, d alpha / d IS ~ 2 / epsilon^3 ~ 1e21, and
+    #: the float32 tangent overflows within a few years of a Cas A run.
+    weno_ad_frozen_weights: bool = False
+
+    #: If > 0: on interfaces whose colder side is below this factor times
+    #: ``params.minimum_specific_pressure``, take the DERIVATIVE of the flux
+    #: through the monotone LLF flux (the primal value is unchanged). The
+    #: frozen-weight WENO linearisation is unstable at cold dense knots; this
+    #: is the tangent-only analogue of the cold-crush LLF blend. Requires one
+    #: of the positivity blend paths to be active (it lives in the blend).
+    ad_tangent_llf_cold_factor: float = 0.0
+
     # physical modules
 
     #: Turbulent forcing configuration.
@@ -808,19 +958,50 @@ class SimulationConfig(NamedTuple):
     cnn_mhd_corrector_config: CNNMHDconfig = CNNMHDconfig()
 
 
+def _parse_compute_capability(cc):
+    """``"8.0"`` -> ``(8, 0)``; ``None`` for anything that is not ``major.minor``."""
+    try:
+        major, minor = str(cc).strip().split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, TypeError):
+        return None
+
+
 def gpu_compute_capability_at_least_80() -> bool:
-    """Return whether every visible NVIDIA GPU has compute capability >= 8.0.
+    """Return whether JAX runs on GPUs that all have compute capability >= 8.0.
 
     Compute capability 8.0 (Ampere) is the floor for the Triton kernels the
     Pallas backend compiles to, so this is the predicate that decides whether
-    OPTIMAL_BACKEND resolves to PALLAS. Any failure to query the GPUs — no
-    ``nvidia-smi`` on the PATH (e.g. a CPU-only host) or the call erroring out —
-    is treated as "not capable" so the safe NATIVE_JAX fallback is chosen.
+    OPTIMAL_BACKEND resolves to PALLAS.
+
+    The question is asked of JAX, not of the machine: what matters is the
+    platform the kernels will be compiled for. ``JAX_PLATFORMS=cpu`` on a GPU
+    node therefore answers False (the kernels would run on XLA:CPU, where
+    Pallas only has an interpreter), which ``nvidia-smi`` could not tell.
+    The capability is read from ``jax.devices()``; ``nvidia-smi`` is only a
+    fallback for GPU devices that do not expose it. Any failure is treated as
+    "not capable" so the safe NATIVE_JAX fallback is chosen.
 
     Returns:
-        True if all visible NVIDIA GPUs report compute capability >= 8.0,
-        False otherwise (including when no GPU could be queried).
+        True if JAX's default backend is a GPU backend and every one of its
+        devices reports compute capability >= 8.0, False otherwise.
     """
+    try:
+        devices = jax.devices()
+    except RuntimeError:
+        return False
+    if not devices or any(d.platform != "gpu" for d in devices):
+        return False
+    caps = [_parse_compute_capability(getattr(d, "compute_capability", None))
+            for d in devices]
+    if all(cc is not None for cc in caps):
+        return all(cc >= (8, 0) for cc in caps)
+    return _nvidia_smi_compute_capability_at_least_80()
+
+
+def _nvidia_smi_compute_capability_at_least_80() -> bool:
+    """Fallback of :func:`gpu_compute_capability_at_least_80`: ask ``nvidia-smi``
+    (every visible NVIDIA GPU; False if it cannot be queried)."""
     try:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -867,8 +1048,49 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             print("OPTIMAL_BACKEND: using the PALLAS backend (GPU compute capability >= 8.0).")
             config = config._replace(backend_config=config.backend_config._replace(backend=PALLAS))
         else:
-            print("OPTIMAL_BACKEND: using the NATIVE_JAX backend (no compute capability >= 8.0 GPU found).")
+            print("OPTIMAL_BACKEND: using the NATIVE_JAX backend (JAX is not running on a "
+                  "compute capability >= 8.0 GPU).")
             config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
+
+    # Cosmic rays exist only in the finite-volume solver. Under the
+    # finite-difference solver the registry does not add the CR variable, so
+    # the CR code paths that still run (DSA injection, energy totals) index
+    # variable -1 -- the pressure in 1D, the last passive scalar in a Cas A
+    # configuration -- and the run silently returns a CR-free (and corrupted)
+    # solution. Refuse instead.
+    if config.cosmic_ray_config.cosmic_rays and config.solver_mode == FINITE_DIFFERENCE:
+        raise ValueError(
+            "cosmic_ray_config.cosmic_rays is not implemented for the "
+            "finite-difference solver (the default solver_mode): the CR "
+            "configuration would be silently ignored and the CR modules would "
+            "write into variable -1. Use solver_mode=FINITE_VOLUME for cosmic "
+            "rays."
+        )
+
+    # Reverse-mode / AD options.
+    if config.ad_remat not in AD_REMAT_MODES:
+        raise ValueError(
+            f"ad_remat must be one of {AD_REMAT_MODES}, got {config.ad_remat!r}."
+        )
+    if int(config.ad_remat_chunks) < 1:
+        raise ValueError(f"ad_remat_chunks must be >= 1, got {config.ad_remat_chunks!r}.")
+    if config.passive_scalar_substep_loop not in (SUBSTEPS_AUTO, SUBSTEPS_DYNAMIC, SUBSTEPS_MASKED):
+        raise ValueError(
+            "passive_scalar_substep_loop must be SUBSTEPS_AUTO, SUBSTEPS_DYNAMIC "
+            f"or SUBSTEPS_MASKED, got {config.passive_scalar_substep_loop!r}."
+        )
+    if int(config.max_passive_scalar_substeps) < 1:
+        raise ValueError("max_passive_scalar_substeps must be >= 1.")
+    if (config.passive_scalar_substep_loop == SUBSTEPS_DYNAMIC
+            and config.differentiation_mode == BACKWARDS
+            and (config.num_passive_scalars > 0 or config.track_shock_history)):
+        print(
+            "NOTE: passive_scalar_substep_loop = SUBSTEPS_DYNAMIC uses a traced "
+            "trip count (a while loop); reverse-mode AD through the passive "
+            "scalars will fail. Use SUBSTEPS_AUTO or SUBSTEPS_MASKED."
+        )
+    if config.ad_smooth_shock_latch and not config.track_shock_history:
+        print("NOTE: ad_smooth_shock_latch has no effect without track_shock_history.")
 
     # weno_z is implemented in the FORWARD Pallas kernels; their hand-written
     # adjoints still hard-code Jiang-Shu, so reverse-mode gradients would not
@@ -1062,8 +1284,18 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         if config.boundary_handling == PERIODIC_ROLL:
             config = config._replace(num_ghost_cells=0)
 
-        if config.boundary_handling == GHOST_CELLS and (config.diffusion or config.thermal_conduction):
+        if config.boundary_handling == GHOST_CELLS and (config.diffusion or config.thermal_conduction
+                                                        or config.resistivity):
             config = config._replace(num_ghost_cells=max(config.num_ghost_cells, 6))
+
+        if config.resistivity:
+            if not config.mhd or config.dimensionality != 3:
+                raise ValueError("resistivity requires 3D finite-difference MHD")
+            if config.equation_of_state != ISOTHERMAL:
+                raise ValueError(
+                    "resistivity is implemented for the ISOTHERMAL EOS only: the "
+                    "ohmic heating eta J^2 is not added to the energy equation"
+                )
 
     # Pick sensible default boundary conditions when the user left them unset.
     if config.boundary_settings is None:

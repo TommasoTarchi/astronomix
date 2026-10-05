@@ -74,7 +74,9 @@ electron column it has swept:
   strength: the default ``log(2)`` corresponds to Mach 3.3 at ``gamma = 5/3``,
   against Mach ~100 (7.1 nats) for a young remnant's shocks and 0.06 nats for a
   Sod tube. Weak compressions and sound waves, which carry no ionization, are
-  correctly ignored.
+  correctly ignored. The label is unbounded, so a non-finite or runaway value
+  (more than ``ENTROPY_LABEL_WINDOW`` nats from the current entropy) is reset to
+  the current entropy every step: see :func:`sanitize_entropy_label`.
 * ``shocked_fraction`` — how much of the parcel has been through a shock,
   advected and saturating at 1. It is what latches a parcel as shocked after it
   stops converging, and it is a FRACTION rather than a boolean flag on purpose:
@@ -96,6 +98,20 @@ entropy contrast has fallen back below the threshold. That is the intended
 behaviour — it is what "this material has been through a shock" means once the
 material moves and mixes — but it means a test of the form "every flagged cell
 is currently above the threshold" will fail, and should.
+
+**Differentiability.** Three things make this module differentiable in reverse
+mode as well as forward mode, all without changing the primal:
+
+* the sub-cycling loop has a traced trip count, which reverse mode cannot
+  differentiate; under ``differentiation_mode == BACKWARDS`` it becomes a
+  static, masked loop (``config.passive_scalar_substep_loop``, see
+  :func:`advect_passive_scalars`);
+* every bound clamp keeps derivative 1 ON its bound (``jnp.clip`` and
+  ``jnp.maximum`` give 0.5 at a tie, and these fields sit exactly on their
+  bounds almost everywhere, so the old clamps halved the tangent every step);
+* ``config.ad_smooth_shock_latch`` gives the boolean shock latch a
+  straight-through surrogate derivative, so that moving a shock changes the
+  shock history in the derivative too (see :func:`update_shock_history`).
 """
 
 # general
@@ -111,10 +127,15 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
+    AD_REMAT_AXIS,
+    AD_REMAT_NONE,
+    BACKWARDS,
     OPEN_BOUNDARY,
     PERIODIC_BOUNDARY,
     REFLECTIVE_BOUNDARY,
     STATE_TYPE,
+    SUBSTEPS_AUTO,
+    SUBSTEPS_MASKED,
     SimulationConfig,
 )
 
@@ -128,11 +149,100 @@ from astronomix.variable_registry.registered_variables import (
 from astronomix._stencil_operations._stencil_operations import _shift
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
     _weno_omega_weights,
+    _weno_omega_weights_ad,
     _weno_omega_weights_z,
 )
 
 #: the WENO smoothness-indicator floor, matching the hydro kernels
 _TINY = 1e-40
+
+#: Largest believable gap, in nats, between a parcel's advected
+#: ``entropy_initial`` label and its current specific entropy. A strong shock
+#: raises ``ln(p / rho^gamma)`` by ~2 ln M, so 50 nats would take a Mach ~1e10
+#: shock, and radiative cooling at fixed pressure from 1e9 K to 1e4 K lowers it by
+#: ~19. The largest physical gap in the Cas A 128^3 run is ~41 nats (cold PLUTO
+#: ejecta at the pressure floor, later shocked). A label further away than this
+#: is the ratio-recovery instability (see :func:`sanitize_entropy_label`).
+ENTROPY_LABEL_WINDOW = 50.0
+
+
+# -----------------------------------------------------------------------------
+# Bound clamps whose derivative survives AT the bound.
+#
+# ``jnp.clip`` and ``jnp.maximum`` split the derivative evenly at a tie:
+# ``grad(clip)(x = lo) = 0.5`` and ``grad(maximum(x, 0))(0) = 0.5``. For these
+# scalars a tie is the common case, not an edge case: most of a remnant's grid
+# holds an ejecta fraction of EXACTLY 0 (84 % of the cells of the Cas A fit
+# state) or exactly 1, and a never-shocked parcel's shock history is exactly 0.
+# Advection keeps them exactly on the bound (the ratio of identical operators is
+# exact), so the clamp ties again every step and the tangent / cotangent of
+# those cells is halved every step: 0.5^30 ~ 1e-9 over a 30-step window. The
+# clamps below have the same primal (the very same ``jnp`` call, so bit for
+# bit) and pass the derivative of ``x`` through whenever ``x`` is inside the
+# bounds OR on them; only a strictly out-of-bounds value takes the bound's.
+# -----------------------------------------------------------------------------
+@jax.custom_jvp
+def _clip_keep_derivative(x, lo, hi):
+    """``jnp.clip(x, lo, hi)`` with derivative 1 inside and ON the bounds."""
+    return jnp.clip(x, lo, hi)
+
+
+@_clip_keep_derivative.defjvp
+def _clip_keep_derivative_jvp(primals, tangents):
+    x, lo, hi = primals
+    dx, dlo, dhi = tangents
+    out = jnp.clip(x, lo, hi)
+    dout = jnp.where(x < lo, dlo, jnp.where(x > hi, dhi, dx))
+    return out, jnp.broadcast_to(dout, out.shape).astype(out.dtype)
+
+
+@jax.custom_jvp
+def _max_keep_derivative(x, floor):
+    """``jnp.maximum(x, floor)`` with the derivative of ``x`` at a tie."""
+    return jnp.maximum(x, floor)
+
+
+@_max_keep_derivative.defjvp
+def _max_keep_derivative_jvp(primals, tangents):
+    x, floor = primals
+    dx, dfloor = tangents
+    out = jnp.maximum(x, floor)
+    dout = jnp.where(x < floor, dfloor, dx)
+    return out, jnp.broadcast_to(dout, out.shape).astype(out.dtype)
+
+
+@jax.custom_jvp
+def _latch_straight_through(carried, latch, soft):
+    """The shocked-fraction latch ``clip(max(carried, latch), 0, 1)``, with a
+    straight-through tangent (``config.ad_smooth_shock_latch``).
+
+    ``latch`` is the boolean "freshly shocked" test as 0/1, ``soft`` its smooth
+    surrogate. The primal is exactly the hard latch. The tangent is that of a
+    probabilistic OR of the carried fraction with the surrogate,
+    ``(1 - latch) d carried + (1 - carried) d soft``: where the latch does not
+    fire it is the exact derivative (transport) plus the surrogate's
+    sensitivity to firing; where it fires the carried fraction is overwritten,
+    so only the surrogate's term remains.
+    """
+    return jnp.clip(jnp.maximum(carried, latch), 0.0, 1.0)
+
+
+@_latch_straight_through.defjvp
+def _latch_straight_through_jvp(primals, tangents):
+    carried, latch, soft = primals
+    d_carried, _, d_soft = tangents
+    out = jnp.clip(jnp.maximum(carried, latch), 0.0, 1.0)
+    dout = (1.0 - latch) * d_carried + (1.0 - carried) * d_soft
+    return out, jnp.broadcast_to(dout, out.shape).astype(out.dtype)
+
+
+def _masked_substeps(config) -> bool:
+    """Whether the passive-scalar sub-cycling uses the static, masked loop
+    (reverse-differentiable) rather than the traced trip count."""
+    mode = config.passive_scalar_substep_loop
+    if mode == SUBSTEPS_AUTO:
+        return config.differentiation_mode == BACKWARDS
+    return mode == SUBSTEPS_MASKED
 
 
 def _velocity_components(primitive_state, config, rv):
@@ -152,6 +262,34 @@ def specific_entropy(primitive_state, gamma, registered_variables):
     rho = jnp.maximum(primitive_state[registered_variables.density_index], 1e-30)
     p = jnp.maximum(primitive_state[registered_variables.pressure_index], 1e-30)
     return jnp.log(p) - gamma * jnp.log(rho)
+
+
+def sanitize_entropy_label(entropy_initial, entropy_now, window=ENTROPY_LABEL_WINDOW):
+    """Reset a non-finite or runaway ``entropy_initial`` label to the current entropy.
+
+    ``entropy_initial`` is the only library scalar with no bound: the mass
+    fractions are clipped to their declared range and the two accumulators to
+    their own global maximum (:func:`_recover_ratios`), but the label can take
+    any value. Where the companion density ``rho~`` nearly collapses without
+    crossing the ``1e-6 rho`` guard, ``rho~ s0 / rho~`` amplifies WENO overshoot
+    every step, as an odd-even pair of opposite sign. Measured on the Cas A
+    R4b run (146 -> 2000): at 128^3 eight cells (box centre, stagnation point;
+    and the jet channel, rho ~ 3e-4) held labels from -3806 to +801 against a
+    current entropy of O(-5); at 448^3 one overflowed, the NaN then covered the
+    whole label field through the WENO stencils, every reverse-mode gradient was
+    NaN, and the shock latch (``entropy_now - s0 > jump``, False for NaN) froze:
+    no parcel was flagged after that, so the shocked fraction and ionisation age
+    of the X-ray model went stale.
+
+    The reset value is the current entropy, i.e. "not shocked relative to now"
+    (entropy rise 0, so it cannot fire the latch), with no derivative: the cell
+    is pathological, and its label's tangent (the WENO overshoot it came from)
+    is meaningless. A label within ``window`` nats of the current entropy is
+    returned bit for bit, so a run that never trips this is unchanged; the test
+    ``|s_now - s0| <= window`` is False for NaN and +-inf as well.
+    """
+    ok = jnp.abs(entropy_now - entropy_initial) <= window
+    return jnp.where(ok, entropy_initial, jax.lax.stop_gradient(entropy_now))
 
 
 def _weno5_left_biased(q0, q1, q2, q3, q4, epsilon, omega_weights):
@@ -178,13 +316,19 @@ def _weno5_left_biased(q0, q1, q2, q3, q4, epsilon, omega_weights):
     return w0 * p0 + w1 * p1 + w2 * p2
 
 
-def _advection_rhs(fields, velocities, grid_spacing, epsilon, omega_weights):
+def _advection_rhs(fields, velocities, grid_spacing, epsilon, omega_weights,
+                   per_axis_remat=False):
     """``-div(fields * v)`` for a stack of conserved densities.
 
     ``fields`` has a leading field axis, so spatial axis ``a`` is array axis
     ``a + 1``. The face velocity is the mean of the two neighbours and the
     interface value is upwinded on its sign, both sides reconstructed to 5th
     order.
+
+    ``per_axis_remat`` wraps each axis' reconstruction + flux difference in
+    ``jax.checkpoint``, and reconstructs the scalars one at a time inside it
+    (reverse-mode memory, ``config.ad_remat == "axis"``); the arithmetic is
+    the same.
     """
     # `fields` holds the CONSERVED stack (rho~, s = rho~ C); the flux needs the
     # ratio, so recover it here at every Runge-Kutta stage
@@ -201,7 +345,8 @@ def _advection_rhs(fields, velocities, grid_spacing, epsilon, omega_weights):
         right = _weno5_left_biased(q[5], q[4], q[3], q[2], q[1], epsilon, omega_weights)
         return jnp.where(bcast >= 0.0, left, right)
 
-    for axis, v in enumerate(velocities):
+    def flux_differences(density, ratios, v, grid_spacing, axis):
+        """This axis' ``(F_{i+1/2} - F_{i-1/2}) / dx`` for rho~ and for s."""
         vf = 0.5 * (v + _shift(v, -1, axis=axis))       # face velocity at i+1/2
 
         # ONE mass flux, built from the density reconstruction ...
@@ -221,11 +366,28 @@ def _advection_rhs(fields, velocities, grid_spacing, epsilon, omega_weights):
         #
         # Reconstructing the ratio rather than rho*C is also better physics: C
         # is smooth across a shock, where rho is not.
+        d_rho = (flux_rho - _shift(flux_rho, 1, axis=axis)) / grid_spacing
+        if per_axis_remat:
+            # one scalar at a time (a rematerialised lax.map): the backward then
+            # holds a single field's WENO internals rather than the whole
+            # stack's -- the scalar stack is 2/3 of the Cas A state, and its
+            # reconstruction dominates the advection's backward memory
+            def one_scalar(ratio):
+                flux = flux_rho * faces(ratio, axis, vf, vf)
+                return (flux - _shift(flux, 1, axis=axis)) / grid_spacing
+            return d_rho, jax.lax.map(jax.checkpoint(one_scalar), ratios)
         c_face = faces(ratios, axis + 1, vf, vf[None, ...])
         flux_s = flux_rho[None, ...] * c_face
 
-        rhs_rho = rhs_rho - (flux_rho - _shift(flux_rho, 1, axis=axis)) / grid_spacing
-        rhs_s = rhs_s - (flux_s - _shift(flux_s, 1, axis=axis + 1)) / grid_spacing
+        return d_rho, (flux_s - _shift(flux_s, 1, axis=axis + 1)) / grid_spacing
+
+    for axis, v in enumerate(velocities):
+        fd = partial(flux_differences, axis=axis)
+        if per_axis_remat:
+            fd = jax.checkpoint(fd)
+        d_rho, d_s = fd(density, ratios, v, grid_spacing)
+        rhs_rho = rhs_rho - d_rho
+        rhs_s = rhs_s - d_s
 
     return jnp.concatenate([rhs_rho[None, ...], rhs_s], axis=0)
 
@@ -284,7 +446,11 @@ def advect_passive_scalars(
         The updated scalars, same shape as ``scalars``.
     """
     epsilon = config.weno_epsilon
-    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
+    # (``_weno_omega_weights_ad``: the same weights bit for bit, with a
+    # derivative that cannot overflow -- these weights are always
+    # differentiated, and an unbounded label such as ``entropy_initial`` with an
+    # O(1e5) jump made the float32 JS-weight VJP NaN even for a zero cotangent)
+    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights_ad
 
     density = primitive_state[registered_variables.density_index]
     velocities = _velocity_components(primitive_state, config, registered_variables)
@@ -294,14 +460,28 @@ def advect_passive_scalars(
     # rather than the hydro solver's updated density is what keeps C bounded.
     stacked = jnp.concatenate([density[None, ...], scalars * density[None, ...]], axis=0)
 
-    def L(u):
-        return _advection_rhs(u, velocities, grid_spacing, epsilon, omega_weights)
+    # reverse-mode rematerialisation of the RHS (config.ad_remat): the backward
+    # keeps only each RK stage's input and recomputes the WENO internals ("axis":
+    # additionally one axis at a time)
+    _rhs_remat = jax.checkpoint(
+        lambda u_, v_, gs_: _advection_rhs(u_, v_, gs_, epsilon, omega_weights,
+                                           per_axis_remat=config.ad_remat == AD_REMAT_AXIS))
 
-    def ssprk3(u, h):
+    def L_remat(u):
+        return _rhs_remat(u, velocities, grid_spacing)
+
+    if config.ad_remat == AD_REMAT_NONE:
+        def L(u):
+            return _advection_rhs(u, velocities, grid_spacing, epsilon, omega_weights)
+    else:
+        L = L_remat
+
+    def ssprk3(u, h, rhs=None):
         """One SSP-RK3 (Shu & Osher 1988) step, the companion to WENO5."""
-        u1 = u + h * L(u)
-        u2 = 0.75 * u + 0.25 * (u1 + h * L(u1))
-        return (1.0 / 3.0) * u + (2.0 / 3.0) * (u2 + h * L(u2))
+        rhs = L if rhs is None else rhs
+        u1 = u + h * rhs(u)
+        u2 = 0.75 * u + 0.25 * (u1 + h * rhs(u1))
+        return (1.0 / 3.0) * u + (2.0 / 3.0) * (u2 + h * rhs(u2))
 
     # SUB-CYCLING. The hydro timestep is limited by |u| + c, which bounds this
     # advection's |u| but NOT the companion density's positivity: the explicit
@@ -315,10 +495,72 @@ def advect_passive_scalars(
     # The substep count is computed from the flow rather than configured, so a
     # benign step costs exactly what it did before (n = 1 and the loop runs
     # once); only the violent steps pay.
-    n_sub = _substep_count(velocities, grid_spacing, dt, config)
-    h = dt / n_sub.astype(stacked.dtype)
-    u_new = jax.lax.fori_loop(0, n_sub, lambda _, u: ssprk3(u, h), stacked)
+    #
+    # The count is a traced integer, so ``fori_loop(0, n_sub)`` is a while loop,
+    # which reverse-mode AD cannot differentiate. Under BACKWARDS (see
+    # ``config.passive_scalar_substep_loop``) the loop instead runs to the
+    # static cap ``max_passive_scalar_substeps`` and skips the surplus sub-steps
+    # with a ``lax.cond`` (only the taken branch executes): the same arithmetic
+    # on the same data. With a cap of 1 this is just one straight-line sub-step.
+    # Otherwise every sub-step, the first included, sits in ONE scan whose body
+    # is ``jax.checkpoint``-ed, with its RHS rematerialised too, whatever
+    # ``config.ad_remat`` says: XLA allocates the buffers of a conditional and
+    # of a loop body whether or not they run, and adds them to the rest of the
+    # step's, so a separately differentiated first sub-step plus a masked loop
+    # for the rest measured nearly twice the scalar-advection backward memory
+    # of the single rematerialised scan (XLA:CPU). The price is one extra
+    # evaluation of the advection in the backward pass.
+    # The count itself carries no derivative (it is an integer; the flow it is
+    # derived from is held constant for it explicitly).
+    if _masked_substeps(config):
+        n_sub = _substep_count(
+            [jax.lax.stop_gradient(v) for v in velocities],
+            jax.lax.stop_gradient(grid_spacing), jax.lax.stop_gradient(dt), config)
+        h = dt / n_sub.astype(stacked.dtype)
+        n_max = int(config.max_passive_scalar_substeps)
+        if n_max == 1:
+            u_new = ssprk3(stacked, h)
+        elif _scalar_lean(config):
+            # (config.ad_scalar_lean) the flow-derived count in an equinox
+            # checkpointed while loop: the same sub-steps, but the backward
+            # stores two scalar-stack checkpoints instead of one per cap slot
+            # (the masked scan's stack was the largest buffer of a Cas A
+            # gradient's peak); a benign step (n_sub = 1) recomputes nothing
+            from equinox.internal._loop.checkpointed import checkpointed_while_loop
 
+            def lean_body(c):
+                i, u = c
+                return i + 1, ssprk3(u, h, L_remat)
+            _, u_new = checkpointed_while_loop(
+                lambda c: c[0] < n_sub, lean_body, (jnp.zeros((), jnp.int32), stacked),
+                checkpoints=min(2, n_max))
+        else:
+            @jax.checkpoint
+            def masked_substep(i, u):
+                return jax.lax.cond(i < n_sub, lambda v: ssprk3(v, h, L_remat), lambda v: v, u)
+            # Python-int bounds: a scan, not a while loop
+            u_new = jax.lax.fori_loop(0, n_max, masked_substep, stacked)
+    else:
+        n_sub = _substep_count(velocities, grid_spacing, dt, config)
+        h = dt / n_sub.astype(stacked.dtype)
+        u_new = jax.lax.fori_loop(0, n_sub, lambda _, u: ssprk3(u, h), stacked)
+
+    recover = partial(_recover_ratios, config=config)
+    if _scalar_lean(config):
+        # (config.ad_scalar_lean) recompute the recovery's clip masks in the
+        # backward instead of storing them
+        recover = jax.checkpoint(recover)
+    return recover(u_new, density, scalars)
+
+
+def _scalar_lean(config) -> bool:
+    """``config.ad_scalar_lean`` under reverse-mode rematerialisation."""
+    return bool(getattr(config, "ad_scalar_lean", False)) and config.ad_remat != AD_REMAT_NONE
+
+
+def _recover_ratios(u_new, density, scalars, *, config):
+    """The scalar ratios ``s / rho~`` of an advected conserved stack, guarded
+    where the companion density collapsed, and bounded (``advect_passive_scalars``)."""
     rho_new = u_new[0]
 
     # The recovered ratio ``s / rho~`` is meaningless wherever the companion
@@ -347,7 +589,7 @@ def advect_passive_scalars(
     hi = jnp.max(scalars, axis=tuple(range(1, scalars.ndim)), keepdims=True)
     untrustworthy = (rho_new < rho_floor)[None, ...]
     out = jnp.where(untrustworthy,
-                    jnp.clip(jnp.nan_to_num(out, nan=0.0), lo, hi),
+                    _clip_keep_derivative(jnp.nan_to_num(out, nan=0.0), lo, hi),
                     out)
 
     # Physical bounds, where the caller has declared them. This is the backstop
@@ -358,8 +600,10 @@ def advect_passive_scalars(
     # unlike clipping to a scalar's own current range, which clips smooth
     # extrema and destroys the order.
     bounds = _scalar_bounds(config, scalars.shape[0])
+    # (``_clip_keep_derivative``: same primal as ``jnp.clip``, but a scalar
+    # sitting exactly on its bound -- most of the grid -- keeps derivative 1)
     if bounds is not None:
-        out = jnp.clip(out, bounds[0], bounds[1])
+        out = _clip_keep_derivative(out, bounds[0], bounds[1])
 
     # The two shock-history ACCUMULATORS have no declarable upper bound -- they
     # grow with the run -- but they do have an exact one available here:
@@ -379,7 +623,8 @@ def advect_passive_scalars(
         acc = out[-n_acc:]
         hi_acc = jnp.max(scalars[-n_acc:],
                          axis=tuple(range(1, scalars.ndim)), keepdims=True)
-        out = jnp.concatenate([out[:-n_acc], jnp.clip(acc, 0.0, hi_acc)], axis=0)
+        out = jnp.concatenate([out[:-n_acc], _clip_keep_derivative(acc, 0.0, hi_acc)],
+                              axis=0)
     return out
 
 
@@ -496,6 +741,9 @@ def update_shock_history(
         The updated history scalars.
     """
     entropy_now = specific_entropy(primitive_state, gamma, registered_variables)
+    # the label is unbounded; a non-finite or runaway one is reset BEFORE the
+    # latch reads it (bit for bit unchanged otherwise; see sanitize_entropy_label)
+    entropy_initial = sanitize_entropy_label(history[0], entropy_now)
 
     # Two conditions for a FRESH shock crossing, then a latch.
     #
@@ -520,7 +768,8 @@ def update_shock_history(
     velocities = _velocity_components(primitive_state, config, registered_variables)
     div_v = sum(0.5 * (_shift(v, -1, axis=a) - _shift(v, 1, axis=a))
                 for a, v in enumerate(velocities))
-    newly_shocked = ((entropy_now - history[0]) > entropy_jump) & (div_v < 0.0)
+    entropy_rise = entropy_now - entropy_initial
+    newly_shocked = (entropy_rise > entropy_jump) & (div_v < 0.0)
 
     # The latch is a FRACTION, not a boolean, and this matters more than it
     # looks. A boolean latch on "has this cell any accumulated time?" is
@@ -530,8 +779,25 @@ def update_shock_history(
     # is flagged (measured: 100%). Carrying the shocked fraction as its own
     # advected scalar instead makes the accumulation proportional, so leakage
     # contributes in proportion to how much shocked material actually arrived.
-    shocked_fraction = jnp.clip(
-        jnp.maximum(history[1], jnp.where(newly_shocked, 1.0, 0.0)), 0.0, 1.0)
+    #
+    # The clamps use the tie-preserving variants (same primal as
+    # jnp.maximum / jnp.clip): a never-shocked parcel sits exactly on the bound
+    # 0, and a tie would halve its derivative every step.
+    latch = jnp.where(newly_shocked, 1.0, 0.0)
+    if config.ad_smooth_shock_latch:
+        # straight-through: the primal is the boolean latch above, the
+        # derivative that of a sigmoid surrogate of the same two criteria (see
+        # SimulationConfig.ad_smooth_shock_latch)
+        rho_ = jnp.maximum(primitive_state[registered_variables.density_index], 1e-30)
+        p_ = jnp.maximum(primitive_state[registered_variables.pressure_index], 1e-30)
+        c_s = jax.lax.stop_gradient(jnp.sqrt(gamma * p_ / rho_))
+        soft = (jax.nn.sigmoid((entropy_rise - entropy_jump)
+                               / config.ad_shock_latch_entropy_width)
+                * jax.nn.sigmoid(-div_v / (config.ad_shock_latch_compression_width * c_s)))
+        shocked_fraction = _latch_straight_through(history[1], latch, soft)
+    else:
+        shocked_fraction = _clip_keep_derivative(
+            _max_keep_derivative(history[1], latch), 0.0, 1.0)
 
     density = primitive_state[registered_variables.density_index]
     # Both accumulators are monotone non-decreasing along a particle path by
@@ -540,8 +806,9 @@ def update_shock_history(
     # peak). Clamp it: a negative ionization age or a negative time since
     # shocking is meaningless downstream, and the clamp cannot mask a real
     # effect because the true value can never be below zero.
-    time_since_shock = jnp.maximum(history[2] + shocked_fraction * dt, 0.0)
-    density_time = jnp.maximum(history[3] + shocked_fraction * density * dt, 0.0)
-    # entropy_initial is a t = 0 label: advected, never rewritten
-    return jnp.stack([history[0], shocked_fraction, time_since_shock, density_time],
+    time_since_shock = _max_keep_derivative(history[2] + shocked_fraction * dt, 0.0)
+    density_time = _max_keep_derivative(history[3] + shocked_fraction * density * dt, 0.0)
+    # entropy_initial is a t = 0 label: advected, never rewritten (except the
+    # reset of a pathological label above)
+    return jnp.stack([entropy_initial, shocked_fraction, time_since_shock, density_time],
                      axis=0)

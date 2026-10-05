@@ -32,6 +32,7 @@ diffusivity at the trouble cell, and the normal-B flux is overwritten by CT).
 """
 
 # jax
+import jax
 import jax.numpy as jnp
 
 # astronomix constants
@@ -162,6 +163,9 @@ def _local_lax_friedrichs_flux(conserved_state, axis, params, config,
         cR = jnp.sqrt(cs2R)
 
     alpha = jnp.maximum(jnp.abs(vdL) + cL, jnp.abs(vdR) + cR)
+    if config.weno_ad_frozen_weights:
+        # frozen with the WENO splitting speed: d c / d p ~ 1 / c in cold gas
+        alpha = jax.lax.stop_gradient(alpha)
 
     qR = R_state(conserved_state)
     FL = jnp.zeros_like(conserved_state)
@@ -364,30 +368,10 @@ def _deepvoid_blend_weight(conserved_state, axis, params, config,
 # Activation path 1b: cold-crush temperature ramp
 # ---------------------------------------------------------------------------
 
-def _coldcrush_blend_weight(conserved_state, axis, params, config,
-                            registered_variables,
-                            internal_energy_density=None):
-    """LLF weight for radiatively crushed cells: interfaces that are both
-    SUB-floor cold and CONVERGING.
-
-    Two gates, both per interface:
-
-    * temperature ramp — on the COLDER of the two adjacent cells' recovered
-      ``p/rho``, ramping from 1 at (or below) the effective temperature
-      floor ``minimum_specific_pressure`` down to 0 at
-      ``coldcrush_blend_factor`` times it. Any interface with a cold side
-      under compression gets the diffusive flux: cold-cold isothermal
-      collapse AND the boundary faces of a cold dense clump being crushed
-      by hot surroundings (the hero-4 failure mode — a hotter-side gate
-      left exactly those faces unprotected). The price is that shock fronts
-      advancing into cold ambient gas are handled at first order locally —
-      the classic FOFC trade, and what the reference Athena SNR setups do.
-    * convergence gate — the normal velocity must be compressive across the
-      interface (``v_L > v_R``), ramped over the floor sound speed. The
-      cold, freely-expanding ejecta core is divergent and never activates,
-      so its seeded clump structure is not diffused away; the static cold
-      ambient has no convergence and is untouched.
-    """
+def _face_min_specific_pressure(conserved_state, axis, params, config,
+                                registered_variables, internal_energy_density=None):
+    """``min(p_L/rho_L, p_R/rho_R)`` per interface, with the dual-energy
+    pressure recovery (shared by the cold-crush gate and the AD tangent path)."""
     di = registered_variables.density_index
     gamma = params.gamma
     rhomin = params.minimum_density
@@ -436,7 +420,42 @@ def _coldcrush_blend_weight(conserved_state, axis, params, config,
 
     pL = jnp.maximum((gamma - 1.0) * eL, params.minimum_pressure)
     pR = jnp.maximum((gamma - 1.0) * eR, params.minimum_pressure)
-    T_face = jnp.minimum(pL / rhoL, pR / rhoR)
+    return jnp.minimum(pL / rhoL, pR / rhoR), rhoL, rhoR, mom_all
+
+
+def _coldcrush_blend_weight(conserved_state, axis, params, config,
+                            registered_variables,
+                            internal_energy_density=None):
+    """LLF weight for radiatively crushed cells: interfaces that are both
+    SUB-floor cold and CONVERGING.
+
+    Two gates, both per interface:
+
+    * temperature ramp — on the COLDER of the two adjacent cells' recovered
+      ``p/rho``, ramping from 1 at (or below) the effective temperature
+      floor ``minimum_specific_pressure`` down to 0 at
+      ``coldcrush_blend_factor`` times it. Any interface with a cold side
+      under compression gets the diffusive flux: cold-cold isothermal
+      collapse AND the boundary faces of a cold dense clump being crushed
+      by hot surroundings (the hero-4 failure mode — a hotter-side gate
+      left exactly those faces unprotected). The price is that shock fronts
+      advancing into cold ambient gas are handled at first order locally —
+      the classic FOFC trade, and what the reference Athena SNR setups do.
+    * convergence gate — the normal velocity must be compressive across the
+      interface (``v_L > v_R``), ramped over the floor sound speed. The
+      cold, freely-expanding ejecta core is divergent and never activates,
+      so its seeded clump structure is not diffused away; the static cold
+      ambient has no convergence and is untouched.
+    """
+    gamma = params.gamma
+    tfloor = params.minimum_specific_pressure  # p/rho at the floor temperature
+
+    def R(a):
+        return _shift(a, -1, axis=axis)
+
+    T_face, rhoL, rhoR, mom_all = _face_min_specific_pressure(
+        conserved_state, axis, params, config, registered_variables,
+        internal_energy_density=internal_energy_density)
 
     # temperature ramp on the colder side: 1 at (or below) the floor
     # temperature, 0 at factor * floor — any compressed cold side qualifies
@@ -507,7 +526,13 @@ def _ppflux_blend_weight(dF_weno, F_llf, conserved_state, axis, dtdx, params,
     P_minus = dtdx * (jnp.maximum(0.0, A_rho)
                       + jnp.maximum(0.0, -_shift(A_rho, 1, axis=fa)))
     Q_minus = jnp.maximum(rho_LF_new - rhomin, 0.0)
-    R_minus = jnp.where(P_minus > 1e-30, jnp.minimum(1.0, Q_minus / P_minus), 1.0)
+    # min(1, Q / P) written without the min and with a guarded divisor. The
+    # value is the same; the tangent is not: for tiny positive P the float32
+    # tangent of Q / P overflows, and jnp.minimum's JVP multiplies it by a 0/1
+    # mask, 0 * inf = NaN -- which made every forward-mode derivative through
+    # this limiter NaN in ~13 % of a Cas A box (quiescent ambient cells).
+    limited = P_minus > Q_minus
+    R_minus = jnp.where(limited, Q_minus / jnp.where(limited, P_minus, 1.0), 1.0)
     theta_rho = jnp.where(A_rho >= 0.0, R_minus, _shift(R_minus, -1, axis=fa))
 
     # pressure limiter (ideal gas only; isothermal pressure is always positive)
@@ -579,8 +604,35 @@ def _blend_interface_flux(dF_weno, conserved_state, axis, dtdx, params, config,
             registered_variables)
         w = w_pp if w is None else jnp.maximum(w, w_pp)
 
+    # The blend weight is a switching function (limiter activation), so its
+    # derivative carries no physical sensitivity -- only the bisection, the
+    # Zalesak ratios and the max over paths, all of which are piecewise and
+    # float32-fragile under JVP. Differentiate with the limiter FROZEN at its
+    # current activation, the usual choice for differentiable solvers with
+    # flux limiters. The primal is untouched.
+    w = jax.lax.stop_gradient(w)
     w = w[None, ...]
-    return dF_weno * (1.0 - w) + F_llf * w
+    F = dF_weno * (1.0 - w) + F_llf * w
+    factor = config.ad_tangent_llf_cold_factor
+    if factor > 0.0 and config.equation_of_state == IDEAL_GAS:
+        # TANGENT-ONLY monotone linearisation in cold gas. With the WENO
+        # weights and eigensystem frozen (weno_ad_frozen_weights) the tangent is
+        # advanced by a LINEAR high-order scheme whose stencils were chosen for
+        # the primal's smoothness, not for stability; at the sharp edges of
+        # cold dense ejecta knots that linear scheme amplifies the tangent
+        # ~x5 per year (measured; not removed by any positivity switch, dual
+        # energy, or float64). On faces whose colder side is below
+        # ``factor * minimum_specific_pressure`` the DERIVATIVE is taken
+        # through the monotone LLF flux instead. Value: the primal flux F,
+        # exactly. Derivative: that of F_t.
+        T_face, _, _, _ = _face_min_specific_pressure(
+            conserved_state, axis, params, config, registered_variables,
+            internal_energy_density=internal_energy_density)
+        cold = (T_face < factor * params.minimum_specific_pressure).astype(F.dtype)
+        w_t = jax.lax.stop_gradient(jnp.maximum(w[0], cold))[None, ...]
+        F_t = dF_weno * (1.0 - w_t) + F_llf * w_t
+        F = jax.lax.stop_gradient(F) + (F_t - jax.lax.stop_gradient(F_t))
+    return F
 
 
 # Back-compat alias: the deep-void-only entry point (density ramp only). Kept so

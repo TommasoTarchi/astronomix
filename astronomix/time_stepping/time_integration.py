@@ -360,8 +360,9 @@ def time_integration(
         # Pallas. The context only needs to be live while the JIT body is
         # traced; it is read by ``_pallas_call_sharded`` at trace time.
         pallas_mesh = sharding.mesh if sharding is not None else None
+        pallas_spec = sharding.spec if sharding is not None else None
         if config.memory_analysis:
-          with mesh_ctx, pallas_mesh_context(pallas_mesh):
+          with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
             compiled_step = time_integration_jit.lower(
                 primitive_state,
                 config,
@@ -398,7 +399,7 @@ def time_integration(
         if config.print_elapsed_time:
             if not config.memory_analysis:
                 # compile the time integration function
-                with mesh_ctx, pallas_mesh_context(pallas_mesh):
+                with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
                     time_integration_jit.lower(
                         primitive_state,
                         config,
@@ -412,7 +413,7 @@ def time_integration(
             print("🚀 Starting simulation...")
 
         try:
-            with mesh_ctx, pallas_mesh_context(pallas_mesh):
+            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
                 final_state = time_integration_jit(
                     primitive_state,
                     config,
@@ -442,6 +443,11 @@ def time_integration(
             from jax._src.sharding_impls import UnspecifiedValue as _Unspec
 
             def _force_concrete(leaf):
+                # tracers (``time_integration`` called inside an outer jit /
+                # grad, e.g. a sharded 4D-Var) have no ``.sharding`` -- and
+                # nothing to repair: the outer jit binds the output shardings
+                if isinstance(leaf, jax.core.Tracer):
+                    return leaf
                 if isinstance(leaf, jax.Array) and isinstance(leaf.sharding, _Unspec):
                     return jnp.asarray(leaf._arrays[0])
                 return leaf
@@ -1006,6 +1012,7 @@ def _time_integration_to_disk(
 
     mesh_ctx = sharding.mesh if sharding is not None else nullcontext()
     pallas_mesh = sharding.mesh if sharding is not None else None
+    pallas_spec = sharding.spec if sharding is not None else None
     replicated = (
         jax.NamedSharding(sharding.mesh, PartitionSpec())
         if sharding is not None
@@ -1038,7 +1045,7 @@ def _time_integration_to_disk(
                     lambda leaf: jax.device_put(leaf, replicated), segment_params
                 )
 
-            with mesh_ctx, pallas_mesh_context(pallas_mesh):
+            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
                 t_final, primitive_state, key, forcing, num_iterations = run_segment_jit(
                     primitive_state,
                     segment_config,

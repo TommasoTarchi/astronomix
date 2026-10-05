@@ -63,6 +63,10 @@ class SimulationParams(NamedTuple):
     #: on the viscosity_type in SimulationConfig.
     viscosity: float = 0.0
 
+    #: Constant ohmic resistivity eta (config.resistivity). Finite-difference
+    #: CT MHD with the isothermal EOS only.
+    resistivity: float = 0.0
+
     #: Constant thermal conductivity kappa in the conductive energy
     #: source div(kappa grad T) (config.thermal_conduction). T is taken
     #: from the ideal-gas relation T = p / rho (code units, R = 1).

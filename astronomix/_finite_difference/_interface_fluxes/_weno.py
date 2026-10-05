@@ -137,6 +137,7 @@ from astronomix._fluid_equations._fluxes import _euler_flux
 from astronomix._stencil_operations._stencil_operations import _shift
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
     _weno_omega_weights,
+    _weno_omega_weights_ad,
     _weno_omega_weights_z,
 )
 
@@ -161,7 +162,14 @@ def _weno_flux_x_native(
 
     epsilon = config.weno_epsilon
     eps_rel = config.weno_epsilon_relative
-    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
+    # (``_weno_omega_weights_ad``: the same weights bit for bit, with an
+    # overflow-free derivative for the exact-weight tangent; see its docstring)
+    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights_ad
+    if config.weno_ad_frozen_weights:
+        _omega_raw = omega_weights
+
+        def omega_weights(*args):
+            return tuple(jax.lax.stop_gradient(w) for w in _omega_raw(*args))
 
     # only used in the IDEAL_GAS case
     rhomin = params.minimum_density
@@ -232,6 +240,12 @@ def _weno_flux_x_native(
             else:
                 lambdas_center = _eigen_lambdas_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
                 L_row = _eigen_L_row_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+        if config.weno_ad_frozen_weights:
+            # the eigensystem and the splitting speed are frozen with the
+            # weights: L carries 1/c^2 terms, so in cold gas d L / d c ~ 1/c^3
+            # and the tangent is amplified ~20x per step in cold dense knots
+            lambdas_center = jax.lax.stop_gradient(lambdas_center)
+            L_row = jax.lax.stop_gradient(L_row)
 
         F0 = _shift(F,  2, axis=1)   # shape (N_vars, Nx, Ny, Nz) — i-2 at target i
         F1 = _shift(F,  1, axis=1)   # i-1
@@ -358,6 +372,8 @@ def _weno_flux_x_native(
                 R_col = _eigen_R_col_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
             else:
                 R_col = _eigen_R_col_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+        if config.weno_ad_frozen_weights:
+            R_col = jax.lax.stop_gradient(R_col)
 
         if config.dimensionality == 3:
             dF = jnp.einsum('nxyz,xyz->nxyz', R_col, Fs)
@@ -567,6 +583,41 @@ def _weno_flux_native_for_axis(axis: int):
     return _weno_flux_z_native
 
 
+def _native_tangent_sharded(axis: int, native):
+    """The native-JAX tangent branch of a diffable Pallas WENO flux, wrapped in
+    the same multi-GPU ``shard_map`` + halo exchange as the Pallas primal
+    (``_pallas_call_sharded``, halo 3 on the flux axis; a pass-through on one
+    device).
+
+    Without it the tangent -- and so the whole reverse-mode sweep -- runs the
+    native WENO under GSPMD: every periodic roll along the split axis became
+    either an all-to-all reshard (GSPMD's concatenate) or, via
+    ``sharded_roll``, one small ppermute per stencil shift. Measured at 128^3 on
+    4 A100s (2-yr solver-only gradient): 7.1 s / 21.1 s against 3.3 s on ONE
+    GPU. Inside the shard_map the rolls are local and only the halo moves.
+    ``native(s, p[, g])``; ``g`` (dual energy, (x, y, z)) rides the halo as a
+    (1, x, y, z) state-shaped input."""
+    import os
+    from astronomix._pallas_helpers import _pallas_call_sharded
+
+    if os.environ.get("ASTRONOMIX_SHARD_NATIVE_TANGENT", "1") == "0":      # A/B switch
+        return native
+    halo = [0, 0, 0]
+    halo[int(axis)] = 3
+
+    def wrapped(s, p, *g):
+        nd = s.ndim - 1
+        h = tuple(halo[:nd])
+        bs = (1,) * nd
+        if g and g[0] is not None:
+            return _pallas_call_sharded(
+                lambda sl, gl: native(sl, p, gl[0]),
+                state_inputs=(s, g[0][None]), halo=h, block_shape=bs,
+            )
+        return _pallas_call_sharded(lambda sl: native(sl, p), state_inputs=(s,), halo=h, block_shape=bs)
+    return wrapped
+
+
 def _weno_flux_axis_dispatch(
     conserved_state,
     params: SimulationParams,
@@ -610,9 +661,9 @@ def _weno_flux_axis_dispatch(
                 s, p, config, registered_variables, axis=axis,
                 internal_energy_density=g,
             )
-            native = lambda s, p, g: _weno_flux_native_for_axis(axis)(  # noqa: E731
+            native = _native_tangent_sharded(axis, lambda s, p, g: _weno_flux_native_for_axis(axis)(
                 s, p, config, registered_variables, internal_energy_density=g,
-            )
+            ))
             return diffable_pallas_call_n(
                 (conserved_state, params, internal_energy_density),
                 pallas_branch=pallas, native_branch=native,
@@ -626,9 +677,9 @@ def _weno_flux_axis_dispatch(
             pallas = lambda s, p: _weno_flux_hydro_pallas(  # noqa: E731
                 s, p, config, registered_variables, axis=axis
             )
-            native = lambda s, p: _weno_flux_native_for_axis(axis)(  # noqa: E731
+            native = _native_tangent_sharded(axis, lambda s, p: _weno_flux_native_for_axis(axis)(
                 s, p, config, registered_variables
-            )
+            ))
             return diffable_pallas_call(
                 conserved_state, params, pallas_branch=pallas, native_branch=native,
             )

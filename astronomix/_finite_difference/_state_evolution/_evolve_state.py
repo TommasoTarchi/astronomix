@@ -21,6 +21,7 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
+    AD_REMAT_NONE,
     GHOST_CELLS,
     IDEAL_GAS,
     ISOTHERMAL,
@@ -48,6 +49,7 @@ from astronomix._fluid_equations._equations_mhd import (
 from astronomix._fluid_equations._dual_energy import advect_internal_energy
 from astronomix._fluid_equations._passive_scalars import (
     _fill_scalar_ghost_cells,
+    _masked_substeps,
     advect_passive_scalars,
     update_shock_history,
 )
@@ -111,6 +113,18 @@ def _evolve_state_fd(
             passive_scalars, primitive_state, dt, config.grid_spacing,
             config, registered_variables,
         )
+        if _masked_substeps(config):
+            # Reverse-mode memory: the scalars never feed back on the hydro, so
+            # the backward of their advection is independent of the hydro
+            # backward and XLA is free to schedule the two together -- adding
+            # the scalar sub-steps' transient to the hydro peak (measured on
+            # XLA:CPU: +280x the state without remat, +100x with). Tying the
+            # two through a barrier (a numerical no-op, whose transpose is a
+            # barrier on the cotangents) makes the scalar backward wait for the
+            # hydro backward. Only on the reverse-mode (masked) path, so the
+            # FORWARDS program is untouched.
+            passive_scalars, primitive_state = jax.lax.optimization_barrier(
+                (passive_scalars, primitive_state))
 
     # Dual-energy formalism: the internal-energy density ``g`` is carried as the
     # LAST variable of the state. Split it off so the hydro/MHD machinery sees
@@ -265,11 +279,17 @@ def _evolve_state_fd(
     if _scalars:
         if _shock_history:
             n_hist = NUM_SHOCK_HISTORY_SCALARS
+            _history = partial(update_shock_history, config=config,
+                               registered_variables=registered_variables)
+            if config.ad_scalar_lean and config.ad_remat != AD_REMAT_NONE:
+                # (config.ad_scalar_lean) recompute the latch / clamp masks in
+                # the backward instead of storing them
+                _history = jax.checkpoint(_history)
             passive_scalars = jnp.concatenate(
                 [passive_scalars[:-n_hist],
-                 update_shock_history(
+                 _history(
                      passive_scalars[-n_hist:], primitive_state, dt, gamma,
-                     config.shock_entropy_jump, config, registered_variables)],
+                     config.shock_entropy_jump)],
                 axis=0,
             )
         if config.boundary_handling == GHOST_CELLS:

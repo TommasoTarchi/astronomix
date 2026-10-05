@@ -15,6 +15,7 @@ new knobs / fallbacks only need to be added once.
 
 # general
 import contextvars
+import os
 from contextlib import contextmanager
 
 # jax
@@ -140,10 +141,13 @@ def _pallas_compiler_params(config: SimulationConfig):
 _pallas_mesh_ctx: contextvars.ContextVar = contextvars.ContextVar(
     "astronomix_pallas_mesh", default=None
 )
+_pallas_spec_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "astronomix_pallas_state_spec", default=None
+)
 
 
 @contextmanager
-def pallas_mesh_context(mesh):
+def pallas_mesh_context(mesh, spec=None):
     """Set the active mesh for Pallas kernel sharding.
 
     ``time_integration`` enters this context around the JIT trace whenever
@@ -152,18 +156,141 @@ def pallas_mesh_context(mesh):
     a ``shard_map`` + ppermute halo exchange instead of the bare
     ``pl.pallas_call``.
 
+    ``spec``: the ``PartitionSpec`` of the ``(var, x, y, z)`` state (the
+    user's ``sharding.spec``). Inside a JIT trace the kernel inputs are
+    tracers, which carry no ``.sharding`` under ``AxisType.Auto`` meshes, so
+    without it the wrapper had to guess ``P(*mesh.axis_names)`` -- right only
+    for the 4-axis ``(var, x, y, z)`` benchmark mesh; for a 1-axis ``("x",)``
+    mesh with ``P(None, "x")`` that guess shards NO spatial axis and every
+    kernel silently fell back to the bare ``pallas_call`` (GSPMD all-gather
+    of the full state per kernel).
+
+    Callers that differentiate a sharded ``time_integration`` must hold this
+    context around the OUTER trace as well: reverse-mode rules (custom_jvp
+    primals, the checkpointed loop's backward sweep) are traced after
+    ``time_integration`` has returned.
+
     When ``mesh`` is ``None`` (single-device run) or has size 1, the
     helper is a no-op — the kernel runs exactly as before.
     """
     token = _pallas_mesh_ctx.set(mesh)
+    token_spec = _pallas_spec_ctx.set(spec)
     try:
         yield
     finally:
+        _pallas_spec_ctx.reset(token_spec)
         _pallas_mesh_ctx.reset(token)
 
 
 def _current_pallas_mesh():
     return _pallas_mesh_ctx.get()
+
+
+def _current_pallas_spec():
+    return _pallas_spec_ctx.get()
+
+
+def sharded_roll(x, shift: int, axis: int):
+    """``jnp.roll(x, shift, axis)`` along the SPLIT axis of the active Pallas
+    mesh context as a shard_map + ppermute of the ``|shift|`` boundary planes,
+    or ``None`` when there is nothing to do differently (no multi-device
+    context, ``axis`` not the split axis, a shape that does not split evenly,
+    ``|shift|`` beyond one shard): the caller then rolls as before.
+
+    Why: GSPMD partitions the slice + concatenate of a periodic roll along a
+    split axis as TWO all-to-all reshards of the whole local block, not as a
+    halo exchange -- 900+ all-to-alls per 4D-Var gradient step at 256^3 on 4
+    GPUs (``casa_4dvar_shard --hlo-audit``); a 20-yr 256^3 forward on 4 A100s
+    took 205.8 s with them against 45.6 s on ONE GPU, and 26.2 s with this.
+    The values are the same as the concatenate's (a pure data movement), so
+    results are bitwise unchanged. (In a reverse sweep one ppermute per
+    stencil shift is itself slow -- the native WENO tangent is therefore
+    shard-local as a whole, ``_weno._native_tangent_sharded``.)
+
+    The split axis is read from the context spec: for an array with as many
+    dims as the ``(var, x, y, z)`` state spec, the spec's own position; with
+    one dim fewer (a single field ``(x, y, z)``), shifted by one.
+    """
+    mesh = _current_pallas_mesh()
+    spec = _current_pallas_spec()
+    if mesh is None or mesh.size <= 1 or spec is None:
+        return None
+    mode = os.environ.get("ASTRONOMIX_SHARDED_ROLL", "auto")    # auto | 1 | 0 (GSPMD's concatenate)
+    if mode == "0":
+        return None
+    names = [nm for nm in spec]
+    split = [i for i, nm in enumerate(names) if nm is not None]
+    if len(split) != 1:
+        return None
+    sa = split[0]
+    name = names[sa]
+    if isinstance(name, tuple):
+        if len(name) != 1:
+            return None
+        name = name[0]
+    nd = x.ndim
+    if nd == len(names):
+        pass
+    elif nd == len(names) - 1 and sa >= 1:
+        sa -= 1
+    else:
+        return None
+    axis = axis % nd
+    if axis != sa:
+        return None
+    ndev = mesh.shape[name]
+    n = x.shape[axis]
+    if ndev <= 1 or n % ndev:
+        return None
+    if ndev == 2 and mode != "1":
+        # 2026-09-27: with 2 devices, rolls of this form inside the native WENO
+        # TANGENT (a custom_jvp rule, transposed) gave a gradient 5 % off at a
+        # few cells (4 devices: exact to 5e-7; the forward bitwise right; a
+        # standalone roll-in-a-loop VJP exact on 2 GPUs too).
+        # Review (shard_review/, state-level 128^3 tests of the 4D-Var solver):
+        # deterministic, compile-dependent (XLA collective-permute combining
+        # off changes it but does not remove it), in the bulk of the hot
+        # ejecta, NOT on the seam planes -- so not a data-movement error, but
+        # a different rounding of the GSPMD-partitioned native tangent that the
+        # non-smooth tangent amplifies; 2-yr: vel. gradients 1-2 % (rel L2) vs a
+        # 2.8-4.8 % change of the 1-GPU gradient under a 1e-7 input jitter.
+        # With the tangent shard-local (``_native_tangent_sharded``) forcing
+        # ASTRONOMIX_SHARDED_ROLL=1 on 2 devices gives a gradient BITWISE equal
+        # to the default below (and 1.5e-7 of the 1-GPU one over 2 yr), so this
+        # guard now only matters for native tangents that are not shard-local
+        # (the MHD fluxes); 2-device meshes keep GSPMD's roll (slower: ~450
+        # whole-block all-to-alls per 128^3 4D-Var gradient) unless
+        # ASTRONOMIX_SHARDED_ROLL=1.
+        return None
+    loc = n // ndev
+    s = int(shift) % n
+    if s > n // 2:
+        s -= n
+    if s == 0:
+        return x
+    if abs(s) > loc:
+        return None
+
+    try:
+        from jax.shard_map import shard_map  # jax >= 0.8
+    except ImportError:  # jax < 0.8
+        from jax.experimental.shard_map import shard_map
+
+    pspec = [None] * nd
+    pspec[sa] = name
+    pspec = PartitionSpec(*pspec)
+    right = [(j, (j + 1) % ndev) for j in range(ndev)]
+    left = [(j, (j - 1) % ndev) for j in range(ndev)]
+
+    def body(xl):
+        if s > 0:           # out[i] = in[i - s]: the first s planes come from the left neighbour
+            recv = jax.lax.ppermute(jax.lax.slice_in_dim(xl, loc - s, loc, axis=axis), name, perm=right)
+            return jax.lax.concatenate([recv, jax.lax.slice_in_dim(xl, 0, loc - s, axis=axis)], axis)
+        t = -s              # out[i] = in[i + t]: the last t planes come from the right neighbour
+        recv = jax.lax.ppermute(jax.lax.slice_in_dim(xl, 0, t, axis=axis), name, perm=left)
+        return jax.lax.concatenate([jax.lax.slice_in_dim(xl, t, loc, axis=axis), recv], axis)
+
+    return shard_map(body, mesh=mesh, in_specs=(pspec,), out_specs=pspec, check_rep=False)(x)
 
 
 def _round_halo_up_to_block(halo, block_shape) -> tuple[int, ...]:
@@ -267,9 +394,16 @@ def _pallas_call_sharded(
     state0 = state_inputs[0]
     ndim = state0.ndim - 1
 
-    sharding = getattr(state0, "sharding", None)
+    try:
+        sharding = getattr(state0, "sharding", None)
+    except Exception:       # tracers: "use jax.typeof(x)" (not always an AttributeError)
+        sharding = None
+    ctx_spec = _current_pallas_spec()
     if isinstance(sharding, NamedSharding):
         pspec = sharding.spec
+    elif ctx_spec is not None and len(ctx_spec) <= state0.ndim:
+        # the state spec of the enclosing ``time_integration(sharding=...)``
+        pspec = PartitionSpec(*ctx_spec, *((None,) * (state0.ndim - len(ctx_spec))))
     else:
         pspec = _default_state_pspec(mesh, ndim)
 
