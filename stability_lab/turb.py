@@ -33,6 +33,9 @@ parser.add_argument("--vacuum-rest", type=int, default=0)
 parser.add_argument("--blend", type=int, default=0)
 parser.add_argument("--pp", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--clamp", type=int, default=1,
+                    help="PositivityConfig.clamp_in_estimates (0 = no read-only or step-end clamps)")
+parser.add_argument("--pmin", type=float, default=1e-10)
 parser.add_argument("--save-every", type=int, default=0,
                     help="dump the full state every this many snapshots (0 = never)")
 parser.add_argument("--state-dir", default="/export/data/lstorcks/weno_stability")
@@ -120,6 +123,7 @@ config = SimulationConfig(
         vacuum_rest=bool(args.vacuum_rest),
         deepvoid_blend=bool(args.blend),
         preserving_flux=bool(args.pp),
+        clamp_in_estimates=bool(args.clamp),
     ),
     return_snapshots=False,
     activate_snapshot_callback=True,
@@ -140,7 +144,7 @@ params = SimulationParams(
         protection_max_velocity=50.0,
     ),
     minimum_density=args.rhomin,
-    minimum_pressure=1e-10,
+    minimum_pressure=args.pmin,
 )
 
 registered_variables = get_registered_variables(config)
@@ -177,15 +181,25 @@ first_nan = {"t": None}
 def diagnostics(time, state, registered_variables):
     rho = state[density_index]
     speed = jnp.sqrt(state[vx] ** 2 + state[vy] ** 2 + state[vz] ** 2)
+    if adiabatic:
+        pressure_field = state[registered_variables.pressure_index]
+    else:
+        pressure_field = rho * sound_speed**2
     stats = jnp.stack([
         time, jnp.min(rho), jnp.max(rho), jnp.max(speed),
         jnp.sqrt(jnp.mean(speed**2)),
         jnp.any(~jnp.isfinite(state)).astype(jnp.float32),
+        jnp.min(pressure_field),
+        # cells sitting at (or below) a floor: zero means no floor ever acted
+        jnp.sum(rho <= 1.0001 * args.rhomin).astype(jnp.float32),
+        jnp.sum(pressure_field <= 1.0001 * args.pmin).astype(jnp.float32) if adiabatic else jnp.float32(0.0),
     ])
 
     def host(stats_array, full_state):
-        t, rho_min, rho_max, v_max, v_rms, nan = [float(x) for x in np.asarray(stats_array)]
-        records.append((t, rho_min, rho_max, v_max, v_rms, nan))
+        values = [float(x) for x in np.asarray(stats_array)]
+        t, rho_min, rho_max, v_max, v_rms, nan = values[:6]
+        p_min, n_rho_floor, n_p_floor = values[6:]
+        records.append((t, rho_min, rho_max, v_max, v_rms, nan, p_min, n_rho_floor, n_p_floor))
         if nan > 0 or rho_min <= 0:
             if first_nan["t"] is None:
                 first_nan["t"] = t
@@ -198,7 +212,8 @@ def diagnostics(time, state, registered_variables):
                 np.save(os.path.join(args.state_dir, f"{args.tag}_snap{snapshot_index:03d}.npy"),
                         last_good["state"].astype(np.float32))
         print(f"[{label}] t/tc={t/t_cross:.3f} min_rho={rho_min:.3e} max_rho={rho_max:.3e} "
-              f"max|v|={v_max:.3f} v_rms={v_rms:.3f} bad={int(nan > 0 or rho_min <= 0)}", flush=True)
+              f"max|v|={v_max:.3f} v_rms={v_rms:.3f} min_p={p_min:.3e} "
+              f"at_floor(rho,p)=({int(n_rho_floor)},{int(n_p_floor)}) bad={int(nan > 0 or rho_min <= 0)}", flush=True)
 
     jax.debug.callback(host, stats, state)
 
@@ -208,7 +223,7 @@ time_integration(initial_state, config, params, registered_variables, diagnostic
 elapsed = walltime.time() - start
 records = np.array(sorted(records))
 np.savetxt(os.path.join(OUT_DIR, f"diag_{args.tag}.txt"), records,
-           header="t min_rho max_rho max_v v_rms bad")
+           header="t min_rho max_rho max_v v_rms bad min_p n_rho_at_floor n_p_at_floor")
 t_last = float(np.nanmax(records[:, 0])) if len(records) else 0.0
 if first_nan["t"] is not None:
     verdict = f"FAILED (NaN) after t/tc={t_last / t_cross:.3f}"
@@ -218,7 +233,8 @@ else:
     verdict = "COMPLETE"
 print(f"RESULT [{label}] N={args.N} M={args.mturb} beta={args.beta} eos={args.eos} cfl={args.cfl} "
       f"rhomin={args.rhomin}: {verdict}; min rho over run={np.nanmin(records[:,1]):.3e} "
-      f"max|v|={np.nanmax(records[:,3]):.2f} wall={elapsed:.0f}s", flush=True)
+      f"max|v|={np.nanmax(records[:,3]):.2f} min p over run={np.nanmin(records[:,6]):.3e} "
+      f"floor hits (rho,p)=({int(np.nansum(records[:,7]))},{int(np.nansum(records[:,8]))}) wall={elapsed:.0f}s", flush=True)
 if first_nan["t"] is not None and last_good["state"] is not None:
     np.savez(os.path.join(OUT_DIR, f"lastgood_{args.tag}.npz"), state=last_good["state"],
              t=last_good["t"])
