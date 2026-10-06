@@ -1,136 +1,325 @@
 """
-Tangent-only safety of reverse-mode AD through the finite-difference solver
-(stage-4 library adjoint work, 2026-09-26): the primal is bit for bit unchanged.
+The overflow-free derivative of the WENO-JS weights (``_weno_omega_weights_ad``).
 
-**Overflow-free WENO-JS weight derivative** (``_weno_omega_weights_ad``). JAX
-differentiates ``alpha_0 / alpha_sum`` through ``alpha_sum^-2``; where every
-smoothness indicator is large (a field with an O(1e5) jump across the stencil)
-``alpha_sum`` falls below ~5e-20 and ``alpha_sum^-2`` overflows float32, so even
-a ZERO cotangent gives ``0 * inf = NaN``. On the Cas A 4D-Var's R' trajectory
-(128^3, float32) the unbounded ``entropy_initial`` label reached -6.7e4 in one
-collapsed cell; the passive-scalar WENO backward made that NaN and the NaN
-covered the whole state gradient within a year while J stayed finite. The
-stencil below is the recorded one.
+JAX differentiates the weight quotient ``alpha_0 / alpha_sum`` through
+``alpha_sum^-2``. Where every smoothness indicator of a stencil is large (a field
+with an O(1e5) jump across the stencil) ``alpha_sum`` falls below ~5e-20 and
+``alpha_sum^-2`` overflows float32, so even a ZERO cotangent gives
+``0 * inf = NaN``. An unbounded passive scalar, the shock-history
+``entropy_initial`` label, can develop such a jump in a single collapsed cell;
+the NaN of the passive-scalar WENO backward pass then spreads through the shared
+mass flux over the whole state gradient while the objective stays finite.
+``_weno_omega_weights_ad`` evaluates the same derivative as a log-derivative with
+bounded factors; its primal is unchanged bit for bit.
 
-Run on the CPU::
+What is checked:
 
-    JAX_PLATFORMS=cpu PYTHONPATH=. python -m pytest pytests/differentiability/test_ad_tangent_safety.py
+* the primal of the overflow-free weights is that of the plain ones, bit for bit;
+* their tangent is the exact derivative wherever autodiff of the plain weights
+  is finite;
+* on a recorded float32 stencil the plain VJP is NaN, the overflow-free one is
+  finite and matches central differences;
+* the VJP of the passive-scalar advection stays finite with that stencil in the
+  ``entropy_initial`` label.
+
+Run on the CPU (the preamble then selects fast-compiling XLA flags)::
+
+    JAX_PLATFORMS=cpu python -m pytest pytests/differentiability/test_ad_tangent_safety.py
 """
+
 # ==== GPU selection ====
 import os
-if os.environ.get("JAX_PLATFORMS", "") == "cpu":
+if os.environ.get("JAX_PLATFORMS") == "cpu":
+    # XLA:CPU compiles the unrolled step in seconds at optimisation level 0
+    # (minutes and tens of GB otherwise); the numerics differ at round-off only.
     os.environ.setdefault(
         "XLA_FLAGS",
-        "--xla_backend_optimization_level=0 --xla_llvm_disable_expensive_passes=true")
+        "--xla_backend_optimization_level=0 --xla_llvm_disable_expensive_passes=true",
+    )
 elif os.environ.get("CUDA_VISIBLE_DEVICES") is None:
     from autocvd import autocvd
     autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
-import numpy as np
-
+# jax
 import jax
 import jax.numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
+# numerics
+import numpy as np
 
+# astronomix constants
+from astronomix import BACKWARDS
+from astronomix.variable_registry.registered_variables import ENTROPY_INITIAL_SLOT
+
+# astronomix functions
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
     _weno_omega_weights,
     _weno_omega_weights_ad,
 )
-from astronomix._fluid_equations._passive_scalars import _weno5_left_biased
+from astronomix._fluid_equations._passive_scalars import (
+    _weno5_left_biased,
+    advect_passive_scalars,
+)
 
-#: the passive-scalar ``entropy_initial`` ratio along x through the cell whose
-#: WENO VJP was NaN (Cas A 4D-Var, R' z_stage3, 2017.4 -> 2018.4, step 2)
-CASA_STENCIL = [-19.62940216064453, -19.648536682128906, -19.625972747802734,
-                -19.603029251098633, -22.161638259887695, -778.392578125,
-                -66914.5078125, -9.308792114257812, -18.60173988342285]
+# shared blast setup (a sibling module of this test)
+from _blast_setup import (
+    NUM_CELLS,
+    fluid_only_registry,
+    get_fluid_state,
+    setup_blast,
+)
+
+jax.config.update("jax_enable_x64", True)
 
 
-def _reconstruct(q, omega):
-    return jnp.stack([_weno5_left_biased(q[i - 2], q[i - 1], q[i], q[i + 1], q[i + 2],
-                                         1e-7, omega) for i in range(2, len(q) - 2)])
+#: The ``entropy_initial`` label along x through a collapsed cell of a float32
+#: remnant run, where the plain weights' VJP was NaN: an O(1e5) spike on a
+#: background of about -20.
+OVERFLOW_STENCIL = [
+    -19.62940216064453,
+    -19.648536682128906,
+    -19.625972747802734,
+    -19.603029251098633,
+    -22.161638259887695,
+    -778.392578125,
+    -66914.5078125,
+    -9.308792114257812,
+    -18.60173988342285,
+]
+
+#: The regularisation ``epsilon`` added to the smoothness indicators.
+WENO_EPSILON = 1e-7
+
+
+def _reconstruct(values, omega_weights):
+    """
+    The left-biased WENO5 face values of the interior cells of a 1D stencil.
+
+    Args:
+        values: The cell values; the first and last two cells only serve as
+            stencil support.
+        omega_weights: The weight function, ``_weno_omega_weights`` or
+            ``_weno_omega_weights_ad``.
+
+    Returns:
+        The values at the right faces of cells ``2, ..., len(values) - 3``.
+    """
+    face_values = [
+        _weno5_left_biased(
+            values[cell - 2],
+            values[cell - 1],
+            values[cell],
+            values[cell + 1],
+            values[cell + 2],
+            WENO_EPSILON,
+            omega_weights,
+        )
+        for cell in range(2, len(values) - 2)
+    ]
+    return jnp.stack(face_values)
 
 
 def test_weno_weights_ad_primal_bitwise():
+    """
+    The overflow-free weights compute the primal of the plain ones bit for bit,
+    in float32 and float64, for smoothness indicators spanning 24 decades and two
+    alpha-sum floors, and so does a reconstruction of the overflow stencil.
+    """
     rng = np.random.default_rng(0)
     for dtype in (jnp.float32, jnp.float64):
-        IS = [jnp.asarray(10.0 ** rng.uniform(-12, 12, size=4096), dtype) for _ in range(3)]
-        for tiny in (1e-40, 1e-14):
-            a = _weno_omega_weights(*IS, 1e-7, tiny)
-            b = _weno_omega_weights_ad(*IS, 1e-7, tiny)
-            for x, y in zip(a, b):
-                assert x.dtype == y.dtype
-                np.testing.assert_array_equal(np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8))
-    q = jnp.asarray(CASA_STENCIL, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(_reconstruct(q, _weno_omega_weights)),
-                                  np.asarray(_reconstruct(q, _weno_omega_weights_ad)))
+        smoothness_indicators = [
+            jnp.asarray(10.0 ** rng.uniform(-12, 12, size=4096), dtype)
+            for _ in range(3)
+        ]
+        for alpha_sum_floor in (1e-40, 1e-14):
+            plain_weights = _weno_omega_weights(
+                *smoothness_indicators,
+                WENO_EPSILON,
+                alpha_sum_floor,
+            )
+            overflow_free_weights = _weno_omega_weights_ad(
+                *smoothness_indicators,
+                WENO_EPSILON,
+                alpha_sum_floor,
+            )
+            for plain_weight, overflow_free_weight in zip(plain_weights, overflow_free_weights):
+                assert plain_weight.dtype == overflow_free_weight.dtype
+                np.testing.assert_array_equal(
+                    np.asarray(plain_weight).view(np.uint8),
+                    np.asarray(overflow_free_weight).view(np.uint8),
+                )
+
+    stencil = jnp.asarray(OVERFLOW_STENCIL, jnp.float32)
+    np.testing.assert_array_equal(
+        np.asarray(_reconstruct(stencil, _weno_omega_weights)),
+        np.asarray(_reconstruct(stencil, _weno_omega_weights_ad)),
+    )
 
 
 def test_weno_weights_ad_tangent_exact():
-    """Same derivative as autodiff of the plain weights wherever that is finite
-    (x64), including a traced epsilon (the ``weno_epsilon_relative`` path)."""
+    """
+    The overflow-free tangent is the derivative of the plain weights by autodiff
+    wherever that is finite (float64), for three indicator scales, and so is the
+    derivative with respect to a traced epsilon (the ``weno_epsilon_relative``
+    path).
+    """
+
+    def plain_weights(indicator_0, indicator_1, indicator_2):
+        """The plain weights with the smallest alpha-sum floor."""
+        return _weno_omega_weights(indicator_0, indicator_1, indicator_2, WENO_EPSILON, 1e-40)
+
+    def overflow_free_weights(indicator_0, indicator_1, indicator_2):
+        """The overflow-free weights with the smallest alpha-sum floor."""
+        return _weno_omega_weights_ad(indicator_0, indicator_1, indicator_2, WENO_EPSILON, 1e-40)
+
     rng = np.random.default_rng(1)
     for scale in (1e-3, 1.0, 1e3):
-        IS = [jnp.asarray(np.abs(rng.normal(size=2000)) * scale ** 2 * 10 ** rng.uniform(-6, 0, 2000))
-              for _ in range(3)]
-        dIS = [jnp.asarray(rng.normal(size=2000)) * IS[k] for k in range(3)]
-        _, t_ref = jax.jvp(lambda a, b, c: _weno_omega_weights(a, b, c, 1e-7, 1e-40), IS, dIS)
-        _, t_new = jax.jvp(lambda a, b, c: _weno_omega_weights_ad(a, b, c, 1e-7, 1e-40), IS, dIS)
-        for x, y in zip(t_ref, t_new):
-            np.testing.assert_allclose(np.asarray(y), np.asarray(x), rtol=1e-11,
-                                       atol=1e-13 * float(jnp.max(jnp.abs(x))))
-    g_ref = jax.grad(lambda e: _weno_omega_weights(*IS, e, 1e-14)[0].sum())(jnp.asarray(1e-7))
-    g_new = jax.grad(lambda e: _weno_omega_weights_ad(*IS, e, 1e-14)[0].sum())(jnp.asarray(1e-7))
-    np.testing.assert_allclose(float(g_new), float(g_ref), rtol=1e-10)
+        smoothness_indicators = []
+        for _ in range(3):
+            magnitude = np.abs(rng.normal(size=2000)) * scale ** 2
+            spread = 10 ** rng.uniform(-6, 0, 2000)
+            smoothness_indicators.append(jnp.asarray(magnitude * spread))
+        indicator_tangents = [
+            jnp.asarray(rng.normal(size=2000)) * smoothness_indicators[k]
+            for k in range(3)
+        ]
+        _, plain_tangents = jax.jvp(plain_weights, smoothness_indicators, indicator_tangents)
+        _, overflow_free_tangents = jax.jvp(
+            overflow_free_weights,
+            smoothness_indicators,
+            indicator_tangents,
+        )
+        for plain_tangent, overflow_free_tangent in zip(plain_tangents, overflow_free_tangents):
+            np.testing.assert_allclose(
+                np.asarray(overflow_free_tangent),
+                np.asarray(plain_tangent),
+                rtol=1e-11,
+                atol=1e-13 * float(jnp.max(jnp.abs(plain_tangent))),
+            )
+
+    # The derivative with respect to epsilon, on the indicators of the largest scale.
+    def summed_plain_omega_0(epsilon):
+        """The sum of the plain ``omega_0`` as a function of epsilon."""
+        return _weno_omega_weights(*smoothness_indicators, epsilon, 1e-14)[0].sum()
+
+    def summed_overflow_free_omega_0(epsilon):
+        """The sum of the overflow-free ``omega_0`` as a function of epsilon."""
+        return _weno_omega_weights_ad(*smoothness_indicators, epsilon, 1e-14)[0].sum()
+
+    plain_epsilon_derivative = jax.grad(summed_plain_omega_0)(jnp.asarray(WENO_EPSILON))
+    overflow_free_epsilon_derivative = jax.grad(summed_overflow_free_omega_0)(
+        jnp.asarray(WENO_EPSILON)
+    )
+    np.testing.assert_allclose(
+        float(overflow_free_epsilon_derivative),
+        float(plain_epsilon_derivative),
+        rtol=1e-10,
+    )
 
 
-def test_weno_weights_ad_no_nan_on_casa_stencil():
-    """The recorded Cas A stencil: the plain weights' float32 VJP is NaN even for
-    a zero cotangent; the overflow-free one is finite (and zero for zero)."""
-    q = jnp.asarray(CASA_STENCIL, jnp.float32)
-    y, vjp_plain = jax.vjp(lambda v: _reconstruct(v, _weno_omega_weights), q)
-    assert not np.all(np.isfinite(np.asarray(vjp_plain(jnp.zeros_like(y))[0])))   # the bug
-    y, vjp = jax.vjp(lambda v: _reconstruct(v, _weno_omega_weights_ad), q)
-    np.testing.assert_array_equal(np.asarray(vjp(jnp.zeros_like(y))[0]), 0.0)
-    g1 = np.asarray(vjp(jnp.ones_like(y))[0])
-    assert np.all(np.isfinite(g1))
-    # and it is the derivative: central differences in float64 on the same stencil
-    q64 = jnp.asarray(CASA_STENCIL, jnp.float64)
-    _, vjp64 = jax.vjp(lambda v: _reconstruct(v, _weno_omega_weights_ad), q64)
-    g64 = np.asarray(vjp64(jnp.ones(5))[0])
-    h = 1e-6
-    fd = np.array([(float(jnp.sum(_reconstruct(q64.at[i].add(h * abs(CASA_STENCIL[i])), _weno_omega_weights)))
-                    - float(jnp.sum(_reconstruct(q64.at[i].add(-h * abs(CASA_STENCIL[i])), _weno_omega_weights))))
-                   / (2 * h * abs(CASA_STENCIL[i])) for i in range(len(CASA_STENCIL))])
-    np.testing.assert_allclose(g64, fd, rtol=1e-4, atol=1e-6)
-    np.testing.assert_allclose(g1, g64, rtol=2e-3, atol=2e-4)
+def test_weno_weights_ad_no_nan_on_overflow_stencil():
+    """
+    On the overflow stencil (float32) the plain weights' VJP is NaN even for a
+    zero cotangent; the overflow-free one is finite (and zero for a zero
+    cotangent) and matches central differences of the plain reconstruction in
+    float64.
+    """
+
+    def plain_reconstruction(values):
+        """The WENO5 face values with the plain weights."""
+        return _reconstruct(values, _weno_omega_weights)
+
+    def overflow_free_reconstruction(values):
+        """The WENO5 face values with the overflow-free weights."""
+        return _reconstruct(values, _weno_omega_weights_ad)
+
+    # --------------- ↓ float32 ↓ ----------------
+
+    stencil = jnp.asarray(OVERFLOW_STENCIL, jnp.float32)
+    face_values, plain_vjp = jax.vjp(plain_reconstruction, stencil)
+    # The plain weights' VJP is NaN even for a zero cotangent.
+    assert not np.all(np.isfinite(np.asarray(plain_vjp(jnp.zeros_like(face_values))[0])))
+    face_values, overflow_free_vjp = jax.vjp(overflow_free_reconstruction, stencil)
+    np.testing.assert_array_equal(
+        np.asarray(overflow_free_vjp(jnp.zeros_like(face_values))[0]),
+        0.0,
+    )
+    float32_gradient = np.asarray(overflow_free_vjp(jnp.ones_like(face_values))[0])
+    assert np.all(np.isfinite(float32_gradient))
+
+    # --------------- ↑ float32 ↑ ----------------
+
+    # --------------- ↓ float64 central differences ↓ ----------------
+
+    # The overflow-free VJP is the derivative: compare it with central
+    # differences of the plain reconstruction in float64 on the same stencil.
+    stencil_64 = jnp.asarray(OVERFLOW_STENCIL, jnp.float64)
+    face_values_64, vjp_64 = jax.vjp(overflow_free_reconstruction, stencil_64)
+    float64_gradient = np.asarray(vjp_64(jnp.ones_like(face_values_64))[0])
+    relative_step = 1e-6
+    central_differences = []
+    for cell, value in enumerate(OVERFLOW_STENCIL):
+        step = relative_step * abs(value)
+        forward_sum = float(jnp.sum(plain_reconstruction(stencil_64.at[cell].add(step))))
+        backward_sum = float(jnp.sum(plain_reconstruction(stencil_64.at[cell].add(-step))))
+        central_differences.append((forward_sum - backward_sum) / (2 * relative_step * abs(value)))
+    np.testing.assert_allclose(
+        float64_gradient,
+        np.array(central_differences),
+        rtol=1e-4,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(float32_gradient, float64_gradient, rtol=2e-3, atol=2e-4)
+
+    # --------------- ↑ float64 central differences ↑ ----------------
 
 
 def test_passive_scalar_advection_vjp_finite_with_huge_label():
-    """End to end through ``advect_passive_scalars`` (float32): an unbounded
-    label holding the Cas A spike gives a finite VJP, zero for a zero cotangent."""
-    from test_fd_reverse_mode import _setup
-    from astronomix import BACKWARDS
-    from astronomix._fluid_equations._passive_scalars import advect_passive_scalars
-    config, rv, state = _setup(differentiation_mode=BACKWARDS)      # the masked (static) sub-step loop
+    """
+    End to end through ``advect_passive_scalars`` in float32: with the overflow
+    stencil in the unbounded ``entropy_initial`` label, the advected scalars and
+    the VJP are finite, and the VJP is zero for a zero cotangent.
+    """
+    # BACKWARDS selects the masked (static) sub-step loop.
+    config, registered_variables, state = setup_blast(differentiation_mode=BACKWARDS)
     state = state.astype(jnp.float32)
-    i_ent = rv.passive_scalar_index + 5            # entropy_initial (first history scalar)
-    lab = jnp.full(state.shape[1:], -19.6, jnp.float32)
-    lab = lab.at[5:14, 8, 8].set(jnp.asarray(CASA_STENCIL, jnp.float32))
-    state = state.at[i_ent].set(lab)
-    rv_h = rv._replace(num_vars=rv.passive_scalar_index, passive_scalar_index=-1,
-                       num_passive_scalars=0, passive_scalars_active=False, shock_history_active=False)
-    hydro = state[:rv.passive_scalar_index]
-    scalars = state[rv.passive_scalar_index:]
 
-    def f(s, h):
-        return advect_passive_scalars(s, h, jnp.float32(2e-3), config.grid_spacing, config, rv_h)
-    out, vjp = jax.vjp(f, scalars, hydro)
-    assert np.all(np.isfinite(np.asarray(out)))
-    gs, gh = vjp(jnp.zeros_like(out))
-    np.testing.assert_array_equal(np.asarray(gs), 0.0)
-    np.testing.assert_array_equal(np.asarray(gh), 0.0)
-    gs, gh = vjp(jnp.ones_like(out))
-    assert np.all(np.isfinite(np.asarray(gs))) and np.all(np.isfinite(np.asarray(gh)))
+    # A uniform label at the stencil's background value, with the overflow
+    # stencil along x through the centre of the box.
+    entropy_label_index = registered_variables.shock_history_index + ENTROPY_INITIAL_SLOT
+    stencil_start = 5
+    stencil_stop = stencil_start + len(OVERFLOW_STENCIL)
+    box_centre = NUM_CELLS // 2
+    entropy_label = jnp.full(state.shape[1:], -19.6, jnp.float32)
+    entropy_label = entropy_label.at[stencil_start:stencil_stop, box_centre, box_centre].set(
+        jnp.asarray(OVERFLOW_STENCIL, jnp.float32)
+    )
+    state = state.at[entropy_label_index].set(entropy_label)
+
+    fluid_registry = fluid_only_registry(registered_variables)
+    fluid_state = get_fluid_state(state, registered_variables)
+    passive_scalars = state[registered_variables.passive_scalar_index:]
+
+    def advect(scalars, fluid):
+        """One advection step of the passive scalars."""
+        return advect_passive_scalars(
+            scalars,
+            fluid,
+            jnp.float32(2e-3),
+            config.grid_spacing,
+            config,
+            fluid_registry,
+        )
+
+    advected, advection_vjp = jax.vjp(advect, passive_scalars, fluid_state)
+    assert np.all(np.isfinite(np.asarray(advected)))
+
+    scalar_gradient, fluid_gradient = advection_vjp(jnp.zeros_like(advected))
+    np.testing.assert_array_equal(np.asarray(scalar_gradient), 0.0)
+    np.testing.assert_array_equal(np.asarray(fluid_gradient), 0.0)
+
+    scalar_gradient, fluid_gradient = advection_vjp(jnp.ones_like(advected))
+    assert np.all(np.isfinite(np.asarray(scalar_gradient)))
+    assert np.all(np.isfinite(np.asarray(fluid_gradient)))
