@@ -9,8 +9,9 @@ reproduces an uninterrupted run.
 The number of simulated devices can only be set before JAX starts, so each
 check runs this file as a script in a fresh process, with
 ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` and
-``JAX_PLATFORMS=cpu``. The pytest process itself does not use JAX. A check can
-also be run by hand::
+``JAX_PLATFORMS=cpu``. The checks use the native JAX backend, since the Pallas
+kernels do not run on CPU devices. The pytest process itself does not use JAX.
+A check can also be run by hand::
 
     python pytests/sink_particles/sink_multi_device.py same_result
 """
@@ -159,11 +160,11 @@ def _check_same_result(sink_passed_in):
     import jax
     import numpy as np
 
-    from astronomix import SnapshotSettings, finalize_state, time_integration
+    from astronomix import NATIVE_JAX, SnapshotSettings, finalize_state, time_integration
     from _sink_helpers import _one_sink_at, _setup
 
     _, sharding = _mesh_and_sharding()
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(backend=NATIVE_JAX)
     # Adaptive steps up to t = 0.03; the sink forms in the first step.
     config = config._replace(
         fixed_timestep=False,
@@ -228,11 +229,12 @@ def _check_no_full_grid_all_gather():
         _empty_sink_particles,
         _form_sink_particles,
     )
+    from astronomix import NATIVE_JAX
     from astronomix._pallas_helpers import pallas_mesh_context
     from _sink_helpers import _setup
 
     mesh, sharding = _mesh_and_sharding()
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(backend=NATIVE_JAX)
     primitive_state = jax.device_put(state.primitive_state, sharding)
     sink_particles = _empty_sink_particles(config, primitive_state.dtype)
     num_cells = int(np.prod(primitive_state.shape[1:]))
@@ -291,6 +293,7 @@ def _check_disk_restart(directory):
     import numpy as np
 
     from astronomix import (
+        NATIVE_JAX,
         TO_DISK,
         finalize_state,
         restart_from_latest_checkpoint,
@@ -299,7 +302,7 @@ def _check_disk_restart(directory):
     from _sink_helpers import _num_sinks, _setup
 
     _, sharding = _mesh_and_sharding()
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(backend=NATIVE_JAX)
     uninterrupted_path = str(Path(directory) / "uninterrupted")
     config = config._replace(
         fixed_timestep=False,

@@ -8,8 +8,12 @@ The tests run on the Gaussian overdensity setup in
 # jax
 import jax.numpy as jnp
 
+# astronomix constants
+from astronomix import OPTIMAL_BACKEND
+
 # astronomix containers
 from astronomix import (
+    BackendConfig,
     SimulationConfig,
     SimulationParams,
     SinkParticleConfig,
@@ -46,19 +50,21 @@ SETTINGS = SinkFormationSettings(
 )
 
 
-def _setup(settings=SETTINGS, mhd=False, **sink_particle_options):
+def _setup(settings=SETTINGS, mhd=False, backend=OPTIMAL_BACKEND, **sink_particle_options):
     """Set up the Gaussian overdensity with sink particles on and the given
     sink options.
 
     Args:
         settings: The problem constants of the setup.
         mhd: Whether MHD is switched on (the field is ``settings.magnetic_field_z``).
+        backend: The compute backend.
         **sink_particle_options: Further ``SinkParticleConfig`` fields.
 
     Returns:
         ``(state, config, params, registered_variables)``.
     """
     config = SimulationConfig(
+        backend_config=BackendConfig(backend=backend),
         num_cells=StaticIntVector(NUM_CELLS, NUM_CELLS, NUM_CELLS),
         fixed_timestep=True,
         num_timesteps=NUM_TIMESTEPS,
