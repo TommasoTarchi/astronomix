@@ -1134,9 +1134,9 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         )
 
     if jax.config.jax_enable_x64:
-        config._replace(numerical_precision=DOUBLE_PRECISION)
+        config = config._replace(numerical_precision=DOUBLE_PRECISION)
     else:
-        config._replace(numerical_precision=SINGLE_PRECISION)
+        config = config._replace(numerical_precision=SINGLE_PRECISION)
 
     # set the number of cells
     if config.dimensionality == 1:

@@ -1,9 +1,10 @@
 """
 Configuration and parameter containers for turbulent forcing.
 
-``TurbulentForcingConfig`` holds the static switches (forcing on/off, vacuum
-protection, and the choice of Ornstein-Uhlenbeck versus white-in-time forcing),
-while ``TurbulentForcingParams`` holds the tunable physical parameters.
+``TurbulentForcingConfig`` holds the static switches (forcing on/off, the choice
+of Ornstein-Uhlenbeck versus white-in-time forcing, the forcing spectrum and its
+normalisation), while ``TurbulentForcingParams`` holds the tunable physical
+parameters.
 """
 
 # typing
@@ -11,6 +12,7 @@ from typing import NamedTuple
 
 
 class TurbulentForcingConfig(NamedTuple):
+    #: Drive the velocity field with a solenoidal random acceleration.
     turbulent_forcing: bool = False
 
     #: Use Ornstein-Uhlenbeck (temporally correlated) forcing instead of the
@@ -68,6 +70,8 @@ class TurbulentForcingConfig(NamedTuple):
 
 
 class TurbulentForcingParams(NamedTuple):
+    #: Kinetic energy injected per unit time by the white-in-time forcing (and
+    #: by the OU forcing with ``ou_exact_injection``).
     energy_injection_rate: float = 2.0
 
     #: OU forcing correlation time tau_f (~ one eddy turnover). Only used when

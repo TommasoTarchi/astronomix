@@ -1,11 +1,15 @@
 """
 Turbulent forcing of the velocity field.
 
-Provides two driving schemes plus a vacuum-protection helper. The default
-white-in-time forcing draws a fresh solenoidal field each step and rescales it
-so that a prescribed energy injection rate is met; the Ornstein-Uhlenbeck
-variant carries a temporally correlated solenoidal field across steps and
-applies it as a constant-amplitude acceleration. The construction of the
+Provides two driving schemes. The default white-in-time forcing draws a fresh
+solenoidal field each step and rescales it so that a prescribed energy
+injection rate is met; the Ornstein-Uhlenbeck variant carries a temporally
+correlated solenoidal field across steps and applies it as a constant-amplitude
+acceleration (or with the amplitude of an exact energy injection). Besides the
+smooth peaked spectrum, the OU forcing reproduces AthenaK's discrete driving
+band and AthenaPK's few-modes driver, and it can be synthesised from a coarse
+spectral grid for large sharded runs. The fields live on the physical grid and
+are continued periodically into a ghost-cell halo. The construction of the
 solenoidal forcing fields follows https://arxiv.org/pdf/2304.04360.
 """
 
