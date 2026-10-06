@@ -1613,6 +1613,7 @@ def _weno_flux_mhd_pallas(
     *,
     axis: int,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """Pallas implementation of the ideal-gas MHD WENO interface flux.
 
@@ -1631,7 +1632,8 @@ def _weno_flux_mhd_pallas(
         )
         native = [_weno_flux_x_native, _weno_flux_y_native, _weno_flux_z_native][axis]
         return native(conserved_state, params, config, registered_variables,
-                      internal_energy_density=internal_energy_density)
+                      internal_energy_density=internal_energy_density,
+                      inflow_reference=inflow_reference)
 
     # the paired positivity-preserving recombination reads interfaces i +- 1
     halo_cells = 4 if config.weno_positivity_preserving else 3
@@ -1645,6 +1647,19 @@ def _weno_flux_mhd_pallas(
             )
         return _weno5_shard_wrap(_local_dual, conserved_state, config, axis,
                                  extra_state_inputs=(g4,), halo_cells=halo_cells)
+
+    if inflow_reference is not None:
+        # the joint inflow limiting reads the reference at cells i and i + 1
+        reference_state, speed_sum = inflow_reference
+
+        def _local_joint(state_local, reference_local, speed_sum_local):
+            return _weno_flux_mhd_pallas_local(
+                state_local, params, config, registered_variables, axis=axis,
+                inflow_reference=(reference_local, speed_sum_local[0]),
+            )
+        return _weno5_shard_wrap(_local_joint, conserved_state, config, axis,
+                                 extra_state_inputs=(reference_state, speed_sum[None]),
+                                 halo_cells=halo_cells)
 
     def _local(state_local):
         return _weno_flux_mhd_pallas_local(
@@ -3418,6 +3433,7 @@ def _weno_flux_mhd_pallas_local(
     *,
     axis: int,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """Single-shard ideal-gas MHD WENO build.  Mirrors
     ``_weno_flux_hydro_pallas`` but with 8 conserved variables and 7
@@ -3584,7 +3600,7 @@ def _weno_flux_mhd_pallas_local(
             conserved_state,
             mhd_physical_flux(conserved_state, params.gamma, registered_variables, axis),
             flux[2 * nvars], flux[:nvars], flux[nvars:2 * nvars], zero, zero,
-            params, config, registered_variables, axis=axis,
+            params, config, registered_variables, axis=axis, inflow_reference=inflow_reference,
         )
     return flux
 

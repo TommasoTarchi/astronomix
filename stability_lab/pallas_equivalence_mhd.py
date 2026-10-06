@@ -21,6 +21,7 @@ from astronomix import (
     get_registered_variables,
 )
 from astronomix._finite_difference._interface_fluxes._weno import _weno_flux_native_for_axis
+from astronomix._finite_difference._interface_fluxes._weno_positivity import mhd_inflow_reference
 from astronomix._finite_difference._interface_fluxes._weno_pallas import (
     _mhd_pallas_flux_supported,
     _weno_flux_mhd_pallas,
@@ -65,4 +66,15 @@ for variant in ["base", "face", "pp"]:
             error = float(jnp.max(jnp.abs(pallas - native) / jnp.maximum(scale, 1e-30)))
             worst = max(worst, error)
             print(f"MHD {variant:4s} axis {axis} dual={int(dual)}: max |pallas - native| / max|native| = {error:.2e}", flush=True)
+        if variant == "pp":
+            # joint per-cell inflow limiting (the production path for ideal MHD + PP)
+            reference = mhd_inflow_reference(state, params, configs[NATIVE_JAX], registered_variables)
+            native = _weno_flux_native_for_axis(axis)(
+                state, params, configs[NATIVE_JAX], registered_variables, inflow_reference=reference)
+            pallas = _weno_flux_mhd_pallas(
+                state, params, configs[PALLAS], registered_variables, axis=axis, inflow_reference=reference)
+            scale = jnp.max(jnp.abs(native), axis=(1, 2, 3), keepdims=True)
+            error = float(jnp.max(jnp.abs(pallas - native) / jnp.maximum(scale, 1e-30)))
+            worst = max(worst, error)
+            print(f"MHD pp-joint axis {axis}: max |pallas - native| / max|native| = {error:.2e}", flush=True)
 print(f"WORST {worst:.2e}")

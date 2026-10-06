@@ -962,10 +962,11 @@ class SimulationConfig(NamedTuple):
     #: pressure for an ideal gas; closed form, as pressure is concave). theta = 1
     #: in smooth flow. For ideal MHD a single q +- F/alpha is often NOT
     #: admissible at the fast speed when beta is low (Wu 2018, SIAM J. Numer.
-    #: Anal. 56, 2124), so theta acts on the two weighted pairs of each cell's
-    #: update instead: its own two mirror states (the cell's flux cancels; base
-    #: q_i) and its two inflow states (Wu's generalized splitting: the
-    #: magnetic-tension terms of the neighbours cancel). The SSPRK stages then
+    #: Anal. 56, 2124), so theta acts on the weighted parts of each cell's
+    #: update instead: its own two mirror states per axis (the cell's flux
+    #: cancels; base q_i) and its inflow states of ALL axes jointly (base: the
+    #: axis-summed first-order inflow, in which the neighbours' magnetic-tension
+    #: terms cancel up to the discrete div B; per axis they do not). The SSPRK stages then
     #: rebuild the cell-centred B from the faces, pressure held, so each
     #: increment starts from the state it was evaluated at. Each forward-Euler
     #: stage is positivity preserving for C_cfl <= 1/2 (sum-of-speeds CFL),

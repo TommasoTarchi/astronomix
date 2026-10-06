@@ -44,6 +44,7 @@ from astronomix._finite_difference._interface_fluxes._weno import (
     _weno_flux_y,
     _weno_flux_z,
 )
+from astronomix._finite_difference._interface_fluxes._weno_positivity import mhd_inflow_reference
 from astronomix._finite_difference._interface_fluxes._flux_blending import (
     _blend_interface_flux,
 )
@@ -177,6 +178,13 @@ def _ssprk4_with_ct(
             current_q, bx, by, bz, config, registered_variables
         )
 
+        # ideal MHD + PP: the axis-summed first-order inflow of every cell, for
+        # limiting each cell's inflow faces jointly (see _weno_positivity.py)
+        inflow_reference = None
+        if (config.weno_positivity_preserving and config.equation_of_state == IDEAL_GAS
+                and internal_energy_density is None):
+            inflow_reference = mhd_inflow_reference(current_q, params, config, registered_variables)
+
         # in the future we might support
         # different grid spacings in each direction
         dtdx = dt_tilde / grid_spacing
@@ -203,7 +211,7 @@ def _ssprk4_with_ct(
                  or config.positivity_config.coldcrush_blend)
 
         # x-axis
-        dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+        dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
         if blend:
             dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
         By_flux_x = dF_x[my]
@@ -218,7 +226,7 @@ def _ssprk4_with_ct(
         # y-axis
         if config.dimensionality >= 2:
             mx = registered_variables.magnetic_index.x
-            dF_y = _weno_flux_y(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            dF_y = _weno_flux_y(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
             if blend:
                 dF_y = _blend_interface_flux(dF_y, current_q, 1, dtdy, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_y = dF_y[mx]
@@ -238,7 +246,7 @@ def _ssprk4_with_ct(
         # z-axis
         if config.dimensionality == 3:
             mx = registered_variables.magnetic_index.x
-            dF_z = _weno_flux_z(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            dF_z = _weno_flux_z(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
             if blend:
                 dF_z = _blend_interface_flux(dF_z, current_q, 2, dtdz, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_z = dF_z[mx]
@@ -818,6 +826,13 @@ def _lsrk4_with_ct(
             current_q, bx, by, bz, config, registered_variables
         )
 
+        # ideal MHD + PP: the axis-summed first-order inflow of every cell, for
+        # limiting each cell's inflow faces jointly (see _weno_positivity.py)
+        inflow_reference = None
+        if (config.weno_positivity_preserving and config.equation_of_state == IDEAL_GAS
+                and internal_energy_density is None):
+            inflow_reference = mhd_inflow_reference(current_q, params, config, registered_variables)
+
         # Axis-incremental flow — see the matching SSPRK4-with-CT path
         # above for the rationale.  Each axis's full dF is built, the
         # two magnetic-flux slices CT needs are extracted, dF is consumed
@@ -841,7 +856,7 @@ def _lsrk4_with_ct(
         # first axis's div kernel via ``scale_in`` so ``rhs_q`` is never
         # materialised; subsequent axes accumulate (scale_in = 1.0).  The
         # native fallback path keeps the explicit ``rhs_q`` register.
-        dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+        dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
         if blend:
             dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
         By_flux_x = dF_x[my]
@@ -877,7 +892,7 @@ def _lsrk4_with_ct(
 
         if config.dimensionality >= 2:
             mx = registered_variables.magnetic_index.x
-            dF_y = _weno_flux_y(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            dF_y = _weno_flux_y(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
             if blend:
                 dF_y = _blend_interface_flux(dF_y, current_q, 1, dtdy, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_y = dF_y[mx]
@@ -904,7 +919,7 @@ def _lsrk4_with_ct(
 
         if config.dimensionality == 3:
             mx = registered_variables.magnetic_index.x
-            dF_z = _weno_flux_z(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
+            dF_z = _weno_flux_z(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
             if blend:
                 dF_z = _blend_interface_flux(dF_z, current_q, 2, dtdz, params, config, registered_variables, internal_energy_density=internal_energy_density)
             Bx_flux_z = dF_z[mx]

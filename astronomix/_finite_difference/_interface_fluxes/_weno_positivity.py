@@ -11,8 +11,9 @@ makes each split flux a scaled vector
 
 ``w~`` is a physically admissible state (positive density, and pressure for
 an ideal gas) whenever ``alpha >= |v_n| + c`` for the Euler equations. For
-ideal MHD it is not (Wu 2018), and the scalings act on pairs of states
-instead (see ``_paired_scalings``). Write ``theta`` for the
+ideal MHD it is not (Wu 2018), and the scalings act on the cell's own
+mirror pairs and on its inflow states summed over the axes instead (see
+``_joint_inflow_scalings``). Write ``theta`` for the
 scaling of the WENO face value toward its upwind cell. Following Zhang & Shu
 (2012, J. Comput. Phys. 231, 2245), the forward-Euler update of a cell is a
 convex combination of admissible states if all of these hold:
@@ -235,6 +236,88 @@ def _paired_scalings(
     return plus_theta, minus_theta
 
 
+# The per-axis inflow pair above is not the right object in multi-D. Its
+# base fails wherever B_n varies along the axis (~7 % of the cells of
+# Mach-20 turbulence), although that variation is mostly divergence-free and
+# cancels between the axes. What the update needs is the cell's inflow summed
+# over all axes,
+#
+#   in_i = B_i + sum_k theta_k s_k,  B_i = sum_d S_d base_d / sum_d S_d,
+#   s_k = alpha_face d_face / sum_d S_d   (the 2 dim inflow faces),
+#
+# whose first-order part B_i was admissible in every cell of the failing
+# states. Splitting it convexly, in_i = sum_k (B_i + n theta_k s_k) / n with
+# n = 2 dim, gives each inflow face its own bound theta_k <= frac(B_i, n s_k).
+# The own pairs stay per axis (base q_i).
+
+
+def mhd_inflow_reference(conserved_state, params: SimulationParams, config: SimulationConfig,
+                         registered_variables: RegisteredVariables):
+    """The axis-summed first-order inflow state of every cell and the summed
+    splitting speeds (ideal MHD, untransposed layout):
+
+        B_i = sum_d [alpha_L q_{i-1} + alpha_R q_{i+1} + F_d(q_{i-1}) - F_d(q_{i+1})] / sum_d S_d,
+
+    with alpha_L, alpha_R the splitting speeds of the faces i -+ 1/2 along d
+    (stencil maxima of |v_d| + c_f, as in the kernels) and S_d = alpha_L + alpha_R.
+
+    Returns:
+        ``(B, sum_d S_d)``.
+    """
+    rv = registered_variables
+    gamma = params.gamma
+    density = conserved_state[rv.density_index]
+    floored_density = jnp.maximum(density, params.minimum_density)
+    pressure = jnp.maximum(_gas_pressure(conserved_state, gamma, config, rv), params.minimum_pressure)
+    field = [conserved_state[index] for index in rv.magnetic_index]
+    field_squared = sum(component * component for component in field) / floored_density
+    sound_squared = gamma * pressure / floored_density
+    numerator = jnp.zeros_like(conserved_state)
+    speed_sum = jnp.zeros_like(density)
+    for axis in range(config.dimensionality):
+        discriminant = (sound_squared + field_squared) ** 2 - 4.0 * sound_squared * field[axis] ** 2 / floored_density
+        fast_speed = jnp.sqrt(0.5 * (sound_squared + field_squared + jnp.sqrt(jnp.maximum(discriminant, 0.0))))
+        radius = jnp.abs(conserved_state[rv.momentum_index[axis]] / density) + fast_speed
+        alpha_right = jnp.max(
+            jnp.stack([_shift(radius, offset, axis=axis) for offset in (2, 1, 0, -1, -2, -3)]), axis=0
+        )
+        alpha_left = _shift(alpha_right, 1, axis=axis)
+        flux = mhd_physical_flux(conserved_state, gamma, rv, axis)
+        numerator = numerator + (
+            alpha_left[None] * _shift(conserved_state, 1, axis=axis + 1)
+            + alpha_right[None] * _shift(conserved_state, -1, axis=axis + 1)
+            + _shift(flux, 1, axis=axis + 1) - _shift(flux, -1, axis=axis + 1)
+        )
+        speed_sum = speed_sum + alpha_left + alpha_right
+    return numerator / speed_sum[None], speed_sum
+
+
+def _joint_inflow_scalings(
+    conserved_state, common_speed, plus_step, minus_step, inflow_reference,
+    params, config, registered_variables, axis=0,
+):
+    """theta+ and theta- per interface: own pairs per axis, inflow faces
+    against the cell's axis-summed inflow ``inflow_reference = (B, sum S)``
+    (in the sweep's layout)."""
+    reference_state, speed_sum = inflow_reference
+    alpha_right = jnp.maximum(common_speed, 1e-30)
+    alpha_left = _shift(alpha_right, 1, axis=axis)
+    own_total = alpha_left + alpha_right
+    own_plus = -(alpha_right / own_total)[None] * plus_step
+    own_minus = -(alpha_left / own_total)[None] * _shift(minus_step, 1, axis=axis + 1)
+    own_fraction = _pair_fraction(conserved_state, own_plus, own_minus, params, config, registered_variables)
+
+    share = (2.0 * config.dimensionality / speed_sum)[None]
+    left_inflow = share * alpha_left[None] * _shift(plus_step, 1, axis=axis + 1)
+    right_inflow = share * alpha_right[None] * minus_step
+    left_fraction = _admissible_fraction(reference_state, left_inflow, params, config, registered_variables)
+    right_fraction = _admissible_fraction(reference_state, right_inflow, params, config, registered_variables)
+
+    plus_theta = jnp.minimum(own_fraction, _shift(left_fraction, -1, axis=axis))
+    minus_theta = jnp.minimum(right_fraction, _shift(own_fraction, -1, axis=axis))
+    return plus_theta, minus_theta
+
+
 def positivity_preserving_interface_flux(
     conserved_state,
     cell_flux,
@@ -247,6 +330,7 @@ def positivity_preserving_interface_flux(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     axis: int = 0,
+    inflow_reference=None,
 ):
     """Assemble the interface flux from admissibility-scaled split fluxes.
 
@@ -263,6 +347,9 @@ def positivity_preserving_interface_flux(
         registered_variables: The registered variables.
         axis: The spatial sweep axis (0 for the native kernel, which moves the
             active axis to the front).
+        inflow_reference: Ideal MHD: ``mhd_inflow_reference`` in the sweep's
+            layout; the inflow faces are then limited jointly per cell. Without
+            it, the per-axis pairs are used.
 
     Returns:
         The interface flux at i + 1/2, aligned with cell i.
@@ -281,7 +368,12 @@ def positivity_preserving_interface_flux(
             _admissible_fraction(unshifted, -step, params, config, registered_variables),
         )
 
-    if config.mhd and config.equation_of_state == IDEAL_GAS:
+    if config.mhd and config.equation_of_state == IDEAL_GAS and inflow_reference is not None:
+        plus_theta, minus_theta = _joint_inflow_scalings(
+            conserved_state, common_speed, plus_step, minus_step, inflow_reference,
+            params, config, registered_variables, axis,
+        )
+    elif config.mhd and config.equation_of_state == IDEAL_GAS:
         plus_theta, minus_theta = _paired_scalings(
             conserved_state, common_speed, plus_unshifted, minus_unshifted, plus_step, minus_step,
             params, config, registered_variables, axis,

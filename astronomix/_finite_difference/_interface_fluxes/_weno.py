@@ -154,6 +154,7 @@ def _weno_flux_x_native(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """
     WENO flux reconstruction.
@@ -491,6 +492,7 @@ def _weno_flux_x_native(
             params,
             config,
             registered_variables,
+            inflow_reference=inflow_reference,
         )
 
     # I went for the for loop instead of one einsum
@@ -504,6 +506,29 @@ def _weno_flux_x_native(
         F_interface
     )
 
+def _reference_in_sweep_layout(inflow_reference, axis, config: SimulationConfig,
+                               registered_variables: RegisteredVariables):
+    """``mhd_inflow_reference`` moved into the layout of the native y / z
+    sweep: the active axis first and its momentum / field components swapped
+    with x, exactly as the state."""
+    if inflow_reference is None:
+        return None
+    reference_state, speed_sum = inflow_reference
+    if axis == 1:
+        state_order = (0, 2, 1) if config.dimensionality == 2 else (0, 2, 1, 3)
+        component = "y"
+    else:
+        state_order = (0, 3, 2, 1)
+        component = "z"
+    reference_state = jnp.transpose(reference_state, state_order)
+    speed_sum = jnp.transpose(speed_sum, tuple(order - 1 for order in state_order[1:]))
+    for index in (registered_variables.momentum_index, registered_variables.magnetic_index):
+        first, other = index.x, getattr(index, component)
+        swapped = jnp.stack([reference_state[other], reference_state[first]])
+        reference_state = reference_state.at[jnp.array([first, other])].set(swapped)
+    return reference_state, speed_sum
+
+
 @partial(jax.jit, static_argnames=["registered_variables", "config"])
 def _weno_flux_y_native(
     conserved_state,
@@ -511,6 +536,7 @@ def _weno_flux_y_native(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """
     WENO flux reconstruction in the y-direction.
@@ -556,7 +582,10 @@ def _weno_flux_y_native(
         qy = qy.at[registered_variables.magnetic_index.x].set(B_y)
         qy = qy.at[registered_variables.magnetic_index.y].set(B_x)
     
-    Fy = _weno_flux_x_native(qy, params, config, registered_variables, internal_energy_density=gy)
+    Fy = _weno_flux_x_native(
+        qy, params, config, registered_variables, internal_energy_density=gy,
+        inflow_reference=_reference_in_sweep_layout(inflow_reference, 1, config, registered_variables),
+    )
     
     # Transpose back
     if config.dimensionality == 2:
@@ -589,6 +618,7 @@ def _weno_flux_z_native(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """
     WENO flux reconstruction in the z-direction.
@@ -630,7 +660,10 @@ def _weno_flux_z_native(
         qz = qz.at[registered_variables.magnetic_index.x].set(B_z)
         qz = qz.at[registered_variables.magnetic_index.z].set(B_x)
     
-    Fz = _weno_flux_x_native(qz, params, config, registered_variables, internal_energy_density=gz)
+    Fz = _weno_flux_x_native(
+        qz, params, config, registered_variables, internal_energy_density=gz,
+        inflow_reference=_reference_in_sweep_layout(inflow_reference, 2, config, registered_variables),
+    )
     
     # Transpose back
     Fz = jnp.transpose(Fz, (0, 3, 2, 1))
@@ -727,9 +760,14 @@ def _weno_flux_axis_dispatch(
     registered_variables: RegisteredVariables,
     axis: int,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """Pick the Pallas flux for the supported equation set, falling back to
     the native per-axis JAX flux.
+
+    ``inflow_reference`` (ideal MHD with ``weno_positivity_preserving``): the
+    axis-summed first-order inflow of every cell, ``mhd_inflow_reference``,
+    for the joint per-cell limiting of the inflow faces.
 
     Every Pallas path is wrapped through ``diffable_pallas_call`` (a
     ``jax.custom_jvp`` boundary: Pallas primal, native-JAX tangent).  A
@@ -786,6 +824,17 @@ def _weno_flux_axis_dispatch(
                 conserved_state, params, pallas_branch=pallas, native_branch=native,
             )
     if _mhd_pallas_flux_supported(conserved_state, config):
+        if inflow_reference is not None:
+            pallas = lambda s, p, r, w: _weno_flux_mhd_pallas(  # noqa: E731
+                s, p, config, registered_variables, axis=axis, inflow_reference=(r, w)
+            )
+            native = lambda s, p, r, w: _weno_flux_native_for_axis(axis)(  # noqa: E731
+                s, p, config, registered_variables, inflow_reference=(r, w)
+            )
+            return diffable_pallas_call_n(
+                (conserved_state, params) + tuple(inflow_reference),
+                pallas_branch=pallas, native_branch=native,
+            )
         pallas = lambda s, p: _weno_flux_mhd_pallas(  # noqa: E731
             s, p, config, registered_variables, axis=axis
         )
@@ -806,7 +855,7 @@ def _weno_flux_axis_dispatch(
             conserved_state, params, pallas_branch=pallas, native_branch=native,
         )
     return _weno_flux_native_for_axis(axis)(
-        conserved_state, params, config, registered_variables
+        conserved_state, params, config, registered_variables, inflow_reference=inflow_reference
     )
 
 
@@ -817,12 +866,13 @@ def _weno_flux_x(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """WENO interface flux in the x-direction (Pallas backend where supported,
     native JAX otherwise)."""
     return _weno_flux_axis_dispatch(
         conserved_state, params, config, registered_variables, axis=0,
-        internal_energy_density=internal_energy_density,
+        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
     )
 
 
@@ -833,12 +883,13 @@ def _weno_flux_y(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """WENO interface flux in the y-direction (Pallas backend where supported,
     native JAX otherwise)."""
     return _weno_flux_axis_dispatch(
         conserved_state, params, config, registered_variables, axis=1,
-        internal_energy_density=internal_energy_density,
+        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
     )
 
 
@@ -849,10 +900,11 @@ def _weno_flux_z(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """WENO interface flux in the z-direction (Pallas backend where supported,
     native JAX otherwise)."""
     return _weno_flux_axis_dispatch(
         conserved_state, params, config, registered_variables, axis=2,
-        internal_energy_density=internal_energy_density,
+        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
     )
