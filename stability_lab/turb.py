@@ -41,6 +41,8 @@ parser.add_argument("--save-every", type=int, default=0,
 parser.add_argument("--state-dir", default="/export/data/lstorcks/weno_stability")
 parser.add_argument("--gpus", type=int, default=1, help="devices to shard the x axis over")
 parser.add_argument("--donate", type=int, default=0, help="config.donate_state")
+parser.add_argument("--stop-on-negative-p", type=int, default=0,
+                    help="save the last positive and the first negative-pressure state, then exit")
 parser.add_argument("--tag", required=True)
 args = parser.parse_args()
 
@@ -136,6 +138,7 @@ config = SimulationConfig(
     **weno_variant_kwargs(),
 )
 t_cross = 0.5
+t_c_value = t_cross
 params = SimulationParams(
     C_cfl=args.cfl,
     gamma=gamma,
@@ -153,7 +156,7 @@ params = SimulationParams(
 )
 
 registered_variables = get_registered_variables(config)
-density = jnp.full((args.N,) * 3, rho0, dtype=jnp.float32)
+density = jnp.full((args.N,) * 3, rho0, dtype=jnp.float64 if args.precision == 64 else jnp.float32)
 zero = jnp.zeros_like(density)
 initial = dict(
     config=config, registered_variables=registered_variables, density=density,
@@ -216,6 +219,13 @@ def diagnostics(time, state, registered_variables):
         if nan > 0 or rho_min <= 0:
             if first_nan["t"] is None:
                 first_nan["t"] = t
+        elif args.stop_on_negative_p and adiabatic and p_min < 0:
+            os.makedirs(args.state_dir, exist_ok=True)
+            np.save(os.path.join(args.state_dir, f"{args.tag}_lastpositive.npy"), last_good["state"])
+            np.save(os.path.join(args.state_dir, f"{args.tag}_firstnegative.npy"), np.asarray(full_state))
+            print(f"NEGATIVE-P [{label}] first at t/tc={t/t_c_value:.4f} (last positive t/tc="
+                  f"{last_good['t']/t_c_value:.4f}), min p={p_min:.3e}; states saved", flush=True)
+            os._exit(0)
         else:
             last_good["state"] = np.asarray(full_state)
             last_good["t"] = t

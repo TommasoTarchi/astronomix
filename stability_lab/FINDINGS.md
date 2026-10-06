@@ -362,9 +362,37 @@ tried; density is the only constraint and it is provable.
   The cells recover (theta = 0 around them), and the wave-speed inputs stay
   real through the kernel's troubled-cell guard.
 
-This is the open multi-D residual of Defect 4: the inflow pair's base is not
-admissible where B_n(i+1) - B_n(i-1) is large. Closing it needs Wu & Shu's
-div-B-consistent form, not another floor.
+**Forensics (2026-10-06): the cause is the per-axis inflow pairs, not div B.**
+
+Scripts: `negp_forensics.py`, `negp_decompose.py`, `inflow_census.py`. Each
+negative event was stopped at its first occurrence (`turb.py
+--stop-on-negative-p`) and stepped with the run's own numerics.
+
+* CT keeps its own divergence (6th-order, on the faces) at round-off in every
+  stage: 1e-5 of |B|/dx after 5 t_c. The fluid update sees a different one,
+  the central difference of the interpolated cell-centred B: median
+  0.06-0.09 % of |B|/dx, locally up to tens of %.
+* The CFL 0.375 control (min p -7.7e-4) and the x64 control (-9.0e-4) also go
+  negative. So it is neither the time step nor round-off.
+* At the CFL 0.375 event, one forward-Euler step at C_FE = 0.25 is already
+  negative. Rebuilt exactly (1e-16) from the decomposition:
+  * the axis-summed own pairs are admissible;
+  * the axis-summed inflow pairs are not (-1.05e-4). The x and y inflow
+    pairs have inadmissible first-order bases (theta = 0), and the z pair
+    spends the margin with theta ~ 1.
+* Over the whole 256³ failing states, the per-axis first-order inflow bases
+  are inadmissible in ~7 % of the cells. B_n varies along each axis, and that
+  variation is mostly divergence-free, cancelling only across axes. The
+  **axis-summed** first-order inflow is admissible in **every** cell, despite
+  the nonzero central divergence.
+* The Godunov-Powell counterfactual also "fixes" the event cell, but it adds
+  more internal energy than the deficit there. It does not discriminate.
+
+Fix: limit each cell's inflow jointly across axes. By convexity, the six
+inflow faces can share the axis-summed base margin, so no non-conservative
+source term is needed. A div-B-consistent source would only matter where the
+summed first-order inflow itself fails; that happened in 0 cells here. Not
+implemented yet.
 
 ### Cold Evrard collapse (e0 = 0.05, fourth-order conservative gravity, fp32)
 
@@ -560,9 +588,10 @@ documented as read-only but is not:
 * A cheap, rigorous per-field monotonicity bound would remove the low-Mach
   contact cost.
 * The gravity coupling (above).
-* Ideal MHD in multi-D: the inflow pair keeps a B_n(i+1) - B_n(i-1)
-  residual. A discrete div-B condition or the Godunov-Powell source would
-  close the proof (Wu & Shu 2018).
+* Ideal MHD in multi-D: limit the inflow pairs jointly per cell (the
+  per-axis pairs fail in ~7 % of cells; their axis sum in none).
+  Godunov-Powell / div-B-consistent sources are only needed where the summed
+  first-order inflow fails (never observed).
 * Costs of the Pallas paired path, both untested in production:
   * it writes 17 channels and recombines on arrays: more memory;
   * its shard halo is 4, never run on multiple GPUs.
