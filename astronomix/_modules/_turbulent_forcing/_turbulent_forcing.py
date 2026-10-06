@@ -19,6 +19,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+# astronomix constants
+from astronomix.option_classes.simulation_config import PERIODIC_ROLL
+
 # astronomix containers
 from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
     TurbulentForcingParams,
@@ -51,9 +54,11 @@ def _create_forcing_field(
     ysize = config.box_size.y
     zsize = config.box_size.z
 
-    nx = config.num_cells.x + 2 * config.num_ghost_cells
-    ny = config.num_cells.y + 2 * config.num_ghost_cells
-    nz = config.num_cells.z + 2 * config.num_ghost_cells
+    # The field lives on the physical grid; with ghost cells it is extended
+    # periodically by ``_on_state_grid`` when it is applied.
+    nx = config.num_cells.x
+    ny = config.num_cells.y
+    nz = config.num_cells.z
 
     # Wavenumbers along each axis via fftfreq.
     kx = 2.0 * jnp.pi * jnp.fft.fftfreq(nx, d=xsize/nx)
@@ -122,9 +127,9 @@ def _create_solenoidal_field(key, config, k_f, band=None):
     modes with the parabolic envelope ``(n/n_pk)^2 (2 - (n/n_pk)^2)`` peaked at
     ``n_pk = k_f L / 2pi``, including its conjugate-pairing of ``k_x = 0`` modes.
     """
-    nx = config.num_cells.x + 2 * config.num_ghost_cells
-    ny = config.num_cells.y + 2 * config.num_ghost_cells
-    nz = config.num_cells.z + 2 * config.num_ghost_cells
+    nx = config.num_cells.x
+    ny = config.num_cells.y
+    nz = config.num_cells.z
 
     kx = 2.0 * jnp.pi * jnp.fft.fftfreq(nx, d=config.box_size.x / nx)
     ky = 2.0 * jnp.pi * jnp.fft.fftfreq(ny, d=config.box_size.y / ny)
@@ -219,6 +224,44 @@ def _create_solenoidal_field(key, config, k_f, band=None):
     return key, field
 
 
+def _uses_ghost_cells(config: SimulationConfig) -> bool:
+    """Whether the state carries a ghost-cell halo around the physical grid."""
+    return config.boundary_handling != PERIODIC_ROLL and config.num_ghost_cells > 0
+
+
+def _on_state_grid(field, config: SimulationConfig):
+    """
+    Extend a forcing component from the physical grid to the state's grid.
+
+    With ghost cells the field is continued periodically into the halo, which
+    is exactly what periodic boundaries put there (for other boundaries the
+    boundary handler overwrites the halo before the next update anyway).
+    """
+    if not _uses_ghost_cells(config):
+        return field
+    return jnp.pad(field, config.num_ghost_cells, mode="wrap")
+
+
+def _add_velocity_kick(primitive_state, amplitude, field, config, registered_variables):
+    """
+    Add ``amplitude * field`` (three components on the physical grid) to the
+    velocity, in the precision of the state.
+    """
+    velocity_index = registered_variables.velocity_index
+    for index, component in zip((velocity_index.x, velocity_index.y, velocity_index.z), field):
+        kick = amplitude * _on_state_grid(component, config)
+        primitive_state = primitive_state.at[index].add(kick.astype(primitive_state.dtype))
+    return primitive_state
+
+
+def _physical_cells(field, config: SimulationConfig):
+    """The physical (non-ghost) cells of a single field on the state's grid."""
+    if not _uses_ghost_cells(config):
+        return field
+    ghosts = config.num_ghost_cells
+    return field[ghosts:-ghosts, ghosts:-ghosts, ghosts:-ghosts]
+
+
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _exact_injection_amplitude(primitive_state, wx, wy, wz, dt, Edot,
                               config, registered_variables):
@@ -228,10 +271,11 @@ def _exact_injection_amplitude(primitive_state, wx, wy, wz, dt, Edot,
     the positive root — the normalisation AthenaK's ``turb_driver`` applies via
     its ``dedt`` parameter, shared here by the white and OU paths.
     """
-    rho = primitive_state[registered_variables.density_index]
-    u = primitive_state[registered_variables.velocity_index.x]
-    v = primitive_state[registered_variables.velocity_index.y]
-    w = primitive_state[registered_variables.velocity_index.z]
+    # Only the physical cells count towards the injected energy.
+    rho = _physical_cells(primitive_state[registered_variables.density_index], config)
+    u = _physical_cells(primitive_state[registered_variables.velocity_index.x], config)
+    v = _physical_cells(primitive_state[registered_variables.velocity_index.y], config)
+    w = _physical_cells(primitive_state[registered_variables.velocity_index.z], config)
     dV = config.grid_spacing ** 3
     tempa = 0.5 * jnp.sum(rho * (wx ** 2 + wy ** 2 + wz ** 2))
     tempb = jnp.sum(rho * u * wx + rho * v * wy + rho * w * wz)
@@ -322,9 +366,12 @@ def _synthesize_forcing_field(spectrum, config):
     sharding, so each device only ever materialises its own shard.
     """
     nc = config.turbulent_forcing_config.synthesis_resolution
-    nx = config.num_cells.x + 2 * config.num_ghost_cells
-    ny = config.num_cells.y + 2 * config.num_ghost_cells
-    nz = config.num_cells.z + 2 * config.num_ghost_cells
+
+    # Like the full-grid draw, the field lives on the physical grid and is
+    # continued into a ghost-cell halo by ``_on_state_grid`` when applied.
+    nx = config.num_cells.x
+    ny = config.num_cells.y
+    nz = config.num_cells.z
 
     # Integer mode numbers in fft order, shared by all axes of the coarse grid.
     modes = jnp.fft.fftfreq(nc) * nc
@@ -447,9 +494,6 @@ def _apply_ou_forcing(
     else:
         g = field
 
-    vx_i = registered_variables.velocity_index.x
-    vy_i = registered_variables.velocity_index.y
-    vz_i = registered_variables.velocity_index.z
     if config.turbulent_forcing_config.ou_exact_injection:
         # AthenaK ``dedt`` normalisation: scale the (unit-rms) OU field so the
         # box gains exactly Edot*dt of kinetic energy this step.
@@ -460,9 +504,7 @@ def _apply_ou_forcing(
         )
     else:
         amp = turbulent_forcing_params.forcing_amplitude * dt
-    primitive_state = primitive_state.at[vx_i].add(amp * g[0])
-    primitive_state = primitive_state.at[vy_i].add(amp * g[1])
-    primitive_state = primitive_state.at[vz_i].add(amp * g[2])
+    primitive_state = _add_velocity_kick(primitive_state, amp, g, config, registered_variables)
 
     return (key, f), primitive_state
 
@@ -517,11 +559,12 @@ def _apply_forcing(
     dtforc = dt
     dV = config.grid_spacing**3
 
-    # Density and velocity components.
-    rho = primitive_state[registered_variables.density_index]
-    u = primitive_state[registered_variables.velocity_index.x]
-    v = primitive_state[registered_variables.velocity_index.y]
-    w = primitive_state[registered_variables.velocity_index.z]
+    # Density and velocity components of the physical cells (the injected
+    # energy is measured there; ghost cells only mirror them).
+    rho = _physical_cells(primitive_state[registered_variables.density_index], config)
+    u = _physical_cells(primitive_state[registered_variables.velocity_index.x], config)
+    v = _physical_cells(primitive_state[registered_variables.velocity_index.y], config)
+    w = _physical_cells(primitive_state[registered_variables.velocity_index.z], config)
 
     # Solve the quadratic a * amp^2 + b * amp + c = 0 for the forcing amplitude
     # that injects the prescribed energy Edot * dt over the box.
@@ -540,8 +583,8 @@ def _apply_forcing(
     )
 
     # Add the scaled forcing field directly to the velocity components.
-    primitive_state = primitive_state.at[registered_variables.velocity_index.x].add(amp * wx_real)
-    primitive_state = primitive_state.at[registered_variables.velocity_index.y].add(amp * wy_real)
-    primitive_state = primitive_state.at[registered_variables.velocity_index.z].add(amp * wz_real)
+    primitive_state = _add_velocity_kick(
+        primitive_state, amp, (wx_real, wy_real, wz_real), config, registered_variables
+    )
 
     return key, primitive_state

@@ -97,6 +97,12 @@ class SimulationParams(NamedTuple):
     #: ``PositivityConfig.per_step_specific_floor``. 0.0 disables both.
     minimum_specific_pressure: float = 0.0
 
+    #: Ratio of the diffusive to the advective time scale of the GLM divergence
+    #: cleaning in the VL2 finite-volume MHD scheme (AthenaPK ``glmmhd_alpha``,
+    #: Mignone & Tzeferacos 2010 eq. 27): psi is damped by
+    #: ``exp(-glm_alpha * c_h * dt / dx)`` every stage.
+    glm_alpha: float = 0.1
+
     #: The maximum time step.
     dt_max: float = jnp.inf
 

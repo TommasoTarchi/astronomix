@@ -25,6 +25,7 @@ from astronomix.option_classes.simulation_config import (
     FINITE_VOLUME,
     IDEAL_GAS,
     ISOTHERMAL,
+    VL2,
     XAXIS,
     YAXIS,
     ZAXIS,
@@ -104,6 +105,11 @@ class RegisteredVariables(NamedTuple):
     #: used in finite difference MHD constrained transport
     interface_magnetic_field_index: Union[int, StaticIntVector] = -1
 
+    #: Index of the GLM divergence-cleaning scalar psi (Dedner et al. 2002),
+    #: carried by the VL2 finite-volume MHD scheme after the magnetic field
+    #: (AthenaPK's ``IPS``); -1 when inactive.
+    magnetic_psi_index: int = -1
+
     #: Pressure index
     pressure_index: int = 2
 
@@ -172,7 +178,22 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
 
     registered_variables = RegisteredVariables()
 
-    if config.solver_mode == FINITE_VOLUME:
+    if config.solver_mode == FINITE_VOLUME and config.mhd and config.time_integrator == VL2:
+
+        # The AthenaPK-equivalent GLM-MHD scheme always carries all three
+        # velocity and field components (also in 1D and 2D), followed by the
+        # divergence-cleaning scalar psi — exactly AthenaPK's
+        # (IDN, IV1, IV2, IV3, IPR, IB1, IB2, IB3, IPS) layout.
+        registered_variables = RegisteredVariables(
+            density_index=0,
+            velocity_index=StaticIntVector(1, 2, 3),
+            pressure_index=4,
+            magnetic_index=StaticIntVector(5, 6, 7),
+            magnetic_psi_index=8,
+            num_vars=9,
+        )
+
+    elif config.solver_mode == FINITE_VOLUME:
 
         if config.dimensionality == 2:
             # we have two velocity components

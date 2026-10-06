@@ -522,7 +522,10 @@ def _prepare_padded_state(primitive_state, config, params, registered_variables)
     if config.boundary_handling == GHOST_CELLS:
         # important for active boundaries influencing
         # the time step criterion for now only gas state
-        if config.mhd:
+        # The FV (PPCT) and FD MHD layouts keep their face / split field in the
+        # last three slots, which the gas boundary handler must not touch; the
+        # VL2 GLM-MHD layout is cell centred throughout.
+        if config.mhd and registered_variables.magnetic_psi_index < 0:
             primitive_state = primitive_state.at[:-3, ...].set(
                 _boundary_handler(primitive_state[:-3, ...], config, registered_variables, params)
             )
