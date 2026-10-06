@@ -346,7 +346,7 @@ over snapshots every 0.05 t_c.
 | adiabatic M20, 128³, paired | complete, 208 s | 1.3e-2 | +3.5e-6 | 0 |
 | adiabatic M10, 256³, paired | complete, 3327 s (old PP 1068 s) | 2.5e-2 | -1.1e-4 (t = 1.2) | 1 |
 | adiabatic M20, 256³, paired | complete, 2869 s (old PP 1088 s) | 1.0e-2 | -2.9e-4 (t = 0.85) | 36 |
-| adiabatic M20, 256³, paired, CFL 0.75 | clean through 2.5 t_c | 1.6e-2 | -4.7e-4 (t = 0.8) | 7 |
+| adiabatic M20, 256³, paired, CFL 0.75 | complete, 5367 s | 1.6e-2 | -4.7e-4 (t = 0.8) | 7 |
 
 **Isothermal MHD** never touches a floor, at any resolution or Mach number
 tried; density is the only constraint and it is provable.
