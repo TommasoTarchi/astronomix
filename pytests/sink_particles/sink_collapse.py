@@ -7,6 +7,11 @@ sink mass and energy are conserved. The energy check is expected to fail until
 the gravity of the sinks is implemented: accretion removes the thermal and
 gravitational energy of the accreted gas, and the gravitational energy of the
 sinks is not computed.
+
+The runs use the second-order conservative self-gravity coupling, which keeps
+the total energy constant to float32 rounding, and end before the core bounce,
+since that coupling becomes unstable later in the collapse at these
+resolutions.
 """
 
 # ==== GPU selection ====
@@ -33,7 +38,7 @@ from astronomix import (
     PALLAS,
     PERIODIC_BOUNDARY,
 )
-from astronomix.option_classes.simulation_config import SIMPLE_SOURCE
+from astronomix.option_classes.simulation_config import SECOND_ORDER_CONSERVATIVE
 
 # astronomix containers
 from astronomix import (
@@ -71,21 +76,21 @@ class CollapseCase(NamedTuple):
     num_cells: int
     backend: int
     t_end: float
-    # Twice the largest relative drift of the total energy over the snapshots
-    # in a run of the same case with sinks off, i.e.
-    # _run_collapse(num_cells, t_end, backend, sink_particles=False).
+    # The larger of twice the largest relative drift of the total energy over
+    # the snapshots in a run of the same case without sinks, and 1e-5, which
+    # stays above the float32 rounding of the total energy on any hardware.
     energy_tolerance: float
 
 
 CASES = {
-    # Measured drift with sinks off: 5.75e-3 (CPU, float32).
-    "cpu": CollapseCase(32, NATIVE_JAX, 0.2, 1.15e-2),
-    # Provisional: the CPU value, until the drift is measured on a GPU.
-    "gpu": CollapseCase(64, PALLAS, 0.8, 1.15e-2),
+    # Measured drift with sinks off: 9.60e-7 (GPU A100 80GB PCIe, float32, native JAX).
+    "cpu": CollapseCase(32, NATIVE_JAX, 0.1, 1e-5),
+    # Measured drift with sinks off: 9.60e-7 (GPU A100 80GB PCIe, float32, Pallas).
+    "gpu": CollapseCase(64, PALLAS, 0.2, 1e-5),
 }
 
 
-def _run_collapse(num_cells, t_end, backend, sink_particles):
+def _run_collapse(num_cells, t_end, backend):
     """Run the Evrard collapse (setup of
     ``examples/scripts/forward/self_gravity/_collapse.py``).
 
@@ -93,7 +98,6 @@ def _run_collapse(num_cells, t_end, backend, sink_particles):
         num_cells: Number of cells per dimension of the cubic grid.
         t_end: The end time of the integration.
         backend: The compute backend (``NATIVE_JAX`` or ``PALLAS``).
-        sink_particles: Whether sink particles are switched on.
 
     Returns:
         The snapshots of the run.
@@ -106,7 +110,7 @@ def _run_collapse(num_cells, t_end, backend, sink_particles):
         progress_bar=False,
         gravity_config=GravityConfig(
             self_gravity=True,
-            self_gravity_version=SIMPLE_SOURCE,
+            self_gravity_version=SECOND_ORDER_CONSERVATIVE,
             poisson_manual_open_boundaries=True,
         ),
         mhd=False,
@@ -126,8 +130,8 @@ def _run_collapse(num_cells, t_end, backend, sink_particles):
             return_total_energy=True,
         ),
         num_snapshots=NUM_SNAPSHOTS,
-        state_struct=sink_particles,
-        sink_particle_config=SinkParticleConfig(sink_particles=sink_particles),
+        state_struct=True,
+        sink_particle_config=SinkParticleConfig(sink_particles=True),
     )
 
     params = SimulationParams(
@@ -186,9 +190,7 @@ def collapse_run(request):
     """The snapshots of the collapse with sinks on, and the case they were
     run with. Each case runs once and is shared by the tests below."""
     case = CASES[request.param]
-    snapshots = _run_collapse(
-        case.num_cells, case.t_end, case.backend, sink_particles=True
-    )
+    snapshots = _run_collapse(case.num_cells, case.t_end, case.backend)
     return snapshots, case
 
 
@@ -230,8 +232,7 @@ def test_collapse_mass_conservation(collapse_run):
 
 def test_collapse_energy_conservation(collapse_run):
     """Gas energy plus sink kinetic energy at every snapshot stays within the
-    energy drift of the scheme of the initial gas energy. Expected to fail
-    until the gravity of the sinks is implemented (see the module docstring).
+    energy drift of the scheme of the initial gas energy.
 
     Args:
         collapse_run: The snapshots of the run and its case.
