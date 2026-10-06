@@ -31,9 +31,13 @@ from astronomix._modules._neural_net_force._neural_net_force_options import (
     NeuralNetForceConfig,
 )
 from astronomix._modules._stellar_wind.stellar_wind_options import WindConfig
-from astronomix._modules._turbulent_forcing._turbulent_forcing_options import TurbulentForcingConfig
+from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
+    TurbulentForcingConfig,
+)
 
-# ===================== constant definition =====================
+# -------------------------------------------------------------
+# ================= ↓ Constant definitions ↓ ==================
+# -------------------------------------------------------------
 
 # backends (very limited support currently)
 NATIVE_JAX = 0
@@ -75,7 +79,9 @@ SUBSTEPS_AUTO = 0
 SUBSTEPS_DYNAMIC = 1
 SUBSTEPS_MASKED = 2
 
-# Rematerialisation in reverse mode (``SimulationConfig.ad_remat``).
+# Rematerialisation in reverse mode (``SimulationConfig.ad_remat``). Unlike the
+# integer enumerations, the modes are strings, so ``ad_remat="stage"`` works
+# without importing the constants.
 #   "none"  - store every residual of the step (fastest backward, most memory)
 #   "stage" - ``jax.checkpoint`` around every Runge-Kutta-stage RHS (hydro WENO
 #             fluxes + blends + divergence + sources, and the passive-scalar
@@ -98,7 +104,12 @@ SUPERBEE = 3
 VAN_ALBADA = 4
 VAN_ALBADA_PP = 5
 #: The harmonic-mean (van Leer) slope of AthenaPK's / Athena++'s piecewise
-#: linear reconstruction (``plm_simple.hpp``). Only used by the VL2 scheme.
+#: linear reconstruction. This is the slope of the VL2 scheme, which always
+#: uses it and does not read ``limiter`` (its choice between piecewise-linear
+#: and donor-cell reconstruction is ``first_order_fallback``); ``finalize_config``
+#: sets ``limiter = VAN_LEER`` for VL2 only so that the configuration reports
+#: the reconstruction in use. The classic finite-volume scheme does not
+#: implement it.
 VAN_LEER = 6
 
 # splitting modes
@@ -113,8 +124,9 @@ LAX_FRIEDRICHS = 3
 HYBRID_HLLC = 4
 AM_HLLC = 5
 #: The HLLD solver of Miyoshi & Kusano (2005) for ideal MHD, in AthenaPK's
-#: GLM form. Only used by the VL2 scheme (which also maps HLL, HLLC and
-#: LAX_FRIEDRICHS onto AthenaPK's HLLE, HLLC and LLF solvers).
+#: GLM form. Only implemented in the VL2 scheme (which also maps HLL, HLLC and
+#: LAX_FRIEDRICHS onto AthenaPK's HLLE, HLLC and LLF solvers); ``finalize_config``
+#: rejects it for the other finite-volume time integrators.
 HLLD = 6
 
 # time integrators
@@ -124,12 +136,17 @@ MUSCL = 1
 # currently only for finite difference
 RK4_SSP = 2
 RK4_LSRK = 3
+# finite volume only
 #: The second-order van Leer predictor-corrector of AthenaPK / Athena++
 #: (Stone & Gardiner 2009): a donor-cell half step followed by a full step
-#: with the configured reconstruction. Finite volume only; selecting it
-#: switches the finite-volume solver to the AthenaPK-equivalent scheme, which
-#: for MHD carries the cell-centred field together with the GLM cleaning
-#: scalar psi (Dedner et al. 2002).
+#: with van Leer-limited piecewise-linear reconstruction (donor cell in both
+#: steps with ``first_order_fallback``). Selecting it switches the
+#: finite-volume solver to the AthenaPK-equivalent scheme, which for MHD
+#: carries the cell-centred field together with the GLM cleaning scalar psi
+#: (Dedner et al. 2002). The scheme is Cartesian and has no self-gravity,
+#: external-potential, stellar-wind-tracer or cosmic-ray terms;
+#: ``finalize_config`` rejects those combinations (spherical geometry, as for
+#: every spherical configuration, is switched to MUSCL instead).
 VL2 = 4
 
 # boundary conditions
@@ -190,9 +207,14 @@ ISOTHERMAL = 1
 ON_DEVICE = 0
 TO_DISK = 1
 
-# ============================================================
+# -------------------------------------------------------------
+# ================= ↑ Constant definitions ↑ ==================
+# -------------------------------------------------------------
 
-# ===================== type definitions =====================
+# -------------------------------------------------------------
+# =================== ↓ Type definitions ↓ ====================
+# -------------------------------------------------------------
+
 
 class StaticIntVector(NamedTuple):
     """A static (compile-time) per-axis integer triple (e.g. cells per axis)."""
@@ -219,6 +241,7 @@ class StaticFloatVector(NamedTuple):
             z=self.z / other.z,
         )
 
+
 STATE_TYPE = Union[
     Float[Array, "num_vars num_cells_x"],
     Float[Array, "num_vars num_cells_x num_cells_y"],
@@ -236,6 +259,11 @@ FIELD_TYPE = Union[
     Float[Array, "num_cells_x num_cells_y"],
     Float[Array, "num_cells_x num_cells_y num_cells_z"],
 ]
+
+# -------------------------------------------------------------
+# =================== ↑ Type definitions ↑ ====================
+# -------------------------------------------------------------
+
 
 class SnapshotSettings(NamedTuple):
     """Settings for the snapshot output of the simulation."""
@@ -368,13 +396,13 @@ class PositivityConfig(NamedTuple):
 
     #: Upgrade the per-step HARD_FLOOR pressure clamp to the density-scaled
     #: temperature floor ``p >= max(minimum_pressure,
-    #: rho * params.minimum_specific_pressure)`` (Athena-style tfloor). Meant
-    #: for RADIATIVE runs: a radiatively cooled shock layer compresses to the
-    #: isothermal jump, and without isothermal pressure support (p ∝ rho) the
-    #: constant floor leaves it effectively pressureless and it ram-crushes
-    #: without bound. With cooling active the floor's energy input is radiated
-    #: away (the isothermal balance). No-op when
-    #: ``params.minimum_specific_pressure == 0``.
+    #: rho * params.minimum_specific_pressure)`` (Athena-style temperature
+    #: floor). Meant for radiatively cooled runs: a radiatively cooled shock
+    #: layer compresses to the isothermal jump, and without isothermal pressure
+    #: support (p ∝ rho) the constant floor leaves it effectively pressureless,
+    #: so it is crushed by the ram pressure without bound. With cooling active
+    #: the floor's energy input is radiated away (the isothermal balance).
+    #: No-op when ``params.minimum_specific_pressure == 0``.
     per_step_specific_floor: bool = False
 
     #: Read-only density/pressure clamp in the flux / eigenvalue / timestep
@@ -383,22 +411,25 @@ class PositivityConfig(NamedTuple):
     clamp_in_estimates: bool = True
 
     #: Cold-crush first-order flux blending (the FD counterpart of Athena's
-    #: FOFC for radiatively cooled gas): blend the WENO interface flux toward
-    #: LLF at interfaces with a COLD side under COMPRESSION. The weight is a
-    #: temperature ramp on the COLDER adjacent cell's recovered ``p/rho``
-    #: (1 at the effective temperature floor
+    #: first-order flux correction for radiatively cooled gas): blend the WENO
+    #: interface flux toward LLF at interfaces with a COLD side under
+    #: COMPRESSION. The weight is a temperature ramp on the COLDER adjacent
+    #: cell's recovered ``p/rho`` (1 at the effective temperature floor
     #: ``params.minimum_specific_pressure``, 0 at ``coldcrush_blend_factor``
-    #: times it) times a compressive-velocity gate (so the freely-expanding
-    #: cold ejecta core and the static ambient never activate). Catches both
-    #: cold-cold isothermal collapse and the crushing of a cold dense clump
-    #: by hot surroundings; the trade is locally first-order shock fronts
-    #: into cold gas (classic FOFC behavior). Radiatively cooled,
-    #: ram-pressure-crushed cells otherwise collapse without bound once the
-    #: grid resolves the cooling layer (the 512^3 blast/shell and jet-cone
-    #: blow-ups): the local first-order diffusion saturates the collapse the
-    #: way coarse-grid numerical diffusion does at lower resolution. Inert
-    #: unless ``params.minimum_specific_pressure > 0``.
+    #: times it) times a compressive-velocity gate, so freely expanding cold
+    #: gas and a static ambient medium never activate it. It catches both
+    #: cold-cold isothermal collapse and the crushing of a cold dense clump by
+    #: hot surroundings; the trade is locally first-order shock fronts into
+    #: cold gas (classic flux-correction behaviour). Radiatively cooled cells
+    #: crushed by ram pressure otherwise collapse without bound once the grid
+    #: resolves the cooling layer: the local first-order diffusion saturates
+    #: the collapse the way coarse-grid numerical diffusion does at lower
+    #: resolution. Inert unless ``params.minimum_specific_pressure > 0``.
     coldcrush_blend: bool = False
+
+    #: Upper end of the temperature ramp of ``coldcrush_blend``, in units of
+    #: ``params.minimum_specific_pressure``: interfaces whose colder side has
+    #: ``p/rho`` above this multiple of the floor are not blended.
     coldcrush_blend_factor: float = 8.0
 
 
@@ -425,17 +456,17 @@ class BackendConfig(NamedTuple):
     pallas_num_warps: int = 4
     #: Toggle for the Pallas constrained-transport helpers
     #: (``update_cell_center_fields``, ``constrained_transport_rhs``).
-    #: Disabled by default: the staged Pallas-CT pipeline gives a clear
-    #: memory win at small grids (~65% temp at N=16 on alfven_wave3D)
-    #: but only marginal savings at production scale (~2% temp at N=64)
-    #: while adding ~25s of one-time compile cost.  Flip to True if the
-    #: small-N memory profile matters; the rest of the Pallas backend
-    #: stays on regardless.
+    #: Disabled by default: the staged Pallas-CT pipeline saves a large share
+    #: of the temporary memory on small grids, but only a few percent on
+    #: production-size grids, while adding a noticeable one-time compile cost.
+    #: Flip to True if the small-grid memory profile matters; the rest of the
+    #: Pallas backend stays on regardless.
     pallas_ct: bool = False
     #: Replace the IEEE ``sqrt`` in the MHD WENO kernel with the refined
     #: approximate ``rsqrt`` path (``x * jax.lax.rsqrt(x)`` -> ``rsqrt.approx.f64``,
-    #: still ~1 ULP).  On A100 this cut the dp WENO kernel ~1.6x and the full
-    #: dp step ~1.77x (spill loads halved) with Alfvén L1 convergence bit-identical.
+    #: still ~1 ULP). On GPUs where the double-precision ``sqrt`` dominates the
+    #: kernel this markedly speeds up the double-precision step (fewer register
+    #: spills) without changing the convergence behaviour.
     #: NOTE: the *forward* kernel is switched but the hand-written Pallas
     #: *adjoints* still use IEEE ``sqrt``; with this on, reverse-mode AD is
     #: therefore ~1 ULP inconsistent with the forward (``finalize_config`` warns).
@@ -518,9 +549,11 @@ class SimulationConfig(NamedTuple):
     #: Integrator used for the magnetic part in the FV MHD scheme.
     fv_magnetic_integrator: int = IMPLICIT_MIDPOINT
 
-    #: VL2 scheme only: use the extended (non-conservative) Dedner source terms
-    #: (AthenaPK ``glmmhd_source = dedner_extended``) instead of the plain
-    #: parabolic damping of psi (``dedner_plain``, AthenaPK's default).
+    #: VL2 scheme only: add the non-conservative Dedner et al. (2002) sources,
+    #: ``-(div B) B`` in the momentum and ``-B . grad(psi)`` in the energy
+    #: equation, to the parabolic damping of psi (AthenaPK
+    #: ``glmmhd_source = dedner_extended``). The default is the plain damping
+    #: only (AthenaPK's default ``dedner_plain``).
     glm_extended_source: bool = False
 
     #: VL2 scheme only: AthenaPK's first-order flux correction. After each
@@ -530,7 +563,9 @@ class SimulationConfig(NamedTuple):
     #: AthenaPK's ``first_order_flux_correct``).
     first_order_flux_correction: bool = False
 
-    #: Density/pressure positivity-enforcement configuration (see PositivityConfig).
+    #: State floors, estimate clamps and the cold-crush flux blend (see
+    #: PositivityConfig). Positivity of the finite-difference scheme itself
+    #: comes from ``weno_positivity_preserving``.
     positivity_config: PositivityConfig = PositivityConfig()
 
     #: Dual-energy formalism (Bryan et al. 1995 switch) for adiabatic FD
@@ -558,15 +593,15 @@ class SimulationConfig(NamedTuple):
     #: scalar (``None`` for an unbounded one). Declaring them is strongly
     #: recommended for anything that is a mass fraction: the recovered label is
     #: a ratio ``s / rho~``, and in the near-vacuum interior of a blast wave the
-    #: denominator can collapse and the ratio run away (measured: an ejecta
-    #: fraction reaching -87 where radiative cooling and a fast ejecta piston
-    #: compress the same cells).
+    #: denominator can collapse and the ratio run away (for example to values
+    #: far outside [0, 1] where radiative cooling and a fast piston compress the
+    #: same cells).
     #:
     #: Note this is NOT the same as clipping a scalar to its own current range,
-    #: which is destructive: that clips smooth extrema every step and cost a
-    #: factor of three in convergence order when tried. A *physical* bound never
-    #: activates on smooth data that respects it, so it is free.
-    passive_scalar_bounds: tuple = ()
+    #: which is destructive: that clips smooth extrema every step and degrades
+    #: the convergence order. A *physical* bound never activates on smooth data
+    #: that respects it, so it is free.
+    passive_scalar_bounds: Tuple[Optional[Tuple[float, float]], ...] = ()
 
     #: CFL number for the passive-scalar sub-steps. The scalar advection is
     #: operator-split, so it does not inherit the hydro timestep's safety: the
@@ -651,13 +686,12 @@ class SimulationConfig(NamedTuple):
     #: only if the entropy sigmoid is narrow enough: quiescent, never-shocked
     #: gas (entropy rise 0, div_v = 0) sits at the steepest point of the
     #: compression sigmoid, so its leak is set by sigmoid(-jump / width) alone,
-    #: and it ACCUMULATES step after step in the carried fraction. Measured
-    #: (review 2026-09-25, 16^3 blast, 1 % pressure tangent): width 0.25 leaks
-    #: 22 % of the at-threshold response per step into every ambient cell,
-    #: width 0.1 (the default) 0.4 %. This is a surrogate gradient, not the
-    #: derivative of the primal (which is zero almost everywhere); check it
-    #: with a finite-difference Taylor test at the amplitudes the optimiser
-    #: uses.
+    #: and it ACCUMULATES step after step in the carried fraction. With width
+    #: 0.25 about 22 % of the at-threshold response leaks into every ambient
+    #: cell per step; with width 0.1 (the default) about 0.4 %. This is a
+    #: surrogate gradient, not the derivative of the primal (which is zero
+    #: almost everywhere); check it with a finite-difference Taylor test at the
+    #: amplitudes the optimiser uses.
     ad_smooth_shock_latch: bool = False
 
     #: Width in nats of the entropy-rise sigmoid of the smooth latch. Keep it
@@ -671,21 +705,25 @@ class SimulationConfig(NamedTuple):
     #: Self-gravity / external-potential configuration (see GravityConfig).
     gravity_config: GravityConfig = GravityConfig()
 
-    #: Explicit diffusion term 
-    #: (currently only for finite difference mode)
+    #: Explicit viscous diffusion term with the coefficient
+    #: ``params.viscosity`` (see ``viscosity_type``), in both the
+    #: finite-difference and the finite-volume solver.
     diffusion: bool = False
 
     #: Viscosity type - either kinematic or dynamic viscosity.
     viscosity_type: int = DYNAMIC_VISCOSITY
 
-    #: Explicit ohmic resistivity ``params.resistivity`` in the induction
-    #: equation, applied to the interface fields as the curl of an edge EMF
-    #: (finite-difference CT MHD, isothermal EOS only: no ohmic heating term).
+    #: Switch for explicit ohmic resistivity in the induction equation. The
+    #: switch pairs with the coefficient of the same name,
+    #: ``params.resistivity`` (eta). It is applied to the interface fields as
+    #: the curl of an edge EMF; 3D finite-difference CT MHD with the isothermal
+    #: EOS only, since no ohmic heating term is added to the energy equation.
     resistivity: bool = False
 
     #: Explicit thermal conduction term div(kappa grad T) in the energy
-    #: equation (constant conductivity params.thermal_conductivity,
-    #: explicit integration). Currently only for finite difference mode.
+    #: equation (constant conductivity ``params.thermal_conductivity``, or
+    #: ``kappa = rho alpha`` with ``conduction_density_weighted``; explicit
+    #: integration). Currently only for finite difference mode.
     thermal_conduction: bool = False
 
     #: Interpret ``params.thermal_conductivity`` as the Athena-style
@@ -698,15 +736,16 @@ class SimulationConfig(NamedTuple):
     #: suppress conduction exactly inside the cold dense clumps.
     conduction_density_weighted: bool = False
 
-    #: Formal order of the conduction discretisation: 2 (legacy) or 4. In a
-    #: FINITE-DIFFERENCE scheme the state IS the pointwise value, so evaluating
-    #: ``T = p/rho`` (and ``kappa = rho*alpha``) pointwise is already exact --
-    #: the order is set purely by the derivative stencils. Order 4 uses the
-    #: 4th-order central first derivative for the pointwise heat flux and the
-    #: 4th-order conservative face interpolation
+    #: Formal order of the conduction discretisation: 2 (default) or 4; any
+    #: other value is rejected by ``finalize_config``. In a FINITE-DIFFERENCE
+    #: scheme the state IS the pointwise value, so evaluating ``T = p/rho``
+    #: (and ``kappa = rho*alpha``) pointwise is already exact -- the order is
+    #: set purely by the derivative stencils. Order 4 uses the 4th-order central
+    #: first derivative for the pointwise heat flux and the 4th-order
+    #: conservative face interpolation
     #: ``(-F_{i-1} + 7F_i + 7F_{i+1} - F_{i+2})/12`` for its divergence (the
     #: same linear flux the WENO kernel uses), so it is consistent with the
-    #: 5th-order hydro rather than throttling it to 2nd order.
+    #: 5th-order hydro rather than reducing it to 2nd order.
     conduction_order: int = 2
 
     #: The size of the simulation box.
@@ -721,12 +760,12 @@ class SimulationConfig(NamedTuple):
     #: reconstruction at the interfaces.
     reconstruction_order: int = 1
 
-    #: The limiter for the reconstruction.
-    #: Only affects finite volume mode.
+    #: The limiter for the reconstruction of the classic finite-volume
+    #: scheme. The VL2 scheme does not read it (see ``VAN_LEER``).
     limiter: int = MINMOD
 
-    #: The Riemann solver used
-    #: Only for finite volume mode.
+    #: The Riemann solver used. Only for finite volume mode; ``HLLD`` is only
+    #: available with the VL2 time integrator.
     riemann_solver: int = HLL
 
     #: Dimensional splitting / unsplit mode.
@@ -735,7 +774,9 @@ class SimulationConfig(NamedTuple):
     #: with self-gravity.
     split: int = UNSPLIT
 
-    #: Time integration method.
+    #: Time integration method: RK2_SSP, MUSCL or VL2 for the finite-volume
+    #: solver, RK4_SSP or RK4_LSRK for the finite-difference solver (which
+    #: falls back to RK4_SSP for any other value).
     time_integrator: int = RK2_SSP
 
     # Explanation of the ghost cells
@@ -793,20 +834,10 @@ class SimulationConfig(NamedTuple):
     #: or ``"axis"`` (see ``AD_REMAT_*``). Changes only what the backward pass
     #: stores versus recomputes; the primal is the same computation, and under
     #: forward-only evaluation or forward-mode AD ``jax.checkpoint`` is inlined
-    #: (no cost). Measured for the casa_xfit configuration (FD/WENO, dual
-    #: energy, 5 scalars + shock history, max_passive_scalar_substeps = 8),
-    #: temp memory of one BACKWARDS gradient in units of the state:
-    #:
-    #: ==========================================  ======  =======  ======
-    #: setting                                     none    stage    axis
-    #: ==========================================  ======  =======  ======
-    #: XLA:CPU, f32 32^3, 1 fixed step (no FCT)    290x    159x     77x
-    #: XLA:CPU, f32 32^3, equinox K = 4 (no FCT)   295x    173x     87x
-    #: A100, f64 64^3, equinox K = 8, FCT, Pallas  --      92x      62x
-    #: ==========================================  ======  =======  ======
-    #:
-    #: Each costs roughly one more forward evaluation of the rematerialised
-    #: pieces in the backward pass ("axis": two).
+    #: (no cost). For a finite-difference WENO step, "stage" roughly halves and
+    #: "axis" roughly quarters the temporary memory of the backward pass, at
+    #: the cost of about one ("stage") or two ("axis") extra forward
+    #: evaluations of the rematerialised pieces.
     ad_remat: str = AD_REMAT_NONE
 
     #: ``ad_remat == "axis"`` only: split each axis' flux + blend + divergence
@@ -819,16 +850,16 @@ class SimulationConfig(NamedTuple):
     ad_remat_chunks: int = 1
 
     #: Reverse-mode memory of the passive-scalar block (``ad_remat != "none"``
-    #: only; default False = unchanged). The scalar advection's backward was the
-    #: peak of a Cas A 4D-Var gradient (xprof memory viewer, 128^3: 45 % of the
-    #: live set): the masked sub-step scan's stack of ``max_passive_scalar_substeps``
-    #: scalar-stack copies, the tie-preserving clips' mask residuals of the ratio
-    #: recovery and of the shock history. With True: the sub-steps run in an
-    #: equinox checkpointed while loop over the flow-derived count (two scalar-
-    #: stack checkpoints instead of the cap's), and the ratio recovery / bounds
-    #: and the shock-history update are ``jax.checkpoint``-ed (their masks are
-    #: recomputed, not stored). Same arithmetic in the primal; derivatives equal
-    #: up to rounding (a different XLA program).
+    #: only; default False = unchanged). With many scalars, the backward of the
+    #: scalar advection dominates the memory of a reverse-mode gradient: the
+    #: masked sub-step scan's stack of ``max_passive_scalar_substeps``
+    #: scalar-stack copies and the tie-preserving clips' mask residuals of the
+    #: ratio recovery and of the shock history. With True: the sub-steps run in
+    #: an equinox checkpointed while loop over the flow-derived count (two
+    #: scalar-stack checkpoints instead of the cap's), and the ratio recovery /
+    #: bounds and the shock-history update are ``jax.checkpoint``-ed (their
+    #: masks are recomputed, not stored). Same arithmetic in the primal;
+    #: derivatives equal up to rounding (a different XLA program).
     ad_scalar_lean: bool = False
 
     #: Return intermediate snapshots of the time evolution
@@ -872,7 +903,10 @@ class SimulationConfig(NamedTuple):
     #: nonlinearity is a ratio of smoothness indicators, not a comparison
     #: against an absolute epsilon) and keeps the optimal linear weights at
     #: smooth extrema, where JS drops order and damps small-amplitude features.
-    #: NOTE: currently implemented for the NATIVE backend only.
+    #: Implemented in the native and the Pallas forward kernels; the
+    #: hand-written Pallas adjoints use the Jiang-Shu weights, so reverse-mode
+    #: gradients with the Pallas backend are inconsistent with the forward pass
+    #: (``finalize_config`` prints a note).
     weno_z: bool = False
 
     #: Absolute floor in the WENO smoothness denominators (JS and Z).
@@ -881,16 +915,16 @@ class SimulationConfig(NamedTuple):
     #: Evaluate the characteristic basis of the WENO projection at an
     #: ADMISSIBLE interface state: the interface sound speed comes from the
     #: averaged pressure, c^2 = gamma <p> / <rho>, and the enthalpy is rebuilt
-    #: from it. ``False`` restores the previous c^2 = (gamma - 1)(<h> - v^2/2)
-    #: from an UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that
-    #: combination is not the state of any gas, is not Galilean invariant, and
-    #: at a density jump (ratio >~ 10) carrying a velocity jump of a few sound
-    #: speeds its c^2 is negative -- the clamp then zeroes the acoustic upwind
-    #: correction exactly at the strongest jumps (a cold dense slab rammed at
-    #: Mach ~800 into tenuous gas blows up in two steps with it). Smooth-flow
-    #: results agree with the old basis to the WENO dissipation level (the
-    #: basis moves by O(dx^2)). Ideal gas only (the isothermal basis has a fixed
-    #: sound speed). Native and Pallas.
+    #: from it. ``False`` uses c^2 = (gamma - 1)(<h> - v^2/2) from an
+    #: UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that combination
+    #: is not the state of any gas, is not Galilean invariant, and at a density
+    #: jump (ratio >~ 10) carrying a velocity jump of a few sound speeds its
+    #: c^2 is negative -- the clamp then zeroes the acoustic upwind correction
+    #: exactly at the strongest jumps, so a cold dense slab driven at high Mach
+    #: number into tenuous gas blows up within a few steps. Smooth-flow results
+    #: of the two bases agree to the WENO dissipation level (the basis moves by
+    #: O(dx^2)). Ideal gas only (the isothermal basis has a fixed sound speed).
+    #: Native and Pallas.
     weno_admissible_face_state: bool = True
 
     #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
@@ -925,22 +959,23 @@ class SimulationConfig(NamedTuple):
     #: smoothness indicators against the local DATA SCALE instead of an
     #: absolute constant. With ``weno_epsilon`` alone the weights are fully
     #: nonlinear whenever the variables are O(10) or larger, regardless of how
-    #: smooth the solution is. NATIVE backend only.
+    #: smooth the solution is. NATIVE backend only (``finalize_config`` rejects
+    #: it with the Pallas backend).
     weno_epsilon_relative: float = 0.0
 
     #: Differentiate through the WENO reconstruction with its nonlinear
     #: weights, characteristic eigenvectors and Lax-Friedrichs splitting speed
     #: FROZEN (``stop_gradient``): the tangent / adjoint is then that of the
     #: linear scheme the primal step actually used, the usual linearisation for
-    #: WENO adjoints. The primal is unchanged. Needed for
-    #: forward-mode derivatives through long runs with cold, near-uniform gas:
-    #: there IS_k << weno_epsilon, d alpha / d IS ~ 2 / epsilon^3 ~ 1e21, and
-    #: the float32 tangent overflows within a few years of a Cas A run.
+    #: WENO adjoints. The primal is unchanged. Needed for forward-mode
+    #: derivatives through long runs with cold, near-uniform gas: there
+    #: IS_k << weno_epsilon, d alpha / d IS ~ 2 / epsilon^3 ~ 1e21, and the
+    #: float32 tangent overflows long before the end of such a run.
     weno_ad_frozen_weights: bool = False
 
     # physical modules
 
-    #: Turbulent forcing configuration.
+    #: Turbulent forcing configuration (see TurbulentForcingConfig).
     turbulent_forcing_config: TurbulentForcingConfig = TurbulentForcingConfig()
 
     #: The configuration for the stellar wind module.
@@ -964,10 +999,13 @@ class SimulationConfig(NamedTuple):
     cnn_mhd_corrector_config: CNNMHDconfig = CNNMHDconfig()
 
 
-def _parse_compute_capability(cc):
-    """``"8.0"`` -> ``(8, 0)``; ``None`` for anything that is not ``major.minor``."""
+def _parse_compute_capability(compute_capability):
+    """
+    Parse a compute capability such as ``"8.0"`` into the tuple ``(8, 0)``.
+    Anything that is not of the form ``major.minor`` gives ``None``.
+    """
     try:
-        major, minor = str(cc).strip().split(".")[:2]
+        major, minor = str(compute_capability).strip().split(".")[:2]
         return int(major), int(minor)
     except (ValueError, TypeError):
         return None
@@ -996,18 +1034,23 @@ def gpu_compute_capability_at_least_80() -> bool:
         devices = jax.devices()
     except RuntimeError:
         return False
-    if not devices or any(d.platform != "gpu" for d in devices):
+    if not devices or any(device.platform != "gpu" for device in devices):
         return False
-    caps = [_parse_compute_capability(getattr(d, "compute_capability", None))
-            for d in devices]
-    if all(cc is not None for cc in caps):
-        return all(cc >= (8, 0) for cc in caps)
+    capabilities = [
+        _parse_compute_capability(getattr(device, "compute_capability", None))
+        for device in devices
+    ]
+    if all(capability is not None for capability in capabilities):
+        return all(capability >= (8, 0) for capability in capabilities)
     return _nvidia_smi_compute_capability_at_least_80()
 
 
 def _nvidia_smi_compute_capability_at_least_80() -> bool:
-    """Fallback of :func:`gpu_compute_capability_at_least_80`: ask ``nvidia-smi``
-    (every visible NVIDIA GPU; False if it cannot be queried)."""
+    """
+    Fallback of :func:`gpu_compute_capability_at_least_80`: ask ``nvidia-smi``
+    whether every visible NVIDIA GPU has compute capability >= 8.0 (False if
+    it cannot be queried).
+    """
     try:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -1034,7 +1077,9 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     cross-field consistency: the positivity-protection defaults, the number
     of cells per axis, the grid spacing, the geometry- and solver-specific
     overrides, the master gravity switch, the boundary defaults, and the
-    disk-snapshot requirements.
+    disk-snapshot requirements. Combinations the solvers do not implement
+    (e.g. cosmic rays with the finite-difference solver, self-gravity or
+    non-Cartesian geometry with VL2, HLLD outside VL2) raise a ``ValueError``.
 
     Args:
         config: The user-supplied simulation configuration.
@@ -1051,23 +1096,29 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         config = config._replace(weno_admissible_face_state=True)
 
     # Resolve the OPTIMAL_BACKEND request into a concrete backend before any
-    # downstream code inspects ``config.backend_config.backend``. PALLAS needs an Ampere-class
-    # (compute capability >= 8.0) GPU for its Triton kernels; anywhere else we
-    # fall back to the portable NATIVE_JAX backend.
+    # downstream code inspects ``config.backend_config.backend``. PALLAS needs
+    # an Ampere-class (compute capability >= 8.0) GPU for its Triton kernels;
+    # anywhere else we fall back to the portable NATIVE_JAX backend.
     if config.backend_config.backend == OPTIMAL_BACKEND:
         if gpu_compute_capability_at_least_80():
             print("OPTIMAL_BACKEND: using the PALLAS backend (GPU compute capability >= 8.0).")
-            config = config._replace(backend_config=config.backend_config._replace(backend=PALLAS))
+            config = config._replace(
+                backend_config=config.backend_config._replace(backend=PALLAS)
+            )
         else:
-            print("OPTIMAL_BACKEND: using the NATIVE_JAX backend (JAX is not running on a "
-                  "compute capability >= 8.0 GPU).")
-            config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
+            print(
+                "OPTIMAL_BACKEND: using the NATIVE_JAX backend (JAX is not running on a "
+                "compute capability >= 8.0 GPU)."
+            )
+            config = config._replace(
+                backend_config=config.backend_config._replace(backend=NATIVE_JAX)
+            )
 
     # Cosmic rays exist only in the finite-volume solver. Under the
     # finite-difference solver the registry does not add the CR variable, so
     # the CR code paths that still run (DSA injection, energy totals) index
-    # variable -1 -- the pressure in 1D, the last passive scalar in a Cas A
-    # configuration -- and the run silently returns a CR-free (and corrupted)
+    # variable -1 -- the pressure in 1D, the last passive scalar when scalars
+    # are carried -- and the run silently returns a CR-free (and corrupted)
     # solution. Refuse instead.
     if config.cosmic_ray_config.cosmic_rays and config.solver_mode == FINITE_DIFFERENCE:
         raise ValueError(
@@ -1103,11 +1154,15 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     if config.ad_smooth_shock_latch and not config.track_shock_history:
         print("NOTE: ad_smooth_shock_latch has no effect without track_shock_history.")
 
+    # The conduction source only distinguishes order 4 from everything else,
+    # so any other value would silently run the second-order discretisation.
+    if config.conduction_order not in (2, 4):
+        raise ValueError(f"conduction_order must be 2 or 4, got {config.conduction_order!r}.")
+
     # weno_z is implemented in the FORWARD Pallas kernels; their hand-written
-    # adjoints still hard-code Jiang-Shu, so reverse-mode gradients would not
+    # adjoints use the Jiang-Shu weights, so reverse-mode gradients would not
     # match the forward pass. weno_epsilon_relative is native-only.
-    if config.weno_epsilon_relative > 0.0 and \
-            config.backend_config.backend == PALLAS:
+    if config.weno_epsilon_relative > 0.0 and config.backend_config.backend == PALLAS:
         raise ValueError(
             "weno_epsilon_relative is implemented for the NATIVE_JAX backend "
             "only; pass BackendConfig(backend=NATIVE_JAX)."
@@ -1115,7 +1170,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     if config.weno_z and config.backend_config.backend == PALLAS:
         print(
             "NOTE: weno_z runs the Pallas FORWARD kernels; the hand-written "
-            "Pallas adjoints are still Jiang-Shu, so reverse-mode gradients "
+            "Pallas adjoints use Jiang-Shu weights, so reverse-mode gradients "
             "would be inconsistent with the forward pass. Forward-only runs "
             "(evolution, convergence, timing) are unaffected."
         )
@@ -1175,7 +1230,10 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             )
     elif config.dimensionality == 3:
         config = config._replace(grid_spacing=grid_spacing_vec.x)
-        if not (math.isclose(grid_spacing_vec.x, grid_spacing_vec.y) and math.isclose(grid_spacing_vec.x, grid_spacing_vec.z)):
+        if not (
+            math.isclose(grid_spacing_vec.x, grid_spacing_vec.y)
+            and math.isclose(grid_spacing_vec.x, grid_spacing_vec.z)
+        ):
             raise ValueError(
                 "For now, we assume the grid spacing is the same in all dimensions. "
                 f"Got grid spacing {grid_spacing_vec}."
@@ -1183,7 +1241,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
 
     if config.geometry == SPHERICAL:
         print(
-            "For spherical geometry, only HLL is currently supported. Also, only the unsplit mode has been tested."
+            "For spherical geometry, only HLL is currently supported. Also, only the "
+            "unsplit mode has been tested."
         )
         # SPHERICAL is intrinsically 1D in this code; pick the x component
         # so grid_spacing stays a scalar (otherwise CFL divisions blow up
@@ -1224,9 +1283,34 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     # stencil needs two ghost cells; with periodic boundaries on every axis the
     # wrap-around is done by rolling the arrays instead (as in the FD solver).
     if config.solver_mode == FINITE_VOLUME and config.time_integrator == VL2:
+
+        # The VL2 update replaces the whole finite-volume step: it has no
+        # gravity source, no geometric source terms and only fluxes for the
+        # gas and field variables, so these combinations would be silently
+        # ignored (gravity, geometry) or fail on the extra state variables.
+        # Spherical geometry was already switched to MUSCL above.
+        if config.gravity_config.gravity:
+            raise ValueError(
+                "The VL2 scheme has no gravity source: self-gravity and an "
+                "external potential require another finite-volume time "
+                "integrator (e.g. RK2_SSP or MUSCL)."
+            )
+        if config.geometry != CARTESIAN:
+            raise ValueError("The VL2 scheme is implemented for Cartesian geometry only.")
+        if config.wind_config.trace_wind_density or config.cosmic_ray_config.cosmic_rays:
+            raise ValueError(
+                "The VL2 scheme does not evolve the stellar-wind tracer "
+                "(wind_config.trace_wind_density) or the cosmic-ray variable "
+                "(cosmic_ray_config.cosmic_rays)."
+            )
+
         if config.split != UNSPLIT:
             print("Setting unsplit mode for the VL2 scheme.")
             config = config._replace(split=UNSPLIT)
+        # The VL2 scheme does not read ``limiter``: its corrector always uses
+        # the van Leer slope, or donor cell with ``first_order_fallback``.
+        # Setting VAN_LEER only makes the configuration report the
+        # reconstruction actually in use.
         if config.limiter != VAN_LEER and not config.first_order_fallback:
             print("Setting the VAN_LEER (AthenaPK PLM) limiter for the VL2 scheme.")
             config = config._replace(limiter=VAN_LEER)
@@ -1257,6 +1341,14 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         else:
             config = config._replace(boundary_handling=GHOST_CELLS, num_ghost_cells=2)
 
+    # HLLD is implemented only inside the VL2 scheme; the classic
+    # finite-volume Riemann-solver dispatch does not know it.
+    elif config.solver_mode == FINITE_VOLUME and config.riemann_solver == HLLD:
+        raise ValueError(
+            "The HLLD Riemann solver is only available with the VL2 time "
+            "integrator (time_integrator=VL2)."
+        )
+
     # Finite-difference-specific checks.
     if config.solver_mode == FINITE_DIFFERENCE:
 
@@ -1286,7 +1378,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             # Fully periodic boundaries are enforced more cheaply by rolling the
             # arrays (PERIODIC_ROLL) than by maintaining explicit ghost cells.
             print(
-                "For 3D simulations with periodic boundaries, setting boundary handling to " \
+                "For 3D simulations with periodic boundaries, setting boundary handling to "
                 "PERIODIC_ROLL and num_ghost_cells to 0 for better performance."
             )
             config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
@@ -1305,7 +1397,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             # Fully periodic boundaries are enforced more cheaply by rolling the
             # arrays (PERIODIC_ROLL) than by maintaining explicit ghost cells.
             print(
-                "For 2D simulations with periodic boundaries, setting boundary handling to " \
+                "For 2D simulations with periodic boundaries, setting boundary handling to "
                 "PERIODIC_ROLL and num_ghost_cells to 0 for better performance."
             )
             config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
@@ -1326,8 +1418,9 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         if config.boundary_handling == PERIODIC_ROLL:
             config = config._replace(num_ghost_cells=0)
 
-        if config.boundary_handling == GHOST_CELLS and (config.diffusion or config.thermal_conduction
-                                                        or config.resistivity):
+        if config.boundary_handling == GHOST_CELLS and (
+            config.diffusion or config.thermal_conduction or config.resistivity
+        ):
             config = config._replace(num_ghost_cells=max(config.num_ghost_cells, 6))
 
         if config.resistivity:
@@ -1353,7 +1446,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 config = config._replace(boundary_settings=BoundarySettings())
         elif config.geometry == SPHERICAL and config.dimensionality == 1:
             print(
-                "Automatically setting reflective left and open right boundary for spherical geometry."
+                "Automatically setting reflective left and open right boundary for "
+                "spherical geometry."
             )
             config = config._replace(
                 boundary_settings=BoundarySettings1D(
@@ -1431,6 +1525,9 @@ def solver_mode_to_string(solver_mode: int) -> str:
 def config_to_string(config: SimulationConfig) -> str:
     """Return a compact one-line description of the solver configuration."""
     if config.solver_mode == FINITE_VOLUME:
-        return f"FV, {riemann_solver_to_string(config.riemann_solver)}, {limiter_to_string(config.limiter)}, {config.num_cells.x} cells"
+        return (
+            f"FV, {riemann_solver_to_string(config.riemann_solver)}, "
+            f"{limiter_to_string(config.limiter)}, {config.num_cells.x} cells"
+        )
     elif config.solver_mode == FINITE_DIFFERENCE:
         return f"FD, {config.num_cells.x} cells"

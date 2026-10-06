@@ -38,10 +38,11 @@ class FixedBoundaryState(NamedTuple):
     y: FixedBoundaryState1D = FixedBoundaryState1D()
     z: FixedBoundaryState1D = FixedBoundaryState1D()
 
+
 class SimulationParams(NamedTuple):
     """
     Different from the simulation configuration, the simulation parameters
-    do not require recompilation when changed. The simulation can be 
+    do not require recompilation when changed. The simulation can be
     differentiated with respect to them.
     """
 
@@ -63,38 +64,45 @@ class SimulationParams(NamedTuple):
     #: on the viscosity_type in SimulationConfig.
     viscosity: float = 0.0
 
-    #: Constant ohmic resistivity eta (config.resistivity). Finite-difference
-    #: CT MHD with the isothermal EOS only.
+    #: Constant ohmic resistivity eta, the coefficient of the switch of the
+    #: same name, ``config.resistivity``, which must be set for it to act.
+    #: Only implemented for 3D finite-difference CT MHD with the isothermal
+    #: EOS (no ohmic heating term).
     resistivity: float = 0.0
 
     #: Constant thermal conductivity kappa in the conductive energy
-    #: source div(kappa grad T) (config.thermal_conduction). T is taken
-    #: from the ideal-gas relation T = p / rho (code units, R = 1).
+    #: source div(kappa grad T) (config.thermal_conduction); with
+    #: ``config.conduction_density_weighted`` it is the diffusivity alpha of
+    #: ``kappa = rho alpha`` instead. T is taken from the ideal-gas relation
+    #: T = p / rho (code units, R = 1).
     #: NOTE: CURRENTLY ONLY IMPLEMENTED FOR FINITE DIFFERENCE MODE.
     thermal_conductivity: float = 0.0
 
     #: The isothermal sound speed used when
     #: config.equation_of_state is ISOTHERMAL.
-    #: NOTE: CURRENTLY ONLY IMPLEMENTED FOR 
+    #: NOTE: CURRENTLY ONLY IMPLEMENTED FOR
     #: FINITE DIFFERENCE MODE.
     isothermal_sound_speed: float = 1.0
 
     #: The adiabatic index of the gas.
     gamma: float = 5/3
 
-    #: Minimum density: the floor of the positivity-preserving WENO scalings
-    #: (capped at half the state being scaled), of the per-step HARD_FLOOR and
-    #: of the read-only estimate clamps.
+    #: Minimum density, the density floor of both solvers: the target of the
+    #: positivity-preserving WENO scalings (capped at half the state being
+    #: scaled), the per-step HARD_FLOOR (which in the VL2 finite-volume scheme
+    #: also switches on AthenaPK's floors in every stage), the finite-difference
+    #: MHD primitive recovery, the cold-crush flux blend and the read-only
+    #: clamps of the flux, wave-speed and time-step estimates.
     minimum_density: float = 1e-14
 
     #: Minimum pressure, in the same roles as ``minimum_density``.
     minimum_pressure: float = 1e-14
 
-    #: Effective temperature-floor SCALE ``p/rho`` (``= k_B T_floor / (mu m_p)``
-    #: in code units). Used by the ``coldcrush_blend`` flux-blending activation
-    #: path as the temperature that defines "radiatively crushed" interfaces —
-    #: Also the per-step temperature floor with
-    #: ``PositivityConfig.per_step_specific_floor``. 0.0 disables both.
+    #: Temperature-floor scale ``p/rho`` (``= k_B T_floor / (mu m_p)`` in code
+    #: units). It defines the radiatively crushed interfaces that
+    #: ``PositivityConfig.coldcrush_blend`` blends towards first order and,
+    #: with ``PositivityConfig.per_step_specific_floor``, the per-step
+    #: temperature floor. 0.0 disables both.
     minimum_specific_pressure: float = 0.0
 
     #: Ratio of the diffusive to the advective time scale of the GLM divergence
