@@ -340,7 +340,7 @@ over snapshots every 0.05 t_c.
 | iso MHD M10 beta 0.1, 256³ | complete | 9.3e-4 | - | 0 |
 | iso MHD M20 beta 0.1, 256³ | complete | 6.3e-4 | - | 0 |
 | iso MHD M10 beta 1, 256³ | complete | 6.8e-4 | - | 0 |
-| iso MHD M10 beta 0.1, **512³** (H100) | running; clean through 1.65 t_c | 3.6e-3 | - | 0 |
+| iso MHD M10 beta 0.1, **512³** (H100) | complete, 5.3 h | 6.5e-4 | - | 0 |
 | adiabatic M10, 256³, old PP | complete | 4.7e-2 | -5.7e-4 | 67 |
 | adiabatic M20, 256³, old PP | complete | 1.3e-2 | -6.1e-4 | 1024 |
 | adiabatic M20, 128³, paired | complete, 208 s | 1.3e-2 | +3.5e-6 | 0 |
@@ -388,11 +388,33 @@ negative event was stopped at its first occurrence (`turb.py
 * The Godunov-Powell counterfactual also "fixes" the event cell, but it adds
   more internal energy than the deficit there. It does not discriminate.
 
-Fix: limit each cell's inflow jointly across axes. By convexity, the six
-inflow faces can share the axis-summed base margin, so no non-conservative
-source term is needed. A div-B-consistent source would only matter where the
-summed first-order inflow itself fails; that happened in 0 cells here. Not
-implemented yet.
+**Fix (9616fdb): limit each cell's inflow faces jointly over the axes.**
+
+* A pre-pass (`mhd_inflow_reference`) builds each cell's axis-summed
+  first-order inflow B_i from q, the physical fluxes and the face speeds. It
+  needs no reconstruction and matches the flux's speeds to 8e-16.
+* Each inflow face is bounded by theta_k <= frac(B_i, 2 dim s_k), a convex
+  equal split. The own pairs stay per axis.
+* No source term is added; the scheme stays conservative.
+* Native == Pallas to 1.9e-10.
+
+Results:
+
+* Both forensic events now stay positive, in the full step and in every
+  forward-Euler step:
+  * CFL 0.375: -6.9e-6 -> +5.3e-5;
+  * CFL 1.5: -3.4e-6 -> +8.9e-5.
+* Alfven orders and errors are unchanged.
+* The low-beta blast's min p rises from 2.9e-2 to 5.2e-2.
+
+256³, Mach 20 unless noted, adiabatic, no clamp, floors 1e-30, every snapshot
+checked:
+
+| run | per-axis pairs | joint inflow |
+|---|---|---|
+| M20, CFL 0.375, to 1.5 t_c | min p -7.7e-4, 17 hits | **+1.3e-6, 0 hits** (complete, 1750 s) |
+| M20, CFL 1.5 | -2.9e-4, 36 hits | **+1.2e-6, 0 hits** through 3.85 t_c |
+| M10, CFL 1.5 | -1.1e-4, 1 hit | **+3.0e-5, 0 hits** through 3.1 t_c |
 
 ### Cold Evrard collapse (e0 = 0.05, fourth-order conservative gravity, fp32)
 
@@ -588,10 +610,10 @@ documented as read-only but is not:
 * A cheap, rigorous per-field monotonicity bound would remove the low-Mach
   contact cost.
 * The gravity coupling (above).
-* Ideal MHD in multi-D: limit the inflow pairs jointly per cell (the
-  per-axis pairs fail in ~7 % of cells; their axis sum in none).
-  Godunov-Powell / div-B-consistent sources are only needed where the summed
-  first-order inflow fails (never observed).
+* Ideal MHD in multi-D: the joint inflow limiter is provable wherever the
+  axis-summed first-order inflow B_i is admissible (all cells observed). Where
+  it is not, only a div-B-consistent (Godunov-Powell) source would restore the
+  guarantee.
 * Costs of the Pallas paired path, both untested in production:
   * it writes 17 channels and recombines on arrays: more memory;
   * its shard halo is 4, never run on multiple GPUs.
