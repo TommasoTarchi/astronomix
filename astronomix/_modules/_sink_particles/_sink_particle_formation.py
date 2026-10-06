@@ -293,6 +293,72 @@ def _periodic_box(config: SimulationConfig) -> tuple[np.ndarray, np.ndarray]:
     return is_periodic, box_length
 
 
+def _select_separated_candidates(
+    candidate_passes: jax.Array,
+    candidate_positions: jax.Array,
+    potential_at_candidates: jax.Array,
+    accretion_radius: float,
+    is_periodic: np.ndarray,
+    box_length: np.ndarray,
+) -> jax.Array:
+    """
+    Keep only passing candidates that lie farther than r_acc from every other
+    kept candidate, so that new sinks formed in the same call respect the
+    proximity rule (Section 2.2.7) among themselves.
+
+    The candidates are taken in order of increasing potential, the deepest
+    first, with exact ties going to the lower candidate index. Each one is kept
+    if it passes and no candidate kept before it lies within r_acc. The pass is
+    sequential: a single parallel rule ("drop a candidate if a higher-priority
+    passing candidate is within r_acc") would also drop candidates that are
+    only near a candidate dropped itself.
+
+    Args:
+        candidate_passes: Whether each candidate passes the creation checks,
+            shape (num_candidates,).
+        candidate_positions: The candidate cell centres, shape
+            (num_candidates, 3).
+        potential_at_candidates: The gravitational potential at each candidate
+            cell, shape (num_candidates,).
+        accretion_radius: The accretion radius r_acc.
+        is_periodic: Which axes are periodic, shape (3,).
+        box_length: The box length along each axis, shape (3,).
+
+    Returns:
+        Whether each candidate becomes a sink, shape (num_candidates,).
+    """
+    # Distances between candidates, to the nearest periodic copy along
+    # periodic axes, as in the proximity check to existing sinks.
+    separation = candidate_positions[:, None, :] - candidate_positions[None, :, :]
+    separation = jnp.where(
+        is_periodic,
+        separation - box_length * jnp.round(separation / box_length),
+        separation,
+    )
+    within_accretion_radius = (
+        jnp.linalg.norm(separation, axis=-1) <= accretion_radius
+    )
+
+    # Failing candidates go last; the stable sort keeps exact ties in
+    # candidate order.
+    order = jnp.argsort(
+        jnp.where(candidate_passes, potential_at_candidates, jnp.inf),
+        stable=True,
+    )
+
+    def keep_if_separated(rank, kept):
+        candidate = order[rank]
+        near_kept = jnp.any(kept & within_accretion_radius[candidate])
+        return kept.at[candidate].set(candidate_passes[candidate] & ~near_kept)
+
+    return jax.lax.fori_loop(
+        0,
+        candidate_passes.shape[0],
+        keep_if_separated,
+        jnp.zeros_like(candidate_passes),
+    )
+
+
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _form_sink_particles(
     primitive_state: STATE_TYPE,
@@ -514,6 +580,19 @@ def _form_sink_particles(
         & far_from_existing_sinks
         & jeans_unstable
         & bound
+    )
+
+    # Proximity among the new sinks (Section 2.2.7): several nearby cells can
+    # pass every check in the same call, e.g. when the potential minimum is
+    # shared by equivalent cells (the potential check is not strict). Only
+    # candidates at least r_acc apart are kept, the deepest potential first.
+    candidate_passes = _select_separated_candidates(
+        candidate_passes,
+        candidate_positions,
+        gravitational_potential[tuple(candidate_indices.T)],
+        accretion_radius,
+        is_periodic,
+        box_length,
     )
 
     # -------------------------------------------------------------

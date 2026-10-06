@@ -3,9 +3,9 @@ Sink particle formation pytest (fast).
 
 Checks the sink particle creation of Federrath et al. (2010), Section 2.2:
 the creation checks (converging flow, potential minimum, Jeans instability
-with and without a magnetic field, bound state, proximity to existing sinks),
-the limit on the number of sink slots, and the wrapping of a new sink's
-position into a periodic box.
+with and without a magnetic field, bound state, proximity to existing sinks
+and between sinks formed in the same call), the limit on the number of sink
+slots, and the wrapping of a new sink's position into a periodic box.
 """
 
 # ==== GPU selection ====
@@ -171,6 +171,25 @@ def test_potential_minimum():
     # slightly toward the spike, but stays within half a cell of the centre.
     assert _num_sinks(sink_particles) == 1
     assert jnp.all(jnp.abs(sink_particles.position[0] - CLUMP_CENTER) < 0.5 * CELL_SIZE)
+
+
+def test_one_sink_per_control_volume():
+    """Candidates that pass every check in the same call are kept at least
+    r_acc apart (Section 2.2.7), so a clump with several equivalent potential
+    minima forms one sink."""
+    # The clump is centred on the corner shared by the 8 cells around cell
+    # (16, 16, 16). These cells are equivalent, so their potentials differ
+    # only by rounding, and several of them pass every creation check.
+    corner = CLUMP_CENTER - 0.5 * CELL_SIZE
+    settings = SETTINGS._replace(overdensity_center=(corner, corner, corner))
+    state, config, params, registered_variables = _setup(settings)
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    # A single sink, which accretes the gas around the corner: its centre of
+    # mass stays within one cell of the corner.
+    assert _num_sinks(sink_particles) == 1
+    assert jnp.all(jnp.abs(sink_particles.position[0] - corner) < CELL_SIZE)
 
 
 @pytest.mark.parametrize(
