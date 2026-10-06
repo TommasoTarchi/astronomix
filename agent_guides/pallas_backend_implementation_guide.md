@@ -346,6 +346,35 @@ The full design rationale (why this is needed, how the alternative
 threading-mesh-through-every-function design was rejected) is in the
 ``pallasify`` skill, §4b'.
 
+**Per-input halos, kept output halos, and the split-axis predicate.**
+``_pallas_call_sharded`` takes two optional arguments that cut the
+communication of a sharded step:
+
+- ``input_halos=((hx, hy, hz), ...)``, one tuple per state input: every
+  input is still padded to the same block-rounded shape, but only the
+  requested cells are exchanged; the rest of the padding is filled with
+  local edge copies. The contract is the kernel's read pattern: declare
+  ``0`` for an input the kernel reads only at the cell itself (an
+  accumulator, the flux slices of the CT modified-flux stage) and the
+  stencil reach otherwise. A stale declaration silently produces wrong
+  values at shard seams only, so re-check it whenever a kernel's read
+  pattern changes, and test with the multi-device equivalence check.
+- ``output_halo``: keep part of the padding on the state outputs (one
+  per-axis tuple for all outputs, or one per output), so a following
+  local stencil can reuse cells this kernel already computed instead of
+  exchanging them again. The multi-GPU fast path of ``_lsrk4_with_ct``
+  keeps one x cell of the x-WENO flux so the x divergence needs no
+  second exchange.
+
+Code that relies on such an exchange must be gated on
+``_pallas_mesh_splits_axis(state, spatial_axis)`` (the active mesh
+really splits that axis), never on ``jax.device_count()``, which says
+nothing about how the state is sharded (an unsharded run on a multi-GPU
+node would otherwise take the sharded path and crash). Kernels called
+outside ``diffable_pallas_call`` break ``jax.jvp`` / ``jax.grad``; wrap
+the whole step with ``diffable_pallas_call_n`` and a native branch that
+computes the same thing (see ``compute_lqs`` in ``_ssprk.py``).
+
 ### 2.4 Backend-aware dispatch
 
 The wrapper for each direction stays small and JIT-able:
