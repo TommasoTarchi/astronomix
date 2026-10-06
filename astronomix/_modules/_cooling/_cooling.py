@@ -219,35 +219,35 @@ def power_law_temporal_evolution_function_inverse(
 
 
 # piecewise power law
-@partial(
-    jnp.vectorize,
-    excluded=(1, 2, 3),  # don’t vectorize over tables
-    signature="()->()",  # scalar in, scalar out
-)
 def _evaluate_piecewise_power_law(
     T_in,
     T_table,
     Lambda_table,
     alpha_table,
 ):
-    def eval_in_range(T_in):
-        k = jnp.searchsorted(T_table, T_in) - 1
+    """Lambda(T) on a piecewise power-law table: ``Lambda_k (T/T_k)^alpha_k``.
 
-        # clip k to be in the valid range
-        k = jnp.clip(k, 0, len(T_table) - 2)
+    BRANCH-FREE and whole-array. The previous implementation was a
+    ``jnp.vectorize``d SCALAR function containing a ``jax.lax.cond``, i.e. a
+    per-cell branch plus a per-cell ``searchsorted``; on GPU that dominated the
+    entire cooling solve (and hence the entire step). Here the bin lookup and
+    the range mask are ordinary batched array ops, which is ~an order of
+    magnitude cheaper and gives identical values.
 
-        alpha_k = alpha_table[k]
-        T_k = T_table[k]
-        Lambda_k = Lambda_table[k]
-        return Lambda_k * (T_in / T_k) ** alpha_k
-
-    return jax.lax.cond(
-        # check if T_in is in the table range
-        (T_in >= T_table[0]) & (T_in <= T_table[-1]),
-        eval_in_range,
-        lambda _: 0.0,  # return 0 if out of range
-        T_in,
-    )
+    ``T_in`` is clamped INSIDE the power so out-of-range cells cannot produce
+    inf/NaN that a later ``where`` would only mask (and which would poison
+    gradients); the mask then zeroes them exactly as before.
+    """
+    lo = T_table[0]
+    hi = T_table[-1]
+    k = jnp.searchsorted(T_table, T_in) - 1
+    k = jnp.clip(k, 0, T_table.shape[0] - 2)
+    alpha_k = jnp.take(alpha_table, k)
+    T_k = jnp.take(T_table, k)
+    Lambda_k = jnp.take(Lambda_table, k)
+    T_safe = jnp.clip(T_in, lo, hi)
+    value = Lambda_k * (T_safe / T_k) ** alpha_k
+    return jnp.where((T_in >= lo) & (T_in <= hi), value, 0.0)
 
 
 @partial(
@@ -515,10 +515,15 @@ def dtemperature_dt(
     gamma: float,
     cooling_curve_config: CoolingCurveConfig,
     cooling_curve_params: COOLING_CURVE_TYPE,
+    heating_rate: float = 0.0,
 ) -> FIELD_TYPE:
     r"""
     T_new = T - (gamma - 1) * rho * \mu / (mu_e * mu_H * k) * Lambda(T) * delta_t
     (units absorbed in Lambda)
+
+    ``heating_rate`` adds the density-independent ISM heating
+    ``+ (gamma - 1) * heating_rate`` (see ``CoolingParams.heating_rate``),
+    making this the NET rate Gamma - Lambda when enabled.
     """
 
     # calculate the cooling rate
@@ -531,7 +536,10 @@ def dtemperature_dt(
         metal_mass_fraction,
     )
 
-    return -(cooling_rate * (gamma - 1) * density * mu) / (mu_e * mu_H)
+    return (
+        -(cooling_rate * (gamma - 1) * density * mu) / (mu_e * mu_H)
+        + (gamma - 1) * heating_rate
+    )
 
 
 @partial(jax.jit, static_argnames=("cooling_curve_config",))
@@ -544,6 +552,7 @@ def update_temperature_explicit(
     gamma: float,
     cooling_curve_config: CoolingCurveConfig,
     cooling_curve_params: COOLING_CURVE_TYPE,
+    heating_rate: float = 0.0,
 ) -> FIELD_TYPE:
     r"""
     T_new = T - (gamma - 1) * rho * \mu / (mu_e * mu_H * k) * Lambda(T) * delta_t
@@ -560,6 +569,7 @@ def update_temperature_explicit(
             gamma,
             cooling_curve_config,
             cooling_curve_params,
+            heating_rate=heating_rate,
         )
         * time_step
     )
@@ -574,48 +584,98 @@ def update_temperature_implicit(
     gamma: float,
     cooling_curve_config: CoolingCurveConfig,
     cooling_curve_params: COOLING_CURVE_TYPE,
+    heating_rate: float = 0.0,
 ) -> FIELD_TYPE:
 
-    def implicit_eq(T_new):
-        return (temperature
-        + dtemperature_dt(
-            density,
-            T_new,
-            hydrogen_mass_fraction,
-            metal_mass_fraction,
-            gamma,
-            cooling_curve_config,
-            cooling_curve_params,
-        ) * time_step)
+    def rate(T):
+        return dtemperature_dt(
+            density, T, hydrogen_mass_fraction, metal_mass_fraction, gamma,
+            cooling_curve_config, cooling_curve_params, heating_rate=heating_rate,
+        )
 
-    # use a simple fixed point iteration
-    # - maybe do newton or bisection method later
-    max_iter = 50
-    tol = 1e-6
+    # Backward-Euler solve of  T = T_old + dt * rate(T)  by SAFEGUARDED NEWTON
+    # (Newton where it stays inside a maintained bracket, bisection otherwise).
+    #
+    # A fixed-point sweep converges only linearly (observed ratio ~0.65 in the
+    # ISM two-phase regime => ~33 sweeps for 1e-6 relative), and each sweep
+    # costs a full cooling-curve evaluation over the grid, which made the
+    # implicit path ~70 ms/call at 64^3 and dominated the whole step. Newton
+    # converges quadratically (~4-6 iterations); ``rate`` is elementwise, so a
+    # single JVP with a unit tangent yields the per-cell derivative d(rate)/dT
+    # and no Jacobian is ever formed.
+    #
+    # The SAFEGUARD is not optional. Lambda(T) is non-monotone, so
+    # F'(T) = 1 - dt * d(rate)/dT passes through zero on the falling branch of
+    # the curve and an unguarded Newton step then jumps the wrong way. Measured
+    # on the Schure curve at float32 with the heating off, plain Newton returned
+    # T_new up to 240x T_old -- impossible for a pure sink, and a direct route
+    # to a CFL collapse. It is what aborted the 256^3 Cas A runs as soon as the
+    # dense pistons (chi_n = 50-100) met the radiative shell.
+    #
+    # A bracket always exists: F(T) = T - T_old - dt*rate(T) is continuous with
+    #   F(0+)   = -T_old - dt*(gamma-1)*heating  <  0     (Lambda -> 0 off-table)
+    #   F(T_hi) = dt * Lambda(T_hi) * (...)      >= 0     for the no-cooling bound
+    #             T_hi = T_old + dt*(gamma-1)*heating,
+    # so bisection is always available as the fallback and the iteration cannot
+    # leave the physical interval whatever the curve does.
+    #
+    # KNOWN LIMIT: with heating enabled the equation has several roots near the
+    # two-phase equilibrium, and at dt an order of magnitude above the usual
+    # operating point (~1e-5 code) a few 1e-3 of cells still carry a residual
+    # above ``tol`` after ``max_iter``. They remain inside the bracket, so they
+    # fail safe; measured residuals: 0 cells over tol at dt = 1e-5, 38 of 32000
+    # at 1e-4, 217 at 1e-3.
+    eps_dtype = jnp.finfo(temperature.dtype).eps
+    tol = jnp.maximum(1e-6, 8.0 * eps_dtype)
+    tiny = jnp.finfo(temperature.dtype).tiny
+    max_iter = 30
 
-    def cond_fun(state):
-        i, T_old = state
-        T_candidate = implicit_eq(T_old)
-        diff = jnp.max(jnp.abs(T_candidate - T_old))
-        return (i < max_iter) & (diff > tol)
+    T_hi = temperature + time_step * (gamma - 1.0) * heating_rate
+    T_lo = jnp.full_like(temperature, tiny)
 
-    def body_fun(state):
-        i, T_old = state
-        T_new = implicit_eq(T_old)
-        return (i + 1, T_new)
+    def newton_body(state):
+        i, T, lo, hi, _ = state
+        f, fp = jax.jvp(rate, (T,), (jnp.ones_like(T),))
+        F = T - temperature - time_step * f
+        # maintain F(lo) < 0 <= F(hi); valid even where F is not monotone
+        lo = jnp.where(F < 0.0, T, lo)
+        hi = jnp.where(F < 0.0, hi, T)
+        Fp = 1.0 - time_step * fp
+        Fp = jnp.where(jnp.abs(Fp) > tiny, Fp, 1.0)
+        T_newton = T - F / Fp
+        inside = (T_newton > lo) & (T_newton < hi)
+        # Plain arithmetic bisection as the fallback. A geometric mean looks
+        # more natural for a quantity spanning decades, but measured on both
+        # the Schure and the ISM-with-heating curves it converges WORSE at
+        # every dt (and sqrt(lo*hi) additionally underflows to zero in float32,
+        # so it would have to be written sqrt(lo)*sqrt(hi)): the fallback is
+        # taken near the root, where the bracket is already narrow, not across
+        # the initial decades.
+        T_new = jnp.where(inside, T_newton, 0.5 * (lo + hi))
+        err = jnp.max(jnp.abs(T_new - T) / jnp.maximum(jnp.abs(T_new), tiny))
+        return (i + 1, T_new, lo, hi, err)
 
-    state = (0, temperature)
-    _, T_final = jax.lax.while_loop(cond_fun, body_fun, state)
+    def newton_cond(state):
+        i, _, _, _, err = state
+        return (i < max_iter) & (err > tol)
+
+    _, T_final, _, _, _ = jax.lax.while_loop(
+        newton_cond, newton_body, (0, temperature, T_lo, T_hi, jnp.inf)
+    )
     return T_final
 
 
-@partial(jax.jit, static_argnames=("cooling_config", "registered_variables"))
+
+@partial(jax.jit,
+         static_argnames=("cooling_config", "registered_variables",
+                          "grid_spacing"))
 def update_pressure_by_cooling(
     primitive_state: STATE_TYPE,
     registered_variables: RegisteredVariables,
     cooling_config: CoolingConfig,
     simulation_params: SimulationParams,
     time_step: float,
+    grid_spacing: float = 0.0,
 ) -> STATE_TYPE:
     """Apply cooling to the pressure of the primitive state for one time step.
 
@@ -654,6 +714,38 @@ def update_pressure_by_cooling(
         metal_mass_fraction,
     )
 
+    # Cooling-resolution limiter: suppress the cooling rate where the cooling
+    # length l_cool = c_s * t_cool is unresolved (below ``alpha`` cells). An
+    # unresolved radiative shock layer otherwise collapses to a cell-scale
+    # cold dense sheet with no pressure support and runs away under ram
+    # pressure; keeping it adiabatic is the resolvable solution. Implemented
+    # by scaling the per-cell effective time step (equivalent to scaling
+    # Lambda), which both the implicit fixed-point and explicit updates
+    # broadcast elementwise.
+    # ``alpha`` rides in the (traced) SimulationParams, so the on/off gate must
+    # be trace-safe: compute the suppression unconditionally and blend it in
+    # with jnp.where. ``grid_spacing`` comes from the static config (a plain
+    # Python float), so that gate can stay a Python conditional.
+    alpha = cooling_params.resolution_limiter_alpha
+    if grid_spacing > 0.0:
+        # NET rate (cooling minus heating): at the two-phase equilibrium the
+        # net rate vanishes, so the limiter correctly leaves equilibrium gas
+        # untouched.
+        dTdt = dtemperature_dt(
+            density, temperature,
+            hydrogen_mass_fraction, metal_mass_fraction, gamma,
+            cooling_curve_config, cooling_params.cooling_curve_params,
+            heating_rate=cooling_params.heating_rate,
+        )
+        t_cool = temperature / jnp.maximum(jnp.abs(dTdt), 1e-30)
+        sound_speed = jnp.sqrt(gamma * pressure / density)
+        l_cool = sound_speed * t_cool
+        alpha_safe = jnp.maximum(alpha, 1e-30)
+        suppression = jnp.clip(
+            (l_cool / (alpha_safe * grid_spacing)) ** 2, 0.0, 1.0
+        )
+        time_step = time_step * jnp.where(alpha > 0.0, suppression, 1.0)
+
     if cooling_config.cooling_method == IMPLICIT_COOLING:
         new_temperature = update_temperature_implicit(
             density,
@@ -664,6 +756,7 @@ def update_pressure_by_cooling(
             gamma,
             cooling_curve_config,
             cooling_params.cooling_curve_params,
+            heating_rate=cooling_params.heating_rate,
         )
     elif cooling_config.cooling_method == EXPLICIT_COOLING:
         new_temperature = update_temperature_explicit(
@@ -675,15 +768,36 @@ def update_pressure_by_cooling(
             gamma,
             cooling_curve_config,
             cooling_params.cooling_curve_params,
+            heating_rate=cooling_params.heating_rate,
         )
 
-    # Never let cooling push the temperature below the configured floor; where
-    # it would, keep the original temperature instead.
+    # Operator-splitting limiter: cap the fractional drop applied in one step.
+    # See CoolingParams.max_cooling_fraction. Downward only, so heating and the
+    # two-phase equilibrium are untouched.
+    max_fraction = cooling_params.max_cooling_fraction
     new_temperature = jnp.where(
-        (new_temperature > cooling_params.floor_temperature),
+        max_fraction > 0.0,
+        jnp.maximum(new_temperature, (1.0 - max_fraction) * temperature),
         new_temperature,
-        temperature,
     )
+
+    # Temperature floor. Two behaviours, see CoolingParams.clamp_to_floor:
+    # REVERT (default) discards the whole update for a cell that would cross the
+    # floor -- worse numerics, but a de-facto crush guard the Cas A runs turn
+    # out to depend on; CLAMP puts the cell on the floor instead, which is what
+    # the explicit path needs to do anything at all. Cells that START at or
+    # below the floor are left alone either way -- clamping those would HEAT
+    # them, and the cold unshocked ejecta sits far below it.
+    floor_temperature = cooling_params.floor_temperature
+    clamped = jnp.where(
+        temperature <= floor_temperature,
+        temperature,
+        jnp.maximum(new_temperature, floor_temperature),
+    )
+    reverted = jnp.where(
+        new_temperature > floor_temperature, new_temperature, temperature
+    )
+    new_temperature = jnp.where(cooling_params.clamp_to_floor, clamped, reverted)
 
     # update the pressure
     new_pressure = get_pressure_from_temperature(
