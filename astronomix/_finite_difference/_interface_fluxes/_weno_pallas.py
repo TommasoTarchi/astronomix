@@ -1270,9 +1270,12 @@ def _weno_flux_hydro_pallas_local(
             dq3 = qproj[4] - qproj[3]
             dq4 = qproj[5] - qproj[4]
 
-            amx = alpha_for_mode(mode)
+            # (under PP the mass-carrying fields use the common speed: skip their
+            # own stencil maximum, which would only be computed and discarded)
             if positivity_preserving and mode not in own_speed_modes:
                 amx = common_speed
+            else:
+                amx = alpha_for_mode(mode)
 
             aterm_p = 0.5 * (d0 + amx * dq0)
             bterm_p = 0.5 * (d1 + amx * dq1)
@@ -2163,9 +2166,12 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
         dq4 = qproj[5] - qproj[4]
 
-        amx = alpha_for_mode(mode)
+        # (under PP the mass-carrying fields use the common speed: skip their
+        # own stencil maximum, which would only be computed and discarded)
         if positivity_preserving and mode not in own_speed_modes:
             amx = common_speed
+        else:
+            amx = alpha_for_mode(mode)
 
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
@@ -3592,6 +3598,16 @@ def _weno_flux_mhd_pallas_local(
         **kwargs,
     )(*args)
 
+    if positivity_preserving and inflow_reference is not None:
+        # joint per-cell inflow limiting, fused into one kernel (it reads the
+        # split fluxes of the interfaces i - 1/2, i + 1/2, i + 3/2)
+        from astronomix._finite_difference._interface_fluxes._weno_positivity_pallas import (
+            mhd_joint_recombination_pallas,
+        )
+        return mhd_joint_recombination_pallas(
+            conserved_state, flux, inflow_reference[0], inflow_reference[1],
+            params, config, registered_variables, axis=axis,
+        )
     if positivity_preserving:
         # paired recombination (needs the neighbouring interfaces; see
         # _weno_positivity._paired_scalings), on the split face fluxes
@@ -4227,9 +4243,12 @@ def _weno_flux_mhd_iso_pallas_local(
             dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
             dq4 = qproj[5] - qproj[4]
 
-            amx = alpha_for_mode(mode)
+            # (under PP the mass-carrying fields use the common speed: skip their
+            # own stencil maximum, which would only be computed and discarded)
             if positivity_preserving and mode not in own_speed_modes:
                 amx = common_speed
+            else:
+                amx = alpha_for_mode(mode)
 
             aterm_p = 0.5 * (d0 + amx * dq0); bterm_p = 0.5 * (d1 + amx * dq1)
             cterm_p = 0.5 * (d2 + amx * dq2); dterm_p = 0.5 * (d3 + amx * dq3)

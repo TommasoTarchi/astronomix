@@ -44,7 +44,9 @@ from astronomix._finite_difference._interface_fluxes._weno import (
     _weno_flux_y,
     _weno_flux_z,
 )
-from astronomix._finite_difference._interface_fluxes._weno_positivity import mhd_inflow_reference
+from astronomix._finite_difference._interface_fluxes._weno_positivity_pallas import (
+    mhd_inflow_reference_dispatch as mhd_inflow_reference,
+)
 from astronomix._finite_difference._interface_fluxes._flux_blending import (
     _blend_interface_flux,
 )
