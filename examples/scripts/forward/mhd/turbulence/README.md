@@ -208,13 +208,18 @@ is the table this README quotes.
 | `_mhd_metrics.py` | the metric definitions every number in this README comes from |
 | `make_convergence_figures.py` | figures + `data/metrics.md` |
 | `make_dissipation_figure.py` | the spectral energy budget: `D(n)`, `nu_eff(n)`, `eta_eff(n)` |
+| `make_calibration_figure.py` | the same spectra for the runs with an explicit Laplacian coefficient: the estimator against a known answer |
+| `make_calibration_model.py` | why the known answer is not recovered one-to-one: exact discrete-operator transfer function, state dependence of the numerical `eta`, and a one-parameter strain share of the numerical `nu` |
 | `make_mechanism_table.py` | `Pm`, `Re`, `Rm` per scheme; the matched-state table, the audit, the growth-rate model comparison and the explicit-diffusivity calibration |
-| `make_mechanism_figure.py` | the three-panel `Re` / `Rm` / `Pm` summary figure |
+| `make_mechanism_figure.py` | the `Re` / `Rm` / `Pm` summary figure: Laplacian band mean (top row) against the form-free dissipation-shell measure (bottom row) |
 | `make_dynamo_movie.py` | the side-by-side dynamo animation |
 | `measure_glm_psi_term.py` | how much of a GLM scheme's `eta_eff` is the divergence cleaning |
 | `DYNAMO_MECHANISM.md` | the written-up version of all of this: animation, derivation, table, discussion |
 | `make_reynolds_figure.py` | the shell-based Reynolds numbers over resolution (read as *proportional to* `Re`/`Rm`; see the audit) |
 | `run_dynamo_ladder.sh` | submits the ladder to the GPU queue |
+| `run_wenoz_and_ensemble.sh` | submits the WENO-Z dissipation runs and the matched-forcing seed ensemble |
+| `run_astro_calibration.sh` | submits the explicit-viscosity / resistivity ladder for astronomix (`--mom-diff`, `--ohm-diff`; the ohmic term lives in `astronomix/_modules/_resistivity/`) |
+| `make_ensemble_table.py` | realisation-averaged growth rates under AthenaPK's forcing statistics (`--forcing athenapk`), with scheme ratios and errors |
 | `paper_turbulence.py`, `make_fig14.py`, `make_fig15.py` | the earlier HOW-MHD reproduction this study's physical setup is taken from |
 
 ## Results
@@ -897,7 +902,12 @@ ladder recovers only 0.62-0.76 per unit for the same reason, more strongly, and
 the cross-talk is asymmetric: an imposed viscosity moves the measured `eta` by
 -26% while an imposed resistivity moves the measured `nu` by +5%. **The `eta`
 measurement, which the whole `Pm` story rests on, is the one that calibrates
-cleanly.**
+cleanly.** Repeated at `256^3` with the ladder scaled to that grid's numerical
+coefficients, the increments are 0.79, 0.95 and 1.00 per unit imposed `eta`
+(exactly additive once the Laplacian dominates, the numerical part displaced by
+~20% as soon as one is present) and 0.68, 0.76 for `nu`; the spectra themselves
+are in `figures/dynamo_dissipation_calibration_N{64,256}.png` and the reading in
+`DYNAMO_MECHANISM.md`.
 
 **Resolvedness -- the one check that fails.** The Kolmogorov shell implied by
 the measured `nu` and the measured dissipation rate,

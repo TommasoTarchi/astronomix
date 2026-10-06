@@ -102,13 +102,18 @@ def dissipation(run, t_lo, deconvolve=False):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--data", default=str(HERE / "data" / "dissipation"))
+    p.add_argument("--data", nargs="*", default=[str(HERE / "data" / "dissipation")],
+                   help="one or more run directories carrying transfer spectra")
     p.add_argument("--figures", default=str(HERE / "figures"))
+    p.add_argument("--out", default="dynamo_dissipation.png")
+    p.add_argument("--n", nargs="*", type=int, default=None,
+                   help="only these resolutions (default: every run found)")
     p.add_argument("--sat-start", type=float, default=28.0)
     p.add_argument("--exclude", nargs="*", default=("smoke",))
     args = p.parse_args()
 
-    runs = load_runs(args.data, skip=("calib", *args.exclude))
+    runs = [r for d in args.data for r in load_runs(d, skip=("calib", *args.exclude))
+            if args.n is None or int(r["N"]) in args.n]
     measured = [(r, dissipation(r, args.sat_start)) for r in runs]
     measured = [(r, d) for r, d in measured if d is not None]
     if not measured:
@@ -156,7 +161,7 @@ def main():
                  r"$D(n) = T_{\rm ideal}(n) - dE(n)/dt$, both terms measured.",
                  fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    out = Path(args.figures) / "dynamo_dissipation.png"
+    out = Path(args.figures) / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=150)
     plt.close(fig)

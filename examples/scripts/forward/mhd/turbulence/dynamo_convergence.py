@@ -51,6 +51,7 @@ from astronomix.option_classes.simulation_config import (
     CARTESIAN,
     FINITE_DIFFERENCE,
     ISOTHERMAL,
+    KINEMATIC_VISCOSITY,
 )
 
 # astronomix containers
@@ -78,6 +79,17 @@ from astronomix import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _mhd_spectral import SCALAR_NAMES, SPECTRUM_NAMES, snapshot_spectra, shell_numbers
+from athenapk_turb import MODES as ATHENAPK_MODES
+
+
+def athenapk_modes():
+    """AthenaPK's 30 driving modes as integer triples, parsed from its deck."""
+    modes = {}
+    for line in ATHENAPK_MODES.splitlines():
+        name, value = (t.strip() for t in line.split("="))
+        _, m, c = name.split("_")
+        modes.setdefault(int(m), [0, 0, 0])[int(c)] = int(value)
+    return tuple(tuple(modes[m]) for m in sorted(modes))
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SCRATCH_DIR = Path("/export/data/lstorcks/mhd_dynamo")
@@ -113,9 +125,24 @@ def build_config(args, num_snapshots):
         # which is what this study measures. (The supersonic ISM case of
         # paper_turbulence.py needs it; this one does not.)
         positivity_config=PositivityConfig(),
+        # WENO-Z weights (Borges et al.) instead of Jiang-Shu: the JS weights
+        # with an absolute epsilon are fully nonlinear on O(1) turbulent fields
+        # and drop the stencil to low order, which is the candidate explanation
+        # for astronomix's PLM-like numerical viscosity (see DYNAMO_MECHANISM).
+        weno_z=args.weno_z,
+        # Explicit Laplacian coefficients for the calibration ladder (the same
+        # test athenapk_turb.py --mom-diff/--ohm-diff runs on AthenaPK).
+        diffusion=args.mom_diff > 0.0,
+        viscosity_type=KINEMATIC_VISCOSITY,
+        resistivity=args.ohm_diff > 0.0,
         turbulent_forcing_config=TurbulentForcingConfig(
             turbulent_forcing=True,
             ou_forcing=True,              # temporally correlated, like AthenaPK
+            # --forcing athenapk: AthenaPK's own 30-mode set and parabolic
+            # envelope, acceleration rescaled to F0 every step, so the two codes
+            # share the forcing STATISTICS (the realisation still differs).
+            forcing_modes=athenapk_modes() if args.forcing == "athenapk" else (),
+            ou_unit_rms_each_step=args.forcing == "athenapk",
         ),
         # In-flight reduction: no snapshot buffer, so the memory cost does not
         # grow with num_snapshots (see module docstring).
@@ -145,8 +172,22 @@ def main():
     p.add_argument("--tcross", type=float, default=40.0, help="run length in crossing times")
     p.add_argument("--F0", type=float, default=3.5, help="OU forcing amplitude")
     p.add_argument("--tau", type=float, default=0.5, help="OU correlation time")
-    p.add_argument("--kf", type=float, default=3.0 * np.pi,
-                   help="OU peak wavenumber (mode number n = k L / 2pi = 1.5)")
+    p.add_argument("--kf", type=float, default=None,
+                   help="OU peak wavenumber. Default 3 pi (mode number "
+                        "n = k L / 2pi = 1.5) for the smooth spectrum, 4 pi "
+                        "(n = 2, AthenaPK's kpeak) for --forcing athenapk")
+    p.add_argument("--forcing", choices=("smooth", "athenapk"), default="smooth",
+                   help="smooth: the k^6 exp(-8k/kpk) spectrum on all modes. "
+                        "athenapk: AthenaPK's 30-mode few-modes driver with its "
+                        "parabolic envelope and per-step rms normalisation")
+    p.add_argument("--weno-z", action="store_true",
+                   help="WENO-Z nonlinear weights instead of Jiang-Shu")
+    p.add_argument("--mom-diff", type=float, default=0.0,
+                   help="explicit kinematic viscosity in code units "
+                        "(calibration runs only; 0 disables)")
+    p.add_argument("--ohm-diff", type=float, default=0.0,
+                   help="explicit ohmic resistivity in code units "
+                        "(calibration runs only; 0 disables)")
     p.add_argument("--cfl", type=float, default=1.5, help="astronomix C_cfl")
     p.add_argument("--nsnap", type=int, default=81,
                    help="snapshots over the whole run. The in-flight reduction "
@@ -189,6 +230,8 @@ def main():
 
     if args.x64:
         jax.config.update("jax_enable_x64", True)
+    if args.kf is None:
+        args.kf = 4.0 * np.pi if args.forcing == "athenapk" else 3.0 * np.pi
 
     a = 1.0 / args.mturb                       # isothermal sound speed
     P_thermal = a ** 2 * RHO0
@@ -209,6 +252,8 @@ def main():
         ),
         minimum_density=1e-4,
         minimum_pressure=1e-6,
+        viscosity=args.mom_diff,
+        resistivity=args.ohm_diff,
     )
 
     # Let the array dtype follow the x64 flag rather than pinning float32, so
@@ -238,10 +283,12 @@ def main():
     config = finalize_config(config, state.shape)
     ng = config.num_ghost_cells
 
-    print(f"[astronomix N={args.n}] isothermal a={a} beta0={args.beta:g} B0={B0:.4g} "
-          f"seed={args.seed_field} "
-          f"F0={args.F0} tau={args.tau} kf={args.kf:.3f} C_cfl={args.cfl} "
-          f"t_end={t_end} ({args.tcross} t_cross)", flush=True)
+    weno_name = "WENO-Z" if args.weno_z else "WENO5"
+    print(f"[astronomix N={args.n}] {weno_name}+CT isothermal a={a} "
+          f"beta0={args.beta:g} B0={B0:.4g} seed={args.seed_field} "
+          f"forcing={args.forcing} F0={args.F0} tau={args.tau} kf={args.kf:.3f} "
+          f"nu={args.mom_diff:g} eta={args.ohm_diff:g} "
+          f"C_cfl={args.cfl} t_end={t_end} ({args.tcross} t_cross)", flush=True)
 
     # -------------------------------------------------------------
     # ========= ↓ In-flight snapshot reduction (callback) ↓ ========
@@ -363,7 +410,11 @@ def main():
     tag = args.tag or f"N{args.n}"
     path = out / f"astronomix_{tag}.npz"
     payload = dict(
-        code="astronomix", label="astronomix WENO5+CT", scheme="WENO5 / SSP-RK / CT",
+        code="astronomix", label=f"astronomix {weno_name}+CT",
+        scheme=f"{weno_name} / SSP-RK / CT",
+        scheme_key="wenoz" if args.weno_z else "weno5",
+        weno_z=args.weno_z, forcing=args.forcing,
+        mom_diff=args.mom_diff, ohm_diff=args.ohm_diff,
         N=args.n, tag=tag, t_wall=t_run, t_compile=t_compile,
         n_steps_estimated=n_steps, zone_updates_per_s=args.n ** 3 * n_steps / t_run,
         finite_volume=False,

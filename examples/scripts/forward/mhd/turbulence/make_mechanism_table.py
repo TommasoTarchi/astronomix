@@ -83,6 +83,29 @@ MATCH_WINDOW = 5          # snapshots averaged around the crossing
 # -------------------------------------------------------------
 # ================== ↓ The measurement ↓ ======================
 # -------------------------------------------------------------
+def dissipation_shells(n, D_v, D_B, n_min=4):
+    """Form-free dissipation scales and the Reynolds numbers they imply.
+
+    The dissipation-weighted shell of the MEASURED ``D(n)``, ``<n> = sum n D /
+    sum D`` over ``n >= n_min`` (below it the budget is the forcing), assumes
+    nothing about how ``D`` scales with ``k`` -- unlike the Laplacian band mean,
+    which is only like-for-like between schemes whose ``nu_eff(n)`` is flat.
+    Converted with the same Kolmogorov convention as ``make_reynolds_figure.py``,
+    ``(n / n_inj)^(4/3)``, so the absolute values are conventional and the ratios
+    between schemes are the result (see DYNAMO_MECHANISM.md).
+    """
+    above = n >= n_min
+
+    def shell(D):
+        w = np.maximum(D[above], 0.0)
+        return float((n[above] * w).sum() / max(w.sum(), 1e-300))
+
+    n_Dv, n_DB = shell(D_v), shell(D_B)
+    Re_D = (n_Dv / N_INJECTION) ** (4.0 / 3.0)
+    Rm_D = (n_DB / N_INJECTION) ** (4.0 / 3.0)
+    return dict(n_Dv=n_Dv, n_DB=n_DB, Re_D=Re_D, Rm_D=Rm_D, Pm_D=Rm_D / Re_D)
+
+
 def measure(run, band=BAND, sat_start=SAT_START, snapshots=None):
     """``nu_eff``, ``eta_eff`` and everything derived, for one run.
 
@@ -118,6 +141,7 @@ def measure(run, band=BAND, sat_start=SAT_START, snapshots=None):
     eps_v = float(D_v[n >= 4].sum())
     eps_B = float(D_B[n >= 4].sum())
     return dict(
+        **dissipation_shells(n, D_v, D_B),
         N=N, label=str(run["label"]), code=str(run["code"]),
         scheme=str(run.get("scheme_key", "-")),
         nu=nu, eta=eta, Pm=nu / eta,
@@ -208,7 +232,8 @@ def measure_at_ratio(run, ratio=MATCH_RATIO, window=MATCH_WINDOW,
                 Rm=v_rms * L_INJ / eta, L_spec=L_spec,
                 Re_L=v_rms * L_spec / nu, Rm_L=v_rms * L_spec / eta,
                 t_over_tc=float(tc[sel].mean()), ratio=float(r[sel].mean()),
-                mach=float(np.asarray(run["mach"])[sel].mean()))
+                mach=float(np.asarray(run["mach"])[sel].mean()),
+                **dissipation_shells(n, D_v, D_B))
 
 
 #: Block length for the bootstrap, in snapshots. The in-band dissipation has an
@@ -275,7 +300,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", nargs="*",
                    default=[str(HERE / "data" / "dissipation"),
-                            str(HERE / "data" / "dissipation_mech")])
+                            str(HERE / "data" / "dissipation_mech"),
+                            str(HERE / "data" / "dissipation_wenoz")])
     p.add_argument("--sat-start", type=float, default=SAT_START)
     p.add_argument("--audit", action="store_true",
                    help="print the validity checks alongside the table")
@@ -694,11 +720,19 @@ def calibration(data_dir, sat_start):
     reason rather than a diagnostic one. Both effects are printed so they can be
     told apart.
     """
-    rows = [m for m in (measure(r, sat_start=sat_start)
-                        for r in load_runs(data_dir, skip=("smoke",))) if m]
-    if not rows:
+    all_rows = [m for m in (measure(r, sat_start=sat_start)
+                            for r in load_runs(data_dir, skip=("smoke",))) if m]
+    if not all_rows:
         raise SystemExit(f"no calibration run in {data_dir}")
+    # One ladder per resolution: the imposed values are scaled to each grid's
+    # own numerical coefficients, so the ladders must not be mixed.
+    for N in sorted({r["N"] for r in all_rows}):
+        print(f"\n=== N = {N} ===")
+        _calibration_ladder([r for r in all_rows if r["N"] == N])
 
+
+def _calibration_ladder(rows):
+    """The measured-against-imposed table and increments for one resolution."""
     print(f"\n{'eta_imp':>9s} {'nu_imp':>9s} | {'eta_meas':>10s} {'nu_meas':>10s} | "
           f"{'eta_meas-eta_imp':>16s} {'nu_meas-nu_imp':>14s} | {'E_B/E_K':>7s}")
     for r in sorted(rows, key=lambda r: (r["mom_diff"], r["ohm_diff"])):

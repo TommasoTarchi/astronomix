@@ -61,6 +61,7 @@ FIG_DIR = HERE / "figures"
 #: "scheme = colour, resolution = dash", the same convention as the hydro study.
 SERIES = {
     "astronomix": ("#1f77b4", "astronomix WENO5+CT (5th)"),
+    "astronomix_wenoz": ("#17becf", "astronomix WENO-Z+CT (5th)"),
     "plm":        ("#d62728", "AthenaPK PLM+VL2 (2nd)"),
     "ppm":        ("#ff9e4a", "AthenaPK PPM+RK3 (3rd)"),
     "limo3":      ("#9467bd", "AthenaPK LimO3+RK3 (3rd)"),
@@ -74,9 +75,12 @@ STYLE = {32: dict(ls=(0, (1, 3)), lw=1.3, alpha=0.65),
 
 
 def series_of(run):
-    """Series key of a run: the code for astronomix, the scheme for AthenaPK."""
-    return "astronomix" if str(run["code"]) == "astronomix" \
-        else str(run["scheme_key"])
+    """Series key of a run: the code for astronomix (split by WENO weights),
+    the scheme for AthenaPK."""
+    if str(run["code"]) == "astronomix":
+        return "astronomix_wenoz" if bool(run.get("weno_z", False)) \
+            else "astronomix"
+    return str(run["scheme_key"])
 
 
 def style_of(run):

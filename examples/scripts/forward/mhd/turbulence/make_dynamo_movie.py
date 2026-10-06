@@ -1,17 +1,22 @@
-"""Side-by-side animation of the dynamo: two codes' fields and their spectra.
+"""Side-by-side animation of the dynamo: two codes' fields, spectra and E_B/E_K.
 
-Three panels sharing one clock:
+Four panels in a 2x2 grid sharing one clock:
 
-* mid-plane magnetic energy of AthenaPK PLM+VL2 (2nd order, GLM cleaning),
-* the same for astronomix WENO5+CT (5th order, constrained transport), and
-* both magnetic spectra, with the kinetic spectrum behind them for scale.
+* top left: mid-plane magnetic energy of AthenaPK PLM+VL2 (2nd order, GLM
+  cleaning),
+* top right: the same for astronomix WENO5+CT (5th order, constrained
+  transport),
+* bottom left: both magnetic spectra, with the kinetic spectra behind them for
+  scale, and
+* bottom right: E_B/E_K against time for both runs, with the current time
+  marked.
 
 The two slices share a single colour scale at every frame, so the panels are
 directly comparable, and that scale follows the CT run's instantaneous maximum
 -- the point of the animation is the *structure* and the relative amplitude, and
 a fixed scale over six decades of dynamo growth would show a black frame
-followed by a white one. The current normalisation is printed on each frame so
-the growth is not hidden by it.
+followed by a white one. The E_B/E_K panel carries the absolute growth that the
+slice normalisation hides.
 
     python make_dynamo_movie.py --data data/anim
 """
@@ -38,6 +43,10 @@ HERE = Path(__file__).resolve().parent
 #: Decades of magnetic energy shown in the slice panels below the frame maximum.
 SLICE_DECADES = 3.0
 
+#: The box starts at rest, so E_B/E_K is unbounded until the driving has built
+#: the flow (~1 crossing time); the ratio panel starts here.
+RATIO_T_MIN = 1.0
+
 
 def _resample(series, t_src, t_dst):
     """Nearest-in-time frame of ``series`` for each time in ``t_dst``.
@@ -58,11 +67,10 @@ def main():
     p.add_argument("--data", default=str(HERE / "data" / "anim"))
     p.add_argument("--figures", default=str(HERE / "figures"))
     p.add_argument("--out", default="dynamo_side_by_side.gif")
-    p.add_argument("--fps", type=int, default=8)
-    p.add_argument("--stride", type=int, default=2,
-                   help="keep every Nth frame. The saturated phase is visually "
-                        "repetitive and a 121-frame 256^3 gif is 31 MB, so the "
-                        "default halves it at no cost to the story.")
+    p.add_argument("--fps", type=int, default=20)
+    p.add_argument("--stride", type=int, default=1,
+                   help="keep every Nth frame (1 = every dump)")
+    p.add_argument("--dpi", type=int, default=80)
     p.add_argument("--colors", type=int, default=96,
                    help="palette size for the final quantisation (0 disables)")
     p.add_argument("--n", type=int, default=256)
@@ -86,22 +94,25 @@ def main():
 
     panels = []
     for run in (left, right):
-        sl, t_act = _resample(np.asarray(run["EB_slice_series"]),
-                              np.asarray(run["t_over_tc"]), clock)
+        t_run = np.asarray(run["t_over_tc"])
+        sl, t_act = _resample(np.asarray(run["EB_slice_series"]), t_run, clock)
         spec = spectra_of(run, deconvolve=False)
-        sp, _ = _resample(spec, np.asarray(run["t_over_tc"]), clock)
-        ratio, _ = _resample(np.asarray(run["E_B"])
-                             / np.maximum(np.asarray(run["E_K"]), 1e-30),
-                             np.asarray(run["t_over_tc"]), clock)
+        sp, _ = _resample(spec, t_run, clock)
+        ratio_full = (np.asarray(run["E_B"])
+                      / np.maximum(np.asarray(run["E_K"]), 1e-30))
+        ratio, _ = _resample(ratio_full, t_run, clock)
+        keep = t_run >= RATIO_T_MIN
         panels.append(dict(slices=sl, spectra=sp, t=t_act, ratio=ratio,
+                           t_full=t_run[keep], ratio_full=ratio_full[keep],
                            label=str(run["label"]),
                            n_shell=np.asarray(run["n_shell"], dtype=float)))
 
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 5.2))
-    ims, curves_B, curves_v = [], [], []
+    fig, axes = plt.subplots(2, 2, figsize=(9.6, 8.6), dpi=args.dpi)
+    ims, curves_B, curves_v, traces, dots = [], [], [], [], []
     colours = ("#d62728", "#1f77b4")
 
-    for ax, panel, colour in zip(axes[:2], panels, colours):
+    # ----- top row: the two slices -----
+    for ax, panel, colour in zip(axes[0], panels, colours):
         im = ax.imshow(np.log10(np.maximum(panel["slices"][0], 1e-300)).T,
                        origin="lower", cmap="inferno",
                        extent=(0, 1, 0, 1), interpolation="nearest")
@@ -109,8 +120,11 @@ def main():
         ax.set_yticks([])
         ax.set_title(panel["label"], fontsize=11, color=colour)
         ims.append(im)
+    time_text = axes[0][0].text(0.03, 0.96, "", transform=axes[0][0].transAxes,
+                                ha="left", va="top", fontsize=10, color="w")
 
-    ax = axes[2]
+    # ----- bottom left: spectra -----
+    ax = axes[1][0]
     for panel, colour in zip(panels, colours):
         n = panel["n_shell"]
         curves_B.append(ax.loglog(n[1:], np.maximum(panel["spectra"][0][E_MAG][1:],
@@ -135,8 +149,25 @@ def main():
     top = max(all_B.max(), all_v.max())
     ax.set_ylim(top * 1e-9, top * 3.0)
 
-    caption = fig.text(0.5, 0.965, "", ha="center", fontsize=11)
-    scale_note = fig.text(0.5, 0.03, "", ha="center", fontsize=8, color="0.35")
+    # ----- bottom right: E_B / E_K against time -----
+    ax = axes[1][1]
+    for panel, colour in zip(panels, colours):
+        # The whole history faintly, so the eye knows where the curve is going,
+        # and the part already reached drawn solid.
+        ax.semilogy(panel["t_full"], np.maximum(panel["ratio_full"], 1e-300),
+                    color=colour, lw=1.0, alpha=0.25)
+        traces.append(ax.semilogy([], [], color=colour, lw=2.0,
+                                  label=panel["label"])[0])
+        dots.append(ax.semilogy([], [], "o", color=colour, ms=6)[0])
+    t_line = ax.axvline(clock[0], color="0.4", lw=0.8, ls="--")
+    ax.set_xlabel(r"$t / t_{\rm cross}$")
+    ax.set_ylabel(r"$E_B / E_K$")
+    ax.set_title(r"$E_B / E_K$", fontsize=11)
+    ax.grid(alpha=0.25, which="both")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.set_xlim(0.0, max(p["t_full"][-1] for p in panels))
+    all_r = np.concatenate([np.maximum(p["ratio_full"], 1e-300) for p in panels])
+    ax.set_ylim(all_r.min() / 3.0, all_r.max() * 3.0)
 
     def update(i):
         # One colour scale for both panels, following the CT run, so the two
@@ -148,22 +179,23 @@ def main():
         for cB, cv, panel in zip(curves_B, curves_v, panels):
             cB.set_ydata(np.maximum(panel["spectra"][i][E_MAG][1:], 1e-300))
             cv.set_ydata(np.maximum(panel["spectra"][i][E_V][1:], 1e-300))
-        caption.set_text(
-            f"$t / t_{{\\rm cross}} = {clock[i]:5.1f}$      mid-plane magnetic "
-            f"energy, ${args.n}^3$      $E_B/E_K$ = "
-            f"{panels[0]['ratio'][i]:.1e} (PLM), "
-            f"{panels[1]['ratio'][i]:.1e} (CT)")
-        scale_note.set_text(
-            f"slice colour scale: $\\log_{{10}} E_B$ over "
-            f"[{vmax - SLICE_DECADES:.1f}, {vmax:.1f}], shared by both panels "
-            f"and following the CT run's frame maximum")
-        return ims + curves_B + curves_v + [caption, scale_note]
+        for tr, dot, panel in zip(traces, dots, panels):
+            m = panel["t_full"] <= clock[i] + 1e-9
+            tr.set_data(panel["t_full"][m],
+                        np.maximum(panel["ratio_full"][m], 1e-300))
+            if panel["t"][i] >= RATIO_T_MIN:
+                dot.set_data([panel["t"][i]], [max(panel["ratio"][i], 1e-300)])
+            else:
+                dot.set_data([], [])
+        t_line.set_xdata([clock[i], clock[i]])
+        time_text.set_text(f"$t / t_{{\\rm cross}} = {clock[i]:4.1f}$")
+        return ims + curves_B + curves_v + traces + dots + [t_line, time_text]
 
-    fig.tight_layout(rect=(0, 0.05, 1, 0.94))
+    fig.tight_layout(pad=0.6)
     anim = FuncAnimation(fig, update, frames=len(clock), blit=False)
     out = Path(args.figures) / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
-    anim.save(out, writer=PillowWriter(fps=args.fps))
+    anim.save(out, writer=PillowWriter(fps=args.fps), dpi=args.dpi)
     plt.close(fig)
 
     if args.colors:
@@ -179,7 +211,7 @@ def main():
         src.close()
         frames[0].save(out, save_all=True, append_images=frames[1:],
                        duration=int(1000 / args.fps), loop=0, optimize=True)
-    print(f"wrote {out}  ({len(clock)} frames, "
+    print(f"wrote {out}  ({len(clock)} frames, {args.fps} fps, "
           f"t/t_cross {clock[0]:.2f} to {clock[-1]:.2f}, "
           f"{out.stat().st_size / 1e6:.1f} MB)")
 
