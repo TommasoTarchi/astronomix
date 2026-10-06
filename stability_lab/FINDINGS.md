@@ -605,6 +605,18 @@ documented as read-only but is not:
     The remaining 1.5x is structural: the 17-channel split output, one
     recombination pass per sweep and one reference pass per stage.
 
+    End to end (256³ Mach 20, 5 t_c, A100), each run on its own limiter
+    version:
+
+    | limiter | wall time |
+    |---|---|
+    | first in-kernel per-face PP (first order at low beta, p < 0) | 1088 s |
+    | joint, array recombination | 2772 s |
+    | **joint, fused kernels** | **1570 s** |
+
+    The fused run has the same min p over the run as the array run (+1.23e-6)
+    and 0 floor hits.
+
 ## Is there a deeper result? One principle, two open assumptions
 
 Every defect found here broke the same property: **each forward-Euler stage
