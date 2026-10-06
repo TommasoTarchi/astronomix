@@ -224,6 +224,11 @@ conversion:
   over from debugging.
 - Commented-out code blocks kept "just in case".
 - Scratch variables, dead branches, `# TEMPORARY` hacks without a tracked reason.
+- History instead of rationale: dated changelog lines (`FIX (2026-09-25): ...`,
+  "used to be ..."), references to reviews, audits or session notes, run
+  anecdotes ("the 512³ blow-ups"), timings of particular runs and scratch
+  paths (`/export/data/...`). State what the code does and why, in general
+  terms; measurements belong in the validation notes under `examples/`.
 
 Genuine, configurable features are **not** cruft (e.g. `coldcrush_blend` is a
 real `PositivityConfig` option and `weno_positivity_preserving` a real
