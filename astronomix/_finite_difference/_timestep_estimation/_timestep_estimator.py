@@ -142,6 +142,10 @@ def _cfl_time_step_fd_mhd_fast(
         dt_visc = C_CFL * grid_spacing ** 2 / (2.0 * config.dimensionality * nu_max)
         dt_cfl = jnp.minimum(dt_cfl, dt_visc)
 
+    if config.resistivity:
+        dt_res = C_CFL * grid_spacing ** 2 / (2.0 * config.dimensionality * params.resistivity)
+        dt_cfl = jnp.minimum(dt_cfl, dt_res)
+
     # conductive (parabolic) time step constraint
     # Explicit-cooling (thermal) time-step constraint, mirroring AthenaK's
     # ``srcterms_newdt``: dt <= min(e_int / |de/dt|), which for an ideal gas is
@@ -319,6 +323,10 @@ def _cfl_time_step_fd(
         dt_visc = C_CFL * grid_spacing**2 / (2.0 * config.dimensionality * nu_max)
         dt_cfl = jnp.minimum(dt_cfl, dt_visc)
 
+    if config.resistivity:
+        dt_res = C_CFL * grid_spacing ** 2 / (2.0 * config.dimensionality * params.resistivity)
+        dt_cfl = jnp.minimum(dt_cfl, dt_res)
+
     # conductive (parabolic) time step constraint
     # Explicit-cooling (thermal) time-step constraint, mirroring AthenaK's
     # ``srcterms_newdt``: dt <= min(e_int / |de/dt|), which for an ideal gas is
@@ -487,6 +495,10 @@ def _cfl_time_step_fd_hydro_native(
         dt_visc = C_CFL * grid_spacing**2 / (2.0 * config.dimensionality * nu_max)
         dt_cfl = jnp.minimum(dt_cfl, dt_visc)
 
+    if config.resistivity:
+        dt_res = C_CFL * grid_spacing ** 2 / (2.0 * config.dimensionality * params.resistivity)
+        dt_cfl = jnp.minimum(dt_cfl, dt_res)
+
     # conductive (parabolic) time step constraint
     # Explicit-cooling (thermal) time-step constraint, mirroring AthenaK's
     # ``srcterms_newdt``: dt <= min(e_int / |de/dt|), which for an ideal gas is
@@ -641,6 +653,10 @@ def _cfl_time_step_fd_hydro_fast(
 
         dt_visc = C_CFL * grid_spacing**2 / (2.0 * config.dimensionality * nu_max)
         dt_cfl = jnp.minimum(dt_cfl, dt_visc)
+
+    if config.resistivity:
+        dt_res = C_CFL * grid_spacing ** 2 / (2.0 * config.dimensionality * params.resistivity)
+        dt_cfl = jnp.minimum(dt_cfl, dt_res)
 
     # conductive (parabolic) time step constraint
     # Explicit-cooling (thermal) time-step constraint, mirroring AthenaK's

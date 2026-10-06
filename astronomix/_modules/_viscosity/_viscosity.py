@@ -173,6 +173,9 @@ def fd_viscosity_source(primitive_state, params, config, registered_variables):
 
     source_term = jnp.zeros_like(primitive_state)
     source_term = source_term.at[1:ndim + 1].set(div_tau)
-    source_term = source_term.at[registered_variables.energy_index].set(energy_src)
+    # An isothermal state has no energy variable (``energy_index`` is -1, which
+    # would otherwise address the LAST variable -- B_z in isothermal MHD).
+    if registered_variables.energy_index >= 0:
+        source_term = source_term.at[registered_variables.energy_index].set(energy_src)
 
     return source_term

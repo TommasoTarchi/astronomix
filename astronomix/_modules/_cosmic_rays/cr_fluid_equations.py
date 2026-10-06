@@ -34,6 +34,43 @@ gamma_gas = 5 / 3
 gamma_cr = 4 / 3
 
 
+# -------------------------------------------------------------
+# ============ ↓ AD- and round-off-safe conversions ↓ ==========
+# -------------------------------------------------------------
+
+
+def cosmic_ray_pressure_from_n(n_cr, gamma_cr=gamma_cr):
+    """``P_cr = n_cr ** gamma_cr`` with ``n_cr`` clipped at zero.
+
+    A reconstruction or Riemann-solver undershoot can leave ``n_cr`` a hair
+    below zero next to a CR front, and a non-integer power of a negative
+    number is NaN. The clip only changes those (previously NaN) cells. The
+    derivative ``gamma_cr * n ** (gamma_cr - 1)`` is finite (zero) at
+    ``n = 0``, so this is AD-safe as it stands.
+    """
+    return jnp.maximum(n_cr, 0.0) ** gamma_cr
+
+
+def cosmic_ray_n_from_pressure(p_cr, gamma_cr=gamma_cr):
+    """``n_cr = P_cr ** (1 / gamma_cr)``, AD-safe at ``P_cr = 0``.
+
+    The naive power has an infinite derivative at zero, which turns every
+    CR-free cell into a NaN tangent (inf * 0) under ``jax.jvp`` / ``jax.grad``
+    -- and CR-free cells are the whole initial condition of a remnant. The
+    double-``where`` evaluates the power only on strictly positive pressures
+    and returns ``n = 0`` with a zero derivative elsewhere; the forward value
+    is unchanged for every ``P_cr >= 0``.
+    """
+    positive = p_cr > 0.0
+    p_safe = jnp.where(positive, p_cr, 1.0)
+    return jnp.where(positive, p_safe ** (1.0 / gamma_cr), 0.0)
+
+
+# -------------------------------------------------------------
+# ============ ↑ AD- and round-off-safe conversions ↑ ==========
+# -------------------------------------------------------------
+
+
 # @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["registered_variables"])
 def total_energy_from_primitives_with_crs(
@@ -52,8 +89,8 @@ def total_energy_from_primitives_with_crs(
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # Cosmic-ray energy density from its (relativistic) equation of state.
@@ -95,8 +132,8 @@ def gas_pressure_from_primitives_with_crs(
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # The stored pressure is the total, so subtract the cosmic-ray part.
@@ -123,8 +160,8 @@ def total_pressure_from_conserved_with_crs(
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        conserved_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        conserved_state[registered_variables.cosmic_ray_n_index]
     )
 
     # Cosmic-ray energy density from its equation of state.
@@ -167,8 +204,8 @@ def speed_of_sound_crs(
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # The stored pressure is the total, so subtract the cosmic-ray part.

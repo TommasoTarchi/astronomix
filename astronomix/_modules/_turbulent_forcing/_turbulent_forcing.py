@@ -10,8 +10,10 @@ solenoidal forcing fields follows https://arxiv.org/pdf/2304.04360.
 """
 
 # general
-import itertools
 from functools import partial
+
+# numerics
+import numpy as np
 
 # jax
 import jax
@@ -114,7 +116,11 @@ def _create_solenoidal_field(key, config, k_f, band=None):
     ``band=None`` uses the legacy smooth ``k^6 exp(-8k/kpk)`` spectrum peaked at
     ``k_f``. ``band=(nlow, nhigh, expo)`` instead reproduces AthenaK's
     ``turb_driver``: power confined to the discrete mode-number shell
-    ``nlow <= n <= nhigh`` with an isotropic ``k^-(expo+2)/2`` envelope.
+    ``nlow <= n <= nhigh`` with an isotropic ``k^-(expo+2)/2`` envelope. A
+    non-empty ``config.turbulent_forcing_config.forcing_modes`` overrides both
+    and reproduces AthenaPK's ``few_modes_ft``: power only on the listed integer
+    modes with the parabolic envelope ``(n/n_pk)^2 (2 - (n/n_pk)^2)`` peaked at
+    ``n_pk = k_f L / 2pi``, including its conjugate-pairing of ``k_x = 0`` modes.
     """
     nx = config.num_cells.x + 2 * config.num_ghost_cells
     ny = config.num_cells.y + 2 * config.num_ghost_cells
@@ -129,7 +135,25 @@ def _create_solenoidal_field(key, config, k_f, band=None):
     k_squared = kx_3d ** 2 + ky_3d ** 2 + kz_3d ** 2
     kk = jnp.sqrt(k_squared)
 
-    if band is None:
+    modes = tuple(config.turbulent_forcing_config.forcing_modes)
+    if modes:
+        # AthenaPK ``few_modes_ft``: a fixed list of integer modes (mode number
+        # n = k L / 2pi, so the array index of mode n is n mod N), each with the
+        # parabolic amplitude (n/n_pk)^2 (2 - (n/n_pk)^2), clipped at zero. The
+        # mode set is static, so the mask is built in numpy at trace time.
+        # ``k_f`` is a traced parameter, so only the mode positions and their
+        # |n| are static; the envelope itself is evaluated in jnp.
+        n_pk = k_f * config.box_size.x / (2.0 * jnp.pi)
+        nmag = np.zeros((nx, ny, nz))
+        listed = np.zeros((nx, ny, nz), dtype=bool)
+        for mx, my, mz in modes:
+            nmag[mx % nx, my % ny, mz % nz] = np.sqrt(mx ** 2 + my ** 2 + mz ** 2)
+            listed[mx % nx, my % ny, mz % nz] = True
+        ratio2 = (jnp.asarray(nmag) / n_pk) ** 2
+        amp = jnp.where(jnp.asarray(listed),
+                        jnp.maximum(ratio2 * (2.0 - ratio2), 0.0), 0.0)
+        Pk = amp ** 2
+    elif band is None:
         # The spectrum k^6 exp(-8 k / kpk) peaks at k = 0.75 kpk, so set kpk =
         # k_f / 0.75 to place the peak at the requested forcing wavenumber k_f.
         kpk = k_f / 0.75
@@ -158,6 +182,23 @@ def _create_solenoidal_field(key, config, k_f, band=None):
     cwx = cwx.at[0, 0, 0].set(0.0 + 0.0j)
     cwy = cwy.at[0, 0, 0].set(0.0 + 0.0j)
     cwz = cwz.at[0, 0, 0].set(0.0 + 0.0j)
+
+    if modes:
+        # AthenaPK's "enforce symmetry" rule: a k_x = 0 mode whose (k_y, k_z) is
+        # the negative of an EARLIER listed mode gets that mode's conjugate
+        # amplitude, so the pair adds coherently in the real part rather than
+        # as two independent draws. Same construction here, since the field is
+        # Re(ifft), which pairs cw(k) with conj(cw(-k)).
+        for j, (mx, my, mz) in enumerate(modes):
+            if mx != 0:
+                continue
+            for mx2, my2, mz2 in modes[:j]:
+                if mx2 == 0 and my2 == -my and mz2 == -mz:
+                    src = (0, my2 % ny, mz2 % nz)
+                    dst = (0, my % ny, mz % nz)
+                    cwx = cwx.at[dst].set(jnp.conj(cwx[src]))
+                    cwy = cwy.at[dst].set(jnp.conj(cwy[src]))
+                    cwz = cwz.at[dst].set(jnp.conj(cwz[src]))
 
     # Project out the compressible (curl-free) component to leave a solenoidal
     # field.
@@ -334,10 +375,11 @@ def _draw_solenoidal_increment(key, config, turbulent_forcing_params):
     """
     band = _ou_driving_band(config, turbulent_forcing_params)
     if config.turbulent_forcing_config.synthesis_resolution > 0:
-        if band is not None:
+        if band is not None or config.turbulent_forcing_config.forcing_modes:
             raise ValueError(
                 "Coarse spectral synthesis (synthesis_resolution > 0) only "
-                "supports the smooth forcing spectrum, not banded_spectrum."
+                "supports the smooth forcing spectrum, not banded_spectrum "
+                "or forcing_modes."
             )
         return _create_solenoidal_spectrum(
             key,
@@ -396,6 +438,15 @@ def _apply_ou_forcing(
     else:
         field = f
 
+    if config.turbulent_forcing_config.ou_unit_rms_each_step:
+        # AthenaPK rescales the real-space acceleration to ``accel_rms`` every
+        # cycle; the persistent spectral field is not renormalised, only the
+        # applied copy. Same here: ``g`` is what is applied, ``f`` what persists.
+        rms = jnp.sqrt(jnp.mean(field[0] ** 2 + field[1] ** 2 + field[2] ** 2) + 1e-30)
+        g = field / rms
+    else:
+        g = field
+
     vx_i = registered_variables.velocity_index.x
     vy_i = registered_variables.velocity_index.y
     vz_i = registered_variables.velocity_index.z
@@ -403,28 +454,15 @@ def _apply_ou_forcing(
         # AthenaK ``dedt`` normalisation: scale the (unit-rms) OU field so the
         # box gains exactly Edot*dt of kinetic energy this step.
         amp = _exact_injection_amplitude(
-            primitive_state, field[0], field[1], field[2], dt,
+            primitive_state, g[0], g[1], g[2], dt,
             turbulent_forcing_params.energy_injection_rate,
             config, registered_variables,
         )
     else:
         amp = turbulent_forcing_params.forcing_amplitude * dt
-    primitive_state = primitive_state.at[vx_i].add(amp * field[0])
-    primitive_state = primitive_state.at[vy_i].add(amp * field[1])
-    primitive_state = primitive_state.at[vz_i].add(amp * field[2])
-
-    # Conservative vacuum protection (HOW-MHD `prot`, called after forcing every
-    # step in forc.f): neighbour-redistribute sub-threshold (vacuum) cells. This
-    # was previously only wired into the white-forcing path; the OU path missed
-    # it entirely.
-    if config.turbulent_forcing_config.vacuum_protection:
-        primitive_state = _vacuum_protection(
-            primitive_state,
-            turbulent_forcing_params.protection_density_threshold,
-            turbulent_forcing_params.protection_max_velocity,
-            config,
-            registered_variables,
-        )
+    primitive_state = primitive_state.at[vx_i].add(amp * g[0])
+    primitive_state = primitive_state.at[vy_i].add(amp * g[1])
+    primitive_state = primitive_state.at[vz_i].add(amp * g[2])
 
     return (key, f), primitive_state
 
@@ -432,100 +470,6 @@ def _apply_ou_forcing(
 # -------------------------------------------------------------
 # ===== ↑ Ornstein-Uhlenbeck (temporally correlated) forcing ↑ =====
 # -------------------------------------------------------------
-
-
-@partial(jax.jit, static_argnames=["config", "registered_variables"])
-def _vacuum_protection(
-    primitive_state,
-    rhopmin: float,
-    vel_max: float,
-    config: SimulationConfig,
-    registered_variables: RegisteredVariables,
-):
-    """
-    Applies the vacuum protection routine.
-
-    For cells where density < rhopmin, it averages the density and momentum
-    over the 3x3x3 neighborhood of valid cells, and clips velocities to vel_max.
-
-    NOTE: this is taken from the HOW-MHD Fortran code; this kind of protection
-    is not mentioned in the paper, but without it turbulent simulations crash.
-    """
-    # Extract the current primitive fields.
-    rho = primitive_state[registered_variables.density_index]
-    vx = primitive_state[registered_variables.velocity_index.x]
-    vy = primitive_state[registered_variables.velocity_index.y]
-    vz = primitive_state[registered_variables.velocity_index.z]
-
-    # Reconstruct the conserved momentum (matches q(iw, 2:4) in the Fortran).
-    mom_x = rho * vx
-    mom_y = rho * vy
-    mom_z = rho * vz
-
-    # Identify vacuum (invalid) cells and healthy (valid) cells.
-    is_invalid = rho <= rhopmin
-    is_valid = ~is_invalid
-
-    # Zero out invalid cells so they do not contribute to the neighborhood sum.
-    rho_valid = rho * is_valid
-    mom_x_valid = mom_x * is_valid
-    mom_y_valid = mom_y * is_valid
-    mom_z_valid = mom_z * is_valid
-    count_valid = is_valid.astype(rho.dtype)
-
-    # Sum a field over the local 3x3x3 neighborhood using periodic shifts. The
-    # itertools product handles 1D, 2D and 3D uniformly.
-    def sum_neighbors(arr):
-        out = jnp.zeros_like(arr)
-        offsets = [-1, 0, 1]
-        axes = tuple(range(config.dimensionality))
-        for shift in itertools.product(offsets, repeat=config.dimensionality):
-            out += jnp.roll(arr, shift=shift, axis=axes)
-        return out
-
-    # Sums over the valid neighbors.
-    rho_sum = sum_neighbors(rho_valid)
-    mom_x_sum = sum_neighbors(mom_x_valid)
-    mom_y_sum = sum_neighbors(mom_y_valid)
-    mom_z_sum = sum_neighbors(mom_z_valid)
-    count_sum = sum_neighbors(count_valid)
-
-    # Guard the division for cells that have no valid neighbors at all.
-    has_valid_neighbors = count_sum > 0
-    count_safe = jnp.where(has_valid_neighbors, count_sum, 1.0)
-    rho_sum_safe = jnp.where(has_valid_neighbors, rho_sum, 1.0)
-
-    # Patched density: the neighbor average, falling back to the floor.
-    rho_patched = jnp.where(has_valid_neighbors, rho_sum / count_safe, rhopmin)
-
-    # If an invalid cell has NO valid neighbors, the Fortran explicitly dampens
-    # the velocity by dividing the old momentum by the rhopmin floor.
-    vx_isolated = mom_x / rhopmin
-    vy_isolated = mom_y / rhopmin
-    vz_isolated = mom_z / rhopmin
-
-    vx_patched = jnp.where(has_valid_neighbors, mom_x_sum / rho_sum_safe, vx_isolated)
-    vy_patched = jnp.where(has_valid_neighbors, mom_y_sum / rho_sum_safe, vy_isolated)
-    vz_patched = jnp.where(has_valid_neighbors, mom_z_sum / rho_sum_safe, vz_isolated)
-
-    # Apply the velocity ceiling strictly to the patched cells.
-    vx_patched = jnp.clip(vx_patched, -vel_max, vel_max)
-    vy_patched = jnp.clip(vy_patched, -vel_max, vel_max)
-    vz_patched = jnp.clip(vz_patched, -vel_max, vel_max)
-
-    # Merge the patched cells back into the global state.
-    rho_new = jnp.where(is_invalid, rho_patched, rho)
-    vx_new = jnp.where(is_invalid, vx_patched, vx)
-    vy_new = jnp.where(is_invalid, vy_patched, vy)
-    vz_new = jnp.where(is_invalid, vz_patched, vz)
-
-    # Reconstruct the final primitive array.
-    primitive_new = primitive_state.at[registered_variables.density_index].set(rho_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.x].set(vx_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.y].set(vy_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.z].set(vz_new)
-
-    return primitive_new
 
 
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
@@ -599,15 +543,5 @@ def _apply_forcing(
     primitive_state = primitive_state.at[registered_variables.velocity_index.x].add(amp * wx_real)
     primitive_state = primitive_state.at[registered_variables.velocity_index.y].add(amp * wy_real)
     primitive_state = primitive_state.at[registered_variables.velocity_index.z].add(amp * wz_real)
-
-    # Protect against vacuum cells created by the forcing.
-    if config.turbulent_forcing_config.vacuum_protection:
-        primitive_state = _vacuum_protection(
-            primitive_state,
-            turbulent_forcing_params.protection_density_threshold,
-            turbulent_forcing_params.protection_max_velocity,
-            config,
-            registered_variables
-        )
 
     return key, primitive_state

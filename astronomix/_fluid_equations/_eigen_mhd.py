@@ -145,7 +145,7 @@ def _eigenvalue_building_blocks(
         slow_magnetosonic_velocity,
     )
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigenvector_building_blocks(
     conserved_state,
     gamma,
@@ -154,6 +154,7 @@ def _eigenvector_building_blocks(
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
     dual_eta=1e-3,
+    admissible_face_state: bool = False,
 ):
 
     if jax.config.jax_enable_x64:
@@ -246,6 +247,19 @@ def _eigenvector_building_blocks(
         specific_enthalpy_interface
         - 0.5 * (velocity_sq_interface + b_sq_over_rho_interface)
     )
+    if admissible_face_state:
+        # Build the interface state from averaged primitives so the frozen
+        # characteristic basis is that of a real, hyperbolic state. The
+        # enthalpy average above mixes an unweighted mean of h with a
+        # mass-weighted velocity: at a density jump with a velocity jump of a
+        # few sound speeds its c^2 goes NEGATIVE (and it is not Galilean
+        # invariant), which zeroes the acoustic upwind correction exactly
+        # where it is needed. Averaging p directly is positive, frame
+        # independent and free of the H - v^2/2 cancellation at high Mach.
+        sound_speed_sq_interface = gamma * avg_x(gas_pressure) / rho_interface
+        specific_enthalpy_interface = sound_speed_sq_interface / (gamma - 1.0) + 0.5 * (
+            velocity_sq_interface + b_sq_over_rho_interface
+        )
     sound_speed_interface = diff_safe_sqrt(jnp.maximum(0.0, sound_speed_sq_interface))
 
     # calculate the characteristic velocities at the interfaces
@@ -388,7 +402,7 @@ def _eigenvector_building_blocks(
     )
 
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigen_R_col(
     conserved_state,
     rhomin: Union[float, jnp.ndarray],
@@ -398,6 +412,7 @@ def _eigen_R_col(
     col: int,
     internal_energy_density=None,
     dual_eta=1e-3,
+    admissible_face_state: bool = False,
 ):
     (
         rho_interface,
@@ -433,6 +448,7 @@ def _eigen_R_col(
         registered_variables,
         internal_energy_density,
         dual_eta,
+        admissible_face_state,
     )
 
     # shorter names for registry indices
@@ -677,7 +693,7 @@ def _eigen_R_col(
     return R
 
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigen_L_row(
     conserved_state,
     rhomin: Union[float, jnp.ndarray],
@@ -687,6 +703,7 @@ def _eigen_L_row(
     row: int,
     internal_energy_density=None,
     dual_eta=1e-3,
+    admissible_face_state: bool = False,
 ):
     (
         rho_interface,
@@ -722,6 +739,7 @@ def _eigen_L_row(
         registered_variables,
         internal_energy_density,
         dual_eta,
+        admissible_face_state,
     )
 
     # shorter names for registry indices

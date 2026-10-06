@@ -77,7 +77,6 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
     BackendConfig,
 )
 
@@ -143,9 +142,6 @@ def simulate(num_cells):
     center = BOX_SIZE / 2.0
 
     config = SimulationConfig(
-        positivity_config=PositivityConfig(
-            default_positivity_protection=False,
-        ),
         # FD/WENO runs ~10x faster through the Pallas (Triton) backend;
         # bit-compatible with native JAX.
         grid_spacing=grid_spacing,

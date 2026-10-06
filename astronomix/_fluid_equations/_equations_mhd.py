@@ -151,7 +151,7 @@ def conserved_state_from_primitive_mhd(
     return conserved_state
 
 
-@partial(jax.jit, static_argnames=["registered_variables", 'config'])
+@partial(jax.jit, static_argnames=["clamp", "registered_variables", 'config'])
 def primitive_state_from_conserved_mhd(
     conserved_state: STATE_TYPE,
     rhomin: Union[float, Float[Array, ""]],
@@ -160,8 +160,12 @@ def primitive_state_from_conserved_mhd(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    clamp: bool = True,
 ) -> STATE_TYPE:
     """Convert the conserved state to the primitive state for ideal-gas MHD.
+
+    ``clamp=False`` for the state that is carried to the next step: the
+    estimate clamps (``clamp_in_estimates``) must never modify the solution.
 
     Currently only the 3D case is supported.
 
@@ -207,9 +211,9 @@ def primitive_state_from_conserved_mhd(
     primitive_state = primitive_state.at[registered_variables.velocity_index.y].set(uy)
     primitive_state = primitive_state.at[registered_variables.velocity_index.z].set(uz)
 
-    if config.positivity_config.clamp_in_estimates:
-        # Optionally enforce positivity of density and pressure in the recovered
-        # primitives (used by the timestep/wave-speed estimates).
+    if clamp and config.positivity_config.clamp_in_estimates:
+        # Positivity of density and pressure in primitives that only feed
+        # estimates (time step, wave speeds, source terms).
         primitive_state = primitive_state.at[registered_variables.density_index].set(
             jnp.maximum(
                 primitive_state[registered_variables.density_index], rhomin
@@ -223,18 +227,20 @@ def primitive_state_from_conserved_mhd(
 
     return primitive_state
 
-@partial(jax.jit, static_argnames=["registered_variables", 'config'])
+@partial(jax.jit, static_argnames=["clamp", "registered_variables", 'config'])
 def primitive_state_from_conserved_isothermal(
     conserved_state: STATE_TYPE,
     minimum_density: Union[float, Float[Array, ""]],
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
+    clamp: bool = True,
 ) -> STATE_TYPE:
-    """Convert the conserved state to the primitive state for the isothermal case."""
+    """Convert the conserved state to the primitive state for the isothermal
+    case (``clamp=False`` for the carried state, as in the ideal-gas form)."""
 
     rho = conserved_state[registered_variables.density_index]
 
-    if config.positivity_config.clamp_in_estimates:
+    if clamp and config.positivity_config.clamp_in_estimates:
         rho = jnp.maximum(rho, minimum_density)
 
     if config.dimensionality == 1 and not config.mhd:

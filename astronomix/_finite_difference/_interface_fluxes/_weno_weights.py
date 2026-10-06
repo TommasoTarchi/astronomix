@@ -5,7 +5,11 @@ module level (backend dispatch), so a helper used by BOTH must sit below the
 two of them in the import graph.
 """
 
+# general
+from functools import partial
+
 # jax
+import jax
 import jax.numpy as jnp
 
 
@@ -43,6 +47,55 @@ def _weno_omega_weights(IS0, IS1, IS2, epsilon, tiny):
     alpha2 = 3.0 / t2 ** 2
     alpha_sum = jnp.maximum(alpha0 + alpha1 + alpha2, tiny)
     return alpha0 / alpha_sum, alpha2 / alpha_sum
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(4,))
+def _weno_omega_weights_ad(IS0, IS1, IS2, epsilon, tiny):
+    """:func:`_weno_omega_weights` with an overflow-free derivative.
+
+    The primal is the very same call, so bit for bit the same weights. Only the
+    tangent differs, and only in how it is evaluated: it is the exact
+    derivative, written as a log-derivative,
+
+        d omega_k = omega_k (l_k - sum_j omega_j l_j),   l_k = d ln alpha_k = -2 d t_k / t_k,
+
+    (``t_k = epsilon + IS_k``; in the clamp branch ``alpha_sum = tiny``,
+    ``d omega_k = omega_k l_k``). Every factor is bounded: ``omega`` in [0, 1],
+    ``t_k >= epsilon``.
+
+    Why: JAX differentiates ``alpha_0 / alpha_sum`` as
+    ``-g alpha_0 alpha_sum^-2``. Where all three smoothness indicators are large
+    -- any field with an O(1e5) jump across the stencil -- ``alpha_sum ~ 1 /
+    IS^2`` falls below ~5e-20, so in float32 ``alpha_sum^-2`` overflows to inf
+    while ``alpha_0`` is finite, and even a ZERO cotangent then yields
+    ``0 * inf = NaN``. Measured on the Cas A 4D-Var (R' trajectory, window to
+    2018.5): the advected ``entropy_initial`` label reached -6.7e4 in one
+    collapsed cell (IS ~ 1.5e10), the passive-scalar WENO backward turned that
+    into NaN, and the NaN spread through the shared mass flux to rho and v and
+    over the whole state within the segment -- a NaN gradient with a finite J.
+    """
+    return _weno_omega_weights(IS0, IS1, IS2, epsilon, tiny)
+
+
+@_weno_omega_weights_ad.defjvp
+def _weno_omega_weights_ad_jvp(tiny, primals, tangents):
+    IS0, IS1, IS2, epsilon = primals
+    dIS0, dIS1, dIS2, deps = tangents
+    omega0, omega2 = _weno_omega_weights(IS0, IS1, IS2, epsilon, tiny)
+    t0 = epsilon + IS0
+    t1 = epsilon + IS1
+    t2 = epsilon + IS2
+    l0 = -2.0 * (dIS0 + deps) / t0
+    l1 = -2.0 * (dIS1 + deps) / t1
+    l2 = -2.0 * (dIS2 + deps) / t2
+    omega1 = 1.0 - omega0 - omega2
+    # the primal's clamp test (alpha_sum = max(sum_k alpha_k, tiny))
+    unclamped = (1.0 / t0 ** 2 + 6.0 / t1 ** 2 + 3.0 / t2 ** 2) > tiny
+    mean = jnp.where(unclamped, omega0 * l0 + omega1 * l1 + omega2 * l2, 0.0)
+    d0 = omega0 * (l0 - mean)
+    d2 = omega2 * (l2 - mean)
+    return (omega0, omega2), (jnp.broadcast_to(d0, omega0.shape).astype(omega0.dtype),
+                              jnp.broadcast_to(d2, omega2.shape).astype(omega2.dtype))
 
 
 def _weno_omega_weights_z(IS0, IS1, IS2, epsilon, tiny):

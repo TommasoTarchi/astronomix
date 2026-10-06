@@ -212,6 +212,19 @@ def _eigenvector_building_blocks(
     sound_speed_sq_interface = (gamma - 1.0) * (
         specific_enthalpy_interface - 0.5 * velocity_sq_interface
     )
+    if config.weno_admissible_face_state:
+        # Build the interface state from averaged primitives so the frozen
+        # characteristic basis is that of a real, hyperbolic state. The
+        # enthalpy average above mixes an unweighted mean of h with a
+        # mass-weighted velocity: at a density jump with a velocity jump of a
+        # few sound speeds its c^2 goes NEGATIVE (and it is not Galilean
+        # invariant), which zeroes the acoustic upwind correction exactly
+        # where it is needed. Averaging p directly is positive, frame
+        # independent and free of the H - v^2/2 cancellation at high Mach.
+        sound_speed_sq_interface = gamma * avg_x(gas_pressure) / rho_interface
+        specific_enthalpy_interface = (
+            sound_speed_sq_interface / (gamma - 1.0) + 0.5 * velocity_sq_interface
+        )
     sound_speed_interface = diff_safe_sqrt(jnp.maximum(0.0, sound_speed_sq_interface))
 
     sound_speed_sq_inverse = jnp.where(

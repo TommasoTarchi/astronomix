@@ -36,7 +36,6 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
     SnapshotSettings,
 )
 
@@ -82,7 +81,6 @@ nu = mu / rho0            # kinematic viscosity
 # -------------------------------------------------------------
 config = SimulationConfig(
     progress_bar=True,
-    positivity_config=PositivityConfig(default_positivity_protection=False),
     mhd=False,
     diffusion=True,
     dimensionality=3,

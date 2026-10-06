@@ -11,7 +11,6 @@ from typing import NamedTuple
 
 
 class TurbulentForcingConfig(NamedTuple):
-    vacuum_protection: bool = False
     turbulent_forcing: bool = False
 
     #: Use Ornstein-Uhlenbeck (temporally correlated) forcing instead of the
@@ -52,10 +51,23 @@ class TurbulentForcingConfig(NamedTuple):
     #: the params are jit-traced.
     banded_spectrum: bool = False
 
+    #: AthenaPK-style FEW-MODES driving (``few_modes_ft``): a static tuple of
+    #: integer mode triples ``((nx, ny, nz), ...)`` in mode-number units
+    #: (n = k L / 2pi). When non-empty the OU spectrum has power ONLY on these
+    #: modes, weighted by AthenaPK's parabolic envelope
+    #: ``(n / n_pk)^2 (2 - (n / n_pk)^2)`` with ``n_pk`` from
+    #: ``forcing_wavenumber``; the smooth and banded spectra are ignored. Static
+    #: because the mode set fixes the trace.
+    forcing_modes: tuple = ()
+
+    #: Normalise the OU field to unit rms at *application* time every step
+    #: (AthenaPK rescales its acceleration to ``accel_rms`` each cycle), so the
+    #: applied acceleration rms is exactly ``forcing_amplitude`` rather than
+    #: fluctuating around it. The persistent field itself is left untouched.
+    ou_unit_rms_each_step: bool = False
+
 
 class TurbulentForcingParams(NamedTuple):
-    protection_density_threshold: float = 0.02
-    protection_max_velocity: float = 50.0
     energy_injection_rate: float = 2.0
 
     #: OU forcing correlation time tau_f (~ one eddy turnover). Only used when

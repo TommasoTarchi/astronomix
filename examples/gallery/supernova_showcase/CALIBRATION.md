@@ -655,7 +655,9 @@ the refactor is otherwise a no-op.
 with `POSITIVITY_HARD_FLOOR`. With `redistribute` the Orlando-route 512³ run
 **completes to 350 yr** — the first one that ever has — with mass conserved to
 6e-5 (17.3224 → 17.3214 M☉), r_FS = 2.465 pc and r_RS = 1.706 pc, both still
-inside the observed 2.52 ± 0.20 / 1.58 ± 0.16.
+inside the observed 2.52 ± 0.20 / 1.58 ± 0.16. (The per-stage positivity modes,
+and `redistribute` altogether, were later removed from the library;
+finite-difference positivity now comes from `weno_positivity_preserving`.)
 
 The contact-discontinuity variant does *not*: it dies at t = 0.0215 (≈171 yr),
 before the shell encounter, in a dt collapse with the mass still conserved to

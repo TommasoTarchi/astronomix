@@ -244,8 +244,7 @@ def main():
         # plain MUSCL reconstruction, and the evacuating origin needs the
         # per-step floor
         first_order_fallback=True,
-        positivity_config=PositivityConfig(
-            per_step_mode=POSITIVITY_HARD_FLOOR, nan_safe=True, vacuum_rest=True),
+        positivity_config=PositivityConfig(per_step_mode=POSITIVITY_HARD_FLOOR),
         gravity_config=GravityConfig(external_potential=True),
         return_snapshots=True, snapshot_settings=snaps,
         num_snapshots=args.nsnap, progress_bar=True,

@@ -44,6 +44,12 @@ from astronomix._pallas_helpers import (
     pl,
     pltriton,
 )
+from astronomix._finite_difference._interface_fluxes._weno_positivity import (
+    mass_free_modes,
+    mhd_physical_flux,
+    positivity_preserving_flux_local,
+    positivity_preserving_interface_flux,
+)
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
     _weno_omega_weights,
     _weno_omega_weights_adjoint,
@@ -52,7 +58,7 @@ from astronomix._finite_difference._interface_fluxes._weno_weights import (
 
 
 def _weno5_shard_wrap(kernel_local, conserved_state, config, axis,
-                      extra_state_inputs=()):
+                      extra_state_inputs=(), halo_cells=3):
     """Multi-GPU wrap for a per-axis 5th-order WENO Pallas kernel.
 
     The WENO5 stencil reads offsets ``-2..+3`` along the *active* axis only —
@@ -69,13 +75,15 @@ def _weno5_shard_wrap(kernel_local, conserved_state, config, axis,
     variable axis, same spatial shape and sharding as the state — e.g. the
     dual-energy internal-energy field as ``g[None]``) that must ride the
     same halo exchange; they are forwarded to ``kernel_local`` after the
-    state, each halo-padded identically.
+    state, each halo-padded identically. ``halo_cells`` widens the halo for
+    kernels whose result also depends on the neighbouring interfaces (the
+    paired positivity-preserving recombination of ideal MHD reads -3..+4).
     """
     ndim = int(config.dimensionality)
     block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=conserved_state.shape[1:])
     halo_list = [0, 0, 0]
     if 0 <= int(axis) < ndim:
-        halo_list[int(axis)] = 3
+        halo_list[int(axis)] = halo_cells
     halo = tuple(halo_list[:ndim])
 
     def _call(state_local, *extra_local):
@@ -934,6 +942,10 @@ def _weno_flux_hydro_pallas_local(
     # here and inlined into the Pallas kernel body below.
     omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
     tiny = 1e-14
+    admissible_face_state = config.weno_admissible_face_state
+    positivity_preserving = config.weno_positivity_preserving
+    # fields that carry no mass keep their own splitting speed
+    own_speed_modes = mass_free_modes(config) if positivity_preserving else ()
 
     # Output block specs keep the conserved-variable axis complete and block only
     # the spatial dimensions.
@@ -1087,9 +1099,15 @@ def _weno_flux_hydro_pallas_local(
         vn_face = 0.5 * (mn_i + mn_j) / rho_face
         vt1_face = 0.5 * (mt1_i + mt1_j) / rho_face
         vt2_face = 0.5 * (mt2_i + mt2_j) / rho_face
-        h_face = 0.5 * (h_i + h_j)
         v2_face = vn_face * vn_face + vt1_face * vt1_face + vt2_face * vt2_face
-        c2_face = gm1 * (h_face - 0.5 * v2_face)
+        if admissible_face_state:
+            # sound speed from the averaged pressure (see the native
+            # _eigenvector_building_blocks): positive and frame independent
+            c2_face = gamma * (0.5 * (p_i + p_j)) / rho_face
+            h_face = c2_face / gm1 + 0.5 * v2_face
+        else:
+            h_face = 0.5 * (h_i + h_j)
+            c2_face = gm1 * (h_face - 0.5 * v2_face)
         c_face = jnp.sqrt(jnp.maximum(c2_face, 1e-12))
         inv_c2 = jnp.where(c2_face > 0.0, 1.0 / c2_face, 0.0)
 
@@ -1216,6 +1234,26 @@ def _weno_flux_hydro_pallas_local(
             for slot in range(ncomp)
         ]
 
+        if positivity_preserving:
+            # One splitting speed (the stencil's spectral radius |v_n| + c) for
+            # every field that carries mass, and the two split fluxes kept
+            # apart, as in the native _weno_flux_x_native.
+            common_speed = jnp.abs(floored_stencil[0][5]) + floored_stencil[0][11]
+            for k in range(1, 6):
+                common_speed = jnp.maximum(
+                    common_speed, jnp.abs(floored_stencil[k][5]) + floored_stencil[k][11]
+                )
+            safe_speed = jnp.maximum(common_speed, 1e-30)
+            central_state = [
+                (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot] + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
+                for slot in range(ncomp)
+            ]
+            plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
+            minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
+            plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+            minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+
+
         for mode in range(num_modes):
             s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
             qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
@@ -1232,7 +1270,12 @@ def _weno_flux_hydro_pallas_local(
             dq3 = qproj[4] - qproj[3]
             dq4 = qproj[5] - qproj[4]
 
-            amx = alpha_for_mode(mode)
+            # (under PP the mass-carrying fields use the common speed: skip their
+            # own stencil maximum, which would only be computed and discarded)
+            if positivity_preserving and mode not in own_speed_modes:
+                amx = common_speed
+            else:
+                amx = alpha_for_mode(mode)
 
             aterm_p = 0.5 * (d0 + amx * dq0)
             bterm_p = 0.5 * (d1 + amx * dq1)
@@ -1262,8 +1305,34 @@ def _weno_flux_hydro_pallas_local(
                 + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
             )
 
+            if positivity_preserving:
+                zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
+                plus_acc = add_right_correction(plus_acc, mode, -second)
+                minus_acc = add_right_correction(minus_acc, mode, third)
+                # a field on its own speed also shifts the central part and
+                # the upwind cells' split states along its eigenvector
+                if mode in own_speed_modes:
+                    speed_offset = amx - common_speed
+                    central_projection = (
+                        -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                    ) * (1.0 / 12.0)
+                    central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                    plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                    minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                    relative_offset = speed_offset / safe_speed
+                    plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                    minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+                continue
+
             Fs = -second + third
             flux_acc = add_right_correction(flux_acc, mode, Fs)
+
+        if positivity_preserving:
+            flux_acc = positivity_preserving_flux_local(
+                q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
+                plus_acc, minus_acc, plus_shift, minus_shift,
+                common_speed, gm1, rhomin, pgmin,
+            )
 
         # Set every output component.  Hydro should fill all components, but the
         # explicit zeroing makes failures obvious if a future registry adds fields.
@@ -1547,6 +1616,7 @@ def _weno_flux_mhd_pallas(
     *,
     axis: int,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """Pallas implementation of the ideal-gas MHD WENO interface flux.
 
@@ -1565,8 +1635,11 @@ def _weno_flux_mhd_pallas(
         )
         native = [_weno_flux_x_native, _weno_flux_y_native, _weno_flux_z_native][axis]
         return native(conserved_state, params, config, registered_variables,
-                      internal_energy_density=internal_energy_density)
+                      internal_energy_density=internal_energy_density,
+                      inflow_reference=inflow_reference)
 
+    # the paired positivity-preserving recombination reads interfaces i +- 1
+    halo_cells = 4 if config.weno_positivity_preserving else 3
     if internal_energy_density is not None:
         g4 = internal_energy_density[None]
 
@@ -1576,19 +1649,38 @@ def _weno_flux_mhd_pallas(
                 internal_energy_density=g_local,
             )
         return _weno5_shard_wrap(_local_dual, conserved_state, config, axis,
-                                 extra_state_inputs=(g4,))
+                                 extra_state_inputs=(g4,), halo_cells=halo_cells)
+
+    if inflow_reference is not None:
+        # the joint inflow limiting reads the reference at cells i and i + 1
+        reference_state, speed_sum = inflow_reference
+
+        def _local_joint(state_local, reference_local, speed_sum_local):
+            return _weno_flux_mhd_pallas_local(
+                state_local, params, config, registered_variables, axis=axis,
+                inflow_reference=(reference_local, speed_sum_local[0]),
+            )
+        return _weno5_shard_wrap(_local_joint, conserved_state, config, axis,
+                                 extra_state_inputs=(reference_state, speed_sum[None]),
+                                 halo_cells=halo_cells)
 
     def _local(state_local):
         return _weno_flux_mhd_pallas_local(
             state_local, params, config, registered_variables, axis=axis
         )
-    return _weno5_shard_wrap(_local, conserved_state, config, axis)
+    return _weno5_shard_wrap(_local, conserved_state, config, axis, halo_cells=halo_cells)
 
 
 def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
                               ncomp, num_modes, use_approx_rsqrt=False,
-                              g_stencil=None, dual_eta=None):
+                              g_stencil=None, dual_eta=None,
+                              admissible_face_state=False, positivity_preserving=False,
+                              return_split=False):
     """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
+
+    With ``positivity_preserving`` and ``return_split`` it returns the two
+    split face fluxes and the splitting speed instead, for the paired
+    recombination, which needs the neighbouring interfaces too.
 
     ``q_stencil`` is the tuple ``(q[-2], q[-1], q[0], q[+1], q[+2], q[+3])`` where
     each entry is a length-8 tuple of the local conserved components in per-axis
@@ -1753,6 +1845,11 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
     bn2_over_rho_face = (Bn_face * Bn_face) / rho_face
 
     c_sq_face = gm1 * (h_face - 0.5 * (v2_face + b2_over_rho_face))
+    if admissible_face_state:
+        # sound speed from the averaged pressure (see the native
+        # _eigenvector_building_blocks): positive and frame independent
+        c_sq_face = gamma * (0.5 * (cell_l[13] + cell_r[13])) / rho_face
+        h_face = c_sq_face / gm1 + 0.5 * (v2_face + b2_over_rho_face)
     c_sq_face = jnp.maximum(c_sq_face, 0.0)
     c_face = jnp.sqrt(jnp.maximum(c_sq_face, sqrt_floor))
     c_sq_safe = jnp.where(c_sq_face > 0.0, c_sq_face, one_typed)
@@ -2039,6 +2136,26 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         for slot in range(ncomp)
     ]
 
+    own_speed_modes = ()  # every ideal-MHD field carries mass or energy
+    if positivity_preserving:
+        # The reference splitting speed (the stencil's spectral radius) and
+        # the two split fluxes kept apart, as in the native kernel.
+        common_speed = alpha_for_mode(0)
+        for mode in range(1, num_modes):
+            common_speed = jnp.maximum(common_speed, alpha_for_mode(mode))
+
+        central_state = [
+            (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot]
+             + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
+            for slot in range(ncomp)
+        ]
+        plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
+        minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
+        safe_speed = jnp.maximum(common_speed, 1e-30)
+        plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+        minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+
+
     for mode in range(num_modes):
         s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
         qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
@@ -2049,7 +2166,12 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
         dq4 = qproj[5] - qproj[4]
 
-        amx = alpha_for_mode(mode)
+        # (under PP the mass-carrying fields use the common speed: skip their
+        # own stencil maximum, which would only be computed and discarded)
+        if positivity_preserving and mode not in own_speed_modes:
+            amx = common_speed
+        else:
+            amx = alpha_for_mode(mode)
 
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
@@ -2073,8 +2195,34 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
                  + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
+        if positivity_preserving:
+            zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
+            plus_acc = add_right_correction(plus_acc, mode, -second)
+            minus_acc = add_right_correction(minus_acc, mode, third)
+            if mode in own_speed_modes:
+                speed_offset = amx - common_speed
+                central_projection = (
+                    -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                ) * (1.0 / 12.0)
+                central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                relative_offset = speed_offset / safe_speed
+                plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+            continue
+
         Fs = -second + third
         flux_acc = add_right_correction(flux_acc, mode, Fs)
+
+    if positivity_preserving:
+        if return_split:
+            return plus_acc, minus_acc, common_speed
+        flux_acc = positivity_preserving_flux_local(
+            q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
+            plus_acc, minus_acc, plus_shift, minus_shift,
+            common_speed, gm1, rhomin, pgmin, ideal_gas=True, magnetic_slots=(4, 5, 6),
+        )
 
     return flux_acc
 
@@ -3291,6 +3439,7 @@ def _weno_flux_mhd_pallas_local(
     *,
     axis: int,
     internal_energy_density=None,
+    inflow_reference=None,
 ):
     """Single-shard ideal-gas MHD WENO build.  Mirrors
     ``_weno_flux_hydro_pallas`` but with 8 conserved variables and 7
@@ -3315,9 +3464,12 @@ def _weno_flux_mhd_pallas_local(
     local_indices = _mhd_indices_for_axis(config, registered_variables, axis)
     ncomp = 8
     num_modes = 7
+    positivity_preserving = config.weno_positivity_preserving
+    # positivity preserving: plus and minus split face fluxes, then the speed
+    out_channels = 2 * nvars + 1 if positivity_preserving else nvars
 
     # Tile sizes / specs — identical to the hydro kernel.
-    block_shape_out = (nvars, bx, by, bz)
+    block_shape_out = (out_channels, bx, by, bz)
     out_spec = pl.BlockSpec(block_shape_out, lambda bi, bj, bk: (0, bi, bj, bk))
     in_state_spec = pl.BlockSpec(conserved_state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
     scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
@@ -3380,12 +3532,27 @@ def _weno_flux_mhd_pallas_local(
             window_kwargs["g_stencil"] = tuple(g_at(off) for off in range(-2, 4))
             window_kwargs["dual_eta"] = eta_ref[()]
 
-        flux_acc = _weno_mhd_flux_from_window(
+        window = _weno_mhd_flux_from_window(
             q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
             ncomp, num_modes,
             use_approx_rsqrt=config.backend_config.use_approximate_rsqrt,
+            admissible_face_state=config.weno_admissible_face_state,
+            positivity_preserving=positivity_preserving,
+            return_split=positivity_preserving,
             **window_kwargs,
         )
+        if positivity_preserving:
+            # split face fluxes + splitting speed; recombined (paired) outside
+            plus_acc, minus_acc, common_speed = window
+            zero = common_speed * 0.0
+            for var in range(2 * nvars):
+                flux_out_ref[var, ...] = zero
+            for slot, var in enumerate(local_indices):
+                flux_out_ref[var, ...] = plus_acc[slot]
+                flux_out_ref[nvars + var, ...] = minus_acc[slot]
+            flux_out_ref[2 * nvars, ...] = common_speed
+            return
+        flux_acc = window
 
         # Write every output component.  Hydro/MHD covers all conserved
         # variables, but explicitly zero anything not in ``local_indices``
@@ -3401,7 +3568,7 @@ def _weno_flux_mhd_pallas_local(
     if compiler_params is not None:
         kwargs["compiler_params"] = compiler_params
 
-    out_shape = jax.ShapeDtypeStruct(conserved_state.shape, conserved_state.dtype)
+    out_shape = jax.ShapeDtypeStruct((out_channels,) + spatial_shape, conserved_state.dtype)
     scalars = (
         jnp.asarray(params.gamma, dtype=conserved_state.dtype),
         jnp.asarray(params.minimum_density, dtype=conserved_state.dtype),
@@ -3431,6 +3598,26 @@ def _weno_flux_mhd_pallas_local(
         **kwargs,
     )(*args)
 
+    if positivity_preserving and inflow_reference is not None:
+        # joint per-cell inflow limiting, fused into one kernel (it reads the
+        # split fluxes of the interfaces i - 1/2, i + 1/2, i + 3/2)
+        from astronomix._finite_difference._interface_fluxes._weno_positivity_pallas import (
+            mhd_joint_recombination_pallas,
+        )
+        return mhd_joint_recombination_pallas(
+            conserved_state, flux, inflow_reference[0], inflow_reference[1],
+            params, config, registered_variables, axis=axis,
+        )
+    if positivity_preserving:
+        # paired recombination (needs the neighbouring interfaces; see
+        # _weno_positivity._paired_scalings), on the split face fluxes
+        zero = jnp.zeros_like(conserved_state)
+        return positivity_preserving_interface_flux(
+            conserved_state,
+            mhd_physical_flux(conserved_state, params.gamma, registered_variables, axis),
+            flux[2 * nvars], flux[:nvars], flux[nvars:2 * nvars], zero, zero,
+            params, config, registered_variables, axis=axis, inflow_reference=inflow_reference,
+        )
     return flux
 
 
@@ -3717,6 +3904,9 @@ def _weno_flux_mhd_iso_pallas_local(
     omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
     tiny = 1e-14
     b_eps_value = 1e-20
+    positivity_preserving = config.weno_positivity_preserving
+    # fields that carry no mass keep their own splitting speed
+    own_speed_modes = mass_free_modes(config) if positivity_preserving else ()
 
     block_shape_out = (nvars, bx_, by_, bz_)
     out_spec = pl.BlockSpec(block_shape_out, lambda bi, bj, bk: (0, bi, bj, bk))
@@ -4025,6 +4215,24 @@ def _weno_flux_mhd_iso_pallas_local(
             for slot in range(ncomp)
         ]
 
+        if positivity_preserving:
+            # One splitting speed (the stencil's spectral radius) for every
+            # field that carries mass; the split fluxes kept apart.
+            common_speed = alpha_for_mode(0)
+            for mode in range(1, num_modes):
+                common_speed = jnp.maximum(common_speed, alpha_for_mode(mode))
+            safe_speed = jnp.maximum(common_speed, 1e-30)
+            central_state = [
+                (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot]
+                 + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
+                for slot in range(ncomp)
+            ]
+            plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
+            minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
+            plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+            minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+
+
         for mode in range(num_modes):
             s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
             qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
@@ -4035,7 +4243,12 @@ def _weno_flux_mhd_iso_pallas_local(
             dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
             dq4 = qproj[5] - qproj[4]
 
-            amx = alpha_for_mode(mode)
+            # (under PP the mass-carrying fields use the common speed: skip their
+            # own stencil maximum, which would only be computed and discarded)
+            if positivity_preserving and mode not in own_speed_modes:
+                amx = common_speed
+            else:
+                amx = alpha_for_mode(mode)
 
             aterm_p = 0.5 * (d0 + amx * dq0); bterm_p = 0.5 * (d1 + amx * dq1)
             cterm_p = 0.5 * (d2 + amx * dq2); dterm_p = 0.5 * (d3 + amx * dq3)
@@ -4055,8 +4268,32 @@ def _weno_flux_mhd_iso_pallas_local(
             third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
                      + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
+            if positivity_preserving:
+                zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
+                plus_acc = add_right_correction(plus_acc, mode, -second)
+                minus_acc = add_right_correction(minus_acc, mode, third)
+                if mode in own_speed_modes:
+                    speed_offset = amx - common_speed
+                    central_projection = (
+                        -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                    ) * (1.0 / 12.0)
+                    central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                    plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                    minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                    relative_offset = speed_offset / safe_speed
+                    plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                    minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+                continue
+
             Fs = -second + third
             flux_acc = add_right_correction(flux_acc, mode, Fs)
+
+        if positivity_preserving:
+            flux_acc = positivity_preserving_flux_local(
+                q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
+                plus_acc, minus_acc, plus_shift, minus_shift,
+                common_speed, 0.0, rhomin, 0.0, ideal_gas=False, magnetic_slots=(4, 5, 6),
+            )
 
         zero = flux_acc[0] * 0.0
         for var in range(nvars):

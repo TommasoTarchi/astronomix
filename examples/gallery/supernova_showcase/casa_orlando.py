@@ -43,7 +43,7 @@ This script does it the way Orlando et al. (2016) do:
 Solver recipe is the one that survived the 512^3 stability campaign: WENO
 finite difference, SSP-RK4, Bryan+95 dual energy (the ejecta core is cold and
 kinetic-energy dominated -- float32 pressure recovery there is cancellation
-noise without it), the positivity-preserving flux limiter, and the cold-crush
+noise without it), the positivity-preserving WENO, and the cold-crush
 LLF blend. With ``--cooling`` add the resolution limiter and the temperature
 floor, without which a resolved radiative shell ram-crushes without bound.
 
@@ -110,9 +110,6 @@ from _common import (
     wind_asymmetry_field,
     explosion_plume_field,
     fd_positivity,
-    POSITIVITY_HARD_FLOOR,
-    POSITIVITY_REDISTRIBUTE,
-    POSITIVITY_CONSERVATIVE,
     layered_composition,
     make_fd_config,
     map_1d_profile,
@@ -239,12 +236,13 @@ def build(args, sharding=None):
         # recovery can run away in the near-vacuum interior where the fast
         # pistons and radiative cooling compress the same cells
         extra["passive_scalar_bounds"] = tuple((0.0, 1.0) for _ in SCALAR_NAMES)
-    # Positivity protection is applied ALWAYS, not only with --cooling. It used
+    # The positivity config is applied ALWAYS, not only with --cooling. It used
     # to be gated on cooling, which meant every adiabatic run silently used the
-    # default PositivityConfig() -- no preserving_flux, no cold-crush blend, no
-    # floor, no vacuum_rest -- despite this module's docstring listing them as
-    # part of the recipe. Those runs are marginal: two completed and a third,
-    # identical but for the node, blew up with rho ~ 1e18.
+    # default PositivityConfig() -- no cold-crush blend -- despite this
+    # module's docstring listing it as part of the recipe. Those runs are
+    # marginal: two completed and a third, identical but for the node, blew up
+    # with rho ~ 1e18. (Positivity itself comes from the positivity-preserving
+    # WENO, which make_fd_config switches on.)
     # ``tfloor`` stays cooling-only: with real cooling the shocked shell reaches
     # the isothermal jump and a CONSTANT pressure floor leaves it pressureless
     # against ram crushing, but for an adiabatic run the density-scaled floor
@@ -257,9 +255,9 @@ def build(args, sharding=None):
         # reuse the input arrays, and host_helper_data keeps the 1024^3
         # meshgrids (4.3 GB each in float32) off the accelerator unless a
         # subsystem actually needs them. LSRK4 is deliberately NOT used here --
-        # its fused low-memory path is disabled whenever preserving_flux or
-        # coldcrush_blend is active (both are, in this recipe), so most of its
-        # saving is unavailable, and what remains costs half the CFL, the SSP
+        # its fused low-memory path is disabled whenever coldcrush_blend is
+        # active (it is, in this recipe), so most of its saving is
+        # unavailable, and what remains costs half the CFL, the SSP
         # property, and comparability with the RK4_SSP resolution ladder.
         extra["donate_state"] = True
         if args.gpus == 1:
@@ -269,10 +267,7 @@ def build(args, sharding=None):
             extra["host_helper_data"] = True
 
     extra["positivity_config"] = fd_positivity(
-        tfloor=bool(args.cooling), coldcrush_factor=args.coldcrush_factor,
-        mode={"floor": POSITIVITY_HARD_FLOOR,
-              "redistribute": POSITIVITY_REDISTRIBUTE,
-              "conservative": POSITIVITY_CONSERVATIVE}[args.positivity])
+        tfloor=bool(args.cooling), coldcrush_factor=args.coldcrush_factor)
     config = make_fd_config(args.box, num_cells, mhd=args.mhd_b0 > 0,
                             cooling_config=cooling_config,
                             snapshot_settings=snaps, num_snapshots=args.nsnap,
@@ -913,17 +908,6 @@ def main():
     ap.add_argument("--nsnap", type=int, default=21, help="number of snapshots")
     ap.add_argument("--gpus", type=int, default=1, help="number of GPUs (x-axis sharding)")
     ap.add_argument("--cooling", action="store_true", help="radiative cooling (+ limiter + tfloor)")
-    ap.add_argument("--positivity", choices=("redistribute", "floor", "conservative"),
-                    default="redistribute",
-                    help="positivity enforcement. REDISTRIBUTE is the default "
-                         "because it is the only one of the three that conserves "
-                         "MASS: 'floor' clamps a would-be-negative cell up from "
-                         "nothing, which beside a compressed cell becomes a pump "
-                         "(17 Msun -> 1e12 Msun, with the total ENERGY still "
-                         "conserved to 0.02% throughout), and 'conservative' "
-                         "conserves energy but keeps a density floor for the "
-                         "voids, so it cannot fix a mass problem (rho_max 1e23). "
-                         "Keep the run's mass report honest either way")
     ap.add_argument("--conduction", action="store_true",
                     help="isotropic thermal conduction; sets a PHYSICAL layer "
                          "thickness (Field length) for the radiative shell, "

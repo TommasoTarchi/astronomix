@@ -26,8 +26,8 @@ spherically symmetric and normalised to the same mass and energy. What it does
 reproduce is the essential Cas A gas dynamics: the forward/reverse-shock shell
 and the cold expanding interior, evolved with a consistent high-order scheme.
 
-Runs in single precision (float32): the positivity-preserving flux limiter in
-``_common.fd_positivity`` keeps this cold, high-Mach blast stable and
+Runs in single precision (float32): the positivity-preserving WENO switched on
+by ``_common.make_fd_config`` keeps this cold, high-Mach blast stable and
 energy-conserving without dropping to double precision or a low-order fallback.
 
 Default resolution (128^3) finishes in a few minutes on one GPU; raise ``--n``

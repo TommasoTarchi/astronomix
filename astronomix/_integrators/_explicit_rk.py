@@ -64,9 +64,14 @@ _SSPRK4_K0 = (1.0, 0.44437049406734, 0.62010185138540, 0.17807995410773, -2.0812
 _SSPRK4_KRHS = (0.39175222700392, 0.36841059262959, 0.25189177424738, 0.54497475021237, 0.22600748319395)
 _SSPRK4_KCURR = (0.0, 0.55562950593266, 0.37989814861460, 0.82192004589227, 5.03580947213895e-01)
 _SSPRK4_FINAL = (-2.081261929715610e-02, 0.0, 0.51723167208978, -6.518979800418380e-12, 5.03580947213895e-01)
+# Part of the u4 weight in _SSPRK4_FINAL that stands in for the Shu-Osher
+# term 0.0961 u3 + 0.0637 dt L(u3) (= 0.1169 (u4 - 0.1781 u0 - 0.8219 u3), the
+# source of the -0.0208 u0 weight). It must multiply u4 exactly as formed, so a
+# ``post_stage`` that changes u4 leaves the final combination convex.
+_SSPRK4_FINAL_RAW = (0.0, 0.0, 0.0, 0.063692468666290 / 0.544974750228521)
 
 
-def ssprk4(u0, dt, *, rhs, pre_stage=_identity, finalize=_identity):
+def ssprk4(u0, dt, *, rhs, pre_stage=_identity, post_stage=_identity, finalize=_identity):
     """5-stage 4th-order SSPRK (Spiteri-Ruuth).
 
     Args:
@@ -74,6 +79,9 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, finalize=_identity):
         dt: Full time step.
         rhs: ``rhs(u, dt_stage) -> du`` stage increment.
         pre_stage: per-stage hook, defaults to identity.
+        post_stage: applied to each new stage state as soon as it is formed,
+            before it is accumulated or used as the base of the next increment;
+            defaults to identity.
         finalize: post-integration hook, defaults to identity.
 
     Returns:
@@ -83,6 +91,7 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, finalize=_identity):
     krhs_s = jnp.asarray(_SSPRK4_KRHS)
     kcurr_s = jnp.asarray(_SSPRK4_KCURR)
     final_s = jnp.asarray(_SSPRK4_FINAL)
+    final_raw_s = jnp.asarray(_SSPRK4_FINAL_RAW)
 
     def stage(stage_idx, carry):
         u_curr, u_final = carry
@@ -96,13 +105,22 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, finalize=_identity):
         du = rhs(u_curr, krhs_s[stage_idx] * dt)
 
         # u_curr <- k0 * u0 + kcurr * u_curr + du
-        u_curr = jax.tree_util.tree_map(
+        u_formed = jax.tree_util.tree_map(
             lambda q0_, c_, r_: k0 * q0_ + kcurr * c_ + r_, u0, u_curr, du
         )
-        # u_final <- u_final + ff * u_curr
-        u_final = jax.tree_util.tree_map(
-            lambda f_, c_: f_ + ff * c_, u_final, u_curr
-        )
+        if post_stage is _identity:
+            u_curr = u_formed
+            # u_final <- u_final + ff * u_curr
+            u_final = jax.tree_util.tree_map(
+                lambda f_, c_: f_ + ff * c_, u_final, u_curr
+            )
+        else:
+            u_curr = post_stage(u_formed)
+            # u_final <- u_final + ff * u_curr (the raw share on u as formed)
+            ff_raw = final_raw_s[stage_idx]
+            u_final = jax.tree_util.tree_map(
+                lambda f_, c_, r_: f_ + (ff - ff_raw) * c_ + ff_raw * r_, u_final, u_curr, u_formed
+            )
 
         return (u_curr, u_final)
 

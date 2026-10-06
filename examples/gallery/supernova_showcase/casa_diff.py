@@ -227,8 +227,7 @@ def base_config(num_cells, r_max):
         # envelope without the fallback, and the origin cell evacuates without
         # the floor. Neither can touch the calibration targets.
         first_order_fallback=True,
-        positivity_config=PositivityConfig(
-            per_step_mode=POSITIVITY_HARD_FLOOR, nan_safe=True, vacuum_rest=True),
+        positivity_config=PositivityConfig(per_step_mode=POSITIVITY_HARD_FLOOR),
         return_snapshots=False,
         progress_bar=False,
     )

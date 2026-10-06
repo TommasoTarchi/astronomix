@@ -61,7 +61,6 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
     BackendConfig,
 )
 from astronomix.option_classes.simulation_params import (
@@ -117,8 +116,8 @@ L_x, L_y, L_z = box_size, box_size, 1.5 * box_size
 # runs to 30 t_sh, 20 t_sh already yields a well-developed layer here.
 t_end_in_t_sh = 20.0
 density_contrast = 100.0
-# cooling timescale ratio; higher xi (stronger cooling) needs the positivity
-# options enabled in the config below to stay stable
+# cooling timescale ratio; higher xi (stronger cooling) needs the
+# positivity-preserving WENO enabled in the config below to stay stable
 xi = 3.0
 mach_number = 0.5
 gamma = 5 / 3
@@ -141,9 +140,9 @@ t_sh = L_x / v_rel
 # =============== ↓ Config ↓ ==================================
 # -------------------------------------------------------------
 config = SimulationConfig(
-    # positivity protection replaces the old enforce_positivity flag; keep it on
-    # so the strong density contrast plus cooling stays stable
-    positivity_config=PositivityConfig(default_positivity_protection=True),
+    # positivity-preserving WENO keeps the strong density contrast plus
+    # cooling stable
+    weno_positivity_preserving=True,
     backend_config=BackendConfig(
         pallas_block_shape=(4, 4, 4),
     ),

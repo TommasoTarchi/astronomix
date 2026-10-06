@@ -187,10 +187,13 @@ longer access the initial state after the simulation has started).
 
 ### What if my simulation crashes?
 
-First of all check if the initial conditions are valid. Then there 
-is the `PositivityConfig` in the `SimulationConfig`, in which for instance
-a positivity preserving limiter can be turned on for the finite 
-difference scheme.
+First of all check if the initial conditions are valid. For the finite
+difference scheme, turn on the positivity-preserving WENO reconstruction
+(`weno_positivity_preserving=True` in the `SimulationConfig`), which keeps
+density and pressure positive for `C_cfl <= 0.75`. For the finite volume
+scheme, use a positivity-preserving limiter such as `VAN_ALBADA_PP`; the
+`PositivityConfig` in the `SimulationConfig` additionally offers a per-step
+density / pressure floor.
 
 ## Documentation
 

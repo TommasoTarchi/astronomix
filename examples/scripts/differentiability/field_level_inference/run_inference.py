@@ -126,7 +126,6 @@ from astronomix import (
     CodeUnits,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
 )
 from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
     TurbulentForcingConfig,
@@ -155,7 +154,7 @@ NF, NC = args.fine_N, args.coarse_N
 
 def make_cfg(N, forcing, backward):
     return SimulationConfig(
-        positivity_config=PositivityConfig(default_positivity_protection=True),
+        weno_positivity_preserving=True,
         mhd=True, progress_bar=False,
         donate_state=False, dimensionality=3,
         box_size=1.0, num_cells=N,

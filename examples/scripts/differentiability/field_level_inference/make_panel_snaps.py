@@ -68,7 +68,6 @@ from astronomix import (
     CodeUnits,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
     BackendConfig,
 )
 from astronomix._modules._turbulent_forcing._turbulent_forcing_options import TurbulentForcingConfig
@@ -110,7 +109,7 @@ def main():
         backend_kw = dict(backend_config=BackendConfig(backend=PALLAS))
 
     config = SimulationConfig(
-        positivity_config=PositivityConfig(default_positivity_protection=True),
+        weno_positivity_preserving=True,
         mhd=True, progress_bar=False,
         donate_state=False, dimensionality=3,
         box_size=box_size, num_cells=resolution,
