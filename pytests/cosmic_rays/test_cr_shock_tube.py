@@ -10,46 +10,64 @@ is freshly injected, so the injected-CR plateau is a direct test of the Mach
 estimate, the dissipated-energy flux and the energy split of
 ``cr_injection``.
 
-Measured 2026-09-25 (after the shock-finder / injection fixes):
-    no injection: region-2 rho / P_th / P_cr / u within 0.05 / 0.08 / 0.05 / 0.04 %
-    injection:    within 0.13 / 0.32 / 0.66 / 0.00 %  (before the fixes the
-                  injected P_cr was 1.8 % low and P_th 1.0 % high)
+Measured region-2 errors in rho / P_th / P_cr / u: within 0.05 / 0.08 / 0.05 /
+0.04 % without injection and within 0.13 / 0.32 / 0.66 / 0.00 % with it.
 """
 
-# ==== device ====
+# ==== GPU selection ====
 import os
-
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # 1D, 801 cells; no GPU needed
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
-# =================
+# =======================
 
+# general
 from pathlib import Path
 
-import numpy as np
-import pytest
-
+# jax
 import jax
 import jax.numpy as jnp
 
-from astronomix import (
-    SimulationConfig,
-    SimulationParams,
-    construct_primitive_state,
-    finalize_config,
-    get_helper_data,
-    get_registered_variables,
-    time_integration,
-)
+# The plateaus are compared with the analytic solution at 0.2 % relative
+# tolerance, which needs double precision.
+jax.config.update("jax_enable_x64", True)
+
+# numerics
+import numpy as np
+
+# plotting
+import matplotlib.pyplot as plt
+
+# testing
+import pytest
+
+# astronomix constants
 from astronomix.option_classes.simulation_config import (
     CARTESIAN,
     FINITE_VOLUME,
     HLL,
     NATIVE_JAX,
-    BackendConfig,
 )
+
+# astronomix containers
+from astronomix import (
+    SimulationConfig,
+    SimulationParams,
+)
+from astronomix.option_classes.simulation_config import BackendConfig
 from astronomix._modules._cosmic_rays.cosmic_ray_options import (
     CosmicRayConfig,
     CosmicRayParams,
+)
+
+# astronomix functions
+from astronomix import (
+    construct_primitive_state,
+    finalize_config,
+    get_helper_data,
+    get_registered_variables,
+    time_integration,
 )
 from astronomix._modules._cosmic_rays.cr_fluid_equations import (
     cosmic_ray_pressure_from_n,
@@ -64,41 +82,63 @@ FIGURE_DIR = Path(__file__).resolve().parent / "figures"
 NUM_CELLS = 801
 T_END = 0.35
 ZETA = 0.5
+BOX_SIZE = 10.0
+MEMBRANE_POSITION = 5.0
+DENSITY_RIGHT = 0.125
 
-#: relative tolerances on the region-2 (post-shock) and region-3 (post-
-#: rarefaction) plateaus, ~2x the errors measured at 801 cells:
-#:   no inj.: rho2 -0.05, P_th2 +0.08, P_cr2 -0.05, v -0.04, rho3 +0.06, P_th3 +0.13, P_cr3 +0.08 %
-#:   inj.:    rho2 +0.13, P_th2 -0.32, P_cr2 +0.66, v -0.00, rho3 +0.00, P_th3 +0.04, P_cr3 +0.01 %
-#: The pre-fix code (rho2 -0.38, P_th2 +1.01, P_cr2 -1.79 % with injection)
-#: fails the injection row.
+#: Relative tolerances on the region-2 (post-shock) and region-3
+#: (post-rarefaction) plateaus, about twice the errors measured at 801 cells.
+#: Without injection these are rho2 -0.05, P_th2 +0.08, P_cr2 -0.05, v -0.04,
+#: rho3 +0.06, P_th3 +0.13 and P_cr3 +0.08 %; with injection rho2 +0.13,
+#: P_th2 -0.32, P_cr2 +0.66, v -0.00, rho3 +0.00, P_th3 +0.04 and P_cr3 +0.01 %.
 TOLERANCES = {
-    False: dict(rho2=2e-3, P_th2=2e-3, P_cr2=2e-3, v3=2e-3, rho3=2e-3, P_th3=3e-3, P_cr3=2e-3),
-    True: dict(rho2=3e-3, P_th2=6e-3, P_cr2=1.2e-2, v3=2e-3, rho3=2e-3, P_th3=2e-3, P_cr3=2e-3),
+    False: dict(
+        rho2=2e-3,
+        P_th2=2e-3,
+        P_cr2=2e-3,
+        v3=2e-3,
+        rho3=2e-3,
+        P_th3=3e-3,
+        P_cr3=2e-3,
+    ),
+    True: dict(
+        rho2=3e-3,
+        P_th2=6e-3,
+        P_cr2=1.2e-2,
+        v3=2e-3,
+        rho3=2e-3,
+        P_th3=2e-3,
+        P_cr3=2e-3,
+    ),
 }
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _x64():
-    """Run this module in float64 and restore the previous setting afterwards."""
-    previous = jax.config.read("jax_enable_x64")
-    jax.config.update("jax_enable_x64", True)
-    yield
-    jax.config.update("jax_enable_x64", previous)
-
-
 def run_cr_shock_tube(dsa, num_cells=NUM_CELLS, zeta=ZETA):
-    """Run the tube; return ``x, rho, u, P_th, P_cr`` at t = 0.35."""
+    """
+    Run the two-fluid shock tube to t = 0.35.
+
+    Args:
+        dsa: Whether diffusive shock acceleration is switched on.
+        num_cells: The number of cells.
+        zeta: The injection efficiency (only used with ``dsa``).
+
+    Returns:
+        The cell centres, density, velocity, thermal pressure and cosmic-ray
+        pressure of the final state, as a tuple
+        ``(x, density, velocity, thermal_pressure, cosmic_ray_pressure)``.
+    """
     config = SimulationConfig(
         geometry=CARTESIAN,
         first_order_fallback=False,
         num_cells=num_cells,
-        box_size=10.0,
+        box_size=BOX_SIZE,
         cosmic_ray_config=CosmicRayConfig(
-            cosmic_rays=True, diffusive_shock_acceleration=dsa,
+            cosmic_rays=True,
+            diffusive_shock_acceleration=dsa,
         ),
         riemann_solver=HLL,
         progress_bar=False,
-        # CRs exist only in the finite-volume solver, and only natively
+        # Cosmic rays exist only in the finite-volume solver, and only natively.
         solver_mode=FINITE_VOLUME,
         backend_config=BackendConfig(backend=NATIVE_JAX),
     )
@@ -110,80 +150,147 @@ def run_cr_shock_tube(dsa, num_cells=NUM_CELLS, zeta=ZETA):
         ),
     )
     helper_data = get_helper_data(config)
-    rv = get_registered_variables(config)
+    registered_variables = get_registered_variables(config)
     x = helper_data.geometric_centers
-    left = x < 5.0
+    left = x < MEMBRANE_POSITION
     state = construct_primitive_state(
-        config=config, registered_variables=rv,
-        density=jnp.where(left, 1.0, 0.125),
+        config=config,
+        registered_variables=registered_variables,
+        density=jnp.where(left, 1.0, DENSITY_RIGHT),
         velocity_x=jnp.zeros_like(x),
         gas_pressure=jnp.where(left, 17.172, 0.05),
         cosmic_ray_pressure=jnp.where(left, 34.344, 0.05),
     )
     config = finalize_config(config, state.shape)
-    out = np.asarray(time_integration(state, config, params, rv))
-    p_cr = np.asarray(cosmic_ray_pressure_from_n(out[rv.cosmic_ray_n_index]))
-    return (np.asarray(x), out[rv.density_index], out[rv.velocity_index],
-            out[rv.pressure_index] - p_cr, p_cr)
+    final_state = np.asarray(time_integration(state, config, params, registered_variables))
+    cosmic_ray_pressure = np.asarray(
+        cosmic_ray_pressure_from_n(final_state[registered_variables.cosmic_ray_n_index])
+    )
+    thermal_pressure = final_state[registered_variables.pressure_index] - cosmic_ray_pressure
+    return (
+        np.asarray(x),
+        final_state[registered_variables.density_index],
+        final_state[registered_variables.velocity_index],
+        thermal_pressure,
+        cosmic_ray_pressure,
+    )
 
 
-def _plateau(x, q, lo, hi, trim=0.2):
-    """Median of ``q`` over the central (1 - 2 trim) of ``lo < x < hi``."""
-    width = hi - lo
-    mask = (x > lo + trim * width) & (x < hi - trim * width)
-    return float(np.median(q[mask]))
+def _plateau(x, quantity, lower, upper, trim=0.2):
+    """Median of ``quantity`` over the central (1 - 2 trim) of ``lower < x < upper``."""
+    width = upper - lower
+    mask = (x > lower + trim * width) & (x < upper - trim * width)
+    return float(np.median(quantity[mask]))
+
+
+def _plot_overview(
+    x,
+    density,
+    velocity,
+    thermal_pressure,
+    cosmic_ray_pressure,
+    zeta,
+    figure_path,
+):
+    """
+    Plot the simulated profiles against the analytic solution.
+
+    Args:
+        x: The cell centres.
+        density: The simulated density.
+        velocity: The simulated velocity.
+        thermal_pressure: The simulated thermal pressure.
+        cosmic_ray_pressure: The simulated cosmic-ray pressure.
+        zeta: The injection efficiency of the analytic solution.
+        figure_path: Where the figure is written.
+    """
+    (
+        analytic_x,
+        analytic_density,
+        analytic_velocity,
+        analytic_thermal_pressure,
+        analytic_cosmic_ray_pressure,
+        _,
+    ) = get_cosmic_ray_analytic_solution(injection_efficiency=zeta)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.6), constrained_layout=True)
+    axes[0].plot(x, density, lw=1.2, label="astronomix FV")
+    axes[0].plot(analytic_x, analytic_density, "k--", lw=0.9, label="analytic")
+    axes[1].plot(x, velocity, lw=1.2)
+    axes[1].plot(analytic_x, analytic_velocity, "k--", lw=0.9)
+    axes[2].plot(x, thermal_pressure, lw=1.2, label="P_th")
+    axes[2].plot(x, cosmic_ray_pressure, lw=1.2, label="P_cr")
+    axes[2].plot(analytic_x, analytic_thermal_pressure, "k--", lw=0.9)
+    axes[2].plot(analytic_x, analytic_cosmic_ray_pressure, "k:", lw=0.9)
+    for ax, label in zip(axes, ("density", "velocity", "pressure")):
+        ax.set(xlabel="x", ylabel=label, xlim=(2, 10))
+    axes[0].legend(fontsize=8)
+    axes[2].legend(fontsize=8)
+    fig.suptitle(f"Pfrommer+17 CR shock tube, zeta = {zeta}")
+    fig.savefig(figure_path, dpi=110)
+    plt.close(fig)
 
 
 @pytest.mark.parametrize("dsa", [False, True], ids=["CR", "CR+inj"])
 def test_cr_shock_tube(dsa):
+    """
+    The post-shock and post-rarefaction plateaus and the shock position match
+    the analytic two-fluid solution, with and without injection, and the
+    thermal pressure stays positive. Also writes an overview figure.
+    """
     zeta = ZETA if dsa else 0.0
-    x, rho, u, p_th, p_cr = run_cr_shock_tube(dsa)
-    assert np.all(np.isfinite(rho)) and np.all(np.isfinite(p_th))
-    assert np.min(p_th) > 0.0
+    x, density, velocity, thermal_pressure, cosmic_ray_pressure = run_cr_shock_tube(dsa)
+    assert np.all(np.isfinite(density))
+    assert np.all(np.isfinite(thermal_pressure))
+    assert np.min(thermal_pressure) > 0.0
 
-    reg = cosmic_ray_shock_tube_regions(injection_efficiency=zeta)
-    x_tail = 5.0 - reg["vt"] * T_END
-    x_cd = 5.0 + reg["v3"] * T_END
-    x_sh = 5.0 + reg["vs"] * T_END
-    assert reg["xs"] == pytest.approx(4.78 if dsa else 3.90, abs=5e-3)
+    regions = cosmic_ray_shock_tube_regions(injection_efficiency=zeta)
+    rarefaction_tail_position = MEMBRANE_POSITION - regions["vt"] * T_END
+    contact_position = MEMBRANE_POSITION + regions["v3"] * T_END
+    shock_position = MEMBRANE_POSITION + regions["vs"] * T_END
+    assert regions["xs"] == pytest.approx(4.78 if dsa else 3.90, abs=5e-3)
 
     measured = dict(
-        rho2=_plateau(x, rho, x_cd, x_sh), P_th2=_plateau(x, p_th, x_cd, x_sh),
-        P_cr2=_plateau(x, p_cr, x_cd, x_sh), v3=_plateau(x, u, x_tail, x_sh),
-        rho3=_plateau(x, rho, x_tail, x_cd), P_th3=_plateau(x, p_th, x_tail, x_cd),
-        P_cr3=_plateau(x, p_cr, x_tail, x_cd),
+        rho2=_plateau(x, density, contact_position, shock_position),
+        P_th2=_plateau(x, thermal_pressure, contact_position, shock_position),
+        P_cr2=_plateau(x, cosmic_ray_pressure, contact_position, shock_position),
+        v3=_plateau(x, velocity, rarefaction_tail_position, shock_position),
+        rho3=_plateau(x, density, rarefaction_tail_position, contact_position),
+        P_th3=_plateau(x, thermal_pressure, rarefaction_tail_position, contact_position),
+        P_cr3=_plateau(x, cosmic_ray_pressure, rarefaction_tail_position, contact_position),
     )
-    for key, tol in TOLERANCES[dsa].items():
-        assert measured[key] == pytest.approx(reg[key], rel=tol), (key, measured[key], reg[key])
+    for key, tolerance in TOLERANCES[dsa].items():
+        assert measured[key] == pytest.approx(regions[key], rel=tolerance), (
+            key,
+            measured[key],
+            regions[key],
+        )
 
-    # shock position: where the density crosses the mean of rho2 and rho1
-    half = 0.5 * (reg["rho2"] + 0.125)
-    right = x > x_cd + 0.05
-    i = np.flatnonzero(right & (rho < half))[0]
-    x_shock = x[i - 1] + (half - rho[i - 1]) * (x[i] - x[i - 1]) / (rho[i] - rho[i - 1])
-    dx = 10.0 / NUM_CELLS
-    assert abs(x_shock - x_sh) < 3 * dx, (x_shock, x_sh)
-
-    # overview figure (not part of the assertion)
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    # The simulated shock sits where the density crosses the mean of rho2 and
+    # rho1, linearly interpolated between the bracketing cells.
+    half_density = 0.5 * (regions["rho2"] + DENSITY_RIGHT)
+    right_of_contact = x > contact_position + 0.05
+    crossing_index = np.flatnonzero(right_of_contact & (density < half_density))[0]
+    inner_x = x[crossing_index - 1]
+    outer_x = x[crossing_index]
+    inner_density = density[crossing_index - 1]
+    outer_density = density[crossing_index]
+    simulated_shock_position = inner_x + (half_density - inner_density) * (
+        outer_x - inner_x
+    ) / (outer_density - inner_density)
+    grid_spacing = BOX_SIZE / NUM_CELLS
+    assert abs(simulated_shock_position - shock_position) < 3 * grid_spacing, (
+        simulated_shock_position,
+        shock_position,
+    )
 
     FIGURE_DIR.mkdir(exist_ok=True)
-    xa, rhoa, ua, ptha, pcra, _ = get_cosmic_ray_analytic_solution(injection_efficiency=zeta)
-    fig, axes = plt.subplots(1, 3, figsize=(13, 3.6), constrained_layout=True)
-    axes[0].plot(x, rho, lw=1.2, label="astronomix FV")
-    axes[0].plot(xa, rhoa, "k--", lw=0.9, label="analytic")
-    axes[1].plot(x, u, lw=1.2)
-    axes[1].plot(xa, ua, "k--", lw=0.9)
-    axes[2].plot(x, p_th, lw=1.2, label="P_th")
-    axes[2].plot(x, p_cr, lw=1.2, label="P_cr")
-    axes[2].plot(xa, ptha, "k--", lw=0.9)
-    axes[2].plot(xa, pcra, "k:", lw=0.9)
-    for ax, lab in zip(axes, ("density", "velocity", "pressure")):
-        ax.set(xlabel="x", ylabel=lab, xlim=(2, 10))
-    axes[0].legend(fontsize=8)
-    axes[2].legend(fontsize=8)
-    fig.suptitle(f"Pfrommer+17 CR shock tube, zeta = {zeta}")
-    fig.savefig(FIGURE_DIR / f"cr_shock_tube_{'inj' if dsa else 'noinj'}.png", dpi=110)
-    plt.close(fig)
+    _plot_overview(
+        x,
+        density,
+        velocity,
+        thermal_pressure,
+        cosmic_ray_pressure,
+        zeta,
+        FIGURE_DIR / f"cr_shock_tube_{'inj' if dsa else 'noinj'}.png",
+    )
