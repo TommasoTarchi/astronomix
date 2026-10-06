@@ -344,8 +344,8 @@ over snapshots every 0.05 t_c.
 | adiabatic M10, 256³, old PP | complete | 4.7e-2 | -5.7e-4 | 67 |
 | adiabatic M20, 256³, old PP | complete | 1.3e-2 | -6.1e-4 | 1024 |
 | adiabatic M20, 128³, paired | complete, 208 s | 1.3e-2 | +3.5e-6 | 0 |
-| adiabatic M10, 256³, paired | clean through 3.25 t_c | 2.5e-2 | -1.1e-4 (t = 1.2) | 1 |
-| adiabatic M20, 256³, paired | clean through 4.15 t_c | 1.0e-2 | -2.9e-4 (t = 0.85) | 36 |
+| adiabatic M10, 256³, paired | complete, 3327 s (old PP 1068 s) | 2.5e-2 | -1.1e-4 (t = 1.2) | 1 |
+| adiabatic M20, 256³, paired | complete, 2869 s (old PP 1088 s) | 1.0e-2 | -2.9e-4 (t = 0.85) | 36 |
 | adiabatic M20, 256³, paired, CFL 0.75 | clean through 2.5 t_c | 1.6e-2 | -4.7e-4 (t = 0.8) | 7 |
 
 **Isothermal MHD** never touches a floor, at any resolution or Mach number
@@ -353,7 +353,9 @@ tried; density is the only constraint and it is provable.
 
 **Adiabatic MHD** with the paired limiter:
 
-* no dt penalty: 128³ runs as fast as before;
+* the CFL estimate is unchanged, but 256³ wall time is ~3x the old PP's (probably the array-level
+  paired recombination in the Pallas path: 17 output channels plus pair fractions on full arrays;
+  not yet profiled);
 * positive at 128³;
 * at 256³, rare transient negative pressures in the cold early phase
   (t/t_c 0.8-1.2), even at CFL 0.75. That is ~30x fewer cells than the old PP.
