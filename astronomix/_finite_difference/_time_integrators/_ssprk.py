@@ -36,6 +36,9 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 # astronomix functions
 from astronomix._finite_difference._interface_fluxes._weno import (
     _hydro_pallas_flux_supported,
+    _mhd_pallas_flux_supported,
+    _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
+    _weno_flux_mhd_pallas_keep_halo_x,
     _weno_flux_x,
     _weno_flux_y,
     _weno_flux_z,
@@ -48,17 +51,28 @@ from astronomix._finite_difference._interface_fluxes._flux_blending import (
 )
 from astronomix._finite_difference._time_integrators._ssprk_pallas import (
     _div_axis_pallas_shape_ok,
+    _hydro_flux_div_axis_native,
+    _hydro_flux_div_axis_native_from_kept_halo_sharded,
     _hydro_flux_div_axis_pallas,
 )
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     _constrained_transport_rhs_from_slices,
     update_cell_center_fields,
 )
+from astronomix._finite_difference._magnetic_update._constrained_transport_pallas import (
+    _ct_rhs_pallas_supported,
+    _ct_rhs_pallas_x_precomputed,
+)
 from astronomix._geometry.boundaries import _boundary_handler
 from astronomix._integrators._explicit_rk import lsrk4, ssprk4
 from astronomix._modules._time_integrator_sources import _time_integrator_sources
 from astronomix._modules._resistivity._resistivity import fd_ohmic_interface_rhs
-from astronomix._pallas_helpers import _backend_is_pallas, pl
+from astronomix._pallas_helpers import (
+    _backend_is_pallas,
+    _pallas_mesh_splits_axis,
+    diffable_pallas_call_n,
+    pl,
+)
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
@@ -740,11 +754,47 @@ def _lsrk4_with_ct(
         and _div_axis_pallas_shape_ok(conserved_state, config)
     )
 
-    dtdx = dt / grid_spacing
-    dtdy = dt / grid_spacing
-    dtdz = dt / grid_spacing
+    # Multi-GPU fast path for x split over devices. The x-WENO kernel keeps one
+    # x-halo cell of its flux, so the x divergence needs no second halo
+    # exchange; the x parts of the constrained-transport modified fluxes are
+    # computed in the same shard_map, and with the Pallas CT kernels the
+    # cell-centred field update is fused into it as well. The fused kernels
+    # implement the plain WENO flux only, so positivity-preserving WENO, dual
+    # energy and the cold-crush blend take the standard path.
+    use_kept_x_flux_halo = (
+        use_pallas_div
+        and int(config.dimensionality) == 3
+        and _pallas_mesh_splits_axis(conserved_state, 0)
+        and _mhd_pallas_flux_supported(conserved_state, config)
+        and not config.weno_positivity_preserving
+        and internal_energy_density is None
+        and not config.positivity_config.coldcrush_blend
+    )
+    fuse_cell_center_update = (
+        use_kept_x_flux_halo and _ct_rhs_pallas_supported(conserved_state, config)
+    )
 
-    def compute_lqs(current_q, bx, by, bz, dq, a_coef):
+    # With y and z unsplit the y and z divergences are purely shard-local and
+    # cheaper in plain JAX than as separate Pallas calls.
+    yz_unsplit = not (
+        _pallas_mesh_splits_axis(conserved_state, 1)
+        or _pallas_mesh_splits_axis(conserved_state, 2)
+    )
+
+    def stage_rhs(
+        kept_halo_path,
+        current_q,
+        bx,
+        by,
+        bz,
+        dq,
+        a_coef,
+        dt,
+        gamma,
+        grid_spacing,
+        params,
+        helper_data,
+    ):
         """Compute ``dq_new = a_coef * dq + dt * L_q`` (in-place via the
         Pallas div-axis accumulator when available) and the three
         interface-B ``dt * L_b{x,y,z}`` increments.
@@ -755,10 +805,19 @@ def _lsrk4_with_ct(
         materialises a separate ``rhs_q``.  When Pallas is unavailable
         we fall back to the explicit
         ``rhs_q`` → ``dq = a_coef * dq + rhs_q`` pattern.
+
+        ``kept_halo_path`` (static) selects the multi-GPU fast path described
+        above; both paths compute the same stage.
         """
-        current_q = update_cell_center_fields(
-            current_q, bx, by, bz, config, registered_variables
-        )
+        dtdx = dt / grid_spacing
+        dtdy = dt / grid_spacing
+        dtdz = dt / grid_spacing
+        fuse_update = kept_halo_path and fuse_cell_center_update
+
+        if not fuse_update:
+            current_q = update_cell_center_fields(
+                current_q, bx, by, bz, config, registered_variables
+            )
 
         # ideal MHD + PP: the axis-summed first-order inflow of every cell, for
         # limiting each cell's inflow faces jointly (see _weno_positivity.py)
@@ -776,25 +835,57 @@ def _lsrk4_with_ct(
         mz = registered_variables.magnetic_index.z
         di = registered_variables.density_index
 
-        # Unified flux blending, exactly as in the SSPRK4-with-CT path: applied
-        # to the full interface flux BEFORE the magnetic-flux slices are
-        # extracted, so CT consumes the blended induction flux. This path used
-        # to skip it, which silently switched every blend option off for MHD
-        # under RK4_LSRK. The low-storage stage increment is dt * L(q), so the
-        # admissibility checks use the full-step dt / dx (as _lsrk4_hydro does).
+        # Cold-crush flux blending, as in the SSPRK4-with-CT path: applied to
+        # the full interface flux before the magnetic-flux slices are
+        # extracted, so CT consumes the blended induction flux. The low-storage
+        # stage increment is dt * L(q), so the admissibility checks use the
+        # full-step dt / dx (as _lsrk4_hydro does).
         blend = config.positivity_config.coldcrush_blend
 
         # x-axis: fold the LSRK4 ``a_coef * dq + ...`` step into the
         # first axis's div kernel via ``scale_in`` so ``rhs_q`` is never
         # materialised; subsequent axes accumulate (scale_in = 1.0).  The
         # native fallback path keeps the explicit ``rhs_q`` register.
-        dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
-        if blend:
-            dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
+        flux_x_modified = None
+        flux_x_with_halo = None
+        if fuse_update:
+            current_q, flux_x_with_halo, dF_x, flux_x_modified = (
+                _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
+                    current_q,
+                    bx,
+                    by,
+                    bz,
+                    params,
+                    config,
+                    registered_variables,
+                )
+            )
+        elif kept_halo_path:
+            flux_x_with_halo, dF_x = _weno_flux_mhd_pallas_keep_halo_x(
+                current_q,
+                params,
+                config,
+                registered_variables,
+            )
+        else:
+            dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
+            if blend:
+                dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
         By_flux_x = dF_x[my]
         Bz_flux_x = dF_x[mz]
         density_flux_x = dF_x[di]
-        if use_pallas_div:
+        if kept_halo_path:
+            dq = _hydro_flux_div_axis_native_from_kept_halo_sharded(
+                flux_x_with_halo,
+                dtdx,
+                config,
+                axis=0,
+                rhs_accumulator=dq,
+                scale_in=a_coef,
+                kept_halo=1,
+            )
+            rhs_q_for_phys = None
+        elif use_pallas_div:
             dq = _hydro_flux_div_axis_pallas(
                 dF_x, dtdx, config, axis=0,
                 rhs_accumulator=dq, scale_in=a_coef,
@@ -802,7 +893,7 @@ def _lsrk4_with_ct(
             rhs_q_for_phys = None
         else:
             rhs_q_for_phys = -dtdx * (dF_x - _shift(dF_x, 1, axis=1))
-        del dF_x
+        del dF_x, flux_x_with_halo
 
         # Serialize the per-axis flux passes.  ``dF_{x,y,z}`` each depend only
         # on ``current_q`` (not on ``dq`` or each other), so without an explicit
@@ -813,14 +904,19 @@ def _lsrk4_with_ct(
         # flux buffer to be freed before the y-axis one is built, holding a
         # single axis live at a time.  ``optimization_barrier`` is a numerical
         # no-op (bit-identical output); at production grid sizes each axis kernel
-        # already saturates the GPU, so the lost cross-axis overlap costs no
-        # throughput while cutting the RHS peak footprint ~3x.
+        # already saturates the GPU, so the lost cross-axis overlap costs little
+        # throughput (a few per cent in multi-GPU runs that are not memory
+        # bound) while cutting the RHS peak footprint ~3x.
         if use_pallas_div:
             current_q, dq = jax.lax.optimization_barrier((current_q, dq))
         else:
             current_q, rhs_q_for_phys = jax.lax.optimization_barrier(
                 (current_q, rhs_q_for_phys)
             )
+
+        # On the fast path with y and z unsplit, the y and z divergences are
+        # shard-local plain-JAX updates of the accumulator.
+        native_yz_divergence = kept_halo_path and yz_unsplit
 
         if config.dimensionality >= 2:
             mx = registered_variables.magnetic_index.x
@@ -830,7 +926,11 @@ def _lsrk4_with_ct(
             Bx_flux_y = dF_y[mx]
             Bz_flux_y = dF_y[mz]
             density_flux_y = dF_y[di]
-            if use_pallas_div:
+            if native_yz_divergence:
+                dq = _hydro_flux_div_axis_native(
+                    dF_y, dtdy, axis=1, rhs_accumulator=dq,
+                )
+            elif use_pallas_div:
                 dq = _hydro_flux_div_axis_pallas(
                     dF_y, dtdy, config, axis=1, rhs_accumulator=dq,
                 )
@@ -857,7 +957,11 @@ def _lsrk4_with_ct(
             Bx_flux_z = dF_z[mx]
             By_flux_z = dF_z[my]
             density_flux_z = dF_z[di]
-            if use_pallas_div:
+            if native_yz_divergence:
+                dq = _hydro_flux_div_axis_native(
+                    dF_z, dtdz, axis=2, rhs_accumulator=dq,
+                )
+            elif use_pallas_div:
                 dq = _hydro_flux_div_axis_pallas(
                     dF_z, dtdz, config, axis=2, rhs_accumulator=dq,
                 )
@@ -868,14 +972,32 @@ def _lsrk4_with_ct(
             Bx_flux_z = 0.0
             By_flux_z = 0.0
 
-        rhs_bx, rhs_by, rhs_bz = _constrained_transport_rhs_from_slices(
-            current_q,
-            By_flux_x, Bz_flux_x,
-            Bx_flux_y, Bz_flux_y,
-            Bx_flux_z, By_flux_z,
-            dtdx, dtdy, dtdz,
-            config, registered_variables,
-        )
+        if fuse_update:
+            rhs_bx, rhs_by, rhs_bz = _ct_rhs_pallas_x_precomputed(
+                current_q,
+                flux_x_modified[0],
+                flux_x_modified[1],
+                Bx_flux_y,
+                Bz_flux_y,
+                Bx_flux_z,
+                By_flux_z,
+                dtdx,
+                dtdy,
+                dtdz,
+                config,
+                registered_variables,
+            )
+        else:
+            rhs_bx, rhs_by, rhs_bz = _constrained_transport_rhs_from_slices(
+                current_q,
+                By_flux_x, Bz_flux_x,
+                Bx_flux_y, Bz_flux_y,
+                Bx_flux_z, By_flux_z,
+                dtdx, dtdy, dtdz,
+                config, registered_variables,
+            )
+        del flux_x_modified
+
         # Explicit ohmic resistivity: a further curl of an edge EMF on the
         # interface fields, so div(B) = 0 is kept exactly (see _resistivity).
         if config.resistivity:
@@ -926,6 +1048,20 @@ def _lsrk4_with_ct(
             dq = a_coef * dq + rhs_q_for_phys
 
         return dq, rhs_bx, rhs_by, rhs_bz
+
+    def compute_lqs(current_q, bx, by, bz, dq, a_coef):
+        """The stage increments of ``stage_rhs``, on the fast path if it applies."""
+        primals = (current_q, bx, by, bz, dq, a_coef, dt, gamma, grid_spacing, params, helper_data)
+        if not use_kept_x_flux_halo:
+            return stage_rhs(False, *primals)
+        # The kept-halo kernels call Pallas outside the differentiable
+        # wrappers, so derivatives are taken through the standard path, which
+        # computes the same stage.
+        return diffable_pallas_call_n(
+            primals,
+            pallas_branch=partial(stage_rhs, True),
+            native_branch=partial(stage_rhs, False),
+        )
 
     def pre_stage(u):
         q, bx, by, bz = u

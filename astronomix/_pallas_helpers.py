@@ -343,6 +343,173 @@ def _default_state_pspec(mesh, ndim) -> PartitionSpec:
     return PartitionSpec(*axis_names[: 1 + ndim])
 
 
+def _resolve_state_pspec(state, mesh) -> PartitionSpec:
+    """
+    Return the PartitionSpec of a (var, x, y, z) state array on ``mesh``.
+
+    Concrete arrays carry their own ``NamedSharding``. Tracers carry no
+    ``.sharding`` under ``AxisType.Auto`` meshes, so inside a traced
+    ``time_integration(sharding=...)`` the spec registered with
+    ``pallas_mesh_context`` is used, and the default ``(var, x, y, z)`` spec
+    otherwise.
+
+    Args:
+        state: A state-shaped array (leading variable axis).
+        mesh: The active Pallas mesh.
+
+    Returns:
+        The PartitionSpec of ``state``.
+    """
+    try:
+        sharding = getattr(state, "sharding", None)
+    except Exception:
+        # Tracers raise "use jax.typeof(x)", not always as an AttributeError.
+        sharding = None
+    context_spec = _current_pallas_spec()
+    if isinstance(sharding, NamedSharding):
+        return sharding.spec
+    if context_spec is not None and len(context_spec) <= state.ndim:
+        return PartitionSpec(*context_spec, *((None,) * (state.ndim - len(context_spec))))
+    return _default_state_pspec(mesh, state.ndim - 1)
+
+
+def _pallas_mesh_splits_axis(state, spatial_axis: int) -> bool:
+    """
+    Whether the active Pallas mesh distributes ``spatial_axis`` (0 = x) of
+    ``state`` over more than one device.
+
+    This is the condition under which ``_pallas_call_sharded`` exchanges halos
+    along that axis; code paths that rely on such an exchange (for example a
+    kept output halo) must be gated on it rather than on the number of
+    visible devices, which says nothing about how the state is split.
+
+    Args:
+        state: A state-shaped array (leading variable axis).
+        spatial_axis: The spatial axis, 0-based.
+
+    Returns:
+        True if the axis is split over several devices.
+    """
+    mesh = _current_pallas_mesh()
+    if mesh is None or mesh.size <= 1:
+        return False
+    num_spatial_dims = state.ndim - 1
+    pspec = _resolve_state_pspec(state, mesh)
+    split_array_axes = {
+        array_axis for array_axis, _, _ in _spatial_sharded_axes(mesh, pspec, num_spatial_dims)
+    }
+    return spatial_axis + 1 in split_array_axes
+
+
+def _per_axis_halo(halo, num_spatial_dims: int) -> tuple:
+    """
+    Normalise a halo specification to one non-negative width per spatial axis.
+
+    Short tuples are padded with zeros and long ones truncated, so ``(2,)``
+    becomes ``(2, 0, 0)`` in 3D and ``(2, 1, 4)`` becomes ``(2, 1)`` in 2D.
+    """
+    widths = tuple(int(width) for width in halo) + (0,) * max(0, num_spatial_dims - len(halo))
+    widths = widths[:num_spatial_dims]
+    if any(width < 0 for width in widths):
+        raise ValueError("Halo widths must be non-negative.")
+    return widths
+
+
+def _normalize_input_halos(input_halos, num_inputs: int, num_spatial_dims: int):
+    """
+    One per-axis halo width tuple per state input, or ``None`` if every input
+    exchanges the full (block-rounded) halo.
+    """
+    if input_halos is None:
+        return None
+    if len(input_halos) != num_inputs:
+        raise ValueError("input_halos must give one halo per state input.")
+    return tuple(_per_axis_halo(halo, num_spatial_dims) for halo in input_halos)
+
+
+def _normalize_output_halos(output_halo, num_outputs: int, num_spatial_dims: int):
+    """
+    One per-axis kept-halo tuple per state output. A single per-axis tuple
+    applies to every output; ``None`` keeps no halo.
+    """
+    if output_halo is None:
+        return tuple((0,) * num_spatial_dims for _ in range(num_outputs))
+    if all(isinstance(width, int) for width in output_halo):
+        output_halos = tuple(output_halo for _ in range(num_outputs))
+    else:
+        if len(output_halo) != num_outputs:
+            raise ValueError("output_halo must give one halo per state output.")
+        output_halos = tuple(output_halo)
+    return tuple(_per_axis_halo(halo, num_spatial_dims) for halo in output_halos)
+
+
+def _local_edge_padding(array, width: int, axis: int, *, left: bool):
+    """
+    ``width`` copies of the local edge plane of ``array`` along ``axis``.
+
+    These fill the part of the block-rounded padding that an input does not
+    exchange with its neighbours (see ``input_halos`` of
+    ``_pallas_call_sharded``); kernels must never read them into a kept
+    output.
+    """
+    if width <= 0:
+        return None
+    size = array.shape[axis]
+    if left:
+        edge = jax.lax.slice_in_dim(array, 0, 1, axis=axis)
+    else:
+        edge = jax.lax.slice_in_dim(array, size - 1, size, axis=axis)
+    repetitions = [1] * array.ndim
+    repetitions[axis] = int(width)
+    return jnp.tile(edge, repetitions)
+
+
+def _pad_axis_with_halo(array, axis, padded_width, exchanged_width, mesh_axis_name, num_devices):
+    """
+    Pad ``array`` by ``padded_width`` cells on both sides of ``axis``: the
+    innermost ``exchanged_width`` cells come from the neighbouring shards
+    (periodic ring), the rest are local edge copies.
+
+    Args:
+        array: The local shard.
+        axis: The array axis to pad.
+        padded_width: The (block-rounded) padding per side.
+        exchanged_width: How many of those cells are real neighbour data.
+        mesh_axis_name: The mesh axis the array axis is split over.
+        num_devices: The number of devices along that mesh axis.
+
+    Returns:
+        The padded local array.
+    """
+    if exchanged_width > padded_width:
+        raise ValueError("An input halo cannot exceed the padded shape halo.")
+
+    pieces = []
+    left_padding = _local_edge_padding(array, padded_width - exchanged_width, axis, left=True)
+    if left_padding is not None:
+        pieces.append(left_padding)
+
+    if exchanged_width > 0:
+        size = array.shape[axis]
+        left_edge = jax.lax.slice_in_dim(array, 0, exchanged_width, axis=axis)
+        right_edge = jax.lax.slice_in_dim(array, size - exchanged_width, size, axis=axis)
+        to_left = [(device, (device - 1) % num_devices) for device in range(num_devices)]
+        to_right = [(device, (device + 1) % num_devices) for device in range(num_devices)]
+        # Each device sends its right edge to the right neighbour, which
+        # installs it as its left halo; symmetrically for the right halo.
+        left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=to_right)
+        right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=to_left)
+        pieces.extend((left_halo, array, right_halo))
+    else:
+        pieces.append(array)
+
+    right_padding = _local_edge_padding(array, padded_width - exchanged_width, axis, left=False)
+    if right_padding is not None:
+        pieces.append(right_padding)
+
+    return jnp.concatenate(pieces, axis=axis)
+
+
 def _pallas_call_sharded(
     kernel_build_fn,
     state_inputs,
@@ -351,6 +518,8 @@ def _pallas_call_sharded(
     halo,
     block_shape,
     num_state_outputs: int = 1,
+    input_halos=None,
+    output_halo=None,
 ):
     """Optionally wrap a Pallas-kernel build-and-call in ``shard_map``.
 
@@ -381,6 +550,19 @@ def _pallas_call_sharded(
             Number of state-shape outputs of ``kernel_build_fn`` (1 for
             most kernels; >1 for the CT staged kernels which return
             tuples of single-channel arrays).
+        input_halos:
+            Optional per-input halo widths ``((hx, hy, hz), ...)``. Every input
+            is still padded to the same block-rounded shape, but only the
+            requested cells are exchanged with the neighbours; the rest are
+            local edge copies. The kernel must not read those copies into any
+            output it keeps. ``None`` exchanges the full padding for every
+            input.
+        output_halo:
+            Optional halo width to keep on the state-shaped outputs, one
+            per-axis tuple for all outputs or one per output. The default
+            strips all padding. A kept halo lets a following local stencil
+            reuse cells this kernel already computed instead of exchanging
+            them again.
 
     Returns:
         Either ``kernel_build_fn(*state_inputs, *other_args)`` directly
@@ -393,19 +575,7 @@ def _pallas_call_sharded(
 
     state0 = state_inputs[0]
     ndim = state0.ndim - 1
-
-    try:
-        sharding = getattr(state0, "sharding", None)
-    except Exception:       # tracers: "use jax.typeof(x)" (not always an AttributeError)
-        sharding = None
-    ctx_spec = _current_pallas_spec()
-    if isinstance(sharding, NamedSharding):
-        pspec = sharding.spec
-    elif ctx_spec is not None and len(ctx_spec) <= state0.ndim:
-        # the state spec of the enclosing ``time_integration(sharding=...)``
-        pspec = PartitionSpec(*ctx_spec, *((None,) * (state0.ndim - len(ctx_spec))))
-    else:
-        pspec = _default_state_pspec(mesh, ndim)
+    pspec = _resolve_state_pspec(state0, mesh)
 
     sharded_axes = _spatial_sharded_axes(mesh, pspec, ndim)
     if not sharded_axes:
@@ -413,7 +583,26 @@ def _pallas_call_sharded(
 
     block_3 = tuple(block_shape) + (1,) * max(0, 3 - len(block_shape))
     halo_3 = tuple(halo) + (0,) * max(0, 3 - len(halo))
-    halo_padded = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
+    requested_input_halos = _normalize_input_halos(input_halos, len(state_inputs), ndim)
+    kept_output_halos = _normalize_output_halos(output_halo, int(num_state_outputs), ndim)
+
+    # ``shape_halo`` is the block-rounded padding of every local array handed
+    # to the kernel; ``exchanged_halos`` are the widths actually received from
+    # the neighbours, per input.
+    if requested_input_halos is None:
+        shape_halo = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
+        exchanged_halos = tuple(shape_halo for _ in state_inputs)
+    else:
+        largest_halo = tuple(
+            max([int(halo_3[axis])] + [input_halo[axis] for input_halo in requested_input_halos])
+            for axis in range(ndim)
+        )
+        shape_halo = _round_halo_up_to_block(largest_halo, block_3[:ndim])
+        exchanged_halos = requested_input_halos
+
+    for kept_halo in kept_output_halos:
+        if any(kept > padded for kept, padded in zip(kept_halo, shape_halo)):
+            raise ValueError("output_halo cannot exceed the padded shape halo.")
 
     try:
         from jax.shard_map import shard_map  # jax >= 0.8 (promoted out of experimental)
@@ -426,30 +615,19 @@ def _pallas_call_sharded(
 
         for array_axis_idx, mesh_axis_name, num_dev in sharded_axes:
             spatial_idx = array_axis_idx - 1
-            if spatial_idx >= len(halo_padded):
+            if spatial_idx >= len(shape_halo):
                 continue
-            h = halo_padded[spatial_idx]
+            h = shape_halo[spatial_idx]
             if h <= 0:
                 continue
-            left_perm = [(j, (j - 1) % num_dev) for j in range(num_dev)]
-            right_perm = [(j, (j + 1) % num_dev) for j in range(num_dev)]
             for i, arr in enumerate(state_arrays):
-                size = arr.shape[array_axis_idx]
-                left_edge = jax.lax.slice_in_dim(arr, 0, h, axis=array_axis_idx)
-                right_edge = jax.lax.slice_in_dim(
-                    arr, size - h, size, axis=array_axis_idx
-                )
-                # Each device sends its right edge to the right neighbour;
-                # the receiving device installs the inbound payload as its
-                # *left* halo.  Symmetric pattern for the right halo.
-                left_halo = jax.lax.ppermute(
-                    right_edge, mesh_axis_name, perm=right_perm
-                )
-                right_halo = jax.lax.ppermute(
-                    left_edge, mesh_axis_name, perm=left_perm
-                )
-                state_arrays[i] = jnp.concatenate(
-                    [left_halo, arr, right_halo], axis=array_axis_idx
+                state_arrays[i] = _pad_axis_with_halo(
+                    arr,
+                    array_axis_idx,
+                    h,
+                    exchanged_halos[i][spatial_idx],
+                    mesh_axis_name,
+                    num_dev,
                 )
 
         # Re-enter the wrapper with mesh=None so the recursive
@@ -459,21 +637,25 @@ def _pallas_call_sharded(
         with pallas_mesh_context(None):
             out = kernel_build_fn(*state_arrays, *others)
 
-        def _strip(o):
+        def _strip(o, kept_halo):
             for array_axis_idx, _, _ in sharded_axes:
                 spatial_idx = array_axis_idx - 1
-                if spatial_idx >= len(halo_padded):
+                if spatial_idx >= len(shape_halo):
                     continue
-                h = halo_padded[spatial_idx]
-                if h <= 0:
+                stripped_width = shape_halo[spatial_idx] - kept_halo[spatial_idx]
+                if stripped_width <= 0:
                     continue
                 size = o.shape[array_axis_idx]
-                o = jax.lax.slice_in_dim(o, h, size - h, axis=array_axis_idx)
+                o = jax.lax.slice_in_dim(
+                    o, stripped_width, size - stripped_width, axis=array_axis_idx
+                )
             return o
 
         if isinstance(out, tuple):
-            return tuple(_strip(o) for o in out)
-        return _strip(out)
+            return tuple(
+                _strip(o, kept_halo) for o, kept_halo in zip(out, kept_output_halos, strict=True)
+            )
+        return _strip(out, kept_output_halos[0])
 
     state_specs = tuple(pspec for _ in state_inputs)
     other_specs = tuple(PartitionSpec() for _ in other_args)

@@ -152,6 +152,8 @@ def _hydro_flux_div_axis_pallas(
             pallas_branch=_pallas_branch, native_branch=_native_branch,
         )
 
+    zero_halo = (0,) * ndim
+
     def _pallas_branch_acc(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
         return _pallas_call_sharded(
             lambda r, d: _hydro_flux_div_axis_pallas_local(
@@ -160,6 +162,9 @@ def _hydro_flux_div_axis_pallas(
             ),
             state_inputs=(rhs_in, dF_in),
             halo=halo,
+            # The accumulator is only read and written at the cell itself, so
+            # only the flux is exchanged.
+            input_halos=(zero_halo, halo),
             block_shape=block_shape[:ndim],
         )
 
@@ -177,6 +182,92 @@ def _hydro_flux_div_axis_pallas(
         pallas_branch=_pallas_branch_acc,
         native_branch=_native_branch_acc,
     )
+
+
+def _hydro_flux_div_axis_native_from_kept_halo_sharded(
+    dF,
+    dt_over_dx,
+    config: SimulationConfig,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in: Union[float, jnp.ndarray] = 1.0,
+    kept_halo: int = 1,
+):
+    """
+    Accumulate ``scale_in * rhs + (-dt/dx) * (F_{i+1/2} - F_{i-1/2})`` along x
+    from a flux that already carries ``kept_halo`` x-halo cells.
+
+    The x-WENO kernel of the multi-GPU fast path keeps one x-halo cell of its
+    flux, so the left face of each shard's first cell is already local and the
+    divergence needs no further halo exchange; it runs as plain JAX inside a
+    shard_map (measured faster than a separate Pallas kernel).
+
+    Args:
+        dF: The interface flux with ``kept_halo`` extra x cells per side.
+        dt_over_dx: The time step over the grid spacing.
+        config: The simulation configuration.
+        axis: The flux axis; only 0 (x) is supported.
+        rhs_accumulator: The accumulator updated in place.
+        scale_in: The factor applied to the accumulator (the LSRK coefficient).
+        kept_halo: The number of kept x-halo cells of ``dF``.
+
+    Returns:
+        The updated accumulator.
+    """
+    if axis != 0:
+        raise RuntimeError("The kept-halo divergence is only implemented along x.")
+
+    ndim = int(config.dimensionality)
+    zero_halo = (0,) * ndim
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=rhs_accumulator.shape[1:],
+    )
+
+    return _pallas_call_sharded(
+        lambda r, f: _hydro_flux_div_axis_from_kept_halo_native(
+            f,
+            dt_over_dx,
+            axis=axis,
+            rhs_accumulator=r,
+            scale_in=scale_in,
+            kept_halo=kept_halo,
+        ),
+        state_inputs=(rhs_accumulator, dF),
+        halo=zero_halo,
+        # Nothing is exchanged: dF already carries its x halo and the
+        # accumulator is only written locally.
+        input_halos=(zero_halo, zero_halo),
+        block_shape=block_shape[:ndim],
+    )
+
+
+def _hydro_flux_div_axis_from_kept_halo_native(
+    dF,
+    dt_over_dx,
+    *,
+    axis: int,
+    rhs_accumulator,
+    scale_in,
+    kept_halo: int,
+):
+    """
+    Local x divergence of a flux with ``kept_halo`` x-halo cells, by slicing.
+
+    ``dF[kept_halo + i]`` is the flux through the right face of cell ``i`` and
+    ``dF[kept_halo - 1 + i]`` the one through its left face.
+    """
+    array_axis = axis + 1
+    n = rhs_accumulator.shape[array_axis]
+    right = jax.lax.slice_in_dim(
+        dF, kept_halo, kept_halo + n, axis=array_axis
+    )
+    left = jax.lax.slice_in_dim(
+        dF, kept_halo - 1, kept_halo - 1 + n, axis=array_axis
+    )
+    return scale_in * rhs_accumulator + (-dt_over_dx) * (right - left)
 
 
 def _hydro_flux_div_axis_pallas_local(
