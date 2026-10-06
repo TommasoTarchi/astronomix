@@ -173,12 +173,13 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
             "Options to stabilize it:"
         )
         hints.append(
-            "  - enable positivity protection: set "
-            "config.positivity_config.default_positivity_protection = True."
+            "  - finite difference: enable the positivity-preserving WENO, "
+            "config.weno_positivity_preserving = True (provable for "
+            "C_cfl <= 0.75)."
         )
         hints.append(
-            "  - use a positivity-preserving limiter such as VAN_ALBADA_PP "
-            "(config.limiter)."
+            "  - finite volume: use a positivity-preserving limiter such as "
+            "VAN_ALBADA_PP (config.limiter)."
         )
         hints.append(
             "  - reduce the CFL number (params.C_cfl) for smaller, safer time "

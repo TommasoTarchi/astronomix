@@ -205,13 +205,14 @@ def _evolve_state_fd(
 
         # back to primitive state
         if config.equation_of_state == IDEAL_GAS:
+            # the carried state: no estimate clamps
             primitive_state = primitive_state_from_conserved_mhd(
                 conserved_state, params.minimum_density, params.minimum_pressure, gamma, config, registered_variables,
-                internal_energy_density=internal_energy_density,
+                internal_energy_density=internal_energy_density, clamp=False,
             )
         elif config.equation_of_state == ISOTHERMAL:
             primitive_state = primitive_state_from_conserved_isothermal(
-                conserved_state, params.minimum_density, config, registered_variables
+                conserved_state, params.minimum_density, config, registered_variables, clamp=False,
             )
 
         # append updated interface magnetic fields

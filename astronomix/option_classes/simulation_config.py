@@ -46,25 +46,13 @@ PALLAS = 1
 #: on a GPU node).
 OPTIMAL_BACKEND = 2
 
-# positivity-enforcement modes (used by ``PositivityConfig.per_stage_mode`` /
-# ``per_step_mode``).  HARD_FLOOR clamps density (and, for ideal
-# gas, pressure) pointwise — cheap, non-conservative, matches the *adiabatic*
-# HOW-MHD ``prot.f``.  REDISTRIBUTE neighbour-averages density+momentum (and
-# energy) over the valid 3x3x3 neighbourhood of sub-threshold cells — much
-# gentler at strong shocks than a hard floor (no sharp floored cell), matches
-# the *isothermal* HOW-MHD ``prot.f`` (not strictly mass-conserving: like
-# ``prot.f`` it copies neighbour values without debiting the donors).
+# Per-step state floor (``PositivityConfig.per_step_mode``). Positivity of the
+# finite-difference scheme itself comes from ``weno_positivity_preserving``; the
+# floor remains for the finite-volume solver and as the temperature floor of
+# radiatively cooled runs (``per_step_specific_floor``). HARD_FLOOR clamps
+# density (and, for an ideal gas, pressure) pointwise; it is not conservative.
 POSITIVITY_NONE = 0
 POSITIVITY_HARD_FLOOR = 1
-POSITIVITY_REDISTRIBUTE = 2
-#: CONSERVATIVE: enforce internal-energy positivity by an antisymmetric
-#: face-flux diffusion that pulls internal energy into (near-)negative-pressure
-#: cells from their hotter neighbours (exact total-energy conservation), plus a
-#: density floor / vacuum-rest for voids and a minimal residual pressure floor
-#: as the unconditional guarantee. The smooth, conservative cousin of HARD_FLOOR:
-#: it keeps the energy-conserving self-gravity scheme stable on violent collapse
-#: without the 100%+ energy injection a bare floor causes.
-POSITIVITY_CONSERVATIVE = 3
 
 # solver modes
 FINITE_VOLUME = 0
@@ -322,19 +310,6 @@ class GravityConfig(NamedTuple):
     #: Manual open boundary conditions in the Poisson solver.
     poisson_manual_open_boundaries: bool = False
 
-    #: Non-conservative backstop for the energy-conserving coupling (finite
-    #: difference, SECOND/FOURTH_ORDER_CONSERVATIVE): the part of the energy
-    #: source that is not the kinetic work of the momentum source is scaled
-    #: down wherever it would drain the internal energy faster than half of it
-    #: per wave-crossing time (a dt-independent rate budget). Use it together
-    #: with ``work_flux_correction``: that conservative correction removes the
-    #: dominant failure (half the climb of mass entering a cold or tenuous cell
-    #: charged to the receiver), and this backstop then only catches the work
-    #: no conservative split can pay for -- mass lifted against gravity by
-    #: numerical diffusion in cold gas -- so the energy it rejects is confined
-    #: to those cells.
-    limit_internal_energy_work: bool = False
-
     #: Flux-corrected gravitational work (finite difference,
     #: SECOND/FOURTH_ORDER_CONSERVATIVE). Every conservative energy coupling
     #: is a choice of the potential-energy flux q at each face,
@@ -360,25 +335,19 @@ class GravityConfig(NamedTuple):
 
 class PositivityConfig(NamedTuple):
     """
-    Density/pressure positivity-enforcement configuration.
+    State floors and estimate clamps.
+
+    The finite-difference scheme keeps density and pressure positive through
+    ``SimulationConfig.weno_positivity_preserving`` (every stage a convex
+    combination of admissible states). What is left here is not a positivity
+    patch: the per-step floor serves the finite-volume solver and the
+    temperature floor of radiatively cooled runs, the clamps keep wave-speed
+    and time-step estimates finite, and the cold-crush blend damps the
+    runaway compression of radiatively cooled shells.
     """
 
-    #: Casual on/off switch for the per-stage / per-step STATE floors. Default
-    #: False (no flooring). When True, finalize_config sets per_stage_mode and
-    #: per_step_mode to HARD_FLOOR unless explicitly overridden. Does NOT affect
-    #: the read-only ``clamp_in_estimates`` (always respected).
-    default_positivity_protection: bool = False
-
-    #: Positivity enforcement applied inside every SSPRK/LSRK stage (on the
-    #: conserved state — the CFL lever for strong shocks). One of
-    #: ``POSITIVITY_{NONE,HARD_FLOOR,REDISTRIBUTE,CONSERVATIVE}``. Default NONE;
-    #: set to HARD_FLOOR by finalize when ``default_positivity_protection``.
-    per_stage_mode: int = POSITIVITY_NONE
-
-    #: Positivity enforcement applied once per step before the evolve (on the
-    #: primitive state). With turbulent forcing + ``vacuum_protection`` the
-    #: conservative ``prot`` redistribution already runs once per step, so a
-    #: per-step REDISTRIBUTE here is redundant and is auto-skipped.
+    #: State floor applied once per step before the evolve (on the primitive
+    #: state): ``POSITIVITY_NONE`` or ``POSITIVITY_HARD_FLOOR``.
     per_step_mode: int = POSITIVITY_NONE
 
     #: Upgrade the per-step HARD_FLOOR pressure clamp to the density-scaled
@@ -387,68 +356,15 @@ class PositivityConfig(NamedTuple):
     #: for RADIATIVE runs: a radiatively cooled shock layer compresses to the
     #: isothermal jump, and without isothermal pressure support (p ∝ rho) the
     #: constant floor leaves it effectively pressureless and it ram-crushes
-    #: without bound. Applied ONCE per step (the per-STAGE variant pumps
-    #: energy and destabilized adiabatic runs, 2026-07-25); with cooling
-    #: active the floor's energy input is radiated away (the isothermal
-    #: balance). No-op when ``params.minimum_specific_pressure == 0``.
+    #: without bound. With cooling active the floor's energy input is radiated
+    #: away (the isothermal balance). No-op when
+    #: ``params.minimum_specific_pressure == 0``.
     per_step_specific_floor: bool = False
 
-    #: Additionally apply the density-scaled temperature floor inside EVERY
-    #: RK stage's HARD_FLOOR positivity pass (p >= rho * msp on the conserved
-    #: state). A radiative crush can complete within the stages between
-    #: per-step floors; this closes that window. CAUTION: in ADIABATIC runs
-    #: the per-stage injection was a proven destabilizer (2026-07-25) — use
-    #: only with real cooling, which radiates the injected energy away.
-    per_stage_specific_floor: bool = False
-
     #: Read-only density/pressure clamp in the flux / eigenvalue / timestep
-    #: estimates (NaN-safety; does NOT modify the evolved state). This is the
-    #: role the old ``enforce_positivity`` bool played in those estimators.
-    #: DECOUPLED from ``default_positivity_protection`` and ON by default --
-    #: cheap insurance that never touches the conserved solution.
+    #: estimates. It never modifies the evolved state (the step-end primitive
+    #: recovery is unclamped).
     clamp_in_estimates: bool = True
-
-    #: Blend the WENO flux toward HLLC instead of first-order Lax-Friedrichs
-    #: in the positivity/FCT limiter (ideal-gas hydro only; MHD and isothermal
-    #: keep LLF). Both are positivity preserving under the CFL condition, but
-    #: LLF smears the CONTACT wave at first order, so blending toward it
-    #: dissolves cold dense condensations — a two-phase medium imported from
-    #: AthenaK was fully evaporated in 10 Myr through that path, while the same
-    #: run with the limiter disabled kept (and grew) its cold phase but went
-    #: numerically unstable. HLLC resolves the contact exactly, so positivity
-    #: can be enforced without erasing the structure.
-    blend_fallback_hllc: bool = False
-
-    #: Vacuum-rest velocity recovery: zero the momentum in below-floor (vacuum)
-    #: cells so the recovered velocity is 0 rather than ``momentum/rho_floored``
-    #: (which spikes and drives high-Mach blow-up); lets ``minimum_density`` be
-    #: lowered by orders of magnitude without instability.
-    vacuum_rest: bool = False
-
-    #: NaN/inf backstop: reset non-finite conserved entries to zero before the
-    #: density/pressure floors so they become a valid floored state.
-    nan_safe: bool = False
-
-    #: POSITIVITY_CONSERVATIVE-mode parameters (conservative internal-energy
-    #: redistribution): per-axis diffusion coefficient (stability needs
-    #: < 1/(2*dim)), number of Jacobi passes, and the activation margin in units
-    #: of the internal-energy floor (keep ~1 -- genuine near-violations only).
-    cons_coeff: float = 0.15
-    cons_passes: int = 16
-    cons_activate: float = 1.0
-
-    #: Deep-void first-order flux blending (FOFC-style): blend the WENO interface
-    #: flux toward LLF in cells near the density floor; the weight ramps from 1
-    #: at the floor to 0 at ``deepvoid_blend_factor * minimum_density``.
-    deepvoid_blend: bool = False
-    deepvoid_blend_factor: float = 8.0
-
-    #: Positivity-preserving (Hu-Adams-Shu / Zalesak FCT) flux limiter: blend the
-    #: WENO flux toward LLF by the largest weight keeping the LF-updated density
-    #: AND pressure above their floors. Shares the unified flux-blending
-    #: infrastructure with ``deepvoid_blend`` (different activation path; both may
-    #: be on, the stronger blend wins). Forces the non-fused WENO+divergence path.
-    preserving_flux: bool = False
 
     #: Cold-crush first-order flux blending (the FD counterpart of Athena's
     #: FOFC for radiatively cooled gas): blend the WENO interface flux toward
@@ -994,14 +910,6 @@ class SimulationConfig(NamedTuple):
     #: the float32 tangent overflows within a few years of a Cas A run.
     weno_ad_frozen_weights: bool = False
 
-    #: If > 0: on interfaces whose colder side is below this factor times
-    #: ``params.minimum_specific_pressure``, take the DERIVATIVE of the flux
-    #: through the monotone LLF flux (the primal value is unchanged). The
-    #: frozen-weight WENO linearisation is unstable at cold dense knots; this
-    #: is the tangent-only analogue of the cold-crush LLF blend. Requires one
-    #: of the positivity blend paths to be active (it lives in the blend).
-    ad_tangent_llf_cold_factor: float = 0.0
-
     # physical modules
 
     #: Turbulent forcing configuration.
@@ -1196,24 +1104,6 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             "sqrt, so reverse-mode gradients are ~1 ULP inconsistent with the "
             "forward. Fine for forward-only runs; turn off for exact AD."
         )
-
-    # ``default_positivity_protection`` is a casual on/off switch for the STATE
-    # floors only: the default ``False`` is a clean slate (no per-stage /
-    # per-step flooring). When set, turn the floors on (HARD_FLOOR) unless the
-    # user explicitly chose a mode. The read-only clamps (clamp_in_estimates)
-    # are decoupled and left untouched (default on), as are the feature toggles
-    # (deepvoid_blend, preserving_flux, conservative redistribution,
-    # vacuum_rest, nan_safe).
-    positivity_config = config.positivity_config
-    if positivity_config.default_positivity_protection:
-        config = config._replace(positivity_config=positivity_config._replace(
-            per_stage_mode=(POSITIVITY_HARD_FLOOR
-                            if positivity_config.per_stage_mode == POSITIVITY_NONE
-                            else positivity_config.per_stage_mode),
-            per_step_mode=(POSITIVITY_HARD_FLOOR
-                           if positivity_config.per_step_mode == POSITIVITY_NONE
-                           else positivity_config.per_step_mode),
-        ))
 
     if jax.config.jax_enable_x64:
         config._replace(numerical_precision=DOUBLE_PRECISION)

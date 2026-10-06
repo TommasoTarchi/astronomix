@@ -18,12 +18,10 @@ parser.add_argument("--precision", type=int, default=32)
 parser.add_argument("--t-end", type=float, default=1.2)
 parser.add_argument("--e0", type=float, default=0.05)
 parser.add_argument("--gravity", default="fourth", choices=["simple", "second", "fourth"])
-parser.add_argument("--positivity", default="none", choices=["none", "pp"])
 parser.add_argument("--tag", default="")
 parser.add_argument("--save-states", action="store_true")
 parser.add_argument("--num-snapshots", type=int, default=25)
 parser.add_argument("--dual", type=int, default=0)
-parser.add_argument("--limit-work", type=int, default=0)
 parser.add_argument("--fct", type=int, default=0)
 args = parser.parse_args()
 
@@ -81,7 +79,6 @@ config = SimulationConfig(
         self_gravity=True,
         self_gravity_version=GRAVITY[args.gravity],
         poisson_manual_open_boundaries=True,
-        limit_internal_energy_work=bool(args.limit_work),
         work_flux_correction=bool(args.fct),
     ),
     dimensionality=3,
@@ -89,7 +86,7 @@ config = SimulationConfig(
     num_cells=args.n,
     numerical_precision=DOUBLE_PRECISION if args.precision == 64 else SINGLE_PRECISION,
     backend_config=BackendConfig(backend=NATIVE_JAX),
-    positivity_config=PositivityConfig(preserving_flux=args.positivity == "pp"),
+    positivity_config=PositivityConfig(clamp_in_estimates=False),
     dual_energy=bool(args.dual),
     **weno_variant_kwargs(),
     boundary_settings=BoundarySettings(
@@ -149,7 +146,7 @@ energy_drift = float(np.nanmax(np.abs(total[finite_mask] - total[0])) / np.abs(t
 face = weno_variant_name()
 print(
     f"EVRARD face={face} tag={args.tag} n={args.n} x{args.precision} grav={args.gravity} "
-    f"pos={args.positivity} dual={args.dual} limit={args.limit_work} fct={args.fct} lab={os.environ.get('ASTX_LAB', '')} e0={args.e0}: {'COMPLETE' if ok else 'FAILED'} "
+    f"dual={args.dual} fct={args.fct} lab={os.environ.get('ASTX_LAB', '')} e0={args.e0}: {'COMPLETE' if ok else 'FAILED'} "
     f"t_reached={t_reached:.3f} max|dE|/|E0|={energy_drift:.3e} "
     f"min rho={np.nanmin(final[0]):.3e} min p={np.nanmin(final[registered_variables.pressure_index]):.3e} "
     f"wall={elapsed:.0f}s",
@@ -157,7 +154,7 @@ print(
 )
 os.makedirs("stability_lab/out", exist_ok=True)
 np.savez(
-    f"stability_lab/out/evrard_{face}{args.tag}_n{args.n}_x{args.precision}_{args.gravity}_{args.positivity}.npz",
+    f"stability_lab/out/evrard_{face}{args.tag}_n{args.n}_x{args.precision}_{args.gravity}.npz",
     times=times, total=total, internal=internal,
     kinetic=np.asarray(snapshots.kinetic_energy),
     gravitational=np.asarray(snapshots.gravitational_energy),

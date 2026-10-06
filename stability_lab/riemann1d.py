@@ -143,9 +143,6 @@ def variant_config_kwargs(variant):
     """Map a variant name onto SimulationConfig keyword arguments."""
     if variant == "baseline":
         return {}
-    from astronomix.option_classes.simulation_config import PositivityConfig
-    if variant == "pp":
-        return dict(positivity_config=PositivityConfig(preserving_flux=True))
     raise ValueError(variant)
 
 

@@ -34,10 +34,6 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
-from astronomix._fluid_equations._enforce_positivity import (
-    _enforce_positivity,
-    _apply_stage_positivity,
-)
 from astronomix._finite_difference._interface_fluxes._weno import (
     _hydro_pallas_flux_supported,
     _weno_flux_x,
@@ -203,14 +199,12 @@ def _ssprk4_with_ct(
         mz = registered_variables.magnetic_index.z
         di = registered_variables.density_index
 
-        # Unified flux blending (deep-void density ramp and/or FCT positivity):
+        # Cold-crush flux blending (radiatively cooled crushes; see _flux_blending):
         # apply to the full interface flux BEFORE the transverse magnetic-flux
         # slices are extracted, so CT consumes the blended (locally-diffusive)
         # induction flux. CT stays div(B)=0 by construction (single-valued edge
         # EMFs from consistent face fluxes).
-        blend = (config.positivity_config.deepvoid_blend
-                 or config.positivity_config.preserving_flux
-                 or config.positivity_config.coldcrush_blend)
+        blend = config.positivity_config.coldcrush_blend
 
         # x-axis
         dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density, inflow_reference=inflow_reference)
@@ -312,15 +306,6 @@ def _ssprk4_with_ct(
 
     def pre_stage(u):
         q, bx, by, bz = u
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         if config.boundary_handling == GHOST_CELLS:
             q = _boundary_handler(
                 q, config, registered_variables, params, CONSERVATIVE_GAS_STATE
@@ -338,15 +323,6 @@ def _ssprk4_with_ct(
         # from the final interface magnetic fields.
         q = update_cell_center_fields(
             q, bx, by, bz, config, registered_variables
-        )
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
         )
         return (q, bx, by, bz)
 
@@ -425,8 +401,6 @@ def _hydro_step_rhs(
     use_fused_pallas = (
         _hydro_pallas_flux_supported(current_q, config)
         and not density_fluxes_needed
-        and not config.positivity_config.deepvoid_blend
-        and not config.positivity_config.preserving_flux
         and not config.positivity_config.coldcrush_blend
     )
 
@@ -462,9 +436,7 @@ def _hydro_step_rhs(
         # the same per-axis flux + blend + divergence as the path below, each
         # axis inside its own jax.checkpoint, so the backward of a stage holds
         # one axis' WENO / blend internals at a time instead of all three.
-        blend = (config.positivity_config.deepvoid_blend
-                 or config.positivity_config.preserving_flux
-                 or config.positivity_config.coldcrush_blend)
+        blend = config.positivity_config.coldcrush_blend
         weno_fluxes = (_weno_flux_x, _weno_flux_y, _weno_flux_z)
 
         def axis_increment(q, dtd, g, axis):
@@ -491,9 +463,7 @@ def _hydro_step_rhs(
         # Per-axis flux + divergence path.  Accumulate axis-by-axis rather
         # than holding all three flux arrays live simultaneously, so XLA
         # can reuse buffers between axes.
-        blend = (config.positivity_config.deepvoid_blend
-                 or config.positivity_config.preserving_flux
-                 or config.positivity_config.coldcrush_blend)
+        blend = config.positivity_config.coldcrush_blend
         dF_x = _weno_flux_x(current_q, params, config, registered_variables, internal_energy_density=internal_energy_density)
         if blend:
             dF_x = _blend_interface_flux(dF_x, current_q, 0, dtdx, params, config, registered_variables, internal_energy_density=internal_energy_density)
@@ -570,15 +540,6 @@ def _ssprk4_hydro(
     density_fluxes_needed = _hydro_density_fluxes_needed(config)
 
     def pre_stage(q):
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         if config.boundary_handling == GHOST_CELLS:
             q = _boundary_handler(
                 q, config, registered_variables, params, CONSERVATIVE_GAS_STATE
@@ -602,15 +563,6 @@ def _ssprk4_hydro(
     rhs = _stage_remat(rhs, config)
 
     def finalize(q):
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         return q
 
     return ssprk4(conserved_state, dt, rhs=rhs, pre_stage=_stage_remat(pre_stage, config),
@@ -652,15 +604,6 @@ def _lsrk4_hydro(
     dtdz = dt / grid_spacing
 
     def pre_stage(q):
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         if config.boundary_handling == GHOST_CELLS:
             q = _boundary_handler(
                 q, config, registered_variables, params, CONSERVATIVE_GAS_STATE
@@ -682,8 +625,6 @@ def _lsrk4_hydro(
         use_fused_pallas = (
             _hydro_pallas_flux_supported(q, config)
             and not density_fluxes_needed
-            and not config.positivity_config.deepvoid_blend
-            and not config.positivity_config.preserving_flux
             and not config.positivity_config.coldcrush_blend
         )
 
@@ -748,15 +689,6 @@ def _lsrk4_hydro(
     lsrk_increment = _stage_remat(lsrk_increment, config)
 
     def finalize(q):
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         return q
 
     return lsrk4(
@@ -850,9 +782,7 @@ def _lsrk4_with_ct(
         # to skip it, which silently switched every blend option off for MHD
         # under RK4_LSRK. The low-storage stage increment is dt * L(q), so the
         # admissibility checks use the full-step dt / dx (as _lsrk4_hydro does).
-        blend = (config.positivity_config.deepvoid_blend
-                 or config.positivity_config.preserving_flux
-                 or config.positivity_config.coldcrush_blend)
+        blend = config.positivity_config.coldcrush_blend
 
         # x-axis: fold the LSRK4 ``a_coef * dq + ...`` step into the
         # first axis's div kernel via ``scale_in`` so ``rhs_q`` is never
@@ -999,15 +929,6 @@ def _lsrk4_with_ct(
 
     def pre_stage(u):
         q, bx, by, bz = u
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
-        )
         if config.boundary_handling == GHOST_CELLS:
             q = _boundary_handler(
                 q, config, registered_variables, params, CONSERVATIVE_GAS_STATE,
@@ -1038,15 +959,6 @@ def _lsrk4_with_ct(
         q, bx, by, bz = u
         q = update_cell_center_fields(
             q, bx, by, bz, config, registered_variables,
-        )
-        q = _apply_stage_positivity(
-            q, config.positivity_config.per_stage_mode, config, gamma,
-            params.minimum_density, params.minimum_pressure,
-            params.positivity_max_velocity, registered_variables,
-            minimum_specific_pressure=(
-                params.minimum_specific_pressure
-                if config.positivity_config.per_stage_specific_floor else 0.0
-            ),
         )
         return (q, bx, by, bz)
 

@@ -26,12 +26,7 @@ parser.add_argument("--tcross", type=float, default=5.0)
 parser.add_argument("--nsnap", type=int, default=100)
 parser.add_argument("--backend", choices=["native", "pallas"], default="native")
 parser.add_argument("--precision", type=int, default=32)
-parser.add_argument("--prot", type=int, default=0)
-parser.add_argument("--stage", choices=["none", "floor", "redist"], default="none")
-parser.add_argument("--step", choices=["none", "floor", "redist"], default="none")
-parser.add_argument("--vacuum-rest", type=int, default=0)
-parser.add_argument("--blend", type=int, default=0)
-parser.add_argument("--pp", type=int, default=0)
+parser.add_argument("--step", choices=["none", "floor"], default="none")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--clamp", type=int, default=1,
                     help="PositivityConfig.clamp_in_estimates (0 = no read-only or step-end clamps)")
@@ -93,11 +88,10 @@ from astronomix.option_classes.simulation_config import (
     ISOTHERMAL,
     POSITIVITY_HARD_FLOOR,
     POSITIVITY_NONE,
-    POSITIVITY_REDISTRIBUTE,
     SINGLE_PRECISION,
 )
 
-POSITIVITY_MODES = dict(none=POSITIVITY_NONE, floor=POSITIVITY_HARD_FLOOR, redist=POSITIVITY_REDISTRIBUTE)
+POSITIVITY_MODES = dict(none=POSITIVITY_NONE, floor=POSITIVITY_HARD_FLOOR)
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out", "turb")
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -121,14 +115,10 @@ config = SimulationConfig(
     backend_config=BackendConfig(backend=NATIVE_JAX if args.backend == "native" else PALLAS),
     boundary_settings=BoundarySettings(periodic, periodic, periodic),
     turbulent_forcing_config=TurbulentForcingConfig(
-        turbulent_forcing=True, ou_forcing=True, vacuum_protection=bool(args.prot),
+        turbulent_forcing=True, ou_forcing=True,
     ),
     positivity_config=PositivityConfig(
-        per_stage_mode=POSITIVITY_MODES[args.stage],
         per_step_mode=POSITIVITY_MODES[args.step],
-        vacuum_rest=bool(args.vacuum_rest),
-        deepvoid_blend=bool(args.blend),
-        preserving_flux=bool(args.pp),
         clamp_in_estimates=bool(args.clamp),
     ),
     return_snapshots=False,
@@ -148,8 +138,6 @@ params = SimulationParams(
         forcing_amplitude=3.5,
         correlation_time=0.5,
         forcing_wavenumber=3.0 * np.pi,
-        protection_density_threshold=args.rhomin,
-        protection_max_velocity=50.0,
     ),
     minimum_density=args.rhomin,
     minimum_pressure=args.pmin,

@@ -276,12 +276,6 @@ def _fd_gravity_source(
             config, params, registered_variables,
         )
 
-    if config.gravity_config.limit_internal_energy_work and \
-            config.gravity_config.self_gravity_version != SIMPLE_SOURCE:
-        S = _limit_internal_energy_work(
-            S, primitive_state, gravitational_potential, dt, config, params, registered_variables
-        )
-
     return S
 
 
@@ -420,62 +414,6 @@ def _fourth_order_work_correction(primitive_state, gravitational_potential, axis
     return 0.5 * (centre + _shift(centre, -1, axis=spatial_axis))
 
 
-def _limit_internal_energy_work(
-    S,
-    primitive_state,
-    gravitational_potential,
-    dt,
-    config: SimulationConfig,
-    params: SimulationParams,
-    registered_variables: RegisteredVariables,
-):
-    """Apply the non-kinetic part of the gravitational energy source only as
-    far as the cell's internal energy can absorb it (non-conservative backstop).
-
-    The kinetic part of the gravitational work is v . (rho a), the change the
-    momentum source makes to the kinetic energy; the rest, D, changes the
-    internal energy. Where D drains internal energy faster than half of it per
-    wave-crossing time dx / (|v| + c), it is scaled down to that rate. The
-    budget is a RATE, so the limiter does not depend on dt. With
-    ``work_flux_correction`` this only sees what no conservative split of the
-    work can supply (mass lifted by numerical diffusion in cold gas), so the
-    energy it rejects is confined to those cells.
-
-    Args:
-        S: The full-state gravity source over the stage time step.
-        primitive_state: The primitive state of the stage.
-        gravitational_potential: The total potential.
-        dt: The stage time step.
-        config: The simulation configuration.
-        params: The simulation parameters.
-        registered_variables: The registered variables.
-
-    Returns:
-        The source with the limited energy component.
-    """
-    del gravitational_potential
-    energy_index = registered_variables.energy_index
-    rho = primitive_state[registered_variables.density_index]
-    gamma = params.gamma
-    pressure = jnp.maximum(primitive_state[registered_variables.pressure_index], 0.0)
-    internal_energy = pressure / (gamma - 1.0)
-    speed = jnp.sqrt(sum(primitive_state[axis] ** 2 for axis in range(1, config.dimensionality + 1)))
-    wave_speed = speed + jnp.sqrt(gamma * pressure / jnp.maximum(rho, 1e-30))
-
-    kinetic_work = sum(
-        primitive_state[axis] * S[axis] for axis in range(1, config.dimensionality + 1)
-    )
-    internal_work = S[energy_index] - kinetic_work
-    internal_rate = internal_work / jnp.maximum(dt, 1e-30)
-    budget = 0.5 * internal_energy * wave_speed / config.grid_spacing
-    theta = jnp.where(
-        internal_rate < -budget,
-        budget / jnp.maximum(-internal_rate, 1e-30),
-        1.0,
-    )
-    return S.at[energy_index].set(kinetic_work + theta * internal_work)
-
-# @jaxtyped(typechecker=typechecker)
 @partial(
     jax.jit, static_argnames=["axis", "grid_spacing", "registered_variables", "config"]
 )

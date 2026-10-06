@@ -18,7 +18,6 @@ parser.add_argument("--n", type=int, default=32)
 parser.add_argument("--e0", type=float, default=0.2)
 parser.add_argument("--steps", default="250,500,1000,2000,4000")
 parser.add_argument("--coupling", default="fourth", choices=["second", "fourth"])
-parser.add_argument("--limit-work", type=int, default=0)
 parser.add_argument("--fct", type=int, default=0)
 parser.add_argument("--tag", default="")
 args = parser.parse_args()
@@ -61,7 +60,7 @@ from astronomix.option_classes.simulation_config import (
 
 GAMMA = 5.0 / 3.0
 periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
-gravity_kwargs = dict(limit_internal_energy_work=bool(args.limit_work))
+gravity_kwargs = {}
 if args.fct:
     gravity_kwargs["work_flux_correction"] = True
 
@@ -107,9 +106,9 @@ for num_timesteps in [int(s) for s in args.steps.split(",")]:
     final = np.asarray(snapshots.final_state)
     error = float(abs(total[-1] - total[0]) / abs(total[0]))
     results.append((num_timesteps, error, float(final[registered_variables.pressure_index].min())))
-    print(f"[{weno_variant_name()}{args.tag} limit={args.limit_work} fct={args.fct}] steps={num_timesteps:6d} "
+    print(f"[{weno_variant_name()}{args.tag} fct={args.fct}] steps={num_timesteps:6d} "
           f"dE/E={error:.3e} min p={results[-1][2]:.3e}", flush=True)
 
 orders = [np.log2(results[k][1] / results[k + 1][1]) for k in range(len(results) - 1)]
-print(f"DT-ORDER [{weno_variant_name()}{args.tag} limit={args.limit_work} fct={args.fct}] "
+print(f"DT-ORDER [{weno_variant_name()}{args.tag} fct={args.fct}] "
       + " ".join(f"{o:.2f}" for o in orders), flush=True)

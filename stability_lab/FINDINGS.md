@@ -591,6 +591,70 @@ documented as read-only but is not:
     MHD (shared GPU, noisy);
   * Pallas, end to end: 128³ isothermal MHD in 133-136 s, *faster* than the
     recipe's 179 s, because no velocity spikes collapse dt.
+  * Ideal MHD with the joint inflow limiter (`profile_pp.py`, 256³ fp32 A100,
+    Mach-20 turbulence state, component medians):
+
+    | | no PP | array recombination | fused kernels (69c1218+) |
+    |---|---|---|---|
+    | SSPRK(5,4)+CT step | 160 ms | 453 ms | **240 ms** (1.50x) |
+    | WENO kernel per sweep | 12.5 ms | 13.9 | 14.0 |
+    | recombination per sweep | - | 16 | ~2.5 (near its bandwidth floor) |
+    | inflow reference per stage | - | 20 | 4.2 |
+    | temporaries | 3.3 GB | 12.4 GB | 5.0 GB |
+
+    The remaining 1.5x is structural: the 17-channel split output, one
+    recombination pass per sweep and one reference pass per stage.
+
+## Is there a deeper result? One principle, two open assumptions
+
+Every defect found here broke the same property: **each forward-Euler stage
+must be a convex combination of admissible states** (invariant-domain
+preservation). In order of discovery:
+
+* the face basis was built from a non-state;
+* per-field splitting speeds made the frozen-basis splitting non-monotone;
+* unlimited WENO face values left the domain;
+* the normal-B flux was zeroed, so the update was no longer the combination;
+* stage states were not re-synced;
+* the register-form SSPRK was non-convex under that re-sync;
+* the per-axis inflow pairs used the wrong decomposition in multi-D;
+* (gravity) the conservative work flux was not a convex split.
+
+Each fix restores the property, and nothing else is needed.
+
+With the joint limiter, two assumptions remain unenforced. Both were measured
+on the hardest state (`invariant_domain_audit.py`: 256³ Mach 20, t = 0.70 t_c,
+just before the old failure):
+
+1. **The axis-summed first-order inflow B_i is admissible.**
+   * It keeps at least **57 %** of the cell's pressure in every cell (71 %
+     at the 1e-5 quantile).
+   * A guarantee for all states needs Wu & Shu's div-B condition; the data
+     say it is far from binding.
+2. **The local Courant condition lambda_FE sum_d S_d,i <= 1** of the stiffest
+   stage, with the stage's own speeds.
+   * This is the sharp positivity time step,
+     dt = 1.508 dx / max_i sum_d S_d,i. It is per cell; the code's CFL uses a
+     sum over axes of global maxima.
+   * In the code's units the sharp bound is C = 0.88 (isothermal MHD), 0.99
+     (adiabatic MHD) and 1.05 (isothermal hydro), against the generic 0.754.
+   * At the nominal C = 1.5 the local condition fails in 3.7 % (adiabatic)
+     to 19 % (isothermal MHD) of the cells, including low-density ones, and
+     the runs survive. So the bound is worst-case, not tight.
+
+Things that are not hiding:
+
+* **A minimum-entropy principle.** After one step, 0.34 % of cells undershoot
+  the local minimum specific entropy (worst 0.84x). The lowest-pressure
+  cells do not (1.01x). Positivity is the binding constraint where it
+  matters.
+* **Isothermal hydro at Mach 10, CFL 0.9.** It fails although, at the start
+  of the step before its NaN, density is positive (min 6.7e-8) and the local
+  Courant number is <= 0.86 everywhere. So the failure comes from inside the
+  steps that follow. The likely cause is near-vacuum signal speeds growing with
+  v = m/rho across the stages, which would break assumption 2 with stage
+  speeds. This is NOT verified by stepping. A stage-level Courant check with
+  step rejection would close it; open.
 
 ## Side findings (fixed)
 

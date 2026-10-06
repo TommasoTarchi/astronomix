@@ -10,7 +10,6 @@ solenoidal forcing fields follows https://arxiv.org/pdf/2304.04360.
 """
 
 # general
-import itertools
 from functools import partial
 
 # numerics
@@ -316,119 +315,12 @@ def _apply_ou_forcing(
     primitive_state = primitive_state.at[vy_i].add(amp * g[1])
     primitive_state = primitive_state.at[vz_i].add(amp * g[2])
 
-    # Conservative vacuum protection (HOW-MHD `prot`, called after forcing every
-    # step in forc.f): neighbour-redistribute sub-threshold (vacuum) cells. This
-    # was previously only wired into the white-forcing path; the OU path missed
-    # it entirely.
-    if config.turbulent_forcing_config.vacuum_protection:
-        primitive_state = _vacuum_protection(
-            primitive_state,
-            turbulent_forcing_params.protection_density_threshold,
-            turbulent_forcing_params.protection_max_velocity,
-            config,
-            registered_variables,
-        )
-
     return (key, f), primitive_state
 
 
 # -------------------------------------------------------------
 # ===== ↑ Ornstein-Uhlenbeck (temporally correlated) forcing ↑ =====
 # -------------------------------------------------------------
-
-
-@partial(jax.jit, static_argnames=["config", "registered_variables"])
-def _vacuum_protection(
-    primitive_state,
-    rhopmin: float,
-    vel_max: float,
-    config: SimulationConfig,
-    registered_variables: RegisteredVariables,
-):
-    """
-    Applies the vacuum protection routine.
-
-    For cells where density < rhopmin, it averages the density and momentum
-    over the 3x3x3 neighborhood of valid cells, and clips velocities to vel_max.
-
-    NOTE: this is taken from the HOW-MHD Fortran code; this kind of protection
-    is not mentioned in the paper, but without it turbulent simulations crash.
-    """
-    # Extract the current primitive fields.
-    rho = primitive_state[registered_variables.density_index]
-    vx = primitive_state[registered_variables.velocity_index.x]
-    vy = primitive_state[registered_variables.velocity_index.y]
-    vz = primitive_state[registered_variables.velocity_index.z]
-
-    # Reconstruct the conserved momentum (matches q(iw, 2:4) in the Fortran).
-    mom_x = rho * vx
-    mom_y = rho * vy
-    mom_z = rho * vz
-
-    # Identify vacuum (invalid) cells and healthy (valid) cells.
-    is_invalid = rho <= rhopmin
-    is_valid = ~is_invalid
-
-    # Zero out invalid cells so they do not contribute to the neighborhood sum.
-    rho_valid = rho * is_valid
-    mom_x_valid = mom_x * is_valid
-    mom_y_valid = mom_y * is_valid
-    mom_z_valid = mom_z * is_valid
-    count_valid = is_valid.astype(rho.dtype)
-
-    # Sum a field over the local 3x3x3 neighborhood using periodic shifts. The
-    # itertools product handles 1D, 2D and 3D uniformly.
-    def sum_neighbors(arr):
-        out = jnp.zeros_like(arr)
-        offsets = [-1, 0, 1]
-        axes = tuple(range(config.dimensionality))
-        for shift in itertools.product(offsets, repeat=config.dimensionality):
-            out += jnp.roll(arr, shift=shift, axis=axes)
-        return out
-
-    # Sums over the valid neighbors.
-    rho_sum = sum_neighbors(rho_valid)
-    mom_x_sum = sum_neighbors(mom_x_valid)
-    mom_y_sum = sum_neighbors(mom_y_valid)
-    mom_z_sum = sum_neighbors(mom_z_valid)
-    count_sum = sum_neighbors(count_valid)
-
-    # Guard the division for cells that have no valid neighbors at all.
-    has_valid_neighbors = count_sum > 0
-    count_safe = jnp.where(has_valid_neighbors, count_sum, 1.0)
-    rho_sum_safe = jnp.where(has_valid_neighbors, rho_sum, 1.0)
-
-    # Patched density: the neighbor average, falling back to the floor.
-    rho_patched = jnp.where(has_valid_neighbors, rho_sum / count_safe, rhopmin)
-
-    # If an invalid cell has NO valid neighbors, the Fortran explicitly dampens
-    # the velocity by dividing the old momentum by the rhopmin floor.
-    vx_isolated = mom_x / rhopmin
-    vy_isolated = mom_y / rhopmin
-    vz_isolated = mom_z / rhopmin
-
-    vx_patched = jnp.where(has_valid_neighbors, mom_x_sum / rho_sum_safe, vx_isolated)
-    vy_patched = jnp.where(has_valid_neighbors, mom_y_sum / rho_sum_safe, vy_isolated)
-    vz_patched = jnp.where(has_valid_neighbors, mom_z_sum / rho_sum_safe, vz_isolated)
-
-    # Apply the velocity ceiling strictly to the patched cells.
-    vx_patched = jnp.clip(vx_patched, -vel_max, vel_max)
-    vy_patched = jnp.clip(vy_patched, -vel_max, vel_max)
-    vz_patched = jnp.clip(vz_patched, -vel_max, vel_max)
-
-    # Merge the patched cells back into the global state.
-    rho_new = jnp.where(is_invalid, rho_patched, rho)
-    vx_new = jnp.where(is_invalid, vx_patched, vx)
-    vy_new = jnp.where(is_invalid, vy_patched, vy)
-    vz_new = jnp.where(is_invalid, vz_patched, vz)
-
-    # Reconstruct the final primitive array.
-    primitive_new = primitive_state.at[registered_variables.density_index].set(rho_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.x].set(vx_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.y].set(vy_new)
-    primitive_new = primitive_new.at[registered_variables.velocity_index.z].set(vz_new)
-
-    return primitive_new
 
 
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
@@ -502,15 +394,5 @@ def _apply_forcing(
     primitive_state = primitive_state.at[registered_variables.velocity_index.x].add(amp * wx_real)
     primitive_state = primitive_state.at[registered_variables.velocity_index.y].add(amp * wy_real)
     primitive_state = primitive_state.at[registered_variables.velocity_index.z].add(amp * wz_real)
-
-    # Protect against vacuum cells created by the forcing.
-    if config.turbulent_forcing_config.vacuum_protection:
-        primitive_state = _vacuum_protection(
-            primitive_state,
-            turbulent_forcing_params.protection_density_threshold,
-            turbulent_forcing_params.protection_max_velocity,
-            config,
-            registered_variables
-        )
 
     return key, primitive_state

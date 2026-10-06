@@ -15,8 +15,6 @@ parser.add_argument("--mturb", type=float, default=10.0)
 parser.add_argument("--mhd", type=int, default=1)
 parser.add_argument("--cfl", type=float, default=1.5)
 parser.add_argument("--rhomin", type=float, default=1e-10)
-parser.add_argument("--pp", type=int, default=0)
-parser.add_argument("--blend-factor", type=float, default=0.0)
 parser.add_argument("--precision", type=int, default=32)
 parser.add_argument("--backend", choices=["native", "pallas"], default="native")
 args = parser.parse_args()
@@ -70,11 +68,7 @@ config = SimulationConfig(
     numerical_precision=DOUBLE_PRECISION if args.precision == 64 else SINGLE_PRECISION,
     backend_config=BackendConfig(backend=NATIVE_JAX if args.backend == "native" else PALLAS),
     boundary_settings=BoundarySettings(periodic, periodic, periodic),
-    positivity_config=PositivityConfig(
-        preserving_flux=bool(args.pp),
-        deepvoid_blend=args.blend_factor > 0,
-        deepvoid_blend_factor=args.blend_factor if args.blend_factor > 0 else 8.0,
-    ),
+    positivity_config=PositivityConfig(clamp_in_estimates=False),
     return_snapshots=True,
     num_snapshots=args.nsnap,
     **weno_variant_kwargs(),
