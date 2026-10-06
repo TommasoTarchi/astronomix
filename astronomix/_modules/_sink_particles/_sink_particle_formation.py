@@ -18,6 +18,7 @@ uniform grid, so every cell is already on the highest level of refinement.
 """
 
 # general
+import inspect
 from functools import partial
 
 # numerics
@@ -26,6 +27,23 @@ import numpy as np
 # jax
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
+
+try:  # the stable alias (newer jax)
+    from jax import shard_map as _shard_map
+except ImportError:  # pragma: no cover - older jax
+    from jax.experimental.shard_map import shard_map as _shard_map
+
+# The keyword that turns off shard_map's check that an output is the same on
+# every device, which it cannot infer through the collectives used below.
+_NO_REPLICATION_CHECK = (
+    {"check_vma": False}
+    if "check_vma" in inspect.signature(_shard_map).parameters
+    else {"check_rep": False}
+)
+
+# astronomix helpers
+from astronomix._pallas_helpers import _current_pallas_mesh
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
@@ -359,6 +377,104 @@ def _select_separated_candidates(
     )
 
 
+def _collect_candidates(
+    candidate_mask: jax.Array,
+    max_num_candidates: int,
+) -> tuple[jax.Array, jax.Array]:
+    """
+    The first ``max_num_candidates`` candidate cells, in the grid's row-major
+    order, and the number of candidate cells.
+
+    On one device this is ``jnp.nonzero`` with a fixed size. When the grid is
+    split across devices (a mesh set by ``pallas_mesh_context``, as
+    ``time_integration`` does for a sharded run), ``jnp.nonzero`` on the
+    global mask would make every device gather the whole mask. Instead, each
+    device lists the first ``max_num_candidates`` candidates of its own part
+    of the grid, in global indices, and only these short lists are gathered.
+    Sorting them in row-major order gives the same list as on one device: a
+    cell among the first ``max_num_candidates`` of the grid is also among the
+    first ``max_num_candidates`` of its device.
+
+    Args:
+        candidate_mask: Boolean mask of the candidate cells, shape of the
+            (padded) grid.
+        max_num_candidates: The length of the list.
+
+    Returns:
+        ``(candidate_indices, num_candidates_found)``: the cell indices, shape
+        (max_num_candidates, 3), with unused entries set to 0, and the total
+        number of candidate cells.
+    """
+    grid_shape = candidate_mask.shape
+
+    # The distributed list needs a 4-axis state mesh (variables, x, y, z) that
+    # splits the grid evenly; otherwise the mask is searched as a whole.
+    mesh = _current_pallas_mesh()
+    split = False
+    if mesh is not None and len(mesh.axis_names) == 4:
+        devices_per_axis = [mesh.shape[name] for name in mesh.axis_names[1:]]
+        split = any(num > 1 for num in devices_per_axis) and all(
+            size % num == 0 for size, num in zip(grid_shape, devices_per_axis)
+        )
+    if not split:
+        candidate_indices = jnp.stack(
+            jnp.nonzero(candidate_mask, size=max_num_candidates, fill_value=0),
+            axis=-1,
+        )
+        return candidate_indices, jnp.sum(candidate_mask)
+
+    # The state mesh may use integer axis names, which JAX's named collectives
+    # would read as array axes. Alias the same devices (same order, so no data
+    # movement) under string names, as the distributed Poisson solve does.
+    axis_names = ("x", "y", "z")
+    named_mesh = jax.sharding.Mesh(mesh.devices, ("vars",) + axis_names)
+
+    def _local_list(local_mask):
+        # The first candidates of this device's part of the grid, in global
+        # indices: local index + device index × local size along each axis.
+        local_indices = jnp.stack(
+            jnp.nonzero(local_mask, size=max_num_candidates, fill_value=0),
+            axis=-1,
+        )
+        offsets = jnp.stack(
+            [
+                jax.lax.axis_index(name) * local_mask.shape[axis]
+                for axis, name in enumerate(axis_names)
+            ]
+        )
+        local_count = jnp.sum(local_mask)
+        local_is_valid = jnp.arange(max_num_candidates) < local_count
+
+        # Gather the short lists of all devices, shape
+        # (num_devices × max_num_candidates, ...), and the total count.
+        indices = jax.lax.all_gather(
+            local_indices + offsets, axis_names, tiled=True
+        )
+        is_valid = jax.lax.all_gather(local_is_valid, axis_names, tiled=True)
+        num_candidates_found = jax.lax.psum(local_count, axis_names)
+
+        # Valid entries first, in row-major order (x, then y, then z). A
+        # lexicographic sort avoids a flat index, which overflows int32 on
+        # large grids.
+        order = jnp.lexsort(
+            (indices[:, 2], indices[:, 1], indices[:, 0], ~is_valid)
+        )[:max_num_candidates]
+        candidate_indices = jnp.where(
+            is_valid[order, None],
+            indices[order],
+            0,
+        )
+        return candidate_indices, num_candidates_found
+
+    return _shard_map(
+        _local_list,
+        mesh=named_mesh,
+        in_specs=(PartitionSpec(*axis_names),),
+        out_specs=(PartitionSpec(), PartitionSpec()),
+        **_NO_REPLICATION_CHECK,
+    )(candidate_mask)
+
+
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _form_sink_particles(
     primitive_state: STATE_TYPE,
@@ -460,10 +576,9 @@ def _form_sink_particles(
     # JIT needs fixed array sizes, so the candidate cells are collected into a
     # list of fixed length; unused entries are marked as invalid.
     max_num_candidates = sink_particle_config.max_num_candidates
-    num_candidates_found = jnp.sum(candidate_mask)
-    candidate_indices = jnp.stack(
-        jnp.nonzero(candidate_mask, size=max_num_candidates, fill_value=0),
-        axis=-1,
+    candidate_indices, num_candidates_found = _collect_candidates(
+        candidate_mask,
+        max_num_candidates,
     )
     candidate_is_valid = jnp.arange(max_num_candidates) < num_candidates_found
 
