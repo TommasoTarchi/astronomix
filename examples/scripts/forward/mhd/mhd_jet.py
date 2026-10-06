@@ -58,7 +58,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 # jax
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P, NamedSharding
+from jax.sharding import AxisType, PartitionSpec as P, NamedSharding
 
 # astronomix constants
 from astronomix import PERIODIC_BOUNDARY
@@ -175,7 +175,13 @@ def simulate(num_cells):
     # Domain-decompose along the x axis across the GPUs. With NUM_GPUS == 1 this
     # is a trivial single-device mesh, so the single- and multi-GPU paths share
     # exactly the same code (and the same numerics).
-    mesh = jax.make_mesh((1, NUM_GPUS, 1, 1), (VARAXIS, XAXIS, YAXIS, ZAXIS))
+    # Auto mesh axes: newer jax defaults to Explicit, which the helper data's
+    # with_sharding_constraint does not accept.
+    mesh = jax.make_mesh(
+        (1, NUM_GPUS, 1, 1),
+        (VARAXIS, XAXIS, YAXIS, ZAXIS),
+        axis_types=(AxisType.Auto,) * 4,
+    )
     sharding = NamedSharding(mesh, P(VARAXIS, XAXIS, YAXIS, ZAXIS))
 
     # -------------------------------------------------------------
