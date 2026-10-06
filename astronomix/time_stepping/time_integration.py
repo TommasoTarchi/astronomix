@@ -10,10 +10,16 @@ available options see the simulation configuration and the simulation parameters
 """
 
 # general
+import warnings
 from contextlib import nullcontext
+from timeit import default_timer as timer
 
 # typing
-from typing import Any, NamedTuple, Union
+from typing import (
+    Any,
+    NamedTuple,
+    Union,
+)
 from types import NoneType
 
 # jax
@@ -21,6 +27,9 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec
 from jax.experimental import checkify
+
+# numerics
+import numpy as np
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
@@ -34,7 +43,7 @@ from astronomix.option_classes.simulation_config import (
     PERIODIC_ROLL,
     RK4_LSRK,
     STATE_TYPE,
-    TO_DISK
+    TO_DISK,
 )
 
 # astronomix containers
@@ -54,15 +63,19 @@ from astronomix._finite_volume._timestep_estimation._timestep_estimator import (
 )
 from astronomix._finite_difference._timestep_estimation._timestep_estimator import (
     _cfl_time_step_fd,
-    _cfl_time_step_fd_hydro
+    _cfl_time_step_fd_hydro,
 )
+from astronomix._fluid_equations._passive_scalars import _fill_scalar_ghost_cells
 from astronomix._modules._iteration_level_updates import _iteration_level_updates
 from astronomix._modules._turbulent_forcing._turbulent_forcing import _init_ou_forcing_state
 from astronomix._snapshotting._snapshot_diagnostics import (
     build_snapshot_store,
     record_snapshot,
 )
-from astronomix.time_stepping._utils import _pad, _unpad
+from astronomix.time_stepping._utils import (
+    _pad,
+    _unpad,
+)
 from astronomix.data_classes.simulation_helper_data import (
     _helper_data_requirements,
     _unpad_helper_data,
@@ -72,7 +85,10 @@ from astronomix._geometry.boundaries import _boundary_handler
 from astronomix._pallas_helpers import pallas_mesh_context
 
 # progress bar
-from astronomix.time_stepping._progress_bar import _show_progress
+from astronomix.time_stepping._progress_bar import (
+    _reset_progress_log,
+    _show_progress,
+)
 
 # generic time-integration loop driver
 from astronomix.time_stepping._time_loop import (
@@ -83,9 +99,6 @@ from astronomix.time_stepping._time_loop import (
     integrate,
     times_close,
 )
-
-# timing
-from timeit import default_timer as timer
 
 
 class LoopState(NamedTuple):
@@ -118,8 +131,9 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
       solver mode: the 2N-storage LSRK4 integrator and the fused Pallas kernels
       on the finite-difference path, plus donating the input state buffers.
     - The solver going unstable and producing NaNs (caught by ``checkify`` when
-      ``runtime_debugging`` is on). We suggest the stability knobs: positivity
-      protection, a positivity-preserving limiter, and a smaller CFL number.
+      ``runtime_debugging`` is on). We suggest the stability knobs: the
+      positivity-preserving WENO (finite difference), a positivity-preserving
+      limiter (finite volume), and a smaller CFL number.
 
     The original error is always re-raised so callers and tracebacks are
     unchanged; the hints are printed alongside it as a convenience.
@@ -174,8 +188,8 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
         )
         hints.append(
             "  - finite difference: enable the positivity-preserving WENO, "
-            "config.weno_positivity_preserving = True (provable for "
-            "C_cfl <= 0.75)."
+            "config.weno_positivity_preserving = True (provably positive for "
+            "C_cfl <= 0.75 with SSPRK4)."
         )
         hints.append(
             "  - finite volume: use a positivity-preserving limiter such as "
@@ -192,7 +206,6 @@ def _raise_with_time_integration_hint(error: Exception, config: SimulationConfig
     raise error
 
 
-# @jaxtyped(typechecker=typechecker)
 def time_integration(
     primitive_state: STATE_TYPE,
     config: SimulationConfig,
@@ -215,7 +228,11 @@ def time_integration(
         snapshot_callable: A callable which is called at certain time points
             if config.activate_snapshot_callback is True. The callable must
             have the signature
-                callable(time: float, state: STATE_TYPE, registered_variables: RegisteredVariables) -> None
+                callable(
+                    time: float,
+                    state: STATE_TYPE,
+                    registered_variables: RegisteredVariables,
+                ) -> None
             and can be used to e.g. output the current state to disk or
             directly produce intermediate plots. Note that inside the callable,
             to pass data to memory, one must use
@@ -237,8 +254,11 @@ def time_integration(
     Returns:
         Depending on the configuration (return_snapshots, num_snapshots)
         either the final state of the fluid after the time
-        integration of snapshots of the time evolution.
+        integration or snapshots of the time evolution.
 
+    Warns:
+        RuntimeWarning: If an adaptive run stops before ``params.t_end``
+            because its time step can no longer advance the clock.
     """
 
     # Here we prepare everything for the actual time integration function,
@@ -246,6 +266,10 @@ def time_integration(
     # runtime debugging via checkify if requested, printing the elapsed
     # time if requested, compiling the function for memory analysis if
     # requested, etc.
+
+    # Every run starts a fresh plain-text progress log.
+    if config.progress_bar:
+        _reset_progress_log()
 
     # depending on the boundary handling, we might need to pad the state
     #  - for periodic boundaries implicitly enforced by only rolling arrays
@@ -360,47 +384,48 @@ def time_integration(
         # Multi-GPU Pallas: the Pallas kernels (WENO, divergence, positivity)
         # are opaque to GSPMD, so on a sharded input XLA would otherwise
         # all-gather the full state on every device before each
-        # ``pallas_call``. ``pallas_mesh_context`` flips them into a
-        # ``shard_map`` + ppermute halo-exchange shape instead, which is
-        # the difference between ~0.95x and ~2x strong-scaling on FD
-        # Pallas. The context only needs to be live while the JIT body is
-        # traced; it is read by ``_pallas_call_sharded`` at trace time.
+        # ``pallas_call``, which removes any strong-scaling gain.
+        # ``pallas_mesh_context`` flips them into a ``shard_map`` + ppermute
+        # halo-exchange shape instead. The context only needs to be live
+        # while the JIT body is traced; it is read by ``_pallas_call_sharded``
+        # at trace time.
         pallas_mesh = sharding.mesh if sharding is not None else None
         pallas_spec = sharding.spec if sharding is not None else None
         if config.memory_analysis:
-          with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
-            compiled_step = time_integration_jit.lower(
-                primitive_state,
-                config,
-                params,
-                registered_variables,
-                helper_data_pad,
-                snapshot_callable,
-            ).compile()
-            compiled_stats = compiled_step.memory_analysis()
-            if compiled_stats is not None:
-                # Calculate total memory usage including temporary storage,
-                # arguments, and outputs (but excluding aliases)
-                total = (
-                    compiled_stats.temp_size_in_bytes
-                    + compiled_stats.argument_size_in_bytes
-                    + compiled_stats.output_size_in_bytes
-                    - compiled_stats.alias_size_in_bytes
-                )
-                memory_stats = (
-                    int(compiled_stats.temp_size_in_bytes),
-                    int(compiled_stats.argument_size_in_bytes),
-                    int(total),
-                )
-                print("=== Compiled memory usage PER DEVICE ===")
-                print(
-                    f"Temp size: {compiled_stats.temp_size_in_bytes / (1024**2):.2f} MB"
-                )
-                print(
-                    f"Argument size: {compiled_stats.argument_size_in_bytes / (1024**2):.2f} MB"
-                )
-                print(f"Total size: {total / (1024**2):.2f} MB")
-                print("========================================")
+            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
+                compiled_step = time_integration_jit.lower(
+                    primitive_state,
+                    config,
+                    params,
+                    registered_variables,
+                    helper_data_pad,
+                    snapshot_callable,
+                ).compile()
+                compiled_stats = compiled_step.memory_analysis()
+                if compiled_stats is not None:
+                    # Calculate total memory usage including temporary storage,
+                    # arguments, and outputs (but excluding aliases)
+                    total = (
+                        compiled_stats.temp_size_in_bytes
+                        + compiled_stats.argument_size_in_bytes
+                        + compiled_stats.output_size_in_bytes
+                        - compiled_stats.alias_size_in_bytes
+                    )
+                    memory_stats = (
+                        int(compiled_stats.temp_size_in_bytes),
+                        int(compiled_stats.argument_size_in_bytes),
+                        int(total),
+                    )
+                    print("=== Compiled memory usage PER DEVICE ===")
+                    print(
+                        f"Temp size: {compiled_stats.temp_size_in_bytes / (1024**2):.2f} MB"
+                    )
+                    print(
+                        f"Argument size: "
+                        f"{compiled_stats.argument_size_in_bytes / (1024**2):.2f} MB"
+                    )
+                    print(f"Total size: {total / (1024**2):.2f} MB")
+                    print("========================================")
 
         if config.print_elapsed_time:
             if not config.memory_analysis:
@@ -449,9 +474,9 @@ def time_integration(
             from jax._src.sharding_impls import UnspecifiedValue as _Unspec
 
             def _force_concrete(leaf):
-                # tracers (``time_integration`` called inside an outer jit /
-                # grad, e.g. a sharded 4D-Var) have no ``.sharding`` -- and
-                # nothing to repair: the outer jit binds the output shardings
+                # Tracers (``time_integration`` called inside an outer jit or
+                # grad) carry no ``.sharding``, and there is nothing to repair:
+                # the outer jit binds the output shardings.
                 if isinstance(leaf, jax.core.Tracer):
                     return leaf
                 if isinstance(leaf, jax.Array) and isinstance(leaf.sharding, _Unspec):
@@ -473,7 +498,8 @@ def time_integration(
                 print(f"🔄 Number of iterations: {num_iterations}")
                 # print the time per iteration
                 print(
-                    f"⏱️ / 🔄 time per iteration: {(end_time - start_time) / num_iterations} seconds"
+                    f"⏱️ / 🔄 time per iteration: "
+                    f"{(end_time - start_time) / num_iterations} seconds"
                 )
                 final_state = final_state._replace(runtime=end_time - start_time)
 
@@ -488,51 +514,162 @@ def time_integration(
     return final_state
 
 
+def _seed_internal_energy(primitive_state, params, registered_variables):
+    """
+    Initialise the dual-energy internal-energy density ``g = p / (gamma - 1)``.
+
+    Accepts either a full state with the ``g`` slot present (overwritten) or a
+    ``g``-less state with one row less (``g`` inserted at its registered index,
+    in front of any passive scalars). This is restart-safe: ``g`` is re-synced
+    to ``p / (gamma - 1)`` at the end of every step, so a checkpointed ``g``
+    already equals ``p / (gamma - 1)`` and re-deriving it reproduces it.
+
+    Args:
+        primitive_state: The unpadded primitive state.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The primitive state with the registered number of variables and an
+        initialised ``g`` (unchanged when the dual energy is inactive).
+
+    Raises:
+        ValueError: If the state has neither the registered number of
+            variables nor one less.
+    """
+    if not registered_variables.internal_energy_active:
+        return primitive_state
+
+    internal_energy_index = registered_variables.internal_energy_index
+    initial_internal_energy_density = (
+        primitive_state[registered_variables.pressure_index] / (params.gamma - 1.0)
+    )
+    num_vars = registered_variables.num_vars
+    if primitive_state.shape[0] == num_vars:
+        return primitive_state.at[internal_energy_index].set(initial_internal_energy_density)
+    if primitive_state.shape[0] == num_vars - 1:
+        return jnp.concatenate(
+            [
+                primitive_state[:internal_energy_index],
+                initial_internal_energy_density[None, ...],
+                primitive_state[internal_energy_index:],
+            ],
+            axis=0,
+        )
+    raise ValueError(
+        f"the primitive state has {primitive_state.shape[0]} variables, but the "
+        f"dual-energy layout needs {num_vars} (or {num_vars - 1} without the "
+        "internal-energy slot, which is then inserted)"
+    )
+
+
 def _prepare_padded_state(primitive_state, config, params, registered_variables):
-    """Pad the primitive state with ghost cells and fill them via the boundary
+    """
+    Pad the primitive state with ghost cells and fill them via the boundary
     handler, exactly as a cold start does.
 
     The boundary handler only writes ghost cells (a deterministic function of
     the interior and ``params``), so re-running it on an unpadded state restored
-    from disk reproduces the ghost cells the loop would have held — keeping a
-    disk restart consistent with an uninterrupted run.
+    from disk reproduces the ghost cells the loop would have held, keeping a
+    disk restart consistent with an uninterrupted run. The dual-energy ``g``
+    must already be initialised (:func:`_seed_internal_energy`).
+
+    NOTE: the shock-history scalars are deliberately NOT re-derived here.
+    Unlike the dual-energy ``g``, which is a function of the current state and
+    so can be re-derived on every restart, they are genuine history variables:
+    ``entropy_initial`` is seeded once in ``construct_primitive_state`` and a
+    checkpointed value must be restored as-is.
+
+    Args:
+        primitive_state: The unpadded primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The padded primitive state with filled ghost cells.
     """
-    # Dual-energy: initialise the internal-energy density ``g = p/(gamma-1)`` as
-    # the last variable. Accept either a g-less state (append ``g``) or a full
-    # state with the slot present (overwrite it). This is restart-safe: ``g`` is
-    # re-synced to ``p/(gamma-1)`` at the end of every step, so a checkpointed
-    # ``g`` already equals ``p/(gamma-1)`` and re-deriving it reproduces it.
-    if registered_variables.internal_energy_active:
-        gidx = registered_variables.internal_energy_index
-        g0 = primitive_state[registered_variables.pressure_index] / (params.gamma - 1.0)
-        if primitive_state.shape[0] == gidx:
-            primitive_state = jnp.concatenate([primitive_state, g0[None, ...]], axis=0)
-        else:
-            primitive_state = primitive_state.at[gidx].set(g0)
-
-    # NOTE the shock-history scalars are deliberately NOT touched here. Unlike
-    # the dual-energy ``g``, which is a function of the current state and so can
-    # be re-derived on every restart, they are genuine history variables:
-    # ``entropy_initial`` is seeded once in ``construct_primitive_state`` and a
-    # checkpointed value must be restored as-is.
-
     if config.boundary_handling != PERIODIC_ROLL:
         primitive_state = _pad(primitive_state, config)
 
     if config.boundary_handling == GHOST_CELLS:
-        # important for active boundaries influencing
-        # the time step criterion for now only gas state
-        # The FV (PPCT) and FD MHD layouts keep their face / split field in the
-        # last three slots, which the gas boundary handler must not touch; the
-        # VL2 GLM-MHD layout is cell centred throughout.
-        if config.mhd and registered_variables.magnetic_psi_index < 0:
-            primitive_state = primitive_state.at[:-3, ...].set(
-                _boundary_handler(primitive_state[:-3, ...], config, registered_variables, params)
-            )
+        # Fill the ghost cells before the first time-step estimate, so that
+        # active boundaries enter the CFL criterion. The gas boundary handler
+        # must not touch the three-component magnetic block that the FV (PPCT)
+        # and FD MHD layouts keep behind the gas variables (the FD integrators
+        # fill the interface field's ghost cells before every stage); the VL2
+        # GLM-MHD layout is cell centred throughout and handled as a whole.
+        if config.mhd and not registered_variables.magnetic_psi_active:
+            if config.solver_mode == FINITE_DIFFERENCE:
+                # FD MHD layout: gas and cell-centred field, the interface
+                # field, then the optional dual-energy g and passive scalars.
+                # The trailing rows behind the interface field are scalars
+                # that keep their sign at a reflective wall, so they get the
+                # passive-scalar boundary fill. For open, periodic and
+                # reflective boundaries this gives g the same ghost cells as
+                # deriving it from the filled pressure, as the step does.
+                interface_field_start = registered_variables.interface_magnetic_field_index.x
+                trailing_rows_start = interface_field_start + 3
+                primitive_state = primitive_state.at[:interface_field_start, ...].set(
+                    _boundary_handler(
+                        primitive_state[:interface_field_start, ...],
+                        config,
+                        registered_variables,
+                        params,
+                    )
+                )
+                if primitive_state.shape[0] > trailing_rows_start:
+                    primitive_state = primitive_state.at[trailing_rows_start:, ...].set(
+                        _fill_scalar_ghost_cells(
+                            primitive_state[trailing_rows_start:, ...],
+                            config,
+                        )
+                    )
+            else:
+                # FV (PPCT) layout: the magnetic field in the last three slots.
+                primitive_state = primitive_state.at[:-3, ...].set(
+                    _boundary_handler(
+                        primitive_state[:-3, ...],
+                        config,
+                        registered_variables,
+                        params,
+                    )
+                )
         else:
-            primitive_state = _boundary_handler(primitive_state, config, registered_variables, params)
+            primitive_state = _boundary_handler(
+                primitive_state,
+                config,
+                registered_variables,
+                params,
+            )
 
     return primitive_state
+
+
+def _warn_if_clock_stalled(final_time, end_time):
+    """
+    Host callback: warn when an adaptive run stopped before its end time.
+
+    The adaptive loop stops early only when a step can no longer advance the
+    clock, so a final time below ``end_time`` means exactly that. Both
+    arguments may carry a batch dimension (``time_integration`` under
+    ``jax.vmap``).
+
+    Args:
+        final_time: The time the loop stopped at.
+        end_time: The requested end time.
+    """
+    final_time = np.asarray(final_time)
+    end_time = np.asarray(end_time)
+    if np.any(final_time < end_time):
+        warnings.warn(
+            f"time_integration stopped at t = {np.min(final_time):.6g}, before "
+            f"t_end = {np.max(end_time):.6g}: the time step can no longer advance "
+            "the clock (dt collapsed to zero or below the float resolution of t), "
+            "which usually means the run has become unstable. The returned state "
+            "is the state at which the clock stopped.",
+            RuntimeWarning,
+        )
 
 
 def _seed_key_and_forcing(config, params):
@@ -642,30 +779,47 @@ def _integrate_core(
                 if config.source_term_aware_timestep:
                     dt = jax.lax.stop_gradient(
                         _source_term_aware_time_step(
-                            primitive_state, config, params, helper_data_pad,
-                            registered_variables, time,
+                            primitive_state,
+                            config,
+                            params,
+                            helper_data_pad,
+                            registered_variables,
+                            time,
                         )
                     )
                 else:
                     dt = jax.lax.stop_gradient(
                         _cfl_time_step(
-                            primitive_state, config, params, registered_variables,
+                            primitive_state,
+                            config,
+                            params,
+                            registered_variables,
                         )
                     )
             elif config.solver_mode == FINITE_DIFFERENCE:
                 if config.mhd:
                     dt = jax.lax.stop_gradient(
                         _cfl_time_step_fd(
-                            primitive_state, config.grid_spacing, params.dt_max,
-                            params.gamma, config, params, registered_variables,
+                            primitive_state,
+                            config.grid_spacing,
+                            params.dt_max,
+                            params.gamma,
+                            config,
+                            params,
+                            registered_variables,
                             params.C_cfl,
                         )
                     )
                 else:
                     dt = jax.lax.stop_gradient(
                         _cfl_time_step_fd_hydro(
-                            primitive_state, config.grid_spacing, params.dt_max,
-                            params.gamma, config, params, registered_variables,
+                            primitive_state,
+                            config.grid_spacing,
+                            params.dt_max,
+                            params.gamma,
+                            config,
+                            params,
+                            registered_variables,
                             params.C_cfl,
                         )
                     )
@@ -686,20 +840,37 @@ def _integrate_core(
 
         # modules that run every time step
         key, forcing, primitive_state = _iteration_level_updates(
-            primitive_state, key, forcing, dt, config, params, helper_data_pad,
-            registered_variables, time + dt,
+            primitive_state,
+            key,
+            forcing,
+            dt,
+            config,
+            params,
+            helper_data_pad,
+            registered_variables,
+            time + dt,
         )
 
         # evolve the state
         if config.solver_mode == FINITE_VOLUME:
             primitive_state = _evolve_state_fv(
-                primitive_state, dt, params.gamma, config, params,
-                helper_data_pad, registered_variables,
+                primitive_state,
+                dt,
+                params.gamma,
+                config,
+                params,
+                helper_data_pad,
+                registered_variables,
             )
         elif config.solver_mode == FINITE_DIFFERENCE:
             primitive_state = _evolve_state_fd(
-                primitive_state, dt, params.gamma, config, params,
-                helper_data_pad, registered_variables,
+                primitive_state,
+                dt,
+                params.gamma,
+                config,
+                params,
+                helper_data_pad,
+                registered_variables,
             )
 
         return dt, LoopState(primitive_state, key, forcing)
@@ -812,6 +983,13 @@ def _integrate_core(
         progress=_show_progress if config.progress_bar else None,
     )
 
+    # An adaptive loop also stops, instead of spinning forever, when a step can
+    # no longer advance the clock. Report that once, after the loop, from the
+    # host; the check costs one scalar callback per run. Fixed-step runs end
+    # after their step count whatever the clock says, so they are not checked.
+    if backend != FIXED_STEP:
+        jax.debug.callback(_warn_if_clock_stalled, t_final, params.t_end)
+
     # -------------------------------------------------------------
     # =================== ↑ loop-level logic ↑ ====================
     # -------------------------------------------------------------
@@ -829,20 +1007,23 @@ def _time_integration(
     initial_loop_state: Union["LoopState", NoneType] = None,
 ) -> Union[STATE_TYPE, StateStruct, SnapshotData]:
     """
-    Time integration.
+    Time integration (the body jitted by :func:`time_integration`).
 
     Args:
         state: The primitive state array (or state struct).
         config: The simulation configuration.
         params: The simulation parameters.
+        registered_variables: The registered variables.
         helper_data_pad: The padded helper data.
+        snapshot_callable: The user callable for
+            ``config.activate_snapshot_callback``, or ``None``.
         initial_loop_state: An optional explicit initial loop carry (used to
             resume a run); seeded from ``config.random_seed`` when ``None``.
 
     Returns:
         Depending on the configuration (return_snapshots, num_snapshots)
         either the final state of the fluid after the time integration
-        of snapshots of the time evolution.
+        or snapshots of the time evolution.
     """
 
     # in simulations, where we also follow e.g. star particles,
@@ -853,8 +1034,11 @@ def _time_integration(
     else:
         primitive_state = state
 
-    # we must pad the state with ghost cells to account for the
-    # boundary conditions (unless they are enforced by rolling)
+    # Initialise the dual-energy g first, so the unpadded shape that sizes the
+    # snapshot buffers includes its slot, then pad the state with ghost cells
+    # to account for the boundary conditions (unless they are enforced by
+    # rolling).
+    primitive_state = _seed_internal_energy(primitive_state, params, registered_variables)
     original_shape = primitive_state.shape
     primitive_state = _prepare_padded_state(
         primitive_state, config, params, registered_variables
@@ -929,6 +1113,7 @@ def _run_segment(
 
     Returns ``(t_final, primitive_state_unpadded, key, forcing, num_iterations)``.
     """
+    primitive_state = _seed_internal_energy(primitive_state, params, registered_variables)
     original_shape = primitive_state.shape
     primitive_state = _prepare_padded_state(
         primitive_state, config, params, registered_variables

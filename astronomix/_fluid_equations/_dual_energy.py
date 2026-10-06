@@ -1,122 +1,68 @@
 """
-Dual-energy formalism (switch variant, Bryan et al. 1995) for adiabatic MHD.
+Operator-split advection of the dual-energy internal-energy density.
 
 In high-Mach or low-beta flows the internal energy recovered from the total
-energy, ``e_int = E - KE - ME``, is a tiny difference of large numbers and is
-destroyed by floating-point cancellation (see the M~50 adiabatic stress test).
-The cure is to evolve a *separate* internal-energy density ``g = rho*e`` with its
-own gas-energy equation
+energy, ``E - kinetic - magnetic``, is a small difference of large numbers and
+is destroyed by floating-point cancellation. The dual-energy formalism (Bryan
+et al. 1995) therefore evolves a separate internal-energy density ``g = rho e``
+with its own gas-energy equation
 
-    d g / d t + div(g v) = - p div(v)                     (1)
+    d g / d t + div(g v) = - p div(v)
 
-and, when recovering the pressure, use a **switch**:
-
-    e_int = e_E  if  e_E / E_total > eta   (internal energy non-negligible:
-                                            total-energy value is accurate and
-                                            captures shock heating)
-          = g    otherwise                 (kinetic/magnetic-energy dominated:
-                                            the separately-advected g avoids the
-                                            cancellation)
-
-with ``eta`` ~ 1e-3. Where the advected value is used, the total energy is reset
-to ``E = e_int + KE + ME`` so the two energies stay consistent going forward.
-
-This module provides the **pure, backend-agnostic** building blocks; the
-operator-split wiring into the time loop (threading ``g`` through the carry and
-calling these once per step) is layered on top. Everything here is plain JAX, so
-it differentiates and runs on CPU/GPU and under either backend.
+and, where the total-energy value is unreliable, recovers the pressure from
+``g`` instead. This module holds the advection of ``g`` used by the
+finite-difference solver (hydro and MHD). The switch itself lives in the
+pressure recoveries of the finite-difference scheme (the primitive recovery and
+the coupled WENO recovery), and ``_evolve_state_fd`` re-syncs ``g`` from the
+switched pressure at the end of every step.
 """
 
+# general
 from functools import partial
-from typing import Union
 
+# typing
+from typing import Union
+from jaxtyping import (
+    Array,
+    Float,
+)
+
+# jax
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
 
-from astronomix._stencil_operations._stencil_operations import _shift
-from astronomix.option_classes.simulation_config import STATE_TYPE, SimulationConfig
+# astronomix constants
+from astronomix.option_classes.simulation_config import STATE_TYPE
+
+# astronomix containers
+from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
+# astronomix functions
+from astronomix._stencil_operations._stencil_operations import _shift
 
-def _momentum_indices(config, rv):
+
+def _momentum_indices(config, registered_variables):
+    """The momentum-density indices of the conserved state, one per dimension."""
     if config.dimensionality == 1:
-        return [rv.momentum_index]
+        return [registered_variables.momentum_index]
     if config.dimensionality == 2:
-        return [rv.momentum_index.x, rv.momentum_index.y]
-    return [rv.momentum_index.x, rv.momentum_index.y, rv.momentum_index.z]
+        return [registered_variables.momentum_index.x, registered_variables.momentum_index.y]
+    return [
+        registered_variables.momentum_index.x,
+        registered_variables.momentum_index.y,
+        registered_variables.momentum_index.z,
+    ]
 
 
-def _velocity_components(conserved_state, config, rv):
-    """v = momentum / rho, with rho floored to a tiny positive value."""
-    rho = jnp.maximum(conserved_state[rv.density_index], 1e-30)
-    return [conserved_state[i] / rho for i in _momentum_indices(config, rv)]
-
-
-def kinetic_and_magnetic_energy(conserved_state, config, rv):
-    """Kinetic + magnetic energy densities (KE, ME) for the ideal-gas MHD state."""
-    rho = jnp.maximum(conserved_state[rv.density_index], 1e-30)
-    mom = [conserved_state[i] for i in _momentum_indices(config, rv)]
-    ke = 0.5 * sum(m * m for m in mom) / rho
-    if config.mhd:
-        bx = conserved_state[rv.magnetic_index.x]
-        by = conserved_state[rv.magnetic_index.y]
-        bz = conserved_state[rv.magnetic_index.z]
-        me = 0.5 * (bx * bx + by * by + bz * bz)
-    else:
-        me = jnp.zeros_like(ke)
-    return ke, me
-
-
-def internal_energy_from_total(conserved_state, config, rv):
-    """``e_E = E - KE - ME`` — internal energy density from the total energy
-    (cancellation-prone in KE/ME-dominated cells)."""
-    ke, me = kinetic_and_magnetic_energy(conserved_state, config, rv)
-    return conserved_state[rv.energy_index] - ke - me
-
-
-@partial(jax.jit, static_argnames=["config", "registered_variables"])
-def dual_energy_switch(
-    conserved_state: STATE_TYPE,
-    internal_energy_density: Float[Array, "..."],
-    gamma: Union[float, Float[Array, ""]],
-    eta: Union[float, Float[Array, ""]],
-    minimum_pressure: Union[float, Float[Array, ""]],
-    config: SimulationConfig,
-    registered_variables: RegisteredVariables,
-):
-    """Apply the dual-energy switch and recover a consistent (E, g, p).
-
-    Args:
-        conserved_state: ideal-gas MHD conserved state (rho, mom, E, B, ...).
-        internal_energy_density: the separately-advected ``g = rho*e``.
-        gamma, eta, minimum_pressure: EoS / switch / floor.
-
-    Returns:
-        ``(conserved_state, g, pressure)`` with ``E`` and ``g`` synchronised to
-        the chosen internal energy and ``pressure = (gamma-1) e_int`` floored.
-    """
-    ke, me = kinetic_and_magnetic_energy(conserved_state, config, rv=registered_variables)
-    E = conserved_state[registered_variables.energy_index]
-    e_E = E - ke - me                          # total-energy internal energy
-
-    g = internal_energy_density
-    # The total-energy value is trustworthy when the internal energy is a
-    # non-negligible fraction of the total energy (no catastrophic cancellation
-    # and shock heating is captured). E is non-negative for a physical state.
-    E_safe = jnp.maximum(E, 1e-30)
-    reliable = (e_E > eta * E_safe) & jnp.isfinite(e_E)
-
-    e_int = jnp.where(reliable, e_E, g)
-    pressure = jnp.maximum((gamma - 1.0) * e_int, minimum_pressure)
-    e_int = pressure / (gamma - 1.0)           # re-derive after the floor
-
-    # Synchronise both energies to the chosen internal energy. In reliable cells
-    # e_int == e_E so E is unchanged; in unreliable cells the (accurate) advected
-    # g is promoted into the total energy, conserving it forward.
-    E_new = e_int + ke + me
-    conserved_state = conserved_state.at[registered_variables.energy_index].set(E_new)
-    return conserved_state, e_int, pressure
+def _velocities_from_conserved(conserved_state, config, registered_variables):
+    """The velocity components ``momentum / rho`` of the conserved state, with
+    the density floored to a tiny positive value."""
+    density = jnp.maximum(conserved_state[registered_variables.density_index], 1e-30)
+    return [
+        conserved_state[momentum_index] / density
+        for momentum_index in _momentum_indices(config, registered_variables)
+    ]
 
 
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
@@ -129,35 +75,63 @@ def advect_internal_energy(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """One operator-split update of ``g`` over ``dt`` solving
-    ``d g/dt + div(g v) = -p div(v)`` on a periodic grid.
-
-    First-order upwind for the conservative advection ``div(g v)`` (with the
-    face velocity ``½(v_i+v_{i+1})``) plus a central-difference ``p div(v)``
-    work term. First order is dissipative but stable and conservative; it is
-    deliberately simple — the dual energy only *matters* where the total-energy
-    internal energy is unusable, and there a robust low-order ``g`` beats a
-    cancellation-destroyed high-order one.
     """
-    ndim = int(config.dimensionality)
-    vels = _velocity_components(conserved_state, config, registered_variables)
-    g = internal_energy_density
-    dtdx = dt / grid_spacing
+    One operator-split update of ``g`` over ``dt``, solving
+    ``d g / d t + div(g v) = - p div(v)``.
 
-    div_gv = jnp.zeros_like(g)
-    div_v = jnp.zeros_like(g)
-    for axis, v in enumerate(vels):
-        sa = axis  # spatial axis of a single field (no leading var axis here)
-        g_p = _shift(g, -1, axis=sa)            # g_{i+1}
-        v_p = _shift(v, -1, axis=sa)            # v_{i+1}
-        # face velocity at i+1/2 and first-order upwind value of g there
-        vf = 0.5 * (v + v_p)
-        g_face = jnp.where(vf >= 0.0, g, g_p)
-        flux_p = vf * g_face                    # F_{i+1/2}
-        flux_m = _shift(flux_p, 1, axis=sa)     # F_{i-1/2}
-        div_gv = div_gv + (flux_p - flux_m)
-        # central divergence of velocity for the pdV work
-        div_v = div_v + 0.5 * (v_p - _shift(v, 1, axis=sa))
+    The conservative advection ``div(g v)`` is first-order upwind with the face
+    velocity ``(v_i + v_{i+1}) / 2``; the work term ``p div(v)`` uses a central
+    velocity divergence. The stencils are periodic shifts; with ghost-cell
+    boundaries the ghost cells supply the boundary values. First order is
+    dissipative but stable and conservative, and deliberately simple: the dual
+    energy only matters where the total-energy internal energy is unusable,
+    and there a robust low-order ``g`` beats a cancellation-destroyed
+    high-order one.
 
-    g_new = g - dtdx * div_gv - dtdx * pressure * div_v
-    return g_new
+    Args:
+        internal_energy_density: The dual-energy density ``g`` (one field).
+        conserved_state: The conserved state at the start of the step, whose
+            momentum and density define the advecting velocity.
+        pressure: The pressure at the start of the step (for the work term).
+        dt: The time step.
+        grid_spacing: The cell width.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The updated internal-energy density.
+    """
+    velocities = _velocities_from_conserved(conserved_state, config, registered_variables)
+    dt_over_dx = dt / grid_spacing
+
+    internal_energy_flux_divergence = jnp.zeros_like(internal_energy_density)
+    velocity_divergence = jnp.zeros_like(internal_energy_density)
+    for axis, velocity in enumerate(velocities):
+        # The field carries no leading variable axis, so the spatial axis is
+        # the array axis.
+        internal_energy_right = _shift(internal_energy_density, -1, axis=axis)
+        velocity_right = _shift(velocity, -1, axis=axis)
+
+        # Face velocity at i+1/2 and the first-order upwind value of g there.
+        face_velocity = 0.5 * (velocity + velocity_right)
+        internal_energy_face = jnp.where(
+            face_velocity >= 0.0,
+            internal_energy_density,
+            internal_energy_right,
+        )
+        flux_right_face = face_velocity * internal_energy_face
+        flux_left_face = _shift(flux_right_face, 1, axis=axis)
+        internal_energy_flux_divergence = internal_energy_flux_divergence + (
+            flux_right_face - flux_left_face
+        )
+
+        # Central divergence of the velocity for the pdV work.
+        velocity_divergence = velocity_divergence + 0.5 * (
+            velocity_right - _shift(velocity, 1, axis=axis)
+        )
+
+    return (
+        internal_energy_density
+        - dt_over_dx * internal_energy_flux_divergence
+        - dt_over_dx * pressure * velocity_divergence
+    )

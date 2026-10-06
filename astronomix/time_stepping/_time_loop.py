@@ -9,7 +9,8 @@ time-stepping loop that are independent of the physics being integrated:
   * collecting snapshots of the evolving state into preallocated buffers at
     chosen times (plus an optional final snapshot);
   * a host-side progress callback;
-  * counting the number of steps taken.
+  * counting the number of steps taken;
+  * stopping an adaptive loop whose timestep can no longer advance the clock.
 
 The physics is supplied entirely through caller closures, so this module
 carries no domain knowledge and can be reused by any project:
@@ -29,10 +30,21 @@ carries no domain knowledge and can be reused by any project:
         (e.g. evenly spaced, or matching explicit timepoints).
 
 ``state`` and ``store`` are opaque pytrees to the driver.
+
+An adaptive loop runs until the clock reaches ``t_end``, but it also stops early
+when a step fails to advance the clock (``t + dt == t`` in float arithmetic once
+``dt`` has collapsed below the resolution of ``t``), which would otherwise spin
+the while loop forever. ``integrate`` then returns normally with ``t < t_end``;
+reporting that is left to the caller.
 """
 
 # typing
-from typing import Any, Callable, NamedTuple, Optional
+from typing import (
+    Any,
+    Callable,
+    NamedTuple,
+    Optional,
+)
 
 # jax
 import jax
@@ -119,28 +131,23 @@ def integrate(
 
     Returns:
         ``(t, state, store, num_iterations)``.  ``store`` is the (possibly
-        updated) snapshot store, or ``None`` when snapshots are disabled.
+        updated) snapshot store, or ``None`` when snapshots are disabled. For
+        the adaptive backends ``t`` is below ``t_end`` only if the loop stopped
+        early because a step could not advance the clock.
     """
     has_snapshots = snapshots is not None
-
-    def _warn_stall(t_stall):
-        print(
-            f"[astronomix] ABORT: the timestep can no longer advance the clock "
-            f"at t = {float(t_stall):.6g} (dt collapsed to zero or below the "
-            f"float resolution of t). The run has become unstable — stopping "
-            f"instead of looping forever.",
-            flush=True,
-        )
 
     def body(carry):
         # The carry has an extra snapshot-store slot only when snapshots are
         # collected; the snapshot index is carried either way (and stays 0 when
         # snapshots are disabled) so ``step`` always receives a valid counter.
         # The trailing ``advanced`` flag records whether the previous step
-        # moved the clock; the adaptive predicates stop when it goes False
-        # (a collapsed dt would otherwise spin the while loop forever, since
-        # in float arithmetic ``t + dt == t`` once dt is small enough).
-        carry, _advanced = carry[:-1], carry[-1]
+        # moved the clock; the adaptive predicate stops when it goes False (a
+        # collapsed dt would otherwise spin the while loop forever, since in
+        # float arithmetic ``t + dt == t`` once dt is small enough). The body
+        # recomputes the flag for the step it takes, so the previous one is
+        # dropped here.
+        carry = carry[:-1]
         if has_snapshots:
             t, state, snapshot_index, num_iterations, store = carry
 
@@ -166,12 +173,6 @@ def integrate(
         dt, state = step(t, state, snapshot_index)
         t_new = t + dt
         advanced = t_new > t
-        jax.lax.cond(
-            advanced,
-            lambda _: None,
-            lambda t_: jax.debug.callback(_warn_stall, t_),
-            t_new,
-        )
         t = t_new
         num_iterations = num_iterations + 1
 
@@ -187,18 +188,24 @@ def integrate(
     else:
         carry = (t_start, state, 0, 0, jnp.asarray(True))
 
+    def clock_running(carry):
+        """The adaptive loop predicate: the clock (first carry slot) has not
+        reached ``t_end`` and the last step advanced it (last carry slot)."""
+        return (carry[0] < t_end) & carry[-1]
+
     # Fixed-step runs use a plain ``fori_loop``; adaptive runs use a while loop
-    # whose predicate runs until the clock reaches ``t_end``, optionally in the
-    # checkpointed variant for reverse-mode differentiability.
+    # whose predicate runs until the clock reaches ``t_end`` (or stops
+    # advancing), optionally in the checkpointed variant for reverse-mode
+    # differentiability.
     if backend == FIXED_STEP:
-        carry = jax.lax.fori_loop(0, num_steps, lambda _i, c: body(c), carry)
+        carry = jax.lax.fori_loop(0, num_steps, lambda _, carry: body(carry), carry)
     elif backend == ADAPTIVE_WHILE:
-        carry = jax.lax.while_loop(
-            lambda c: (c[0] < t_end) & c[-1], body, carry
-        )
+        carry = jax.lax.while_loop(clock_running, body, carry)
     elif backend == ADAPTIVE_CHECKPOINTED:
         carry = checkpointed_while_loop(
-            lambda c: (c[0] < t_end) & c[-1], body, carry,
+            clock_running,
+            body,
+            carry,
             checkpoints=num_checkpoints,
         )
     else:
@@ -220,5 +227,5 @@ def integrate(
             )
             store = snapshots.record(t, state, store, final_snapshot_index)
         return t, state, store, num_iterations
-    t, state, _snapshot_index, num_iterations = carry
+    t, state, _, num_iterations = carry
     return t, state, None, num_iterations

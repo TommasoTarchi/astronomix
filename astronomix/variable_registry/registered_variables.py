@@ -1,23 +1,27 @@
 """
-The registered_variables module tells the code where
-in the state array which field is stored. This is important
-for modularity and readability of the code.
+The variable registry: where in the state array each field is stored.
 
-When you want to add new variables to the state array, e.g.
-densities for chemical species, you have to register them here.
+Keeping the layout of the state array in one place is what makes the code
+modular and readable; every consumer indexes the state through the registry
+rather than through hard-coded positions. New variables, e.g. densities of
+chemical species, are registered here.
 
-NOTE: For finite volume MHD simulation, the magnetic field
-is assumed to be stored in the last three indices of the state array
-and for finite difference MHD the magnetic field at interfaces
-is assumed to be stored in the three indices.
+NOTE: For MHD the magnetic field occupies three consecutive slots behind the
+gas variables: for the finite-volume solver the cell-centred field, for the
+finite-difference solver the interface (face-centred) field of constrained
+transport, behind the cell-centred one. The finite-difference solver may append
+further rows behind the interface field: first the dual-energy internal-energy
+density ``g``, then the passive-scalar block (the user's scalars followed by the
+shock-history scalars). ``_evolve_state_fd`` splits these trailing rows off
+before the hydro / MHD update, so on the state that update sees the interface
+field is again in the last three slots.
 """
 
 # typing
-from typing import NamedTuple, Union
-from jaxtyping import Array, Float, Int
-
-# jax
-import jax.numpy as jnp
+from typing import (
+    NamedTuple,
+    Union,
+)
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
@@ -26,17 +30,31 @@ from astronomix.option_classes.simulation_config import (
     IDEAL_GAS,
     ISOTHERMAL,
     VL2,
-    XAXIS,
-    YAXIS,
-    ZAXIS,
 )
 
 # astronomix containers
 from astronomix.option_classes.simulation_config import (
     SimulationConfig,
     StaticIntVector,
-    solver_mode_to_string,
 )
+
+# astronomix functions
+from astronomix.option_classes.simulation_config import solver_mode_to_string
+
+
+#: Number of library-managed scalars appended to the passive-scalar block when
+#: ``config.track_shock_history`` is set. Defined here rather than in
+#: ``_passive_scalars`` because that module imports :class:`RegisteredVariables`
+#: from this one.
+NUM_SHOCK_HISTORY_SCALARS = 4
+
+#: Positions of the shock-history scalars within their block, which starts at
+#: ``RegisteredVariables.shock_history_index`` (their meaning is documented in
+#: ``_passive_scalars``). The two accumulators are the last two slots.
+ENTROPY_INITIAL_SLOT = 0
+SHOCKED_FRACTION_SLOT = 1
+TIME_SINCE_SHOCK_SLOT = 2
+DENSITY_TIME_SLOT = 3
 
 
 # =============================================================
@@ -46,14 +64,6 @@ from astronomix.option_classes.simulation_config import (
 # that axis (e.g. the x-velocity or the x-component of the magnetic field). A
 # common pattern is a loop over the spatial dimensions that needs exactly this
 # mapping, which ``AxisInfo`` bundles together.
-
-
-#: Number of library-managed scalars appended when ``config.track_shock_history``
-#: is set, in order: ``entropy_initial``, ``shocked_fraction``,
-#: ``time_since_shock``, ``density_time``. Defined here rather than in
-#: ``_passive_scalars`` because that module imports :class:`RegisteredVariables`
-#: from this one.
-NUM_SHOCK_HISTORY_SCALARS = 4
 
 
 class AxisInfo(NamedTuple):
@@ -107,8 +117,11 @@ class RegisteredVariables(NamedTuple):
 
     #: Index of the GLM divergence-cleaning scalar psi (Dedner et al. 2002),
     #: carried by the VL2 finite-volume MHD scheme after the magnetic field
-    #: (AthenaPK's ``IPS``); -1 when inactive.
+    #: (AthenaPK's ``IPS`` slot); -1 when inactive. ``magnetic_psi_active``
+    #: marks this cell-centred VL2 GLM-MHD layout, which stores all three
+    #: velocity and field components in any dimensionality.
     magnetic_psi_index: int = -1
+    magnetic_psi_active: bool = False
 
     #: Pressure index
     pressure_index: int = 2
@@ -133,29 +146,32 @@ class RegisteredVariables(NamedTuple):
     cosmic_ray_n_index: int = -1
     cosmic_ray_n_active: bool = False
 
-    #: dual-energy internal-energy density ``g = rho e`` (Bryan et al. 1995).
-    #: Stored as the LAST variable in the state array (for MHD after the
-    #: interface magnetic field, so the ``[:-3]`` interface-B convention is
-    #: unaffected); ``_evolve_state_fd`` splits it off, advects it and uses it
-    #: in the coupled pressure recovery. Active only for finite-difference
-    #: ideal-gas (hydro or MHD) with ``config.dual_energy``.
+    #: Dual-energy internal-energy density ``g = rho e`` (Bryan et al. 1995).
+    #: Stored behind all other variables except the passive scalars (for MHD
+    #: behind the interface magnetic field). ``_evolve_state_fd`` splits it off
+    #: (after the passive scalars), so the ``[:-3]`` interface-field convention
+    #: holds on the state the MHD update sees, advects it and uses it in the
+    #: coupled pressure recovery. Active only for finite-difference ideal-gas
+    #: (hydro or MHD) runs with ``config.dual_energy``.
     internal_energy_index: int = -1
     internal_energy_active: bool = False
 
     #: Passive scalars: per-parcel labels advected with the flow without acting
-    #: back on it (composition mass fractions, an ejecta/CSM discriminator, the
-    #: shock-history bookkeeping). Stored as a contiguous block at the very END
-    #: of the state array — after the dual-energy ``g``, and therefore after the
-    #: MHD interface magnetic field — so every existing slicing convention
-    #: (``[:-3]`` for interface B, ``[:g_index]`` for ``g``) keeps working once
-    #: the block has been split off. ``_evolve_state_fd`` strips them before the
-    #: hydro update, advects them operator-split, and reattaches them.
-    #: ``num_passive_scalars`` counts the user's scalars plus, when
-    #: ``config.track_shock_history`` is set, the three library-managed
-    #: shock-history scalars, which occupy the LAST three slots.
+    #: back on it (composition mass fractions, an ejecta / circumstellar
+    #: discriminator, the shock-history bookkeeping). Stored as one contiguous
+    #: block at the very end of the state array, behind the dual-energy ``g``
+    #: and the MHD interface magnetic field, so stripping the block off leaves
+    #: a state the hydro / MHD machinery already understands.
+    #: ``_evolve_state_fd`` strips the block before the update, advects it
+    #: operator-split and reattaches it. ``num_passive_scalars`` counts the
+    #: user's scalars plus, when ``config.track_shock_history`` is set, the
+    #: ``NUM_SHOCK_HISTORY_SCALARS`` (four) library-managed shock-history
+    #: scalars, which form the end of the block starting at
+    #: ``shock_history_index`` (see the ``*_SLOT`` constants for their order).
     passive_scalar_index: int = -1
     num_passive_scalars: int = 0
     passive_scalars_active: bool = False
+    shock_history_index: int = -1
     shock_history_active: bool = False
 
     # here you can add more variables
@@ -166,7 +182,8 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
 
     Starts from the baseline (density, velocity, pressure) registry and grows /
     re-indexes it for the active solver mode, dimensionality, equation of state
-    and any extra tracked fields (MHD, stellar-wind density, cosmic rays), so
+    and any extra tracked fields (MHD, stellar-wind density, cosmic rays, the
+    dual-energy internal energy, passive scalars and the shock history), so
     that every field lands at the index the rest of the code expects.
 
     Args:
@@ -182,16 +199,19 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
 
         # The AthenaPK-equivalent GLM-MHD scheme always carries all three
         # velocity and field components (also in 1D and 2D), followed by the
-        # divergence-cleaning scalar psi — exactly AthenaPK's
-        # (IDN, IV1, IV2, IV3, IPR, IB1, IB2, IB3, IPS) layout.
+        # divergence-cleaning scalar psi: (rho, v_x, v_y, v_z, p, B_x, B_y, B_z,
+        # psi), AthenaPK's variable order.
         registered_variables = RegisteredVariables(
             density_index=0,
             velocity_index=StaticIntVector(1, 2, 3),
             pressure_index=4,
             magnetic_index=StaticIntVector(5, 6, 7),
             magnetic_psi_index=8,
+            magnetic_psi_active=True,
             num_vars=9,
         )
+        # NOTE: this layout registers no extra tracers (stellar-wind density,
+        # cosmic rays); the VL2 scheme does not evolve them.
 
     elif config.solver_mode == FINITE_VOLUME:
 
@@ -268,7 +288,6 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
             )
             registered_variables = registered_variables._replace(cosmic_ray_n_active=True)
 
-
     if config.solver_mode == FINITE_DIFFERENCE:
 
         if config.mhd:
@@ -277,8 +296,10 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
             # components (even in 1D and 2D) for the magnetic field update, so
             # the registry is set explicitly per equation of state rather than
             # derived from the dimensionality as in the hydrodynamics case.
-            # NOTE: the magnetic field is stored before the interface magnetic
-            # field, which occupies the final three indices.
+            # NOTE: the cell-centred magnetic field is stored before the
+            # interface magnetic field, which occupies the last three slots of
+            # this layout; the dual-energy g and the passive scalars, if any,
+            # are appended behind it below.
             if config.equation_of_state == IDEAL_GAS:
                 registered_variables = RegisteredVariables(
                     density_index=0,
@@ -330,33 +351,40 @@ def get_registered_variables(config: SimulationConfig) -> RegisteredVariables:
                     num_vars=registered_variables.num_vars - 1
                 )
 
-    # dual-energy formalism: append the internal-energy density ``g`` as the
-    # LAST variable so the MHD interface-B "last three" convention is preserved
-    # (for hydro g simply lands behind the pressure).
-    if (config.solver_mode == FINITE_DIFFERENCE
-            and config.equation_of_state == IDEAL_GAS and config.dual_energy):
-        registered_variables = registered_variables._replace(
-            internal_energy_index=registered_variables.num_vars,
-            num_vars=registered_variables.num_vars + 1,
-            internal_energy_active=True,
-        )
-
-    # passive scalars: a contiguous block after everything else, so that
-    # stripping it off leaves a state the hydro/MHD machinery already
-    # understands. The library-managed shock-history scalars sit at the end of
-    # the block, behind the user's.
-    if config.solver_mode == FINITE_DIFFERENCE:
-        n_scalars = int(config.num_passive_scalars)
-        if config.track_shock_history:
-            n_scalars += NUM_SHOCK_HISTORY_SCALARS
-        if n_scalars > 0:
+        # Dual-energy formalism: the internal-energy density ``g`` goes behind
+        # everything registered so far (for hydro simply behind the pressure,
+        # for MHD behind the interface magnetic field).
+        if config.equation_of_state == IDEAL_GAS and config.dual_energy:
             registered_variables = registered_variables._replace(
-                passive_scalar_index=registered_variables.num_vars,
-                num_passive_scalars=n_scalars,
-                num_vars=registered_variables.num_vars + n_scalars,
+                internal_energy_index=registered_variables.num_vars,
+                num_vars=registered_variables.num_vars + 1,
+                internal_energy_active=True,
+            )
+
+        # Passive scalars: one contiguous block behind everything else, so that
+        # stripping it off leaves a state the hydro / MHD machinery already
+        # understands. The library-managed shock-history scalars form the end
+        # of the block, behind the user's.
+        num_scalars = int(config.num_passive_scalars)
+        if config.track_shock_history:
+            num_scalars += NUM_SHOCK_HISTORY_SCALARS
+        if num_scalars > 0:
+            passive_scalar_index = registered_variables.num_vars
+            if config.track_shock_history:
+                shock_history_index = (
+                    passive_scalar_index + num_scalars - NUM_SHOCK_HISTORY_SCALARS
+                )
+            else:
+                shock_history_index = -1
+            registered_variables = registered_variables._replace(
+                passive_scalar_index=passive_scalar_index,
+                num_passive_scalars=num_scalars,
+                num_vars=registered_variables.num_vars + num_scalars,
                 passive_scalars_active=True,
+                shock_history_index=shock_history_index,
                 shock_history_active=bool(config.track_shock_history),
             )
+
     elif config.num_passive_scalars > 0 or config.track_shock_history:
         raise NotImplementedError(
             "passive scalars are implemented for the finite-difference solver "

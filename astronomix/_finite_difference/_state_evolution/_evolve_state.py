@@ -5,6 +5,13 @@ Converts the primitive state to conserved variables, dispatches to the
 requested Runge-Kutta integrator (SSPRK4 or low-storage RK4, with constrained
 transport for MHD), converts back to primitives, and re-fills ghost cells when
 ghost-cell boundaries are in use.
+
+The rows the finite-difference solver appends behind the gas / field variables
+are handled around that update by operator splitting: the passive-scalar block
+and the dual-energy internal-energy density ``g`` are split off first and
+advected with the pre-step flow (``g`` also enters the coupled pressure
+recovery), then ``g`` is re-synced from the recovered pressure, the shock
+history is updated against the new state, and both are reattached.
 """
 
 # general
@@ -12,8 +19,10 @@ from functools import partial
 
 # typing
 from typing import Union
-from jaxtyping import Array, Float
-from beartype import beartype as typechecker
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax
@@ -21,7 +30,6 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
-    AD_REMAT_NONE,
     GHOST_CELLS,
     IDEAL_GAS,
     ISOTHERMAL,
@@ -50,11 +58,10 @@ from astronomix._fluid_equations._dual_energy import advect_internal_energy
 from astronomix._fluid_equations._passive_scalars import (
     _fill_scalar_ghost_cells,
     _masked_substeps,
+    _scalar_lean,
     advect_passive_scalars,
     update_shock_history,
 )
-from astronomix.variable_registry.registered_variables import NUM_SHOCK_HISTORY_SCALARS
-from astronomix._finite_difference._magnetic_update._constrained_transport import update_cell_center_fields
 from astronomix._finite_difference._time_integrators._ssprk import (
     _lsrk4_hydro,
     _lsrk4_with_ct,
@@ -64,7 +71,11 @@ from astronomix._finite_difference._time_integrators._ssprk import (
 from astronomix._geometry.boundaries import _boundary_handler
 
 
-@partial(jax.jit, static_argnames=["config", "registered_variables"], donate_argnames=["primitive_state"])
+@partial(
+    jax.jit,
+    static_argnames=["config", "registered_variables"],
+    donate_argnames=["primitive_state"],
+)
 def _evolve_state_fd(
     primitive_state: STATE_TYPE,
     dt: Float[Array, ""],
@@ -76,6 +87,13 @@ def _evolve_state_fd(
 ) -> STATE_TYPE:
     """
     Advance the primitive state by one finite-difference time step.
+
+    The passive-scalar block and the dual-energy ``g`` are split off first and
+    advected operator-split with the pre-step flow, so the Runge-Kutta update
+    sees the plain gas / field state (``g`` enters it only through the coupled
+    pressure recovery). Afterwards ``g`` is re-synced from the recovered
+    pressure, the shock history is updated against the new state, and both are
+    reattached in the registered order.
 
     Args:
         primitive_state: The primitive state array.
@@ -90,95 +108,141 @@ def _evolve_state_fd(
         The primitive state after one time step.
     """
 
-    # Passive scalars occupy a contiguous block at the very END of the state
-    # (after the dual-energy ``g``, hence after the MHD interface field). Split
-    # them off FIRST so every downstream slicing convention sees exactly the
-    # state it was written for; they are advected operator-split with the
-    # pre-step flow and reattached at the end.
-    _scalars = registered_variables.passive_scalars_active
-    _shock_history = registered_variables.shock_history_active
+    # -------------------------------------------------------------
+    # ============= ↓ Split off and advect passive scalars ↓ =======
+    # -------------------------------------------------------------
+
+    # The passive scalars occupy a contiguous block at the very end of the
+    # state (behind the dual-energy ``g``, hence behind the MHD interface
+    # field). They are split off FIRST so every downstream slicing convention
+    # sees exactly the state it was written for; they are advected
+    # operator-split with the pre-step flow and reattached at the end.
+    passive_scalars_active = registered_variables.passive_scalars_active
+    shock_history_active = registered_variables.shock_history_active
     passive_scalars = None
-    if _scalars:
-        _sidx = registered_variables.passive_scalar_index
-        passive_scalars = primitive_state[_sidx:]
-        primitive_state = primitive_state[:_sidx]
+    if passive_scalars_active:
+        passive_scalar_index = registered_variables.passive_scalar_index
+        if shock_history_active:
+            # Where the shock-history block starts within the scalar block.
+            shock_history_offset = (
+                registered_variables.shock_history_index - passive_scalar_index
+            )
+        passive_scalars = primitive_state[passive_scalar_index:]
+        primitive_state = primitive_state[:passive_scalar_index]
         registered_variables = registered_variables._replace(
-            num_vars=_sidx, passive_scalar_index=-1, num_passive_scalars=0,
-            passive_scalars_active=False, shock_history_active=False,
+            num_vars=passive_scalar_index,
+            passive_scalar_index=-1,
+            num_passive_scalars=0,
+            passive_scalars_active=False,
+            shock_history_index=-1,
+            shock_history_active=False,
         )
-        # advect with the PRE-step flow (operator splitting); the hydro CFL is
-        # set by |u| + c and is therefore always stricter than |u|, so a single
-        # SSP-RK3 step over dt is stable without substepping
+        # Advect with the pre-step flow (operator splitting);
+        # ``advect_passive_scalars`` sub-cycles internally when the flow
+        # requires it.
         passive_scalars = advect_passive_scalars(
-            passive_scalars, primitive_state, dt, config.grid_spacing,
-            config, registered_variables,
+            passive_scalars,
+            primitive_state,
+            dt,
+            config.grid_spacing,
+            config,
+            registered_variables,
         )
         if _masked_substeps(config):
             # Reverse-mode memory: the scalars never feed back on the hydro, so
-            # the backward of their advection is independent of the hydro
-            # backward and XLA is free to schedule the two together -- adding
-            # the scalar sub-steps' transient to the hydro peak (measured on
-            # XLA:CPU: +280x the state without remat, +100x with). Tying the
-            # two through a barrier (a numerical no-op, whose transpose is a
-            # barrier on the cotangents) makes the scalar backward wait for the
-            # hydro backward. Only on the reverse-mode (masked) path, so the
-            # FORWARDS program is untouched.
+            # the backward pass of their advection is independent of the hydro
+            # backward pass and XLA is free to schedule the two together,
+            # adding the scalar sub-steps' transient memory to the hydro peak.
+            # Tying the two through a barrier (a numerical no-op, whose
+            # transpose is a barrier on the cotangents) makes the scalar
+            # backward pass wait for the hydro one. Only on the reverse-mode
+            # (masked) path, so the FORWARDS program is untouched.
             passive_scalars, primitive_state = jax.lax.optimization_barrier(
-                (passive_scalars, primitive_state))
+                (passive_scalars, primitive_state)
+            )
 
-    # Dual-energy formalism: the internal-energy density ``g`` is carried as the
-    # LAST variable of the state. Split it off so the hydro/MHD machinery sees
-    # the standard state (for MHD: interface B as the last three vars), advect
-    # it with the pre-step flow, and feed it into the coupled WENO pressure
-    # recovery; it is re-synced from the recovered pressure and reattached at
-    # the end.
-    _dual = registered_variables.internal_energy_active
+    # -------------------------------------------------------------
+    # ============= ↑ Split off and advect passive scalars ↑ =======
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ============ ↓ Split off and advect the dual energy ↓ ========
+    # -------------------------------------------------------------
+
+    # Dual-energy formalism: once the scalars are split off, the internal-energy
+    # density ``g`` is the last row of the state. Split it off so the hydro /
+    # MHD machinery sees the standard state (for MHD: the interface field as the
+    # last three rows), advect it with the pre-step flow, and feed it into the
+    # coupled WENO pressure recovery; it is re-synced from the recovered
+    # pressure and reattached at the end.
+    dual_energy_active = registered_variables.internal_energy_active
     internal_energy_density = None
-    if _dual:
-        _gidx = registered_variables.internal_energy_index
-        internal_energy_density = primitive_state[_gidx]
-        primitive_state = primitive_state[:_gidx]
+    if dual_energy_active:
+        internal_energy_index = registered_variables.internal_energy_index
+        internal_energy_density = primitive_state[internal_energy_index]
+        primitive_state = primitive_state[:internal_energy_index]
         registered_variables = registered_variables._replace(
-            num_vars=_gidx, internal_energy_index=-1, internal_energy_active=False,
+            num_vars=internal_energy_index,
+            internal_energy_index=-1,
+            internal_energy_active=False,
         )
         if config.mhd:
-            _g_cons = conserved_state_from_primitive_mhd(
-                primitive_state[:-3], gamma, registered_variables
+            conserved_state_pre_step = conserved_state_from_primitive_mhd(
+                primitive_state[:registered_variables.interface_magnetic_field_index.x],
+                gamma,
+                registered_variables,
             )
         else:
-            _g_cons = conserved_state_from_primitive(
-                primitive_state, gamma, config, registered_variables
+            conserved_state_pre_step = conserved_state_from_primitive(
+                primitive_state,
+                gamma,
+                config,
+                registered_variables,
             )
         internal_energy_density = advect_internal_energy(
-            internal_energy_density, _g_cons,
+            internal_energy_density,
+            conserved_state_pre_step,
             primitive_state[registered_variables.pressure_index],
-            dt, config.grid_spacing, config, registered_variables,
+            dt,
+            config.grid_spacing,
+            config,
+            registered_variables,
         )
-        del _g_cons
-        # g is an internal-energy density: the explicit div(gv) + p div(v)
-        # update can undershoot zero in strongly-expanding (homologous-ejecta)
-        # cells, and a negative g would feed a negative switched pressure into
-        # the WENO flux. Hold it to the same floor as the pressure.
+        del conserved_state_pre_step
+        # g is an internal-energy density: the explicit div(g v) + p div(v)
+        # update can undershoot zero in strongly expanding cells, and a negative
+        # g would feed a negative switched pressure into the WENO flux. Hold it
+        # to the same floor as the pressure.
         internal_energy_density = jnp.maximum(
             internal_energy_density, params.minimum_pressure / (gamma - 1.0)
         )
 
+    # -------------------------------------------------------------
+    # ============ ↑ Split off and advect the dual energy ↑ ========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # =============== ↓ Hydro / MHD Runge-Kutta update ↓ ===========
+    # -------------------------------------------------------------
+
     if config.mhd:
-        # NOTE: here we assume the magnetic field at interfaces
-        # is stored in the last three indices of the state array
+        # The interface magnetic field occupies the last three rows of the
+        # (scalar- and g-free) state; the conserved state is built from the
+        # cell-centred rows in front of it.
+        interface_field_start = registered_variables.interface_magnetic_field_index.x
         if config.equation_of_state == IDEAL_GAS:
             conserved_state = conserved_state_from_primitive_mhd(
-                primitive_state[:-3], gamma, registered_variables
+                primitive_state[:interface_field_start], gamma, registered_variables
             )
         elif config.equation_of_state == ISOTHERMAL:
             conserved_state = conserved_state_from_primitive_isothermal(
-                primitive_state[:-3], config, registered_variables
+                primitive_state[:interface_field_start], config, registered_variables
             )
 
         # extract interface magnetic fields
-        bxb = primitive_state[registered_variables.interface_magnetic_field_index.x]
-        byb = primitive_state[registered_variables.interface_magnetic_field_index.y]
-        bzb = primitive_state[registered_variables.interface_magnetic_field_index.z]
+        interface_field_x = primitive_state[registered_variables.interface_magnetic_field_index.x]
+        interface_field_y = primitive_state[registered_variables.interface_magnetic_field_index.y]
+        interface_field_z = primitive_state[registered_variables.interface_magnetic_field_index.z]
 
         # update conserved state and interface magnetic fields — RK4_LSRK
         # selects the 2N-storage Carpenter-Kennedy LSRK4 variant (saves one
@@ -188,11 +252,11 @@ def _evolve_state_fd(
         else:
             mhd_integrator = _ssprk4_with_ct
 
-        conserved_state, bxb, byb, bzb = mhd_integrator(
+        conserved_state, interface_field_x, interface_field_y, interface_field_z = mhd_integrator(
             conserved_state,
-            bxb,
-            byb,
-            bzb,
+            interface_field_x,
+            interface_field_y,
+            interface_field_z,
             gamma,
             config.grid_spacing,
             dt,
@@ -205,20 +269,36 @@ def _evolve_state_fd(
 
         # back to primitive state
         if config.equation_of_state == IDEAL_GAS:
-            # the carried state: no estimate clamps
+            # This state is carried to the next step, so the estimate-only
+            # clamps (``clamp_in_estimates``) must not touch it.
             primitive_state = primitive_state_from_conserved_mhd(
-                conserved_state, params.minimum_density, params.minimum_pressure, gamma, config, registered_variables,
-                internal_energy_density=internal_energy_density, clamp=False,
+                conserved_state,
+                params.minimum_density,
+                params.minimum_pressure,
+                gamma,
+                config,
+                registered_variables,
+                internal_energy_density=internal_energy_density,
+                clamp=False,
             )
         elif config.equation_of_state == ISOTHERMAL:
             primitive_state = primitive_state_from_conserved_isothermal(
-                conserved_state, params.minimum_density, config, registered_variables, clamp=False,
+                conserved_state,
+                params.minimum_density,
+                config,
+                registered_variables,
+                clamp=False,
             )
 
-        # append updated interface magnetic fields
-        # NOTE: same assumption as above
+        # Append the updated interface magnetic fields as the last three rows.
         primitive_state = jnp.concatenate(
-            [primitive_state, bxb[None, :], byb[None, :], bzb[None, :]], axis=0
+            [
+                primitive_state,
+                interface_field_x[None, :],
+                interface_field_y[None, :],
+                interface_field_z[None, :],
+            ],
+            axis=0,
         )
     else:
         conserved_state = conserved_state_from_primitive(
@@ -260,41 +340,69 @@ def _evolve_state_fd(
             primitive_state, config, registered_variables, params
         )
 
-    # dual-energy: re-sync g from the recovered (switched) pressure and reattach
-    # it as the last variable so the carried state stays self-consistent. The
-    # recovered pressure is floored here too — the coupled recovery itself does
+    # -------------------------------------------------------------
+    # =============== ↑ Hydro / MHD Runge-Kutta update ↑ ===========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ================ ↓ Re-sync and reattach the g row ↓ ==========
+    # -------------------------------------------------------------
+
+    # Re-sync g from the recovered (switched) pressure and reattach it behind
+    # the gas / field rows, so the carried state stays self-consistent. The
+    # recovered pressure is floored here too: the coupled recovery itself does
     # not floor, and a switch-active cell must never hand a sub-floor g to the
     # next step.
-    if _dual:
-        g_new = jnp.maximum(
+    if dual_energy_active:
+        resynced_internal_energy_density = jnp.maximum(
             primitive_state[registered_variables.pressure_index],
             params.minimum_pressure,
         ) / (gamma - 1.0)
         primitive_state = jnp.concatenate(
-            [primitive_state, g_new[None, :]], axis=0
+            [primitive_state, resynced_internal_energy_density[None, :]], axis=0
         )
 
-    # Passive scalars: apply the shock bookkeeping against the UPDATED state
-    # (the entropy comparison needs the post-shock entropy), fill their ghost
-    # cells, and reattach the block at the end of the state.
-    if _scalars:
-        if _shock_history:
-            n_hist = NUM_SHOCK_HISTORY_SCALARS
-            _history = partial(update_shock_history, config=config,
-                               registered_variables=registered_variables)
-            if config.ad_scalar_lean and config.ad_remat != AD_REMAT_NONE:
-                # (config.ad_scalar_lean) recompute the latch / clamp masks in
-                # the backward instead of storing them
-                _history = jax.checkpoint(_history)
+    # -------------------------------------------------------------
+    # ================ ↑ Re-sync and reattach the g row ↑ ==========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ========= ↓ Shock history and reattaching the scalars ↓ ======
+    # -------------------------------------------------------------
+
+    # Apply the shock bookkeeping against the UPDATED state (the entropy
+    # comparison needs the post-shock entropy), fill the scalars' ghost cells,
+    # and reattach the block at the end of the state.
+    if passive_scalars_active:
+        if shock_history_active:
+            shock_history_update = partial(
+                update_shock_history,
+                config=config,
+                registered_variables=registered_variables,
+            )
+            if _scalar_lean(config):
+                # With ``config.ad_scalar_lean`` the latch and clamp masks are
+                # recomputed in the backward pass instead of being stored.
+                shock_history_update = jax.checkpoint(shock_history_update)
             passive_scalars = jnp.concatenate(
-                [passive_scalars[:-n_hist],
-                 _history(
-                     passive_scalars[-n_hist:], primitive_state, dt, gamma,
-                     config.shock_entropy_jump)],
+                [
+                    passive_scalars[:shock_history_offset],
+                    shock_history_update(
+                        passive_scalars[shock_history_offset:],
+                        primitive_state,
+                        dt,
+                        gamma,
+                        config.shock_entropy_jump,
+                    ),
+                ],
                 axis=0,
             )
         if config.boundary_handling == GHOST_CELLS:
             passive_scalars = _fill_scalar_ghost_cells(passive_scalars, config)
         primitive_state = jnp.concatenate([primitive_state, passive_scalars], axis=0)
+
+    # -------------------------------------------------------------
+    # ========= ↑ Shock history and reattaching the scalars ↑ ======
+    # -------------------------------------------------------------
 
     return primitive_state
