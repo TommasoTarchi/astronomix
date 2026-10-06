@@ -9,7 +9,7 @@ weighting the stencils based on their smoothness.
 The reconstruction is done in characteristic variables to
 better capture the underlying wave structure. At each interface,
 we compute the eigenstructure (evaluated at the average of the
-left and right states), and project all stencil
+left and right states), and project all stencil values into
 characteristic space.
 
 Consider the interface at i + 1/2. Our vector of conserved
@@ -19,10 +19,10 @@ we have N_char = 7 characteristic waves.
 
 We calculate the flux as follows:
 
-1. We retrieve the eigenstructure given by the right 
-   and left eigenvector matrices R_{i+1/2} \in R^{N_vars x N_char} 
-   and L_{i+1/2} \in R^{N_char x N_vars}, as well 
-   as the eigenvalues lambda at 
+1. We retrieve the eigenstructure given by the right
+   and left eigenvector matrices R_{i+1/2} \in R^{N_vars x N_char}
+   and L_{i+1/2} \in R^{N_char x N_vars}, as well
+   as the eigenvalues lambda at
    q_{i+1/2} ~ 0.5 * (q_i + q_{i+1}).
 
 2. In the stencil m = i - 2, ..., i + 2, we project the fluxes
@@ -39,30 +39,30 @@ We calculate the flux as follows:
    into F_s^+ and F_s^- such that \partial_u F_s^+ only has non-negative
    eigenvalues, and \partial_u F_s^- only has non-positive eigenvalues.
    Both can then be properly upwinded with skewed stencils (for F_s^+ we
-   use a left-biased stencil, for F_s^- we use a right-biased stencil, 
+   use a left-biased stencil, for F_s^- we use a right-biased stencil,
    see step 5).
 
    ΔF_s^+_{m+1/2} = 0.5 * (ΔF_s_{m+1/2} + alpha^s * Δq_s_{m+1/2}), m = i - 2, ..., i + 1
    ΔF_s^-_{m+1/2} = 0.5 * (ΔF_s_{m+1/2} - alpha^s * Δq_s_{m+1/2}), m = i - 1, ..., i + 2
 
-   where alpha^s = max(|lambda^s_m|) over the 
+   where alpha^s = max(|lambda^s_m|) over the
    stencil m = i - 2, ..., i + 3.
 
 5. We can compactly write the WENO flux reconstruction as:
-   
+
    F_{i+1/2} = 1/12 * (-F_{i-1} + 7*F_i + 7*F_{i+1} - F_{i+2})
                 +sum_{s = 1}^{N_char} [
                     -\phi(ΔF_s^+_{i-3/2}, ΔF_s^+_{i-1/2}, ΔF_s^+_{i+1/2}, ΔF_s^+_{i+3/2})
                     +\phi(ΔF_s^-_{i+5/2}, ΔF_s^-_{i+3/2}, ΔF_s^-_{i+1/2}, ΔF_s^-_{i-1/2})
                 ] * R^s_{i+1/2}
-    
+
     where R^s_{i+1/2} is the s-th column of R at the interface i + 1/2,
     and \phi is the WENO interpolant function given by:
 
     \phi(a, b, c, d) = 1/3 ω_0 (a - 2b + c) + 1/6 (ω_2 - 1/2) (b - 2c + d)
 
     with weight functions:
-    
+
     ω_0 = α_0 / (α_0 + α_1 + α_2)
     ω_2 = α_2 / (α_0 + α_1 + α_2)
 
@@ -76,8 +76,9 @@ We calculate the flux as follows:
     IS_1 = 13 (b - c)^2 + 3 (b + c)^2
     IS_2 = 13 (c - d)^2 + 3 (3c - d)^2
 
-    ε is a small parameter to avoid 
-    division by zero, here taken as 1e-8.
+    ε is a small parameter to avoid division by zero:
+    ``config.weno_epsilon``, plus ``config.weno_epsilon_relative * (alpha^s q_s_i)^2``
+    when the relative epsilon is set.
 
 NOTE: I have seen formulations where the first part of the flux
 is also calculated in characteristic space and then transformed back,
@@ -89,37 +90,29 @@ For literature references, see:
  - High Order ENO and WENO Schemes for Computational Fluid Dynamics by Chi-Wang Shu (1997)
    (https://doi.org/10.1007/978-3-662-03882-6_5)
 
-Concretely we implement the 5th-order WENO scheme as described in 
+Concretely we implement the 5th-order WENO scheme as described in
 
-- HOW-MHD: A High-Order WENO-Based Magnetohydrodynamic Code with a High-Order 
+- HOW-MHD: A High-Order WENO-Based Magnetohydrodynamic Code with a High-Order
   Constrained Transport Algorithm for Astrophysical Applications by Seo & Ryu 2023
   (https://arxiv.org/abs/2304.04360)
+
+The per-axis dispatchers at the bottom of the module run the Pallas kernels of
+``_weno_pallas.py`` where they support the equation set and fall back to the
+native-JAX reconstruction above otherwise.
 """
 
 # general
 from functools import partial
 
-# typing
-from typing import Union
-
 # jax
 import jax
 import jax.numpy as jnp
-from jax import checkpoint
-
-# optional Pallas backend (absent on platforms without a Pallas/Triton build)
-try:
-    from jax.experimental import pallas as pl
-except Exception:  # pragma: no cover - optional backend
-    pl = None
-
-try:
-    from jax.experimental.pallas import triton as pltriton
-except Exception:  # pragma: no cover - optional backend
-    pltriton = None
 
 # astronomix constants
-from astronomix.option_classes.simulation_config import IDEAL_GAS, ISOTHERMAL, PALLAS
+from astronomix.option_classes.simulation_config import (
+    IDEAL_GAS,
+    ISOTHERMAL,
+)
 
 # astronomix containers
 from astronomix.option_classes.simulation_config import SimulationConfig
@@ -127,16 +120,35 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
-from astronomix._fluid_equations._eigen_hydro import _eigen_L_row_hydro, _eigen_R_col_hydro, _eigen_lambdas_hydro
-from astronomix._fluid_equations._eigen_hydro_iso import _eigen_L_row_hydro_iso, _eigen_R_col_hydro_iso, _eigen_lambdas_hydro_iso
-from astronomix._fluid_equations._eigen_mhd import _eigen_L_row, _eigen_R_col, _eigen_lambdas
-from astronomix._fluid_equations._eigen_mhd_iso import _eigen_L_row_iso, _eigen_R_col_iso, _eigen_lambdas_iso
-from astronomix._fluid_equations._fluxes_mhd import _euler_flux_isothermal_x, _mhd_flux_isothermal_x, _mhd_flux_x
+from astronomix._fluid_equations._eigen_hydro import (
+    _eigen_L_row_hydro,
+    _eigen_R_col_hydro,
+    _eigen_lambdas_hydro,
+)
+from astronomix._fluid_equations._eigen_hydro_iso import (
+    _eigen_L_row_hydro_iso,
+    _eigen_R_col_hydro_iso,
+    _eigen_lambdas_hydro_iso,
+)
+from astronomix._fluid_equations._eigen_mhd import (
+    _eigen_L_row,
+    _eigen_R_col,
+    _eigen_lambdas,
+)
+from astronomix._fluid_equations._eigen_mhd_iso import (
+    _eigen_L_row_iso,
+    _eigen_R_col_iso,
+    _eigen_lambdas_iso,
+)
+from astronomix._fluid_equations._fluxes_mhd import (
+    _euler_flux_isothermal_x,
+    _mhd_flux_isothermal_x,
+    _mhd_flux_x,
+)
 from astronomix._fluid_equations._equations import primitive_state_from_conserved
 from astronomix._fluid_equations._fluxes import _euler_flux
 from astronomix._stencil_operations._stencil_operations import _shift
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
-    _weno_omega_weights,
     _weno_omega_weights_ad,
     _weno_omega_weights_z,
 )
@@ -144,6 +156,22 @@ from astronomix._finite_difference._interface_fluxes._weno_positivity import (
     mass_free_modes,
     positivity_preserving_interface_flux,
     stencil_maximum,
+)
+from astronomix._pallas_helpers import (
+    _pallas_call_sharded,
+    diffable_pallas_call,
+    diffable_pallas_call_n,
+)
+
+# astronomix functions (Pallas backend; ``_weno_pallas.py`` imports the native
+# fluxes of this module only inside its functions, so there is no import cycle)
+from astronomix._finite_difference._interface_fluxes._weno_pallas import (
+    _hydro_pallas_flux_supported,
+    _mhd_iso_pallas_flux_supported,
+    _mhd_pallas_flux_supported,
+    _weno_flux_hydro_pallas,
+    _weno_flux_mhd_iso_pallas,
+    _weno_flux_mhd_pallas,
 )
 
 
@@ -157,61 +185,84 @@ def _weno_flux_x_native(
     inflow_reference=None,
 ):
     """
-    WENO flux reconstruction.
+    WENO flux reconstruction along x (the first spatial axis), native JAX.
 
-    ``internal_energy_density`` (dual-energy ``g``, aligned with ``conserved_state``
-    along the active axis), when given, is used by the cell-centred pressure
-    recovery in both the physical flux and the eigenstructure so the
-    reconstruction never sees the cancellation-corrupted pressure.
+    Args:
+        conserved_state: The conserved state array.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g``, aligned with
+            ``conserved_state`` along the active axis, or None. When given, it
+            is used by the cell-centred pressure recovery in both the physical
+            flux and the eigenstructure, so the reconstruction never sees the
+            cancellation-corrupted pressure.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference`` in this sweep's
+            layout, for the joint limiting of each cell's inflow faces; None
+            otherwise.
+
+    Returns:
+        The WENO interface fluxes at i + 1/2, aligned with cell i.
     """
     dual_eta = config.dual_energy_eta
 
     epsilon = config.weno_epsilon
-    eps_rel = config.weno_epsilon_relative
-    # (``_weno_omega_weights_ad``: the same weights bit for bit, with an
-    # overflow-free derivative for the exact-weight tangent; see its docstring)
+    relative_epsilon = config.weno_epsilon_relative
+    # ``_weno_omega_weights_ad`` gives the same weights bit for bit as the
+    # plain Jiang-Shu weights, with an overflow-free derivative for the
+    # exact-weight tangent (see its docstring).
     omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights_ad
     positivity_preserving = config.weno_positivity_preserving
     admissible_face_state = config.weno_admissible_face_state
     if config.weno_ad_frozen_weights:
-        _omega_raw = omega_weights
+        unfrozen_omega_weights = omega_weights
 
         def omega_weights(*args):
-            return tuple(jax.lax.stop_gradient(w) for w in _omega_raw(*args))
+            return tuple(jax.lax.stop_gradient(w) for w in unfrozen_omega_weights(*args))
 
-    # only used in the IDEAL_GAS case
-    rhomin = params.minimum_density
-    pgmin = params.minimum_pressure
+    # The floors and gamma are only used for an ideal gas.
+    minimum_density = params.minimum_density
+    minimum_pressure = params.minimum_pressure
     gamma = params.gamma
 
-    # only used in the ISOTHERMAL case
+    # The sound speed is only used for an isothermal gas.
     isothermal_sound_speed = params.isothermal_sound_speed
 
+    # -------------------------------------------------------------
+    # ================= ↓ Cell-centred fluxes ↓ ===================
+    # -------------------------------------------------------------
+
     if config.equation_of_state == IDEAL_GAS:
-        # retrieve the center fluxes
         if config.mhd:
             F = _mhd_flux_x(
                 conserved_state,
-                rhomin,
-                pgmin,
+                minimum_density,
+                minimum_pressure,
                 gamma,
                 config,
                 registered_variables,
                 internal_energy_density=internal_energy_density,
             )
         else:
-            F =  _euler_flux(
+            F = _euler_flux(
                 primitive_state_from_conserved(
-                    conserved_state, gamma, config, registered_variables,
+                    conserved_state,
+                    gamma,
+                    config,
+                    registered_variables,
                     internal_energy_density=internal_energy_density,
                 ),
-                gamma, config, registered_variables, 1
+                gamma,
+                config,
+                registered_variables,
+                1,
             )
     elif config.equation_of_state == ISOTHERMAL:
         if config.mhd:
             F = _mhd_flux_isothermal_x(
                 conserved_state,
-                rhomin,
+                minimum_density,
                 isothermal_sound_speed,
                 config,
                 registered_variables,
@@ -219,17 +270,25 @@ def _weno_flux_x_native(
         else:
             F = _euler_flux_isothermal_x(
                 conserved_state,
-                rhomin,
+                minimum_density,
                 isothermal_sound_speed,
                 config,
                 registered_variables,
             )
 
-        
-    # with this we can already compute the first part of the flux
+    # With the cell-centred fluxes we can already compute the central part of
+    # the interface flux.
     F_interface = 1/12 * (
         -_shift(F, 1, axis=1) + 7 * F + 7 * _shift(F, -1, axis=1) - _shift(F, -2, axis=1)
     )
+
+    # -------------------------------------------------------------
+    # ================= ↑ Cell-centred fluxes ↑ ===================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ======== ↓ Eigensystem of one characteristic field ↓ ========
+    # -------------------------------------------------------------
 
     if config.mhd:
         num_modes = 7
@@ -240,37 +299,147 @@ def _weno_flux_x_native(
         num_modes -= 1
 
     def mode_eigenvalues(mode):
+        """The eigenvalue of characteristic field ``mode`` in every cell."""
         if config.equation_of_state == IDEAL_GAS:
             if config.mhd:
-                return _eigen_lambdas(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
-            return _eigen_lambdas_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
+                return _eigen_lambdas(
+                    conserved_state,
+                    minimum_density,
+                    minimum_pressure,
+                    gamma,
+                    registered_variables,
+                    mode,
+                    internal_energy_density=internal_energy_density,
+                    dual_eta=dual_eta,
+                )
+            return _eigen_lambdas_hydro(
+                conserved_state,
+                minimum_density,
+                minimum_pressure,
+                gamma,
+                config,
+                registered_variables,
+                mode,
+                internal_energy_density=internal_energy_density,
+                dual_eta=dual_eta,
+            )
         if config.mhd:
-            return _eigen_lambdas_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-        return _eigen_lambdas_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+            return _eigen_lambdas_iso(
+                conserved_state,
+                minimum_density,
+                isothermal_sound_speed,
+                registered_variables,
+                mode,
+            )
+        return _eigen_lambdas_hydro_iso(
+            conserved_state,
+            minimum_density,
+            isothermal_sound_speed,
+            config,
+            registered_variables,
+            mode,
+        )
 
     def mode_left_row(mode):
+        """Row ``mode`` of the left eigenvector matrix at every interface."""
         if config.equation_of_state == IDEAL_GAS:
             if config.mhd:
-                return _eigen_L_row(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta, admissible_face_state=admissible_face_state)
-            return _eigen_L_row_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
+                return _eigen_L_row(
+                    conserved_state,
+                    minimum_density,
+                    minimum_pressure,
+                    gamma,
+                    registered_variables,
+                    mode,
+                    internal_energy_density=internal_energy_density,
+                    dual_eta=dual_eta,
+                    admissible_face_state=admissible_face_state,
+                )
+            return _eigen_L_row_hydro(
+                conserved_state,
+                minimum_density,
+                minimum_pressure,
+                gamma,
+                config,
+                registered_variables,
+                mode,
+                internal_energy_density=internal_energy_density,
+                dual_eta=dual_eta,
+            )
         if config.mhd:
-            return _eigen_L_row_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-        return _eigen_L_row_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+            return _eigen_L_row_iso(
+                conserved_state,
+                minimum_density,
+                isothermal_sound_speed,
+                registered_variables,
+                mode,
+            )
+        return _eigen_L_row_hydro_iso(
+            conserved_state,
+            minimum_density,
+            isothermal_sound_speed,
+            config,
+            registered_variables,
+            mode,
+        )
 
     def mode_right_column(mode):
+        """Column ``mode`` of the right eigenvector matrix at every interface."""
         if config.equation_of_state == IDEAL_GAS:
             if config.mhd:
-                return _eigen_R_col(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta, admissible_face_state=admissible_face_state)
-            return _eigen_R_col_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
+                return _eigen_R_col(
+                    conserved_state,
+                    minimum_density,
+                    minimum_pressure,
+                    gamma,
+                    registered_variables,
+                    mode,
+                    internal_energy_density=internal_energy_density,
+                    dual_eta=dual_eta,
+                    admissible_face_state=admissible_face_state,
+                )
+            return _eigen_R_col_hydro(
+                conserved_state,
+                minimum_density,
+                minimum_pressure,
+                gamma,
+                config,
+                registered_variables,
+                mode,
+                internal_energy_density=internal_energy_density,
+                dual_eta=dual_eta,
+            )
         if config.mhd:
-            return _eigen_R_col_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-        return _eigen_R_col_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+            return _eigen_R_col_iso(
+                conserved_state,
+                minimum_density,
+                isothermal_sound_speed,
+                registered_variables,
+                mode,
+            )
+        return _eigen_R_col_hydro_iso(
+            conserved_state,
+            minimum_density,
+            isothermal_sound_speed,
+            config,
+            registered_variables,
+            mode,
+        )
+
+    # -------------------------------------------------------------
+    # ======== ↑ Eigensystem of one characteristic field ↑ ========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====== ↓ Positivity-preserving splitting speed ↓ ============
+    # -------------------------------------------------------------
 
     if positivity_preserving:
         # The common splitting speed of the fields that carry mass: the
         # largest wave speed anywhere on the stencil (see _weno_positivity.py).
         spectral_radius = jnp.max(
-            jnp.stack([jnp.abs(mode_eigenvalues(mode)) for mode in range(num_modes)]), axis=0
+            jnp.stack([jnp.abs(mode_eigenvalues(mode)) for mode in range(num_modes)]),
+            axis=0,
         )
         common_speed = stencil_maximum(spectral_radius)
         if config.weno_ad_frozen_weights:
@@ -278,43 +447,46 @@ def _weno_flux_x_native(
         safe_common_speed = jnp.maximum(common_speed, 1e-30)
 
         # Fields that carry no mass keep their own splitting speed.
-        keeps_own_speed = jnp.array([mode in mass_free_modes(config) for mode in range(num_modes)])
-        # the split-state shifts only exist when some field keeps its own speed
+        keeps_own_speed = jnp.array(
+            [mode in mass_free_modes(config) for mode in range(num_modes)]
+        )
+        # The split-state shifts only exist when some field keeps its own speed.
         carries_shifts = len(mass_free_modes(config)) > 0
-        right_neighbour = _shift(conserved_state, -1, axis=1)
         zero = jnp.zeros_like(F_interface)
 
-    def mode_flux(mode, F_current):
+    # -------------------------------------------------------------
+    # ====== ↑ Positivity-preserving splitting speed ↑ ============
+    # -------------------------------------------------------------
 
-        # get eigenstructure for this mode
-        if config.equation_of_state == IDEAL_GAS:
-            if config.mhd:
-                lambdas_center = _eigen_lambdas(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
-                L_row = _eigen_L_row(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta, admissible_face_state=admissible_face_state)
-            else:
-                lambdas_center = _eigen_lambdas_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
-                L_row = _eigen_L_row_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
-        elif config.equation_of_state == ISOTHERMAL:
-            if config.mhd:
-                lambdas_center = _eigen_lambdas_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-                L_row = _eigen_L_row_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-            else:
-                lambdas_center = _eigen_lambdas_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
-                L_row = _eigen_L_row_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+    # -------------------------------------------------------------
+    # ====== ↓ Per-mode characteristic reconstruction ↓ ===========
+    # -------------------------------------------------------------
+
+    def mode_flux(mode, F_current):
+        """Add the WENO correction of characteristic field ``mode`` to the
+        flux accumulated over the previous fields (the split-flux tuple under
+        positivity preservation)."""
+
+        lambdas_center = mode_eigenvalues(mode)
+        L_row = mode_left_row(mode)
         if config.weno_ad_frozen_weights:
-            # the eigensystem and the splitting speed are frozen with the
+            # The eigensystem and the splitting speed are frozen with the
             # weights: L carries 1/c^2 terms, so in cold gas d L / d c ~ 1/c^3
-            # and the tangent is amplified ~20x per step in cold dense knots
+            # and the tangent is amplified ~20x per step in cold dense knots.
             lambdas_center = jax.lax.stop_gradient(lambdas_center)
             L_row = jax.lax.stop_gradient(L_row)
 
-        F0 = _shift(F,  2, axis=1)   # shape (N_vars, Nx, Ny, Nz) — i-2 at target i
-        F1 = _shift(F,  1, axis=1)   # i-1
-        F2 = F                         # i
-        F3 = _shift(F, -1, axis=1)   # i+1
-        F4 = _shift(F, -2, axis=1)   # i+2
-        F5 = _shift(F, -3, axis=1)   # i+3
+        # The six stencil cells i - 2 ... i + 3 of the interface i + 1/2, as
+        # fields aligned with cell i; each has shape (N_vars, Nx, Ny, Nz).
+        F0 = _shift(F,  2, axis=1)
+        F1 = _shift(F,  1, axis=1)
+        F2 = F
+        F3 = _shift(F, -1, axis=1)
+        F4 = _shift(F, -2, axis=1)
+        F5 = _shift(F, -3, axis=1)
 
+        # Project the fluxes (s_k = F_s_m) and the conserved variables
+        # (q_k = q_s_m) of the stencil onto the characteristic field.
         if config.dimensionality == 3:
             s0 = jnp.einsum('nxyz,nxyz->xyz', L_row, F0)
             s1 = jnp.einsum('nxyz,nxyz->xyz', L_row, F1)
@@ -358,7 +530,7 @@ def _weno_flux_x_native(
             q4 = jnp.einsum('nx,nx->x', L_row, _shift(conserved_state, -2, axis=1))
             q5 = jnp.einsum('nx,nx->x', L_row, _shift(conserved_state, -3, axis=1))
 
-        # dFsk identical to original: d0 = s1 - s0, d1 = s2 - s1, ...
+        # The differences ΔF_s and Δq_s of neighbouring stencil cells.
         d0 = s1 - s0
         d1 = s2 - s1
         d2 = s3 - s2
@@ -371,7 +543,8 @@ def _weno_flux_x_native(
         dq3 = q4 - q3
         dq4 = q5 - q4
 
-        # compute amx over the same stencil (take abs then max over the six entries)
+        # The splitting speed alpha^s: the largest |lambda^s| over the six
+        # stencil cells.
         lam0 = _shift(lambdas_center,  2, axis=0)
         lam1 = _shift(lambdas_center,  1, axis=0)
         lam2 = lambdas_center
@@ -383,16 +556,17 @@ def _weno_flux_x_native(
         if positivity_preserving:
             amx = jnp.where(keeps_own_speed[mode], amx, common_speed)
 
-        # Now use the exact same definitions as original for aterm/bterm/cterm/dterm
         # Optional RELATIVE epsilon: compare the smoothness indicators against
         # the local data scale (amx * |q|)^2 rather than an absolute constant,
         # so a smooth solution stays on the optimal linear weights whatever the
         # magnitude of the characteristic variables happens to be.
-        if eps_rel > 0.0:
-            eps_s = epsilon + eps_rel * (amx * q2) ** 2
+        if relative_epsilon > 0.0:
+            smoothness_epsilon = epsilon + relative_epsilon * (amx * q2) ** 2
         else:
-            eps_s = epsilon
+            smoothness_epsilon = epsilon
 
+        # The left-biased reconstruction of the split flux ΔF_s^+ (the
+        # arguments a, b, c, d of phi in the module docstring).
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
         cterm_p = 0.5 * (d2 + amx * dq2)
@@ -402,13 +576,13 @@ def _weno_flux_x_native(
         IS1_p = 13.0 * (bterm_p - cterm_p)**2 + 3.0 * (bterm_p + cterm_p)**2
         IS2_p = 13.0 * (cterm_p - dterm_p)**2 + 3.0 * (3.0*cterm_p - dterm_p)**2
 
-        omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, eps_s, 1e-14)
+        omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, smoothness_epsilon, 1e-14)
 
         second = (omega0_p * (aterm_p - 2.0*bterm_p + cterm_p) * (1.0 / 3.0)
                   + (omega2_p - 0.5) * (bterm_p - 2.0*cterm_p + dterm_p) * (1.0 / 6.0))
 
-        # Backward WENO similarly with the matching stencil differences:
-        aterm_m = 0.5 * (d4 - amx * dq4)   # corresponds to original dFsk[4] etc.
+        # The right-biased reconstruction of ΔF_s^-, on the mirrored stencil.
+        aterm_m = 0.5 * (d4 - amx * dq4)
         bterm_m = 0.5 * (d3 - amx * dq3)
         cterm_m = 0.5 * (d2 - amx * dq2)
         dterm_m = 0.5 * (d1 - amx * dq1)
@@ -417,24 +591,15 @@ def _weno_flux_x_native(
         IS1_m = 13.0 * (bterm_m - cterm_m)**2 + 3.0 * (bterm_m + cterm_m)**2
         IS2_m = 13.0 * (cterm_m - dterm_m)**2 + 3.0 * (3.0*cterm_m - dterm_m)**2
 
-        omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, eps_s, 1e-14)
+        omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, smoothness_epsilon, 1e-14)
 
         third = (omega0_m * (aterm_m - 2.0*bterm_m + cterm_m) * (1.0 / 3.0)
                  + (omega2_m - 0.5) * (bterm_m - 2.0*cterm_m + dterm_m) * (1.0 / 6.0))
 
         Fs = -second + third
 
-        # transform back and add to current flux
-        if config.equation_of_state == IDEAL_GAS:
-            if config.mhd:
-                R_col = _eigen_R_col(conserved_state, rhomin, pgmin, gamma, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta, admissible_face_state=admissible_face_state)
-            else:
-                R_col = _eigen_R_col_hydro(conserved_state, rhomin, pgmin, gamma, config, registered_variables, mode, internal_energy_density=internal_energy_density, dual_eta=dual_eta)
-        elif config.equation_of_state == ISOTHERMAL:
-            if config.mhd:
-                R_col = _eigen_R_col_iso(conserved_state, rhomin, isothermal_sound_speed, registered_variables, mode)
-            else:
-                R_col = _eigen_R_col_hydro_iso(conserved_state, rhomin, isothermal_sound_speed, config, registered_variables, mode)
+        # Transform back to conserved variables and add to the current flux.
+        R_col = mode_right_column(mode)
         if config.weno_ad_frozen_weights:
             R_col = jax.lax.stop_gradient(R_col)
 
@@ -444,14 +609,18 @@ def _weno_flux_x_native(
             # states along its eigenvector, by (own - common) speed.
             if not carries_shifts:
                 plus_correction, minus_correction = F_current
-                return (plus_correction - R_col * second[None], minus_correction + R_col * third[None])
+                return (
+                    plus_correction - R_col * second[None],
+                    minus_correction + R_col * third[None],
+                )
             plus_correction, minus_correction, plus_owner_shift, minus_owner_shift = F_current
             speed_offset = (amx - common_speed)[None]
             central_projection = (1.0 / 12.0) * (-q1 + 7.0 * q2 + 7.0 * q3 - q4)
             relative_offset = speed_offset / safe_common_speed[None]
+            central_shift = 0.5 * speed_offset * R_col * central_projection[None]
             return (
-                plus_correction - R_col * second[None] + 0.5 * speed_offset * R_col * central_projection[None],
-                minus_correction + R_col * third[None] - 0.5 * speed_offset * R_col * central_projection[None],
+                plus_correction - R_col * second[None] + central_shift,
+                minus_correction + R_col * third[None] - central_shift,
                 plus_owner_shift + relative_offset * R_col * q2[None],
                 minus_owner_shift + relative_offset * R_col * q3[None],
             )
@@ -464,23 +633,40 @@ def _weno_flux_x_native(
             dF = jnp.einsum('nx,x->nx', R_col, Fs)
         return F_current + dF
 
+    # -------------------------------------------------------------
+    # ====== ↑ Per-mode characteristic reconstruction ↑ ===========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====== ↓ Positivity-preserving recombination ↓ ==============
+    # -------------------------------------------------------------
+
     if positivity_preserving:
         if carries_shifts:
-            plus_face_flux, minus_face_flux, plus_owner_shift, minus_owner_shift = jax.lax.fori_loop(
-                0, num_modes, mode_flux, (zero, zero, zero, zero)
+            plus_face_flux, minus_face_flux, plus_owner_shift, minus_owner_shift = (
+                jax.lax.fori_loop(0, num_modes, mode_flux, (zero, zero, zero, zero))
             )
         else:
-            plus_face_flux, minus_face_flux = jax.lax.fori_loop(0, num_modes, mode_flux, (zero, zero))
+            plus_face_flux, minus_face_flux = jax.lax.fori_loop(
+                0,
+                num_modes,
+                mode_flux,
+                (zero, zero),
+            )
             plus_owner_shift = minus_owner_shift = 0.0
-        # the central parts of the two split fluxes, at the common speed (the
-        # fields' own speeds entered through the shifts above)
+        # The central parts of the two split fluxes, at the common speed (the
+        # fields' own speeds entered through the shifts above).
         central_flux = F_interface
         central_state = (1.0 / 12.0) * (
             -_shift(conserved_state, 1, axis=1) + 7.0 * conserved_state
-            + 7.0 * right_neighbour - _shift(conserved_state, -2, axis=1)
+            + 7.0 * _shift(conserved_state, -1, axis=1) - _shift(conserved_state, -2, axis=1)
         )
-        plus_face_flux = plus_face_flux + 0.5 * (central_flux + common_speed[None] * central_state)
-        minus_face_flux = minus_face_flux + 0.5 * (central_flux - common_speed[None] * central_state)
+        plus_face_flux = plus_face_flux + 0.5 * (
+            central_flux + common_speed[None] * central_state
+        )
+        minus_face_flux = minus_face_flux + 0.5 * (
+            central_flux - common_speed[None] * central_state
+        )
         return positivity_preserving_interface_flux(
             conserved_state,
             F,
@@ -495,22 +681,42 @@ def _weno_flux_x_native(
             inflow_reference=inflow_reference,
         )
 
-    # I went for the for loop instead of one einsum
-    # because of memory considerations (the full projection
-    # matrix does not need to be materialized)
-    # But probably this (as I originally had it)
-    # would be faster (?).
+    # -------------------------------------------------------------
+    # ====== ↑ Positivity-preserving recombination ↑ ==============
+    # -------------------------------------------------------------
+
+    # A loop over the characteristic fields instead of one einsum over all of
+    # them keeps the full projection matrix from being materialised (memory);
+    # a single einsum might be faster.
     return jax.lax.fori_loop(
-        0, num_modes,
+        0,
+        num_modes,
         mode_flux,
-        F_interface
+        F_interface,
     )
 
-def _reference_in_sweep_layout(inflow_reference, axis, config: SimulationConfig,
-                               registered_variables: RegisteredVariables):
-    """``mhd_inflow_reference`` moved into the layout of the native y / z
-    sweep: the active axis first and its momentum / field components swapped
-    with x, exactly as the state."""
+
+def _reference_in_sweep_layout(
+    inflow_reference,
+    axis,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """
+    Move ``mhd_inflow_reference`` into the layout of the native y / z sweep:
+    the active axis first and its momentum / field components swapped with x,
+    exactly as the state.
+
+    Args:
+        inflow_reference: The ``(B, sum S)`` pair of ``mhd_inflow_reference``
+            in the untransposed layout, or None.
+        axis: The sweep axis (1 or 2).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The pair in the sweep's layout, or None.
+    """
     if inflow_reference is None:
         return None
     reference_state, speed_sum = inflow_reference
@@ -551,22 +757,31 @@ def _weno_flux_y_native(
         params: The simulation parameters.
         config: The simulation configuration.
         registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference`` in the
+            untransposed layout; None otherwise.
 
     Returns:
         The WENO interface fluxes in the y-direction.
     """
 
-    # Transpose to make y the "x" direction
+    # Transpose to make y the "x" direction.
     if config.dimensionality == 2:
         qy = jnp.transpose(conserved_state, (0, 2, 1))
     elif config.dimensionality == 3:
         qy = jnp.transpose(conserved_state, (0, 2, 1, 3))
 
-    # transpose the (scalar) dual-energy field the same way (no leading var axis)
-    gy = internal_energy_density
-    if gy is not None:
-        gy = jnp.transpose(gy, (1, 0)) if config.dimensionality == 2 else jnp.transpose(gy, (1, 0, 2))
-    
+    # The dual-energy field is transposed the same way (it has no leading
+    # variable axis).
+    internal_energy_density_y = internal_energy_density
+    if internal_energy_density_y is not None:
+        if config.dimensionality == 2:
+            internal_energy_density_y = jnp.transpose(internal_energy_density_y, (1, 0))
+        else:
+            internal_energy_density_y = jnp.transpose(internal_energy_density_y, (1, 0, 2))
+
     # Swap components
     momentum_x = qy[registered_variables.momentum_index.x]
     momentum_y = qy[registered_variables.momentum_index.y]
@@ -574,25 +789,34 @@ def _weno_flux_y_native(
     if config.mhd:
         B_x = qy[registered_variables.magnetic_index.x]
         B_y = qy[registered_variables.magnetic_index.y]
-    
+
     qy = qy.at[registered_variables.momentum_index.x].set(momentum_y)
     qy = qy.at[registered_variables.momentum_index.y].set(momentum_x)
 
     if config.mhd:
         qy = qy.at[registered_variables.magnetic_index.x].set(B_y)
         qy = qy.at[registered_variables.magnetic_index.y].set(B_x)
-    
+
     Fy = _weno_flux_x_native(
-        qy, params, config, registered_variables, internal_energy_density=gy,
-        inflow_reference=_reference_in_sweep_layout(inflow_reference, 1, config, registered_variables),
+        qy,
+        params,
+        config,
+        registered_variables,
+        internal_energy_density=internal_energy_density_y,
+        inflow_reference=_reference_in_sweep_layout(
+            inflow_reference,
+            1,
+            config,
+            registered_variables,
+        ),
     )
-    
+
     # Transpose back
     if config.dimensionality == 2:
         Fy = jnp.transpose(Fy, (0, 2, 1))
     elif config.dimensionality == 3:
         Fy = jnp.transpose(Fy, (0, 2, 1, 3))
-    
+
     # Swap components back
     Fmomentum_x = Fy[registered_variables.momentum_index.x]
     Fmomentum_y = Fy[registered_variables.momentum_index.y]
@@ -600,14 +824,14 @@ def _weno_flux_y_native(
     if config.mhd:
         FB_x = Fy[registered_variables.magnetic_index.x]
         FB_y = Fy[registered_variables.magnetic_index.y]
-    
+
     Fy = Fy.at[registered_variables.momentum_index.x].set(Fmomentum_y)
     Fy = Fy.at[registered_variables.momentum_index.y].set(Fmomentum_x)
 
     if config.mhd:
         Fy = Fy.at[registered_variables.magnetic_index.x].set(FB_y)
         Fy = Fy.at[registered_variables.magnetic_index.y].set(FB_x)
-    
+
     return Fy
 
 
@@ -633,18 +857,23 @@ def _weno_flux_z_native(
         params: The simulation parameters.
         config: The simulation configuration.
         registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference`` in the
+            untransposed layout; None otherwise.
 
     Returns:
         The WENO interface fluxes in the z-direction.
     """
 
-    # Transpose to make z the "x" direction
+    # Transpose to make z the "x" direction.
     qz = jnp.transpose(conserved_state, (0, 3, 2, 1))
 
-    gz = internal_energy_density
-    if gz is not None:
-        gz = jnp.transpose(gz, (2, 1, 0))
-    
+    internal_energy_density_z = internal_energy_density
+    if internal_energy_density_z is not None:
+        internal_energy_density_z = jnp.transpose(internal_energy_density_z, (2, 1, 0))
+
     # Swap components
     momentum_x = qz[registered_variables.momentum_index.x]
     momentum_z = qz[registered_variables.momentum_index.z]
@@ -652,22 +881,31 @@ def _weno_flux_z_native(
     if config.mhd:
         B_x = qz[registered_variables.magnetic_index.x]
         B_z = qz[registered_variables.magnetic_index.z]
-    
+
     qz = qz.at[registered_variables.momentum_index.x].set(momentum_z)
     qz = qz.at[registered_variables.momentum_index.z].set(momentum_x)
 
     if config.mhd:
         qz = qz.at[registered_variables.magnetic_index.x].set(B_z)
         qz = qz.at[registered_variables.magnetic_index.z].set(B_x)
-    
+
     Fz = _weno_flux_x_native(
-        qz, params, config, registered_variables, internal_energy_density=gz,
-        inflow_reference=_reference_in_sweep_layout(inflow_reference, 2, config, registered_variables),
+        qz,
+        params,
+        config,
+        registered_variables,
+        internal_energy_density=internal_energy_density_z,
+        inflow_reference=_reference_in_sweep_layout(
+            inflow_reference,
+            2,
+            config,
+            registered_variables,
+        ),
     )
-    
+
     # Transpose back
     Fz = jnp.transpose(Fz, (0, 3, 2, 1))
-    
+
     # Swap components back
     Fmomentum_x = Fz[registered_variables.momentum_index.x]
     Fmomentum_z = Fz[registered_variables.momentum_index.z]
@@ -675,40 +913,15 @@ def _weno_flux_z_native(
     if config.mhd:
         FB_x = Fz[registered_variables.magnetic_index.x]
         FB_z = Fz[registered_variables.magnetic_index.z]
-    
+
     Fz = Fz.at[registered_variables.momentum_index.x].set(Fmomentum_z)
     Fz = Fz.at[registered_variables.momentum_index.z].set(Fmomentum_x)
 
     if config.mhd:
         Fz = Fz.at[registered_variables.magnetic_index.x].set(FB_z)
         Fz = Fz.at[registered_variables.magnetic_index.z].set(FB_x)
-    
+
     return Fz
-
-
-# -----------------------------------------------------------------------------
-# Pallas backend symbols (full implementation lives in ``_weno_pallas.py``).
-#
-# Importing them at the *bottom* of this file lets ``_weno_pallas.py`` perform
-# a lazy import of the ``_weno_flux_{x,y,z}_native`` symbols above without
-# tripping a circular import: those names are already bound in this module's
-# global namespace by the time ``_weno_pallas`` is loaded.  A developer who
-# only touches native JAX never needs to look at the Pallas module.
-# -----------------------------------------------------------------------------
-from astronomix._finite_difference._interface_fluxes._weno_pallas import (  # noqa: E402
-    _hydro_pallas_flux_supported,
-    _mhd_iso_pallas_flux_supported,
-    _mhd_pallas_flux_supported,
-    _weno_flux_hydro_pallas,
-    _weno_flux_hydro_pallas_rhs,
-    _weno_flux_mhd_iso_pallas,
-    _weno_flux_mhd_pallas,
-    _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod,
-    _weno_flux_mhd_pallas_keep_halo_x,
-)
-
-
-from astronomix._pallas_helpers import diffable_pallas_call, diffable_pallas_call_n  # noqa: E402
 
 
 def _weno_flux_native_for_axis(axis: int):
@@ -721,38 +934,69 @@ def _weno_flux_native_for_axis(axis: int):
 
 
 def _native_tangent_sharded(axis: int, native):
-    """The native-JAX tangent branch of a diffable Pallas WENO flux, wrapped in
-    the same multi-GPU ``shard_map`` + halo exchange as the Pallas primal
+    """
+    Wrap the native-JAX tangent branch of a diffable Pallas WENO flux in the
+    same multi-GPU ``shard_map`` + halo exchange as the Pallas primal
     (``_pallas_call_sharded``, halo 3 on the flux axis; a pass-through on one
     device).
 
     Without it the tangent -- and so the whole reverse-mode sweep -- runs the
-    native WENO under GSPMD: every periodic roll along the split axis became
-    either an all-to-all reshard (GSPMD's concatenate) or, via
-    ``sharded_roll``, one small ppermute per stencil shift. Measured at 128^3 on
-    4 A100s (2-yr solver-only gradient): 7.1 s / 21.1 s against 3.3 s on ONE
-    GPU. Inside the shard_map the rolls are local and only the halo moves.
-    ``native(s, p[, g])``; ``g`` (dual energy, (x, y, z)) rides the halo as a
-    (1, x, y, z) state-shaped input."""
-    import os
-    from astronomix._pallas_helpers import _pallas_call_sharded
+    native WENO under GSPMD, where every periodic roll along the split axis
+    becomes either an all-to-all reshard or one small ppermute per stencil
+    shift, which makes the multi-GPU gradient slower than the single-GPU one.
+    Inside the shard_map the rolls are local and only the halo moves.
 
-    if os.environ.get("ASTRONOMIX_SHARD_NATIVE_TANGENT", "1") == "0":      # A/B switch
-        return native
-    halo = [0, 0, 0]
-    halo[int(axis)] = 3
+    Args:
+        axis: The spatial axis of the flux.
+        native: ``native(state, params)``, or ``native(state, params,
+            internal_energy_density)`` with the dual-energy ``g`` of shape
+            ``(x, y, z)``, which then rides the halo exchange as a state-shaped
+            ``(1, x, y, z)`` input.
 
-    def wrapped(s, p, *g):
-        nd = s.ndim - 1
-        h = tuple(halo[:nd])
-        bs = (1,) * nd
-        if g and g[0] is not None:
+    Returns:
+        The wrapped callable, with the signature of ``native``.
+    """
+    halo_widths = [0, 0, 0]
+    halo_widths[int(axis)] = 3
+
+    def wrapped(state, params, *dual_energy):
+        num_spatial_dims = state.ndim - 1
+        halo = tuple(halo_widths[:num_spatial_dims])
+        block_shape = (1,) * num_spatial_dims
+        if dual_energy and dual_energy[0] is not None:
+            internal_energy_density = dual_energy[0]
+
+            def native_local(state_local, internal_energy_local):
+                return native(state_local, params, internal_energy_local[0])
+
             return _pallas_call_sharded(
-                lambda sl, gl: native(sl, p, gl[0]),
-                state_inputs=(s, g[0][None]), halo=h, block_shape=bs,
+                native_local,
+                state_inputs=(state, internal_energy_density[None]),
+                halo=halo,
+                block_shape=block_shape,
             )
-        return _pallas_call_sharded(lambda sl: native(sl, p), state_inputs=(s,), halo=h, block_shape=bs)
+
+        def native_local(state_local):
+            return native(state_local, params)
+
+        return _pallas_call_sharded(
+            native_local,
+            state_inputs=(state,),
+            halo=halo,
+            block_shape=block_shape,
+        )
+
     return wrapped
+
+
+def _hydro_pallas_axis_supported(conserved_state, axis: int, config: SimulationConfig):
+    """Whether the hydro Pallas WENO kernel supports this state and axis
+    (only the axes of the configured dimensionality)."""
+    return _hydro_pallas_flux_supported(conserved_state, config) and (
+        axis == 0
+        or (axis == 1 and int(config.dimensionality) >= 2)
+        or (axis == 2 and int(config.dimensionality) == 3)
+    )
 
 
 def _weno_flux_axis_dispatch(
@@ -764,12 +1008,9 @@ def _weno_flux_axis_dispatch(
     internal_energy_density=None,
     inflow_reference=None,
 ):
-    """Pick the Pallas flux for the supported equation set, falling back to
+    """
+    Pick the Pallas flux for the supported equation set, falling back to
     the native per-axis JAX flux.
-
-    ``inflow_reference`` (ideal MHD with ``weno_positivity_preserving``): the
-    axis-summed first-order inflow of every cell, ``mhd_inflow_reference``,
-    for the joint per-cell limiting of the inflow faces.
 
     Every Pallas path is wrapped through ``diffable_pallas_call`` (a
     ``jax.custom_jvp`` boundary: Pallas primal, native-JAX tangent).  A
@@ -780,84 +1021,171 @@ def _weno_flux_axis_dispatch(
     ``params`` (so gradients w.r.t. physical parameters that enter the flux are
     non-zero), and the backward is standard native-JAX AD, which compiles fast.
 
-    Previously the reverse-mode path used a hand-rolled Pallas adjoint kernel via
-    ``jax.custom_vjp``; that kept the backward on the GPU but (a) raised under
-    forward-mode AD, (b) gave a zero cotangent for ``params``, and (c) hit a
-    pathologically slow Triton lowering.  Routing both modes through the native
-    tangent removes all three problems at the cost of a native-speed (not
-    Pallas-speed) backward pass — a trade the differentiable examples want."""
+    A hand-written Pallas adjoint behind ``jax.custom_vjp`` would keep the
+    backward on the GPU, but it raises under forward-mode AD, gives a zero
+    cotangent for ``params`` and has a pathologically slow Triton lowering.
+    The native tangent avoids all three at the cost of a native-speed (not
+    Pallas-speed) backward pass — a trade the differentiable examples want.
+
+    TODO: wrap the ideal- and isothermal-MHD tangents in
+    ``_native_tangent_sharded`` like the hydro and dual-energy ones; they still
+    run the native WENO under GSPMD on multi-GPU meshes.
+
+    Args:
+        conserved_state: The conserved state array.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The spatial axis of the flux.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            axis-summed first-order inflow of every cell,
+            ``mhd_inflow_reference``, for the joint per-cell limiting of the
+            inflow faces; None otherwise.
+
+    Returns:
+        The WENO interface fluxes along ``axis``.
+    """
+    native_flux = _weno_flux_native_for_axis(axis)
+
     if internal_energy_density is not None:
         # Coupled dual-energy recovery: the hydro and MHD Pallas WENO kernels
         # carry the internal-energy field g as an extra (halo-exchanged) input
         # and apply the Bryan+95 switch in their pressure recovery.  Iso-MHD
         # has no energy equation, so g never arrives there.
-        hydro_ok = _hydro_pallas_flux_supported(conserved_state, config) and (
-            axis == 0
-            or (axis == 1 and int(config.dimensionality) >= 2)
-            or (axis == 2 and int(config.dimensionality) == 3)
-        )
-        mhd_ok = _mhd_pallas_flux_supported(conserved_state, config)
-        if hydro_ok or mhd_ok:
-            kernel = _weno_flux_hydro_pallas if hydro_ok else _weno_flux_mhd_pallas
-            pallas = lambda s, p, g: kernel(  # noqa: E731
-                s, p, config, registered_variables, axis=axis,
-                internal_energy_density=g,
-            )
-            native = _native_tangent_sharded(axis, lambda s, p, g: _weno_flux_native_for_axis(axis)(
-                s, p, config, registered_variables, internal_energy_density=g,
-            ))
+        hydro_supported = _hydro_pallas_axis_supported(conserved_state, axis, config)
+        mhd_supported = _mhd_pallas_flux_supported(conserved_state, config)
+        if hydro_supported or mhd_supported:
+            kernel = _weno_flux_hydro_pallas if hydro_supported else _weno_flux_mhd_pallas
+
+            def pallas_branch(state, params, internal_energy):
+                return kernel(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    internal_energy_density=internal_energy,
+                )
+
+            def native_branch(state, params, internal_energy):
+                return native_flux(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    internal_energy_density=internal_energy,
+                )
+
             return diffable_pallas_call_n(
                 (conserved_state, params, internal_energy_density),
-                pallas_branch=pallas, native_branch=native,
+                pallas_branch=pallas_branch,
+                native_branch=_native_tangent_sharded(axis, native_branch),
             )
-        return _weno_flux_native_for_axis(axis)(
-            conserved_state, params, config, registered_variables,
+        return native_flux(
+            conserved_state,
+            params,
+            config,
+            registered_variables,
             internal_energy_density=internal_energy_density,
         )
-    if _hydro_pallas_flux_supported(conserved_state, config):
-        if axis == 0 or (axis == 1 and int(config.dimensionality) >= 2) or (axis == 2 and int(config.dimensionality) == 3):
-            pallas = lambda s, p: _weno_flux_hydro_pallas(  # noqa: E731
-                s, p, config, registered_variables, axis=axis
+
+    if _hydro_pallas_axis_supported(conserved_state, axis, config):
+
+        def pallas_branch(state, params):
+            return _weno_flux_hydro_pallas(
+                state,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
             )
-            native = _native_tangent_sharded(axis, lambda s, p: _weno_flux_native_for_axis(axis)(
-                s, p, config, registered_variables
-            ))
-            return diffable_pallas_call(
-                conserved_state, params, pallas_branch=pallas, native_branch=native,
-            )
+
+        def native_branch(state, params):
+            return native_flux(state, params, config, registered_variables)
+
+        return diffable_pallas_call(
+            conserved_state,
+            params,
+            pallas_branch=pallas_branch,
+            native_branch=_native_tangent_sharded(axis, native_branch),
+        )
+
     if _mhd_pallas_flux_supported(conserved_state, config):
         if inflow_reference is not None:
-            pallas = lambda s, p, r, w: _weno_flux_mhd_pallas(  # noqa: E731
-                s, p, config, registered_variables, axis=axis, inflow_reference=(r, w)
-            )
-            native = lambda s, p, r, w: _weno_flux_native_for_axis(axis)(  # noqa: E731
-                s, p, config, registered_variables, inflow_reference=(r, w)
-            )
+
+            def pallas_branch(state, params, reference_state, speed_sum):
+                return _weno_flux_mhd_pallas(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    inflow_reference=(reference_state, speed_sum),
+                )
+
+            def native_branch(state, params, reference_state, speed_sum):
+                return native_flux(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    inflow_reference=(reference_state, speed_sum),
+                )
+
             return diffable_pallas_call_n(
                 (conserved_state, params) + tuple(inflow_reference),
-                pallas_branch=pallas, native_branch=native,
+                pallas_branch=pallas_branch,
+                native_branch=native_branch,
             )
-        pallas = lambda s, p: _weno_flux_mhd_pallas(  # noqa: E731
-            s, p, config, registered_variables, axis=axis
-        )
-        native = lambda s, p: _weno_flux_native_for_axis(axis)(  # noqa: E731
-            s, p, config, registered_variables
-        )
+
+        def pallas_branch(state, params):
+            return _weno_flux_mhd_pallas(
+                state,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+            )
+
+        def native_branch(state, params):
+            return native_flux(state, params, config, registered_variables)
+
         return diffable_pallas_call(
-            conserved_state, params, pallas_branch=pallas, native_branch=native,
+            conserved_state,
+            params,
+            pallas_branch=pallas_branch,
+            native_branch=native_branch,
         )
+
     if _mhd_iso_pallas_flux_supported(conserved_state, config):
-        pallas = lambda s, p: _weno_flux_mhd_iso_pallas(  # noqa: E731
-            s, p, config, registered_variables, axis=axis
-        )
-        native = lambda s, p: _weno_flux_native_for_axis(axis)(  # noqa: E731
-            s, p, config, registered_variables
-        )
+
+        def pallas_branch(state, params):
+            return _weno_flux_mhd_iso_pallas(
+                state,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+            )
+
+        def native_branch(state, params):
+            return native_flux(state, params, config, registered_variables)
+
         return diffable_pallas_call(
-            conserved_state, params, pallas_branch=pallas, native_branch=native,
+            conserved_state,
+            params,
+            pallas_branch=pallas_branch,
+            native_branch=native_branch,
         )
-    return _weno_flux_native_for_axis(axis)(
-        conserved_state, params, config, registered_variables, inflow_reference=inflow_reference
+
+    return native_flux(
+        conserved_state,
+        params,
+        config,
+        registered_variables,
+        inflow_reference=inflow_reference,
     )
 
 
@@ -870,11 +1198,31 @@ def _weno_flux_x(
     internal_energy_density=None,
     inflow_reference=None,
 ):
-    """WENO interface flux in the x-direction (Pallas backend where supported,
-    native JAX otherwise)."""
+    """
+    WENO interface flux in the x-direction (Pallas backend where supported,
+    native JAX otherwise).
+
+    Args:
+        conserved_state: The conserved state array.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference``; None otherwise.
+
+    Returns:
+        The WENO interface fluxes in the x-direction.
+    """
     return _weno_flux_axis_dispatch(
-        conserved_state, params, config, registered_variables, axis=0,
-        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
+        conserved_state,
+        params,
+        config,
+        registered_variables,
+        axis=0,
+        internal_energy_density=internal_energy_density,
+        inflow_reference=inflow_reference,
     )
 
 
@@ -887,11 +1235,31 @@ def _weno_flux_y(
     internal_energy_density=None,
     inflow_reference=None,
 ):
-    """WENO interface flux in the y-direction (Pallas backend where supported,
-    native JAX otherwise)."""
+    """
+    WENO interface flux in the y-direction (Pallas backend where supported,
+    native JAX otherwise).
+
+    Args:
+        conserved_state: The conserved state array.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference``; None otherwise.
+
+    Returns:
+        The WENO interface fluxes in the y-direction.
+    """
     return _weno_flux_axis_dispatch(
-        conserved_state, params, config, registered_variables, axis=1,
-        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
+        conserved_state,
+        params,
+        config,
+        registered_variables,
+        axis=1,
+        internal_energy_density=internal_energy_density,
+        inflow_reference=inflow_reference,
     )
 
 
@@ -904,9 +1272,29 @@ def _weno_flux_z(
     internal_energy_density=None,
     inflow_reference=None,
 ):
-    """WENO interface flux in the z-direction (Pallas backend where supported,
-    native JAX otherwise)."""
+    """
+    WENO interface flux in the z-direction (Pallas backend where supported,
+    native JAX otherwise).
+
+    Args:
+        conserved_state: The conserved state array.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The dual-energy ``g`` with the spatial shape
+            of the state, or None.
+        inflow_reference: Ideal MHD with ``weno_positivity_preserving``: the
+            ``(B, sum S)`` pair of ``mhd_inflow_reference``; None otherwise.
+
+    Returns:
+        The WENO interface fluxes in the z-direction.
+    """
     return _weno_flux_axis_dispatch(
-        conserved_state, params, config, registered_variables, axis=2,
-        internal_energy_density=internal_energy_density, inflow_reference=inflow_reference,
+        conserved_state,
+        params,
+        config,
+        registered_variables,
+        axis=2,
+        internal_energy_density=internal_energy_density,
+        inflow_reference=inflow_reference,
     )

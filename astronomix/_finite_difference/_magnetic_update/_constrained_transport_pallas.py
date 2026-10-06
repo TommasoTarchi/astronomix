@@ -1,50 +1,51 @@
-"""Pallas backend for the Constrained-Transport (CT) helpers.
+"""
+Pallas backend for the constrained-transport (CT) helpers of
+``_constrained_transport.py``.
 
-This file is the **Pallas backend** for ``_constrained_transport.py``.
-Two CT helpers are ported here:
+Two CT helpers are ported:
 
-* ``update_cell_center_fields`` — one Pallas kernel per call.  Just three
-  ``interp_face_to_center`` stencils (halo 3 per axis, no chained
-  closures) plus the cell-centered B / energy update.  Compiles in well
-  under a second.
+* ``update_cell_center_fields``: one Pallas kernel, three independent
+  ``interp_face_to_center`` stencils (halo 3 per axis) plus the cell-centred
+  magnetic field and energy update.
 
-* ``constrained_transport_rhs_from_slices`` — split into **three**
-  bounded-halo Pallas kernels so Triton never has to lower the full
-  chained EMF closure tree at once.  Each kernel is a thin per-cell
-  stencil with halo ≤ 4 per axis.  Their JAX-level glue materialises one
-  intermediate per stage instead of the 12+ named intermediates the
-  native code carries:
+* ``constrained_transport_rhs_from_slices``: three bounded-halo Pallas kernels,
+  so that Triton never has to lower the full chained EMF expression tree at
+  once. Each kernel is a short per-cell stencil with a halo of at most 4 cells
+  per axis, and the JAX-level glue materialises one intermediate per stage
+  instead of the many named intermediates of the native code:
 
-    Stage 1 — ``_ct_modified_flux_pallas``
-        rho, mom_*, B_*  +  6 raw B-flux slices
-          → 6 ``B_flux_axis_mod`` slices  (halo 2 along one axis each).
+    Stage 1, ``_ct_modified_flux_pallas``
+        rho, momenta, B and the six raw magnetic-flux slices
+        -> the six modified fluxes (halo 2 along one axis each).
 
-    Stage 2 — ``_ct_edge_emf_pallas``
-        6 modified fluxes  →  Omega_z, Omega_x, Omega_y at cell edges
-        (halo 2 per axis, two axes per output).
+    Stage 2, ``_ct_edge_emf_pallas``
+        the six modified fluxes -> Omega_z, Omega_x, Omega_y at the cell edges
+        (halo 2 along the two axes of each output).
 
-    Stage 3 — ``_ct_curl_pallas``
-        Omega_z, Omega_x, Omega_y (edge values)  →  rhs_b{x,y,z}.
-        Fuses ``point_values_to_averages`` smoothing with the
-        ``finite_difference_int6`` curl in one tile; combined halo ≤ 4
-        along the curl axis, ≤ 1 along the smoothing axis.
+    Stage 3, ``_ct_curl_pallas``
+        the edge EMFs -> the interface-field increments (rhs_bx, rhs_by,
+        rhs_bz), fusing the ``point_values_to_averages`` smoothing with the
+        ``finite_difference_int6`` curl (halo 4 along the curl axis).
 
-Multi-GPU: every public entry point routes its ``pl.pallas_call`` through
-``_pallas_call_sharded`` (a bare ``pl.pallas_call`` is opaque to GSPMD,
-which would ``all-gather`` the full grid on every device).  The
-single-channel field slices are therefore *stacked* along a leading axis
-— ``(6, nx, ny, nz)`` modified fluxes, ``(3, nx, ny, nz)`` EMFs — so
-they ride the same vars-first halo-exchange machinery as the conserved
-state, and each stage costs one ppermute halo exchange instead of the
-many per-shift collective-permutes of the native roll-based stencils.
-The ``*_local`` bodies derive every shape from their *own* arguments, so
-the same kernel build runs on the global grid (single device) or a
-halo-padded local shard (multi device).
+Multi-GPU: every entry point routes its ``pl.pallas_call`` through
+``_pallas_call_sharded`` (a bare ``pl.pallas_call`` is opaque to GSPMD, which
+would all-gather the full grid on every device). The single-channel field
+slices are therefore stacked along a leading axis (``(6, nx, ny, nz)`` modified
+fluxes, ``(3, nx, ny, nz)`` EMFs), so they ride the same variables-first halo
+exchange as the conserved state, and each stage costs one ppermute halo
+exchange instead of one collective permute per stencil shift of the native
+roll-based stencils. When the mesh splits x, stages 2 and 3 compute the
+x-dependent and x-free outputs in separate calls, so that the x-free part does
+not wait for the x halo exchange; stage 1 can also be skipped for the x faces
+when they were formed together with the x WENO flux
+(``_ct_rhs_pallas_x_precomputed``).
 
-The developer never touches this file by hand; the pallasify skill
-regenerates it from the native ``_constrained_transport.py`` when those
-change.  See ``pallas_backend_implementation_guide.md`` §4.4 for the
-recipe and the diagnostic that motivated the split.
+The ``*_local`` builds derive every shape from their own arguments, so the
+same kernel build runs on the global grid (single device) or on a halo-padded
+local shard (multi device). Following the Pallas convention of this codebase
+(see ``agent_guides/pallas_backend_implementation_guide.md``, §4.5), the
+kernels are translations of the native ``_constrained_transport.py`` and are
+regenerated from it when the native helpers change.
 """
 
 # jax
@@ -69,47 +70,236 @@ from astronomix._pallas_helpers import (
 )
 
 
-XAXIS = 0
-YAXIS = 1
-ZAXIS = 2
+# Coefficients of the sixth-order interface difference
+# c1 (f_i - f_{i-1}) + c2 (f_{i+1} - f_{i-2}) + c3 (f_{i+2} - f_{i-3}) of
+# ``finite_difference_int6``.
+_FD6_COEFFICIENTS = (75.0 / 64.0, -25.0 / 384.0, 3.0 / 640.0)
+
+
+# -------------------------------------------------------------
+# ============ ↓ Shared helpers and stencil algebra ↓ =========
+# -------------------------------------------------------------
+#
+# The stencil helpers below combine values that the kernels read from their
+# refs; each takes a callable ``value_at(offset)``. They are plain Python and
+# are inlined into every kernel at trace time.
 
 
 def _ct_pallas_block_ok(state_shape, config: SimulationConfig) -> bool:
-    """Spatial-block divisibility check shared by all CT kernels."""
+    """
+    Whether the configured Pallas block shape divides every spatial dimension.
+
+    Args:
+        state_shape: The shape of a state-shaped array (variable axis leading).
+        config: The simulation configuration.
+
+    Returns:
+        True if the CT kernels can tile the array.
+    """
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state_shape[1:])
-    for n, b in zip(state_shape[1:], block_shape[:ndim], strict=True):
-        if int(n) % int(b) != 0:
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=state_shape[1:],
+    )
+    for extent, block_size in zip(state_shape[1:], block_shape[:ndim], strict=True):
+        if int(extent) % int(block_size) != 0:
             return False
     return True
 
 
 def _ct_block_and_grid(spatial_shape, config: SimulationConfig):
-    """Block shape and Pallas grid for a (possibly halo-padded) local
-    spatial shape.  Called inside every ``*_local`` body so the grid
-    resizes automatically when ``_pallas_call_sharded`` hands the build a
-    padded shard."""
-    nx, ny, nz = (int(x) for x in spatial_shape)
-    bx_blk, by_blk, bz_blk = _as_3tuple_block_shape(
-        config.backend_config.pallas_block_shape, 3, spatial_shape=(nx, ny, nz)
+    """
+    Block shape and Pallas grid for a (possibly halo-padded) local spatial
+    shape. Called inside every ``*_local`` build so that the grid resizes
+    automatically when ``_pallas_call_sharded`` hands the build a padded shard.
+
+    Args:
+        spatial_shape: The spatial shape ``(nx, ny, nz)`` to tile.
+        config: The simulation configuration.
+
+    Returns:
+        ``((nx, ny, nz), (block_x, block_y, block_z), grid)``.
+    """
+    nx, ny, nz = (int(extent) for extent in spatial_shape)
+    block_x, block_y, block_z = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        3,
+        spatial_shape=(nx, ny, nz),
     )
-    grid = (nx // bx_blk, ny // by_blk, nz // bz_blk)
-    return (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid
+    grid = (nx // block_x, ny // block_y, nz // block_z)
+    return (nx, ny, nz), (block_x, block_y, block_z), grid
 
 
-# -----------------------------------------------------------------------------
-# Cell-center reconstruction from interface B-fields (one Pallas kernel).
-# -----------------------------------------------------------------------------
+def _block_cell_indices(block_shape, spatial_shape):
+    """
+    Cell indices ``(ii, jj, kk)`` of the current Pallas block, broadcastable
+    over the 3D tile.
+
+    Args:
+        block_shape: The block shape ``(block_x, block_y, block_z)``.
+        spatial_shape: The (local) spatial shape ``(nx, ny, nz)``.
+
+    Returns:
+        The three index arrays.
+    """
+    block_x, block_y, block_z = block_shape
+    nx, ny, nz = spatial_shape
+    ii = (pl.program_id(0) * block_x + jnp.arange(block_x)[:, None, None]) % nx
+    jj = (pl.program_id(1) * block_y + jnp.arange(block_y)[None, :, None]) % ny
+    kk = (pl.program_id(2) * block_z + jnp.arange(block_z)[None, None, :]) % nz
+    return ii, jj, kk
+
+
+def _wrapped_index(index, offset: int, extent: int):
+    """``index`` shifted by ``offset`` with periodic wrap (``index`` itself for 0)."""
+    if offset == 0:
+        return index
+    return (index + offset) % extent
+
+
+def _compiler_kwargs(config: SimulationConfig) -> dict:
+    """The ``compiler_params`` keyword of ``pl.pallas_call`` (empty without Triton)."""
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+    return kwargs
+
+
+def _face_to_center(value_at):
+    """
+    ``interp_face_to_center``: the coefficients (3, -25, 150, 150, -25, 3) / 256
+    over the face offsets (-3, -2, -1, 0, 1, 2) along one axis (derivation in
+    ``_spatial_operators/_interpolate.py``).
+    """
+    return (
+        3.0 * value_at(-3)
+        - 25.0 * value_at(-2)
+        + 150.0 * value_at(-1)
+        + 150.0 * value_at(0)
+        - 25.0 * value_at(1)
+        + 3.0 * value_at(2)
+    ) / 256.0
+
+
+def _center_to_face(value_at):
+    """``interp_center_to_face``: (-f[i-1] + 9 f[i] + 9 f[i+1] - f[i+2]) / 16."""
+    return (-value_at(-1) + 9.0 * value_at(0) + 9.0 * value_at(1) - value_at(2)) / 16.0
+
+
+def _point_to_average(value_at, offset, smoothing_axes):
+    """
+    ``point_values_to_averages`` at the 3D cell offset ``offset``: the point
+    value plus (f[+1] - 2 f + f[-1]) / 24 along each of ``smoothing_axes``.
+
+    Args:
+        value_at: Callable returning the field at a 3D offset ``(ox, oy, oz)``.
+        offset: The 3D offset of the evaluation point.
+        smoothing_axes: The (two) axes of the smoothing.
+
+    Returns:
+        The smoothed value.
+    """
+    center = value_at(offset)
+    smoothed = center
+    for axis in smoothing_axes:
+        plus_offset = list(offset)
+        plus_offset[axis] += 1
+        minus_offset = list(offset)
+        minus_offset[axis] -= 1
+        smoothed = smoothed + (
+            value_at(tuple(plus_offset)) - 2.0 * center + value_at(tuple(minus_offset))
+        ) / 24.0
+    return smoothed
+
+
+def _sixth_order_difference(value_at):
+    """``finite_difference_int6`` at an interface; ``value_at(k)`` is f[i + k]."""
+    first, second, third = _FD6_COEFFICIENTS
+    return (
+        first * (value_at(0) - value_at(-1))
+        + second * (value_at(1) - value_at(-2))
+        + third * (value_at(2) - value_at(-3))
+    )
+
+
+def _smoothed_curl(omega_z_at, omega_x_at, omega_y_at, dt_over_dx, dt_over_dy, dt_over_dz):
+    """
+    The interface-field increments from the edge EMFs: each EMF is smoothed
+    in the two directions of its edge plane (Omega_z in x and y, Omega_x in y
+    and z, Omega_y in x and z) and differentiated with the sixth-order
+    interface difference along the curl direction.
+
+    Args:
+        omega_z_at: Callable returning Omega_z at a 3D offset.
+        omega_x_at: Callable returning Omega_x at a 3D offset.
+        omega_y_at: Callable returning Omega_y at a 3D offset.
+        dt_over_dx: The time step over the grid spacing in x.
+        dt_over_dy: The time step over the grid spacing in y.
+        dt_over_dz: The time step over the grid spacing in z.
+
+    Returns:
+        ``(rhs_bx, rhs_by, rhs_bz)``.
+    """
+
+    def omega_z_average(offset):
+        return _point_to_average(omega_z_at, offset, (0, 1))
+
+    def omega_x_average(offset):
+        return _point_to_average(omega_x_at, offset, (1, 2))
+
+    def omega_y_average(offset):
+        return _point_to_average(omega_y_at, offset, (0, 2))
+
+    def difference(averaged_field, axis):
+        """The sixth-order difference of ``averaged_field`` along ``axis``."""
+
+        def value_along_axis(offset_along_axis):
+            offset = [0, 0, 0]
+            offset[axis] = offset_along_axis
+            return averaged_field(tuple(offset))
+
+        return _sixth_order_difference(value_along_axis)
+
+    rhs_bx = (
+        -dt_over_dy * difference(omega_z_average, 1)
+        + dt_over_dz * difference(omega_y_average, 2)
+    )
+    rhs_by = (
+        -dt_over_dz * difference(omega_x_average, 2)
+        + dt_over_dx * difference(omega_z_average, 0)
+    )
+    rhs_bz = (
+        -dt_over_dx * difference(omega_y_average, 0)
+        + dt_over_dy * difference(omega_x_average, 1)
+    )
+    return rhs_bx, rhs_by, rhs_bz
+
+
+# -------------------------------------------------------------
+# ============ ↑ Shared helpers and stencil algebra ↑ =========
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ===== ↓ Cell-centred fields from the interface fields ↓ =====
+# -------------------------------------------------------------
 
 
 def _ct_update_cell_center_fields_pallas_supported(state, config: SimulationConfig) -> bool:
-    """Whether the Pallas cell-center reconstruction can run.
+    """
+    Whether the Pallas cell-centre reconstruction can run.
 
-    3D ideal-gas MHD only — the smaller iso/lower-dim paths fall through
-    to the native version, which is short and unproblematic.  Enabled
-    by default; the single-kernel implementation is just three
-    independent face-to-center stencils with halo 3 each, so it compiles
-    quickly.
+    3D ideal-gas MHD only; the isothermal and lower-dimensional paths use the
+    short native version. Gated on ``config.backend_config.pallas_ct``.
+
+    Args:
+        state: The conserved state.
+        config: The simulation configuration.
+
+    Returns:
+        True if the Pallas kernel can be used.
     """
     if pl is None:
         return False
@@ -136,154 +326,163 @@ def _ct_update_cell_center_fields_pallas(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Pallas ``update_cell_center_fields`` — public, shard-aware wrapper.
+    """
+    Pallas ``update_cell_center_fields``: the cell-centred magnetic field from
+    the interface fields, with the total energy adjusted to the new magnetic
+    energy.
 
-    Stacks the three interface fields along a leading axis so they ride
-    the vars-first halo exchange, then routes the kernel build through
-    ``_pallas_call_sharded`` (halo 3: the face-to-center stencil reads
-    offsets −3..+2 along each axis).
+    The three interface fields are stacked along a leading axis so that they
+    ride the variables-first halo exchange of ``_pallas_call_sharded`` (halo 3:
+    the face-to-centre stencil reads the offsets -3..+2 along each axis).
+
+    Args:
+        conserved_state: The conserved state.
+        bx_interface: The x-face magnetic field.
+        by_interface: The y-face magnetic field.
+        bz_interface: The z-face magnetic field.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The conserved state with updated cell-centred field and energy.
     """
     assert _ct_update_cell_center_fields_pallas_supported(conserved_state, config)
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
-    b_stacked = jnp.stack([bx_interface, by_interface, bz_interface])
-    b_halo = (3, 3, 3)[:ndim]
+    _, block_shape, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
+    stacked_interface_fields = jnp.stack([bx_interface, by_interface, bz_interface])
+    interface_field_halo = (3, 3, 3)[:ndim]
     zero_halo = (0,) * ndim
 
-    def _local(state_local, b_local):
+    def build_local(state_local, interface_fields_local):
         return _ct_update_cell_center_fields_pallas_local(
-            state_local, b_local, config, registered_variables
+            state_local,
+            interface_fields_local,
+            config,
+            registered_variables,
         )
 
     return _pallas_call_sharded(
-        _local,
-        state_inputs=(conserved_state, b_stacked),
-        halo=b_halo,
+        build_local,
+        state_inputs=(conserved_state, stacked_interface_fields),
+        halo=interface_field_halo,
         # The kernel reads the conserved state only at the cell itself, so
-        # only the interface field (stencil -3..+2 on every axis) is exchanged.
-        input_halos=(zero_halo, b_halo),
-        block_shape=block[:ndim],
+        # only the interface fields (stencil -3..+2 on every axis) are
+        # exchanged.
+        input_halos=(zero_halo, interface_field_halo),
+        block_shape=block_shape[:ndim],
     )
 
 
 def _ct_update_cell_center_fields_pallas_local(
     conserved_state,
-    b_interfaces,
+    interface_fields,
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Single-shard kernel build: 3 face-to-center stencils (halo 3 per
-    axis, independent stencils — no chained closures), one state
-    pass-through + cell-centered B + energy fix-up.  All shapes come from
-    *this* call's arguments so the build works on padded local shards.
     """
-    nvars = int(conserved_state.shape[0])
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        conserved_state.shape[1:], config
+    Single-shard build of ``_ct_update_cell_center_fields_pallas``: three
+    independent face-to-centre stencils, the cell-centred field and the energy
+    update, and a pass-through of every other variable. All shapes come from
+    this call's arguments, so the build works on padded local shards.
+
+    Args:
+        conserved_state: The conserved state (possibly halo-padded).
+        interface_fields: The stacked ``(3, nx, ny, nz)`` interface fields.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The updated conserved state.
+    """
+    num_vars = int(conserved_state.shape[0])
+    spatial_shape, block_shape, grid = _ct_block_and_grid(conserved_state.shape[1:], config)
+    nx, ny, nz = spatial_shape
+
+    magnetic_x_index = int(registered_variables.magnetic_index.x)
+    magnetic_y_index = int(registered_variables.magnetic_index.y)
+    magnetic_z_index = int(registered_variables.magnetic_index.z)
+    energy_index = int(registered_variables.energy_index)
+
+    state_out_spec = pl.BlockSpec(
+        (num_vars,) + block_shape,
+        lambda bi, bj, bk: (0, bi, bj, bk),
     )
-
-    BX = int(registered_variables.magnetic_index.x)
-    BY = int(registered_variables.magnetic_index.y)
-    BZ = int(registered_variables.magnetic_index.z)
-    E = int(registered_variables.pressure_index)
-
-    state_out_spec = pl.BlockSpec((nvars, bx_blk, by_blk, bz_blk),
-                                  lambda bi, bj, bk: (0, bi, bj, bk))
     state_in_spec = pl.BlockSpec(conserved_state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    b_in_spec = pl.BlockSpec(b_interfaces.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    interface_in_spec = pl.BlockSpec(interface_fields.shape, lambda bi, bj, bk: (0, 0, 0, 0))
 
-    def kernel(q_ref, b_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    def kernel(state_ref, interface_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
 
-        # interp_face_to_center coefficients (3, -25, 150, 150, -25, 3) / 256
-        # over offsets (-3, -2, -1, 0, 1, 2) along the axis: see the native
-        # ``interp_face_to_center`` derivation in ``_interpolate.py``.
-        def f2c_x():
-            return (
-                3.0  * b_ref[0, (ii - 3) % nx, jj, kk]
-              - 25.0  * b_ref[0, (ii - 2) % nx, jj, kk]
-              + 150.0 * b_ref[0, (ii - 1) % nx, jj, kk]
-              + 150.0 * b_ref[0, ii,            jj, kk]
-              - 25.0  * b_ref[0, (ii + 1) % nx, jj, kk]
-              + 3.0   * b_ref[0, (ii + 2) % nx, jj, kk]
-            ) / 256.0
+        bx_center = _face_to_center(
+            lambda offset: interface_ref[0, _wrapped_index(ii, offset, nx), jj, kk]
+        )
+        by_center = _face_to_center(
+            lambda offset: interface_ref[1, ii, _wrapped_index(jj, offset, ny), kk]
+        )
+        bz_center = _face_to_center(
+            lambda offset: interface_ref[2, ii, jj, _wrapped_index(kk, offset, nz)]
+        )
 
-        def f2c_y():
-            return (
-                3.0  * b_ref[1, ii, (jj - 3) % ny, kk]
-              - 25.0  * b_ref[1, ii, (jj - 2) % ny, kk]
-              + 150.0 * b_ref[1, ii, (jj - 1) % ny, kk]
-              + 150.0 * b_ref[1, ii, jj,            kk]
-              - 25.0  * b_ref[1, ii, (jj + 1) % ny, kk]
-              + 3.0   * b_ref[1, ii, (jj + 2) % ny, kk]
-            ) / 256.0
+        bx_old = state_ref[magnetic_x_index, ii, jj, kk]
+        by_old = state_ref[magnetic_y_index, ii, jj, kk]
+        bz_old = state_ref[magnetic_z_index, ii, jj, kk]
+        magnetic_energy_density_old = bx_old * bx_old + by_old * by_old + bz_old * bz_old
+        magnetic_energy_density_new = (
+            bx_center * bx_center + by_center * by_center + bz_center * bz_center
+        )
+        energy_old = state_ref[energy_index, ii, jj, kk]
+        energy_new = energy_old + 0.5 * (magnetic_energy_density_new - magnetic_energy_density_old)
 
-        def f2c_z():
-            return (
-                3.0  * b_ref[2, ii, jj, (kk - 3) % nz]
-              - 25.0  * b_ref[2, ii, jj, (kk - 2) % nz]
-              + 150.0 * b_ref[2, ii, jj, (kk - 1) % nz]
-              + 150.0 * b_ref[2, ii, jj, kk]
-              - 25.0  * b_ref[2, ii, jj, (kk + 1) % nz]
-              + 3.0   * b_ref[2, ii, jj, (kk + 2) % nz]
-            ) / 256.0
-
-        Bx_center = f2c_x()
-        By_center = f2c_y()
-        Bz_center = f2c_z()
-
-        Bx_old = q_ref[BX, ii, jj, kk]
-        By_old = q_ref[BY, ii, jj, kk]
-        Bz_old = q_ref[BZ, ii, jj, kk]
-        b2_old = Bx_old * Bx_old + By_old * By_old + Bz_old * Bz_old
-        b2_new = Bx_center * Bx_center + By_center * By_center + Bz_center * Bz_center
-        E_old = q_ref[E, ii, jj, kk]
-        E_new = E_old + 0.5 * (b2_new - b2_old)
-
-        for var in range(nvars):
-            if var == BX:
-                out_ref[var, ...] = Bx_center
-            elif var == BY:
-                out_ref[var, ...] = By_center
-            elif var == BZ:
-                out_ref[var, ...] = Bz_center
-            elif var == E:
-                out_ref[var, ...] = E_new
+        for var in range(num_vars):
+            if var == magnetic_x_index:
+                out_ref[var, ...] = bx_center
+            elif var == magnetic_y_index:
+                out_ref[var, ...] = by_center
+            elif var == magnetic_z_index:
+                out_ref[var, ...] = bz_center
+            elif var == energy_index:
+                out_ref[var, ...] = energy_new
             else:
-                out_ref[var, ...] = q_ref[var, ii, jj, kk]
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+                out_ref[var, ...] = state_ref[var, ii, jj, kk]
 
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct(conserved_state.shape, conserved_state.dtype),
         grid=grid,
-        in_specs=[state_in_spec, b_in_spec],
+        in_specs=[state_in_spec, interface_in_spec],
         out_specs=state_out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_update_cell_center_fields",
-        **kwargs,
-    )(conserved_state, b_interfaces)
+        **_compiler_kwargs(config),
+    )(conserved_state, interface_fields)
 
 
-# -----------------------------------------------------------------------------
-# CT EMF — split into three bounded-halo Pallas kernels.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------
+# ===== ↑ Cell-centred fields from the interface fields ↑ =====
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ======= ↓ Stage 1: modified magnetic-field fluxes ↓ =========
+# -------------------------------------------------------------
 
 
 def _ct_rhs_pallas_supported(state, config: SimulationConfig) -> bool:
-    """Whether the staged Pallas CT-RHS path can run (3D only).  Gated
-    on ``config.backend_config.pallas_ct`` (default off): the staged kernel chain is
-    correct and stable but adds ~25 s of one-time compile cost while
-    giving only marginal memory savings at production grid sizes."""
+    """
+    Whether the staged Pallas CT right-hand side can run (3D MHD only).
+
+    Gated on ``config.backend_config.pallas_ct`` (default off): the staged
+    kernels add compile time and save little memory on a single device, but
+    replace the many per-shift collective permutes of the native stencils by
+    one halo exchange per stage in sharded runs.
+
+    Args:
+        state: The conserved state.
+        config: The simulation configuration.
+
+    Returns:
+        True if the Pallas kernels can be used.
+    """
     if pl is None:
         return False
     if not _backend_is_pallas(config):
@@ -305,32 +504,91 @@ def _ct_modified_flux_pallas(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Stage 1 public wrapper: per-axis modified magnetic flux.
+    """
+    Stage 1: the modified magnetic-field fluxes of all three face directions.
 
-    ``flux_slices`` is the stacked ``(6, nx, ny, nz)`` array of raw WENO
-    magnetic-flux slices in the order (By_fx, Bz_fx, Bx_fy, Bz_fy,
-    Bx_fz, By_fz); the output keeps the same layout.  Halo 2: the
-    center-to-face stencil reads offsets −1..+2 along one axis per slice.
+    Halo 2: the centre-to-face stencil reads the offsets -1..+2 along one axis
+    per slice.
+
+    Args:
+        conserved_state: The conserved state.
+        flux_slices: The stacked ``(6, nx, ny, nz)`` raw WENO magnetic-flux
+            slices in the order (By_fx, Bz_fx, Bx_fy, Bz_fy, Bx_fz, By_fz).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The stacked modified fluxes, same layout as ``flux_slices``.
     """
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
-    q_halo = (2, 2, 2)[:ndim]
+    _, block_shape, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
+    state_halo = (2, 2, 2)[:ndim]
     zero_halo = (0,) * ndim
 
-    def _local(state_local, flux_local):
+    def build_local(state_local, flux_local):
         return _ct_modified_flux_pallas_local(
-            state_local, flux_local, config, registered_variables
+            state_local,
+            flux_local,
+            config,
+            registered_variables,
         )
 
     return _pallas_call_sharded(
-        _local,
+        build_local,
         state_inputs=(conserved_state, flux_slices),
-        halo=q_halo,
+        halo=state_halo,
         # The flux slices are read only at the cell itself; only the
         # conserved state (stencil -1..+2) is exchanged.
-        input_halos=(q_halo, zero_halo),
-        block_shape=block[:ndim],
+        input_halos=(state_halo, zero_halo),
+        block_shape=block_shape[:ndim],
     )
+
+
+def _magnetic_velocity_product_reader(state_ref, registered_variables, ii, jj, kk, spatial_shape):
+    """
+    Return ``product(field_component, velocity_component, axis, offset)``, the
+    cell-centred product B_field * v_velocity of the state at ``offset`` cells
+    along ``axis`` from the block's cells.
+
+    Args:
+        state_ref: The conserved-state ref of the kernel.
+        registered_variables: The registered variables.
+        ii: The block's x cell indices.
+        jj: The block's y cell indices.
+        kk: The block's z cell indices.
+        spatial_shape: The (local) spatial shape ``(nx, ny, nz)``.
+
+    Returns:
+        The product reader.
+    """
+    nx, ny, nz = spatial_shape
+    density_index = int(registered_variables.density_index)
+    momentum_indices = (
+        int(registered_variables.momentum_index.x),
+        int(registered_variables.momentum_index.y),
+        int(registered_variables.momentum_index.z),
+    )
+    magnetic_indices = (
+        int(registered_variables.magnetic_index.x),
+        int(registered_variables.magnetic_index.y),
+        int(registered_variables.magnetic_index.z),
+    )
+
+    def product(field_component, velocity_component, axis, offset):
+        if axis == 0:
+            cell = ((ii + offset) % nx, jj, kk)
+        elif axis == 1:
+            cell = (ii, (jj + offset) % ny, kk)
+        else:
+            cell = (ii, jj, (kk + offset) % nz)
+        density = state_ref[(density_index,) + cell]
+        return (
+            state_ref[(magnetic_indices[field_component],) + cell]
+            * state_ref[(momentum_indices[velocity_component],) + cell]
+            / density
+        )
+
+    return product
 
 
 def _ct_modified_flux_pallas_local(
@@ -339,11 +597,10 @@ def _ct_modified_flux_pallas_local(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Stage 1 single-shard build: per-axis modified magnetic-flux
-    (Eq. 12–17).
-
-    Six output channels, each obtained by adding to the raw WENO magnetic
-    flux one ``interp_center_to_face`` of a cell-centered product:
+    """
+    Single-shard build of stage 1: the per-axis modified magnetic-field fluxes
+    (Eqs. 12-17). Each output channel adds to a raw WENO magnetic flux the
+    ``interp_center_to_face`` of a cell-centred product:
 
       out[0] = By_flux_x + interp_c2f_x(Bx * vy)
       out[1] = Bz_flux_x + interp_c2f_x(Bx * vz)
@@ -352,73 +609,41 @@ def _ct_modified_flux_pallas_local(
       out[4] = Bx_flux_z + interp_c2f_z(Bz * vx)
       out[5] = By_flux_z + interp_c2f_z(Bz * vy)
 
-    Worst-case stencil halo: 2 along each axis (independent per output).
-    """
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        conserved_state.shape[1:], config
-    )
+    The stencil reaches two cells along the face axis of each output.
 
-    DENSITY = int(registered_variables.density_index)
-    MX = int(registered_variables.momentum_index.x)
-    MY = int(registered_variables.momentum_index.y)
-    MZ = int(registered_variables.momentum_index.z)
-    BX = int(registered_variables.magnetic_index.x)
-    BY = int(registered_variables.magnetic_index.y)
-    BZ = int(registered_variables.magnetic_index.z)
+    Args:
+        conserved_state: The conserved state (possibly halo-padded).
+        flux_slices: The stacked raw magnetic-flux slices.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The stacked modified fluxes.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(conserved_state.shape[1:], config)
 
     state_spec = pl.BlockSpec(conserved_state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
     flux_in_spec = pl.BlockSpec(flux_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((6, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    out_spec = pl.BlockSpec((6,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
 
-    def kernel(q_ref, f_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    def kernel(state_ref, flux_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        product = _magnetic_velocity_product_reader(
+            state_ref,
+            registered_variables,
+            ii,
+            jj,
+            kk,
+            spatial_shape,
+        )
 
-        # Product Bn*vm at a cell offset along ONE axis from (ii,jj,kk).
-        def Bvy_at_x(off):
-            rho = q_ref[DENSITY, (ii + off) % nx, jj, kk]
-            return q_ref[BX, (ii + off) % nx, jj, kk] * q_ref[MY, (ii + off) % nx, jj, kk] / rho
-
-        def Bvz_at_x(off):
-            rho = q_ref[DENSITY, (ii + off) % nx, jj, kk]
-            return q_ref[BX, (ii + off) % nx, jj, kk] * q_ref[MZ, (ii + off) % nx, jj, kk] / rho
-
-        def Bvx_at_y(off):
-            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
-            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MX, ii, (jj + off) % ny, kk] / rho
-
-        def Bvz_at_y(off):
-            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
-            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MZ, ii, (jj + off) % ny, kk] / rho
-
-        def Bvx_at_z(off):
-            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
-            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MX, ii, jj, (kk + off) % nz] / rho
-
-        def Bvy_at_z(off):
-            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
-            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MY, ii, jj, (kk + off) % nz] / rho
-
-        # interp_center_to_face: (-f[i-1] + 9 f[i] + 9 f[i+1] - f[i+2]) / 16
-        def c2f(prod):
-            return (-prod(-1) + 9.0 * prod(0) + 9.0 * prod(1) - prod(2)) / 16.0
-
-        out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvy_at_x)
-        out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_x)
-        out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_y)
-        out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvz_at_y)
-        out_ref[4, ...] = f_ref[4, ii, jj, kk] + c2f(Bvx_at_z)
-        out_ref[5, ...] = f_ref[5, ii, jj, kk] + c2f(Bvy_at_z)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+        # (field component, velocity component, face axis) of each output.
+        for channel, (field, velocity, axis) in enumerate(
+            ((0, 1, 0), (0, 2, 0), (1, 0, 1), (1, 2, 1), (2, 0, 2), (2, 1, 2))
+        ):
+            out_ref[channel, ...] = flux_ref[channel, ii, jj, kk] + _center_to_face(
+                lambda offset: product(field, velocity, axis, offset)
+            )
 
     return pl.pallas_call(
         kernel,
@@ -428,7 +653,7 @@ def _ct_modified_flux_pallas_local(
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_modified_flux",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(conserved_state, flux_slices)
 
 
@@ -453,24 +678,27 @@ def _ct_modified_flux_yz_pallas(
         The stacked modified fluxes, same layout as ``flux_yz_slices``.
     """
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
-    q_halo = (0, 2, 2)[:ndim]
+    _, block_shape, _ = _ct_block_and_grid(conserved_state.shape[1:], config)
+    state_halo = (0, 2, 2)[:ndim]
     zero_halo = (0,) * ndim
 
-    def _local(state_local, flux_local):
+    def build_local(state_local, flux_local):
         return _ct_modified_flux_yz_pallas_local(
-            state_local, flux_local, config, registered_variables
+            state_local,
+            flux_local,
+            config,
+            registered_variables,
         )
 
     return _pallas_call_sharded(
-        _local,
+        build_local,
         state_inputs=(conserved_state, flux_yz_slices),
-        halo=q_halo,
+        halo=state_halo,
         # The flux slices are read only at the cell itself and the conserved
         # state only along y and z (stencil -1..+2), so only its y/z halo is
         # exchanged.
-        input_halos=(q_halo, zero_halo),
-        block_shape=block[:ndim],
+        input_halos=(state_halo, zero_halo),
+        block_shape=block_shape[:ndim],
     )
 
 
@@ -480,59 +708,43 @@ def _ct_modified_flux_yz_pallas_local(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Single-shard build of ``_ct_modified_flux_yz_pallas``."""
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        conserved_state.shape[1:], config
-    )
+    """
+    Single-shard build of ``_ct_modified_flux_yz_pallas`` (channels 2..5 of
+    ``_ct_modified_flux_pallas_local``).
 
-    DENSITY = int(registered_variables.density_index)
-    MX = int(registered_variables.momentum_index.x)
-    MY = int(registered_variables.momentum_index.y)
-    MZ = int(registered_variables.momentum_index.z)
-    BY = int(registered_variables.magnetic_index.y)
-    BZ = int(registered_variables.magnetic_index.z)
+    Args:
+        conserved_state: The conserved state (possibly halo-padded).
+        flux_yz_slices: The stacked y- and z-face raw magnetic-flux slices.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The stacked modified y- and z-face fluxes.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(conserved_state.shape[1:], config)
 
     state_spec = pl.BlockSpec(conserved_state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
     flux_in_spec = pl.BlockSpec(flux_yz_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((4, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    out_spec = pl.BlockSpec((4,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
 
-    def kernel(q_ref, f_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    def kernel(state_ref, flux_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        product = _magnetic_velocity_product_reader(
+            state_ref,
+            registered_variables,
+            ii,
+            jj,
+            kk,
+            spatial_shape,
+        )
 
-        def Bvx_at_y(off):
-            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
-            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MX, ii, (jj + off) % ny, kk] / rho
-
-        def Bvz_at_y(off):
-            rho = q_ref[DENSITY, ii, (jj + off) % ny, kk]
-            return q_ref[BY, ii, (jj + off) % ny, kk] * q_ref[MZ, ii, (jj + off) % ny, kk] / rho
-
-        def Bvx_at_z(off):
-            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
-            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MX, ii, jj, (kk + off) % nz] / rho
-
-        def Bvy_at_z(off):
-            rho = q_ref[DENSITY, ii, jj, (kk + off) % nz]
-            return q_ref[BZ, ii, jj, (kk + off) % nz] * q_ref[MY, ii, jj, (kk + off) % nz] / rho
-
-        def c2f(prod):
-            return (-prod(-1) + 9.0 * prod(0) + 9.0 * prod(1) - prod(2)) / 16.0
-
-        out_ref[0, ...] = f_ref[0, ii, jj, kk] + c2f(Bvx_at_y)
-        out_ref[1, ...] = f_ref[1, ii, jj, kk] + c2f(Bvz_at_y)
-        out_ref[2, ...] = f_ref[2, ii, jj, kk] + c2f(Bvx_at_z)
-        out_ref[3, ...] = f_ref[3, ii, jj, kk] + c2f(Bvy_at_z)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+        # (field component, velocity component, face axis) of each output.
+        for channel, (field, velocity, axis) in enumerate(
+            ((1, 0, 1), (1, 2, 1), (2, 0, 2), (2, 1, 2))
+        ):
+            out_ref[channel, ...] = flux_ref[channel, ii, jj, kk] + _center_to_face(
+                lambda offset: product(field, velocity, axis, offset)
+            )
 
     return pl.pallas_call(
         kernel,
@@ -542,96 +754,119 @@ def _ct_modified_flux_yz_pallas_local(
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_modified_flux_yz",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(conserved_state, flux_yz_slices)
 
 
+# -------------------------------------------------------------
+# ======= ↑ Stage 1: modified magnetic-field fluxes ↑ =========
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ================= ↓ Stage 2: edge EMFs ↓ ====================
+# -------------------------------------------------------------
+
+
+def _center_to_face_reader(field_ref, ii, jj, kk, spatial_shape):
+    """
+    Return ``interpolate(channel, axis)``, the centre-to-face interpolation of
+    one channel of ``field_ref`` along ``axis`` at the block's cells.
+
+    Args:
+        field_ref: The ref of the stacked input channels.
+        ii: The block's x cell indices.
+        jj: The block's y cell indices.
+        kk: The block's z cell indices.
+        spatial_shape: The (local) spatial shape ``(nx, ny, nz)``.
+
+    Returns:
+        The interpolation function.
+    """
+    nx, ny, nz = spatial_shape
+
+    def interpolate(channel, axis):
+        if axis == 0:
+            return _center_to_face(
+                lambda offset: field_ref[channel, _wrapped_index(ii, offset, nx), jj, kk]
+            )
+        if axis == 1:
+            return _center_to_face(
+                lambda offset: field_ref[channel, ii, _wrapped_index(jj, offset, ny), kk]
+            )
+        return _center_to_face(
+            lambda offset: field_ref[channel, ii, jj, _wrapped_index(kk, offset, nz)]
+        )
+
+    return interpolate
+
+
 def _ct_edge_emf_pallas(flux_mod_slices, config: SimulationConfig):
-    """Stage 2 public wrapper: edge EMFs from the stacked modified
-    fluxes.  Halo 2 (center-to-face stencil along two axes per output)."""
+    """
+    Stage 2: the edge EMFs from the stacked modified fluxes (halo 2: the
+    centre-to-face stencil along two axes per output).
+
+    Args:
+        flux_mod_slices: The stacked ``(6, nx, ny, nz)`` modified fluxes.
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` EMFs (Omega_z, Omega_x, Omega_y).
+    """
     # With x split over devices, the x-dependent and x-free parts are computed
     # separately so only the former waits for the x halo exchange.
     if _pallas_mesh_splits_axis(flux_mod_slices, 0):
         return _ct_edge_emf_pallas_split_x(flux_mod_slices, config)
 
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
+    _, block_shape, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
 
-    def _local(flux_local):
+    def build_local(flux_local):
         return _ct_edge_emf_pallas_local(flux_local, config)
 
     return _pallas_call_sharded(
-        _local,
+        build_local,
         state_inputs=(flux_mod_slices,),
         halo=(2, 2, 2)[:ndim],
-        block_shape=block[:ndim],
+        block_shape=block_shape[:ndim],
     )
 
 
 def _ct_edge_emf_pallas_local(flux_mod_slices, config: SimulationConfig):
-    """Stage 2 single-shard build: edge EMFs Omega_z, Omega_x, Omega_y
-    (Eq. 19–21), stacked as output channels (0, 1, 2):
-
-      Omega_z = interp_c2f_x(Bx_flux_y_mod) − interp_c2f_y(By_flux_x_mod)
-      Omega_x = interp_c2f_y(By_flux_z_mod) − interp_c2f_z(Bz_flux_y_mod)
-      Omega_y = interp_c2f_z(Bz_flux_x_mod) − interp_c2f_x(Bx_flux_z_mod)
-
-    Input channel order matches stage 1's output: (By_fx, Bz_fx, Bx_fy,
-    Bz_fy, Bx_fz, By_fz).  Halo: 2 per axis.
     """
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        flux_mod_slices.shape[1:], config
-    )
+    Single-shard build of stage 2: the edge EMFs (Eqs. 19-21), stacked as the
+    output channels (0, 1, 2):
+
+      Omega_z = interp_c2f_x(Bx_flux_y_mod) - interp_c2f_y(By_flux_x_mod)
+      Omega_x = interp_c2f_y(By_flux_z_mod) - interp_c2f_z(Bz_flux_y_mod)
+      Omega_y = interp_c2f_z(Bz_flux_x_mod) - interp_c2f_x(Bx_flux_z_mod)
+
+    The input channels follow stage 1's output, (By_fx, Bz_fx, Bx_fy, Bz_fy,
+    Bx_fz, By_fz); the stencil reaches two cells along each axis.
+
+    Args:
+        flux_mod_slices: The stacked modified fluxes (possibly halo-padded).
+        config: The simulation configuration.
+
+    Returns:
+        The stacked EMFs.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
 
     field_spec = pl.BlockSpec(flux_mod_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((3, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    out_spec = pl.BlockSpec((3,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
 
-    def kernel(f_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    def kernel(flux_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        interpolate = _center_to_face_reader(flux_ref, ii, jj, kk, spatial_shape)
 
-        # interp_center_to_face along each axis on one stacked channel.
-        def c2f_x(ch):
-            return (
-                -f_ref[ch, (ii - 1) % nx, jj, kk]
-              + 9.0 * f_ref[ch, ii, jj, kk]
-              + 9.0 * f_ref[ch, (ii + 1) % nx, jj, kk]
-              - f_ref[ch, (ii + 2) % nx, jj, kk]
-            ) / 16.0
-
-        def c2f_y(ch):
-            return (
-                -f_ref[ch, ii, (jj - 1) % ny, kk]
-              + 9.0 * f_ref[ch, ii, jj, kk]
-              + 9.0 * f_ref[ch, ii, (jj + 1) % ny, kk]
-              - f_ref[ch, ii, (jj + 2) % ny, kk]
-            ) / 16.0
-
-        def c2f_z(ch):
-            return (
-                -f_ref[ch, ii, jj, (kk - 1) % nz]
-              + 9.0 * f_ref[ch, ii, jj, kk]
-              + 9.0 * f_ref[ch, ii, jj, (kk + 1) % nz]
-              - f_ref[ch, ii, jj, (kk + 2) % nz]
-            ) / 16.0
-
-        # Channels: 0=By_fx, 1=Bz_fx, 2=Bx_fy, 3=Bz_fy, 4=Bx_fz, 5=By_fz.
-        out_ref[0, ...] = c2f_x(2) - c2f_y(0)   # Omega_z
-        out_ref[1, ...] = c2f_y(5) - c2f_z(3)   # Omega_x
-        out_ref[2, ...] = c2f_z(1) - c2f_x(4)   # Omega_y
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+        out_ref[0, ...] = interpolate(2, 0) - interpolate(0, 1)  # Omega_z
+        out_ref[1, ...] = interpolate(5, 1) - interpolate(3, 2)  # Omega_x
+        out_ref[2, ...] = interpolate(1, 2) - interpolate(4, 0)  # Omega_y
 
     out_shape = jax.ShapeDtypeStruct(
-        (3,) + tuple(flux_mod_slices.shape[1:]), flux_mod_slices.dtype
+        (3,) + tuple(flux_mod_slices.shape[1:]),
+        flux_mod_slices.dtype,
     )
     return pl.pallas_call(
         kernel,
@@ -641,7 +876,7 @@ def _ct_edge_emf_pallas_local(flux_mod_slices, config: SimulationConfig):
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_edge_emf",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(flux_mod_slices)
 
 
@@ -650,153 +885,124 @@ def _ct_edge_emf_pallas_split_x(flux_mod_slices, config: SimulationConfig):
     Stage 2 for a mesh that splits x: the edge EMFs of ``_ct_edge_emf_pallas``
     computed as an x-dependent part (Omega_z, Omega_y) and an x-free part
     (Omega_x), so the latter needs no x halo exchange.
+
+    Args:
+        flux_mod_slices: The stacked ``(6, nx, ny, nz)`` modified fluxes.
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` EMFs (Omega_z, Omega_x, Omega_y).
     """
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
+    _, block_shape, _ = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
     emf_halo = (2, 2, 2)[:ndim]
-    xfree_halo = (0, 2, 2)[:ndim]
+    x_free_halo = (0, 2, 2)[:ndim]
 
-    flux_xline = jnp.stack([flux_mod_slices[2], flux_mod_slices[4]])
-    flux_yzline = jnp.stack([flux_mod_slices[0], flux_mod_slices[1]])
-    flux_xfree = jnp.stack([flux_mod_slices[3], flux_mod_slices[5]])
+    # Channels interpolated along x (Bx_fy, Bx_fz), along y or z for the
+    # x-dependent EMFs (By_fx, Bz_fx), and the two of the x-free EMF
+    # (Bz_fy, By_fz).
+    flux_x_line = jnp.stack([flux_mod_slices[2], flux_mod_slices[4]])
+    flux_yz_line = jnp.stack([flux_mod_slices[0], flux_mod_slices[1]])
+    flux_x_free = jnp.stack([flux_mod_slices[3], flux_mod_slices[5]])
 
     # Omega_z and Omega_y need x neighbours, Omega_x does not. Computing them
     # in two independent calls gives XLA the chance to overlap the x-free part
     # with the x halo exchange of the other.
-
-    omega_zy = _pallas_call_sharded(
+    omega_z_and_y = _pallas_call_sharded(
         lambda flux_x_local, flux_yz_local: _ct_edge_emf_xdep_pallas_local(
-            flux_x_local, flux_yz_local, config
+            flux_x_local,
+            flux_yz_local,
+            config,
         ),
-        state_inputs=(flux_xline, flux_yzline),
+        state_inputs=(flux_x_line, flux_yz_line),
         halo=emf_halo,
         # The x-face fluxes are shifted only along x and the y/z-face fluxes
         # only along y and z (offsets -1..+2).
-        input_halos=((2, 0, 0)[:ndim], xfree_halo),
-        block_shape=block[:ndim],
+        input_halos=((2, 0, 0)[:ndim], x_free_halo),
+        block_shape=block_shape[:ndim],
     )
 
     # Omega_x only reads y and z neighbours: with a mesh split along x alone
     # it is a purely local computation.
     omega_x = _pallas_call_sharded(
         lambda flux_local: _ct_edge_emf_xfree_pallas_local(flux_local, config),
-        state_inputs=(flux_xfree,),
-        halo=xfree_halo,
-        input_halos=(xfree_halo,),
-        block_shape=block[:ndim],
+        state_inputs=(flux_x_free,),
+        halo=x_free_halo,
+        input_halos=(x_free_halo,),
+        block_shape=block_shape[:ndim],
     )
-    return jnp.stack([omega_zy[0], omega_x[0], omega_zy[1]])
+    return jnp.stack([omega_z_and_y[0], omega_x[0], omega_z_and_y[1]])
 
 
 def _ct_edge_emf_xdep_pallas_local(flux_xline, flux_yzline, config: SimulationConfig):
-    """Single-shard build of the x-dependent EMFs (Omega_z, Omega_y) of ``_ct_edge_emf_pallas_split_x``."""
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        flux_xline.shape[1:], config
-    )
+    """
+    Single-shard build of the x-dependent EMFs (Omega_z, Omega_y) of
+    ``_ct_edge_emf_pallas_split_x``.
 
-    xline_spec = pl.BlockSpec(flux_xline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    yzline_spec = pl.BlockSpec(flux_yzline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((2, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    Args:
+        flux_xline: The stacked (Bx_fy, Bx_fz) modified fluxes.
+        flux_yzline: The stacked (By_fx, Bz_fx) modified fluxes.
+        config: The simulation configuration.
 
-    def kernel(fx_ref, fyz_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    Returns:
+        The stacked ``(2, nx, ny, nz)`` EMFs (Omega_z, Omega_y).
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(flux_xline.shape[1:], config)
 
-        def c2f_x(ch):
-            return (
-                -fx_ref[ch, (ii - 1) % nx, jj, kk]
-              + 9.0 * fx_ref[ch, ii, jj, kk]
-              + 9.0 * fx_ref[ch, (ii + 1) % nx, jj, kk]
-              - fx_ref[ch, (ii + 2) % nx, jj, kk]
-            ) / 16.0
+    x_line_spec = pl.BlockSpec(flux_xline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    yz_line_spec = pl.BlockSpec(flux_yzline.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((2,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
 
-        def c2f_y(ch):
-            return (
-                -fyz_ref[ch, ii, (jj - 1) % ny, kk]
-              + 9.0 * fyz_ref[ch, ii, jj, kk]
-              + 9.0 * fyz_ref[ch, ii, (jj + 1) % ny, kk]
-              - fyz_ref[ch, ii, (jj + 2) % ny, kk]
-            ) / 16.0
+    def kernel(flux_x_ref, flux_yz_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        interpolate_x_line = _center_to_face_reader(flux_x_ref, ii, jj, kk, spatial_shape)
+        interpolate_yz_line = _center_to_face_reader(flux_yz_ref, ii, jj, kk, spatial_shape)
 
-        def c2f_z(ch):
-            return (
-                -fyz_ref[ch, ii, jj, (kk - 1) % nz]
-              + 9.0 * fyz_ref[ch, ii, jj, kk]
-              + 9.0 * fyz_ref[ch, ii, jj, (kk + 1) % nz]
-              - fyz_ref[ch, ii, jj, (kk + 2) % nz]
-            ) / 16.0
-
-        out_ref[0, ...] = c2f_x(0) - c2f_y(0)
-        out_ref[1, ...] = c2f_z(1) - c2f_x(1)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+        out_ref[0, ...] = interpolate_x_line(0, 0) - interpolate_yz_line(0, 1)  # Omega_z
+        out_ref[1, ...] = interpolate_yz_line(1, 2) - interpolate_x_line(1, 0)  # Omega_y
 
     out_shape = jax.ShapeDtypeStruct(
-        (2,) + tuple(flux_xline.shape[1:]), flux_xline.dtype
+        (2,) + tuple(flux_xline.shape[1:]),
+        flux_xline.dtype,
     )
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,
         grid=grid,
-        in_specs=[xline_spec, yzline_spec],
+        in_specs=[x_line_spec, yz_line_spec],
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_edge_emf_xdep",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(flux_xline, flux_yzline)
 
 
 def _ct_edge_emf_xfree_pallas_local(flux_mod_slices, config: SimulationConfig):
-    """Single-shard build of the x-free EMF (Omega_x) of ``_ct_edge_emf_pallas_split_x``."""
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        flux_mod_slices.shape[1:], config
-    )
+    """
+    Single-shard build of the x-free EMF (Omega_x) of
+    ``_ct_edge_emf_pallas_split_x``.
+
+    Args:
+        flux_mod_slices: The stacked (Bz_fy, By_fz) modified fluxes.
+        config: The simulation configuration.
+
+    Returns:
+        Omega_x as a ``(1, nx, ny, nz)`` array.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(flux_mod_slices.shape[1:], config)
 
     field_spec = pl.BlockSpec(flux_mod_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((1, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    out_spec = pl.BlockSpec((1,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
 
-    def kernel(f_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
+    def kernel(flux_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        interpolate = _center_to_face_reader(flux_ref, ii, jj, kk, spatial_shape)
 
-        def c2f_y(ch):
-            return (
-                -f_ref[ch, ii, (jj - 1) % ny, kk]
-              + 9.0 * f_ref[ch, ii, jj, kk]
-              + 9.0 * f_ref[ch, ii, (jj + 1) % ny, kk]
-              - f_ref[ch, ii, (jj + 2) % ny, kk]
-            ) / 16.0
-
-        def c2f_z(ch):
-            return (
-                -f_ref[ch, ii, jj, (kk - 1) % nz]
-              + 9.0 * f_ref[ch, ii, jj, kk]
-              + 9.0 * f_ref[ch, ii, jj, (kk + 1) % nz]
-              - f_ref[ch, ii, jj, (kk + 2) % nz]
-            ) / 16.0
-
-        out_ref[0, ...] = c2f_y(1) - c2f_z(0)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+        out_ref[0, ...] = interpolate(1, 1) - interpolate(0, 2)  # Omega_x
 
     out_shape = jax.ShapeDtypeStruct(
-        (1,) + tuple(flux_mod_slices.shape[1:]), flux_mod_slices.dtype
+        (1,) + tuple(flux_mod_slices.shape[1:]),
+        flux_mod_slices.dtype,
     )
     return pl.pallas_call(
         kernel,
@@ -806,27 +1012,84 @@ def _ct_edge_emf_xfree_pallas_local(flux_mod_slices, config: SimulationConfig):
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_edge_emf_xfree",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(flux_mod_slices)
 
 
+# -------------------------------------------------------------
+# ================= ↑ Stage 2: edge EMFs ↑ ====================
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ============= ↓ Stage 3: smoothed sixth-order curl ↓ ========
+# -------------------------------------------------------------
+
+
+def _channel_reader(field_ref, channel, ii, jj, kk, spatial_shape):
+    """
+    Return ``value_at((ox, oy, oz))``, one channel of ``field_ref`` at a 3D
+    offset from the block's cells (periodic wrap).
+
+    Args:
+        field_ref: The ref of the stacked channels.
+        channel: The channel to read.
+        ii: The block's x cell indices.
+        jj: The block's y cell indices.
+        kk: The block's z cell indices.
+        spatial_shape: The (local) spatial shape ``(nx, ny, nz)``.
+
+    Returns:
+        The reader.
+    """
+    nx, ny, nz = spatial_shape
+
+    def value_at(offset):
+        offset_x, offset_y, offset_z = offset
+        return field_ref[
+            channel,
+            (ii + offset_x) % nx,
+            (jj + offset_y) % ny,
+            (kk + offset_z) % nz,
+        ]
+
+    return value_at
+
+
 def _ct_curl_pallas(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
-    """Stage 3 public wrapper: smoothed 6th-order curl of the stacked
-    edge EMFs.  Halo 4: FD6 reach 3 plus 1 for the fused PVA smoothing."""
+    """
+    Stage 3: the smoothed sixth-order curl of the stacked edge EMFs (halo 4:
+    the reach 3 of the sixth-order difference plus 1 for the fused smoothing).
+
+    Args:
+        omega_slices: The stacked ``(3, nx, ny, nz)`` EMFs (Omega_z, Omega_x,
+            Omega_y).
+        dtdx: The time step over the grid spacing in x.
+        dtdy: The time step over the grid spacing in y.
+        dtdz: The time step over the grid spacing in z.
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` interface-field increments.
+    """
     # Same split of the x-dependent and x-free parts as for the edge EMFs.
     if _pallas_mesh_splits_axis(omega_slices, 0):
         return _ct_curl_pallas_split_x(omega_slices, dtdx, dtdy, dtdz, config)
 
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
+    _, block_shape, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
 
-    def _local(omega_local, dtdx_a, dtdy_a, dtdz_a):
+    def build_local(omega_local, dt_over_dx, dt_over_dy, dt_over_dz):
         return _ct_curl_pallas_local(
-            omega_local, dtdx_a, dtdy_a, dtdz_a, config
+            omega_local,
+            dt_over_dx,
+            dt_over_dy,
+            dt_over_dz,
+            config,
         )
 
     return _pallas_call_sharded(
-        _local,
+        build_local,
         state_inputs=(omega_slices,),
         other_args=(
             jnp.asarray(dtdx, dtype=omega_slices.dtype),
@@ -834,7 +1097,7 @@ def _ct_curl_pallas(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
             jnp.asarray(dtdz, dtype=omega_slices.dtype),
         ),
         halo=(4, 4, 4)[:ndim],
-        block_shape=block[:ndim],
+        block_shape=block_shape[:ndim],
     )
 
 
@@ -842,28 +1105,45 @@ def _ct_curl_pallas_split_x(omega_slices, dtdx, dtdy, dtdz, config: SimulationCo
     """
     Stage 3 for a mesh that splits x: the smoothed curl of ``_ct_curl_pallas``
     with Omega_x exchanged only along y and z.
+
+    Args:
+        omega_slices: The stacked ``(3, nx, ny, nz)`` EMFs (Omega_z, Omega_x,
+            Omega_y).
+        dtdx: The time step over the grid spacing in x.
+        dtdy: The time step over the grid spacing in y.
+        dtdz: The time step over the grid spacing in z.
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` interface-field increments.
     """
     ndim = int(config.dimensionality)
-    _, block, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
+    _, block_shape, _ = _ct_block_and_grid(omega_slices.shape[1:], config)
     curl_halo = (4, 4, 4)[:ndim]
-    xfree_halo = (0, 4, 4)[:ndim]
+    x_free_halo = (0, 4, 4)[:ndim]
 
-    omega_xdep = jnp.stack([omega_slices[0], omega_slices[2]])
-    omega_xfree = omega_slices[1:2]
+    omega_x_dependent = jnp.stack([omega_slices[0], omega_slices[2]])
+    omega_x_free = omega_slices[1:2]
 
-    def _local(omega_xdep_local, omega_xfree_local, dtdx_a, dtdy_a, dtdz_a):
+    def build_local(
+        omega_x_dependent_local,
+        omega_x_free_local,
+        dt_over_dx,
+        dt_over_dy,
+        dt_over_dz,
+    ):
         return _ct_curl_split_x_pallas_local(
-            omega_xdep_local,
-            omega_xfree_local,
-            dtdx_a,
-            dtdy_a,
-            dtdz_a,
+            omega_x_dependent_local,
+            omega_x_free_local,
+            dt_over_dx,
+            dt_over_dy,
+            dt_over_dz,
             config,
         )
 
     return _pallas_call_sharded(
-        _local,
-        state_inputs=(omega_xdep, omega_xfree),
+        build_local,
+        state_inputs=(omega_x_dependent, omega_x_free),
         other_args=(
             jnp.asarray(dtdx, dtype=omega_slices.dtype),
             jnp.asarray(dtdy, dtype=omega_slices.dtype),
@@ -872,246 +1152,122 @@ def _ct_curl_pallas_split_x(omega_slices, dtdx, dtdy, dtdz, config: SimulationCo
         halo=curl_halo,
         # Omega_z and Omega_y enter the x derivatives; Omega_x is only
         # differentiated (and smoothed) along y and z.
-        input_halos=(curl_halo, xfree_halo),
-        block_shape=block[:ndim],
+        input_halos=(curl_halo, x_free_halo),
+        block_shape=block_shape[:ndim],
     )
 
 
 def _ct_curl_split_x_pallas_local(
-    omega_xdep, omega_xfree, dtdx, dtdy, dtdz, config: SimulationConfig
+    omega_xdep,
+    omega_xfree,
+    dtdx,
+    dtdy,
+    dtdz,
+    config: SimulationConfig,
 ):
-    """Single-shard build of ``_ct_curl_pallas_split_x``."""
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        omega_xdep.shape[1:], config
-    )
+    """
+    Single-shard build of ``_ct_curl_pallas_split_x``.
 
-    xdep_spec = pl.BlockSpec(omega_xdep.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    xfree_spec = pl.BlockSpec(omega_xfree.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((3, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    Args:
+        omega_xdep: The stacked (Omega_z, Omega_y) EMFs.
+        omega_xfree: Omega_x as a ``(1, nx, ny, nz)`` array.
+        dtdx: The time step over the grid spacing in x (scalar array).
+        dtdy: The time step over the grid spacing in y (scalar array).
+        dtdz: The time step over the grid spacing in z (scalar array).
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` interface-field increments.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(omega_xdep.shape[1:], config)
+
+    x_dependent_spec = pl.BlockSpec(omega_xdep.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    x_free_spec = pl.BlockSpec(omega_xfree.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    out_spec = pl.BlockSpec((3,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
     scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
 
-    c1 = 75.0 / 64.0
-    c2 = -25.0 / 384.0
-    c3 = 3.0 / 640.0
-
-    def kernel(om_xdep_ref, om_xfree_ref, dtdx_ref, dtdy_ref, dtdz_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
-
-        dtdx_v = dtdx_ref[()]
-        dtdy_v = dtdy_ref[()]
-        dtdz_v = dtdz_ref[()]
-
-        def pva_xy_omz(ox, oy, oz):
-            q_c = om_xdep_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sx = (
-                om_xdep_ref[0, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_xdep_ref[0, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sy = (
-                om_xdep_ref[0, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_xdep_ref[0, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
-            ) / 24.0
-            return q_c + sx + sy
-
-        def pva_yz_omx(ox, oy, oz):
-            q_c = om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sy = (
-                om_xfree_ref[0, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_xfree_ref[0, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sz = (
-                om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
-              - 2.0 * q_c
-              + om_xfree_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
-            ) / 24.0
-            return q_c + sy + sz
-
-        def pva_xz_omy(ox, oy, oz):
-            q_c = om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sx = (
-                om_xdep_ref[1, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_xdep_ref[1, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sz = (
-                om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
-              - 2.0 * q_c
-              + om_xdep_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
-            ) / 24.0
-            return q_c + sx + sz
-
-        def fd6_x(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(-1, 0, 0))
-              + c2 * (pva(1, 0, 0) - pva(-2, 0, 0))
-              + c3 * (pva(2, 0, 0) - pva(-3, 0, 0))
-            )
-
-        def fd6_y(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(0, -1, 0))
-              + c2 * (pva(0, 1, 0) - pva(0, -2, 0))
-              + c3 * (pva(0, 2, 0) - pva(0, -3, 0))
-            )
-
-        def fd6_z(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(0, 0, -1))
-              + c2 * (pva(0, 0, 1) - pva(0, 0, -2))
-              + c3 * (pva(0, 0, 2) - pva(0, 0, -3))
-            )
-
-        out_ref[0, ...] = -dtdy_v * fd6_y(pva_xy_omz) + dtdz_v * fd6_z(pva_xz_omy)
-        out_ref[1, ...] = -dtdz_v * fd6_z(pva_yz_omx) + dtdx_v * fd6_x(pva_xy_omz)
-        out_ref[2, ...] = -dtdx_v * fd6_x(pva_xz_omy) + dtdy_v * fd6_y(pva_yz_omx)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+    def kernel(
+        omega_x_dependent_ref,
+        omega_x_free_ref,
+        dt_over_dx_ref,
+        dt_over_dy_ref,
+        dt_over_dz_ref,
+        out_ref,
+    ):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        rhs_bx, rhs_by, rhs_bz = _smoothed_curl(
+            _channel_reader(omega_x_dependent_ref, 0, ii, jj, kk, spatial_shape),
+            _channel_reader(omega_x_free_ref, 0, ii, jj, kk, spatial_shape),
+            _channel_reader(omega_x_dependent_ref, 1, ii, jj, kk, spatial_shape),
+            dt_over_dx_ref[()],
+            dt_over_dy_ref[()],
+            dt_over_dz_ref[()],
+        )
+        out_ref[0, ...] = rhs_bx
+        out_ref[1, ...] = rhs_by
+        out_ref[2, ...] = rhs_bz
 
     out_shape = jax.ShapeDtypeStruct(
-        (3,) + tuple(omega_xdep.shape[1:]), omega_xdep.dtype
+        (3,) + tuple(omega_xdep.shape[1:]),
+        omega_xdep.dtype,
     )
     return pl.pallas_call(
         kernel,
         out_shape=out_shape,
         grid=grid,
-        in_specs=[xdep_spec, xfree_spec, scalar_spec, scalar_spec, scalar_spec],
+        in_specs=[x_dependent_spec, x_free_spec, scalar_spec, scalar_spec, scalar_spec],
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_curl_split_x",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(omega_xdep, omega_xfree, dtdx, dtdy, dtdz)
 
 
 def _ct_curl_pallas_local(omega_slices, dtdx, dtdy, dtdz, config: SimulationConfig):
-    """Stage 3 single-shard build: edge-average smoothing
-    (``point_values_to_averages``) + 6th-order curl
-    (``finite_difference_int6``).  Outputs the stacked interface-B RHS
-    channels (rhs_bx, rhs_by, rhs_bz).
-
-    Input channels: 0=Omega_z, 1=Omega_x, 2=Omega_y.  Fuses two short
-    stencils per output: PVA (halo 1 on its two axes) and FD6 (halo 3 on
-    its axis).  Worst-case combined halo along any axis is therefore ≤ 4,
-    well inside Triton's comfort zone.
     """
-    (nx, ny, nz), (bx_blk, by_blk, bz_blk), grid = _ct_block_and_grid(
-        omega_slices.shape[1:], config
-    )
+    Single-shard build of stage 3: the edge-average smoothing
+    (``point_values_to_averages``) and the sixth-order curl
+    (``finite_difference_int6``) in one tile, with the stacked interface-field
+    increments (rhs_bx, rhs_by, rhs_bz) as output.
+
+    The input channels are 0 = Omega_z, 1 = Omega_x, 2 = Omega_y. Each output
+    fuses two short stencils, the smoothing (reach 1 along its two axes) and
+    the difference (reach 3 along its axis), so the combined reach along any
+    axis is at most 4.
+
+    Args:
+        omega_slices: The stacked EMFs (possibly halo-padded).
+        dtdx: The time step over the grid spacing in x (scalar array).
+        dtdy: The time step over the grid spacing in y (scalar array).
+        dtdz: The time step over the grid spacing in z (scalar array).
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` interface-field increments.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(omega_slices.shape[1:], config)
 
     field_spec = pl.BlockSpec(omega_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
-    out_spec = pl.BlockSpec((3, bx_blk, by_blk, bz_blk),
-                            lambda bi, bj, bk: (0, bi, bj, bk))
+    out_spec = pl.BlockSpec((3,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
     scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
 
-    c1 = 75.0 / 64.0
-    c2 = -25.0 / 384.0
-    c3 = 3.0 / 640.0
-
-    def kernel(om_ref, dtdx_ref, dtdy_ref, dtdz_ref, out_ref):
-        bi = pl.program_id(0)
-        bj = pl.program_id(1)
-        bk = pl.program_id(2)
-        ii = (bi * bx_blk + jnp.arange(bx_blk)[:, None, None]) % nx
-        jj = (bj * by_blk + jnp.arange(by_blk)[None, :, None]) % ny
-        kk = (bk * bz_blk + jnp.arange(bz_blk)[None, None, :]) % nz
-
-        dtdx_v = dtdx_ref[()]
-        dtdy_v = dtdy_ref[()]
-        dtdz_v = dtdz_ref[()]
-
-        # ---- PVA helpers (Omega_bar at one specific offset along EACH
-        # of its two smoothing axes; the curl below loops over offsets
-        # of these PVA results along its differentiation axis).
-        # 3D PVA is on two axes; the third axis stays at the cell.
-        # Channels: 0 = Omega_z (smoothed in X, Y), 1 = Omega_x (Y, Z),
-        # 2 = Omega_y (X, Z).
-        def pva_xy_omz(ox, oy, oz):
-            q_c = om_ref[0, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sx = (
-                om_ref[0, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_ref[0, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sy = (
-                om_ref[0, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_ref[0, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
-            ) / 24.0
-            return q_c + sx + sy
-
-        def pva_yz_omx(ox, oy, oz):
-            q_c = om_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sy = (
-                om_ref[1, (ii + ox) % nx, (jj + oy + 1) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_ref[1, (ii + ox) % nx, (jj + oy - 1) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sz = (
-                om_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
-              - 2.0 * q_c
-              + om_ref[1, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
-            ) / 24.0
-            return q_c + sy + sz
-
-        def pva_xz_omy(ox, oy, oz):
-            q_c = om_ref[2, (ii + ox) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            sx = (
-                om_ref[2, (ii + ox + 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-              - 2.0 * q_c
-              + om_ref[2, (ii + ox - 1) % nx, (jj + oy) % ny, (kk + oz) % nz]
-            ) / 24.0
-            sz = (
-                om_ref[2, (ii + ox) % nx, (jj + oy) % ny, (kk + oz + 1) % nz]
-              - 2.0 * q_c
-              + om_ref[2, (ii + ox) % nx, (jj + oy) % ny, (kk + oz - 1) % nz]
-            ) / 24.0
-            return q_c + sx + sz
-
-        # ---- 6th-order interface FD: c1·(f[i]−f[i−1]) + c2·(f[i+1]−f[i−2])
-        # + c3·(f[i+2]−f[i−3]).
-        def fd6_x(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(-1, 0, 0))
-              + c2 * (pva(1, 0, 0) - pva(-2, 0, 0))
-              + c3 * (pva(2, 0, 0) - pva(-3, 0, 0))
-            )
-
-        def fd6_y(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(0, -1, 0))
-              + c2 * (pva(0, 1, 0) - pva(0, -2, 0))
-              + c3 * (pva(0, 2, 0) - pva(0, -3, 0))
-            )
-
-        def fd6_z(pva):
-            return (
-                c1 * (pva(0, 0, 0) - pva(0, 0, -1))
-              + c2 * (pva(0, 0, 1) - pva(0, 0, -2))
-              + c3 * (pva(0, 0, 2) - pva(0, 0, -3))
-            )
-
-        out_ref[0, ...] = -dtdy_v * fd6_y(pva_xy_omz) + dtdz_v * fd6_z(pva_xz_omy)
-        out_ref[1, ...] = -dtdz_v * fd6_z(pva_yz_omx) + dtdx_v * fd6_x(pva_xy_omz)
-        out_ref[2, ...] = -dtdx_v * fd6_x(pva_xz_omy) + dtdy_v * fd6_y(pva_yz_omx)
-
-    kwargs = {}
-    compiler_params = _pallas_compiler_params(config)
-    if compiler_params is not None:
-        kwargs["compiler_params"] = compiler_params
+    def kernel(omega_ref, dt_over_dx_ref, dt_over_dy_ref, dt_over_dz_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+        rhs_bx, rhs_by, rhs_bz = _smoothed_curl(
+            _channel_reader(omega_ref, 0, ii, jj, kk, spatial_shape),
+            _channel_reader(omega_ref, 1, ii, jj, kk, spatial_shape),
+            _channel_reader(omega_ref, 2, ii, jj, kk, spatial_shape),
+            dt_over_dx_ref[()],
+            dt_over_dy_ref[()],
+            dt_over_dz_ref[()],
+        )
+        out_ref[0, ...] = rhs_bx
+        out_ref[1, ...] = rhs_by
+        out_ref[2, ...] = rhs_bz
 
     out_shape = jax.ShapeDtypeStruct(
-        (3,) + tuple(omega_slices.shape[1:]), omega_slices.dtype
+        (3,) + tuple(omega_slices.shape[1:]),
+        omega_slices.dtype,
     )
     return pl.pallas_call(
         kernel,
@@ -1121,8 +1277,18 @@ def _ct_curl_pallas_local(omega_slices, dtdx, dtdy, dtdz, config: SimulationConf
         out_specs=out_spec,
         interpret=config.backend_config.pallas_interpret,
         name="ct_curl",
-        **kwargs,
+        **_compiler_kwargs(config),
     )(omega_slices, dtdx, dtdy, dtdz)
+
+
+# -------------------------------------------------------------
+# ============= ↑ Stage 3: smoothed sixth-order curl ↑ ========
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ============== ↓ Three-stage CT right-hand side ↓ ===========
+# -------------------------------------------------------------
 
 
 def _ct_rhs_pallas(
@@ -1139,24 +1305,48 @@ def _ct_rhs_pallas(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    """Three-stage Pallas CT-RHS: chain ``_ct_modified_flux_pallas`` →
-    ``_ct_edge_emf_pallas`` → ``_ct_curl_pallas``.
+    """
+    Three-stage Pallas CT right-hand side: ``_ct_modified_flux_pallas`` ->
+    ``_ct_edge_emf_pallas`` -> ``_ct_curl_pallas``.
 
-    Each stage is a single bounded-halo Pallas kernel — compile time
-    stays sub-second per kernel — and each stage costs exactly one halo
-    exchange under a multi-device mesh (the wrappers route through
-    ``_pallas_call_sharded``).  The flux slices travel stacked between
-    stages, so the peak temporary footprint stays well below the native
-    code's 12+ intermediates.
+    Each stage is one bounded-halo Pallas kernel and costs one halo exchange
+    under a multi-device mesh. The flux slices travel stacked between the
+    stages, so the peak temporary footprint stays well below that of the
+    native code's many intermediates.
+
+    Args:
+        conserved_state: The conserved state.
+        By_flux_x_interface: The raw x-face flux of B_y.
+        Bz_flux_x_interface: The raw x-face flux of B_z.
+        Bx_flux_y_interface: The raw y-face flux of B_x.
+        Bz_flux_y_interface: The raw y-face flux of B_z.
+        Bx_flux_z_interface: The raw z-face flux of B_x.
+        By_flux_z_interface: The raw z-face flux of B_y.
+        dtdx: The time step over the grid spacing in x.
+        dtdy: The time step over the grid spacing in y.
+        dtdz: The time step over the grid spacing in z.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The three interface-field increments ``(rhs_bx, rhs_by, rhs_bz)``.
     """
     assert _ct_rhs_pallas_supported(conserved_state, config)
-    flux_slices = jnp.stack([
-        By_flux_x_interface, Bz_flux_x_interface,
-        Bx_flux_y_interface, Bz_flux_y_interface,
-        Bx_flux_z_interface, By_flux_z_interface,
-    ])
+    flux_slices = jnp.stack(
+        [
+            By_flux_x_interface,
+            Bz_flux_x_interface,
+            Bx_flux_y_interface,
+            Bz_flux_y_interface,
+            Bx_flux_z_interface,
+            By_flux_z_interface,
+        ]
+    )
     flux_mod = _ct_modified_flux_pallas(
-        conserved_state, flux_slices, config, registered_variables
+        conserved_state,
+        flux_slices,
+        config,
+        registered_variables,
     )
     del flux_slices
     omega = _ct_edge_emf_pallas(flux_mod, config)
@@ -1185,24 +1375,53 @@ def _ct_rhs_pallas_x_precomputed(
     ``_update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod``):
     stages 1 (y and z only), 2 and 3 of ``_ct_rhs_pallas``.
 
+    Args:
+        conserved_state: The conserved state.
+        By_flux_x_interface_mod: The modified x-face flux of B_y.
+        Bz_flux_x_interface_mod: The modified x-face flux of B_z.
+        Bx_flux_y_interface: The raw y-face flux of B_x.
+        Bz_flux_y_interface: The raw y-face flux of B_z.
+        Bx_flux_z_interface: The raw z-face flux of B_x.
+        By_flux_z_interface: The raw z-face flux of B_y.
+        dtdx: The time step over the grid spacing in x.
+        dtdy: The time step over the grid spacing in y.
+        dtdz: The time step over the grid spacing in z.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
     Returns:
         The three interface-field increments ``(rhs_bx, rhs_by, rhs_bz)``.
     """
     assert _ct_rhs_pallas_supported(conserved_state, config)
-    flux_yz_slices = jnp.stack([
-        Bx_flux_y_interface, Bz_flux_y_interface,
-        Bx_flux_z_interface, By_flux_z_interface,
-    ])
+    flux_yz_slices = jnp.stack(
+        [
+            Bx_flux_y_interface,
+            Bz_flux_y_interface,
+            Bx_flux_z_interface,
+            By_flux_z_interface,
+        ]
+    )
     flux_yz_mod = _ct_modified_flux_yz_pallas(
-        conserved_state, flux_yz_slices, config, registered_variables
+        conserved_state,
+        flux_yz_slices,
+        config,
+        registered_variables,
     )
     del flux_yz_slices
-    flux_mod = jnp.concatenate([
-        jnp.stack([By_flux_x_interface_mod, Bz_flux_x_interface_mod]),
-        flux_yz_mod,
-    ], axis=0)
+    flux_mod = jnp.concatenate(
+        [
+            jnp.stack([By_flux_x_interface_mod, Bz_flux_x_interface_mod]),
+            flux_yz_mod,
+        ],
+        axis=0,
+    )
     del flux_yz_mod
     omega = _ct_edge_emf_pallas(flux_mod, config)
     del flux_mod
     rhs_b = _ct_curl_pallas(omega, dtdx, dtdy, dtdz, config)
     return rhs_b[0], rhs_b[1], rhs_b[2]
+
+
+# -------------------------------------------------------------
+# ============== ↑ Three-stage CT right-hand side ↑ ===========
+# -------------------------------------------------------------

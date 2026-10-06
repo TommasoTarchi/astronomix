@@ -1,16 +1,16 @@
-"""Pallas backend for the hydro per-axis flux-divergence step.
+"""
+Pallas backend for the per-axis flux-divergence step of the finite-difference
+time integrators.
 
-This file holds the only Pallas kernel that the FD time-integrators in
-``_ssprk.py`` need: ``_hydro_flux_div_axis_pallas``.  The integrator
-``_ssprk4_hydro`` / ``_ssprk4_with_ct`` / ``_lsrk4_hydro`` in ``_ssprk.py``
-all simply import this kernel and call it under the ``_backend_is_pallas``
-predicate.  A developer never has to touch this file when writing the
-native algorithm.
+The integrators in ``_ssprk.py`` (SSPRK4 and LSRK4, hydrodynamics and MHD with
+constrained transport) call ``_hydro_flux_div_axis_pallas`` under the
+``_backend_is_pallas`` predicate. The kernel is MHD-agnostic, since it walks
+every variable channel, so one kernel serves all integrators and lets them keep
+a single physical right-hand-side buffer (via ``input_output_aliases``).
 
-The kernel is mhd-agnostic — it just walks every variable channel — so
-the same Pallas helper covers both the hydro and CT/MHD divergence steps.
-Sharing it lets all FD integrators converge on a single buffer (via
-``input_output_aliases``).
+The module also holds the native-JAX twin of the kernel, used as its tangent
+for automatic differentiation, and the divergence of an x flux that already
+carries its x halo (the multi-GPU fast path of ``_lsrk4_with_ct``).
 """
 
 # typing
@@ -36,34 +36,54 @@ from astronomix._stencil_operations._stencil_operations import _shift
 
 
 def _hydro_flux_div_axis_native(
-    dF,
+    interface_flux,
     dt_over_dx,
     *,
     axis: int,
     rhs_accumulator=None,
     scale_in: Union[float, jnp.ndarray] = 1.0,
 ):
-    """Native-JAX equivalent of :func:`_hydro_flux_div_axis_pallas`.
-
-    Used as the tangent branch by ``diffable_pallas_call`` so that AD through
-    the Pallas kernel goes through a transposable JAX expression. Must match
-    the Pallas kernel's behaviour bit-for-bit on the primal output for the
-    gradient to equal the gradient of the Pallas op at the input.
     """
-    div = -dt_over_dx * (dF - _shift(dF, 1, axis=axis + 1))
+    Native-JAX equivalent of :func:`_hydro_flux_div_axis_pallas`.
+
+    Used as the tangent branch of ``diffable_pallas_call`` so that AD through
+    the Pallas kernel goes through a transposable JAX expression. It must
+    reproduce the Pallas kernel's primal output for the gradient to equal the
+    gradient of the Pallas operation at the input.
+
+    Args:
+        interface_flux: The flux through the right face of each cell
+            (variable axis leading).
+        dt_over_dx: The time step over the grid spacing along ``axis``.
+        axis: The spatial axis of the divergence (0 = x).
+        rhs_accumulator: Optional accumulator the divergence is added to.
+        scale_in: The factor applied to the accumulator.
+
+    Returns:
+        ``scale_in * rhs_accumulator - dt/dx * (F_{i+1/2} - F_{i-1/2})``, or the
+        divergence term alone without an accumulator.
+    """
+    divergence = -dt_over_dx * (interface_flux - _shift(interface_flux, 1, axis=axis + 1))
     if rhs_accumulator is None:
-        return div
-    return scale_in * rhs_accumulator + div
+        return divergence
+    return scale_in * rhs_accumulator + divergence
 
 
 def _div_axis_pallas_shape_ok(state, config: SimulationConfig) -> bool:
-    """Lightweight predicate used by callers (e.g. the MHD CT integrator) that
-    want the per-axis divergence Pallas kernel but cannot rely on the full
-    hydro-WENO support predicate (which excludes MHD on its WENO step).
+    """
+    Whether the per-axis divergence Pallas kernel can tile ``state``.
 
-    The divergence kernel itself is mhd-agnostic — it just walks every
-    variable channel — so this only checks the spatial block-divisibility
-    constraint required by ``pl.pallas_call``.
+    Used by callers (e.g. the MHD constrained-transport integrators) that want
+    the divergence kernel but cannot rely on the hydro WENO support predicate,
+    which excludes MHD. The kernel itself is MHD-agnostic, so only the spatial
+    block divisibility required by ``pl.pallas_call`` is checked.
+
+    Args:
+        state: A state-shaped array (variable axis leading).
+        config: The simulation configuration.
+
+    Returns:
+        True if the kernel can run on ``state``.
     """
     if pl is None:
         return False
@@ -72,15 +92,19 @@ def _div_axis_pallas_shape_ok(state, config: SimulationConfig) -> bool:
         return False
     if state.ndim != ndim + 1:
         return False
-    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=state.shape[1:])
-    for n, b in zip(state.shape[1:], (bx, by, bz)[:ndim], strict=True):
-        if int(n) % int(b) != 0:
+    bx, by, bz = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=state.shape[1:],
+    )
+    for extent, block_size in zip(state.shape[1:], (bx, by, bz)[:ndim], strict=True):
+        if int(extent) % int(block_size) != 0:
             return False
     return True
 
 
 def _hydro_flux_div_axis_pallas(
-    dF,
+    interface_flux,
     dt_over_dx,
     config: SimulationConfig,
     *,
@@ -88,79 +112,98 @@ def _hydro_flux_div_axis_pallas(
     rhs_accumulator=None,
     scale_in: Union[float, jnp.ndarray] = 1.0,
 ):
-    """Per-axis Pallas divergence kernel with optional in-place accumulation.
-
-    Computes ``rhs_out = scale_in * (rhs_accumulator if provided else 0) +
-    (-dt_over_dx) * (dF[..., i+1/2] - dF[..., (i+1/2)-1])`` along ``axis``.
-    Calling it sequentially for each axis with ``rhs_accumulator=rhs_q`` lets
-    XLA keep a single physical RHS buffer (via ``input_output_aliases``) across
-    all three axes, eliminating both the chained ``rhs + ...`` adds and the
-    transient buffers they would otherwise need.
-
-    ``scale_in`` is folded into the kernel so the LSRK4 first-stage update
-    ``dq = A[i] * dq + (-dt/dx) * div_0(F_0)`` can be done in place on the
-    ``dq`` buffer without materialising a separate ``rhs`` register.
-
-    This keeps the original 1-flux-per-cell WENO kernel (so peak compute is
-    unchanged) while still consuming each ``dF_axis`` immediately after it is
-    produced, instead of holding all three live for the original
-    three-input divergence helper.
     """
-    # Multi-GPU: divergence reads ``dF[i] - dF[i-1]`` along ``axis``, so the
-    # only halo needed is 1 cell on the active axis (rounded up to the
-    # Pallas block size by ``_pallas_call_sharded``).  The accumulator is
-    # read at the local cell only — no halo — but we pass it through the
-    # same wrapper to keep the input_output_aliases trick intact inside
-    # each shard.
+    Per-axis Pallas divergence kernel with optional in-place accumulation.
+
+    Computes ``rhs_out = scale_in * rhs_accumulator - dt/dx * (F_{i+1/2} -
+    F_{i-1/2})`` along ``axis`` (without the accumulator term when none is
+    given). Calling it sequentially for each axis with ``rhs_accumulator=rhs``
+    lets XLA keep a single physical right-hand-side buffer (via
+    ``input_output_aliases``) across all three axes, eliminating both the
+    chained ``rhs + ...`` additions and the transient buffers they would need.
+
+    ``scale_in`` is folded into the kernel so that the first LSRK4 stage update
+    ``dq = A[i] * dq - dt/dx * div_0(F_0)`` can be done in place on the ``dq``
+    buffer without materialising a separate right-hand-side register.
+
+    Each flux is thereby consumed directly after it is produced, so the three
+    axis fluxes never coexist, while the WENO kernel keeps computing one flux
+    per cell.
+
+    The call is wrapped for AD (native tangent) and for multi-GPU runs
+    (``_pallas_call_sharded``).
+
+    Args:
+        interface_flux: The flux through the right face of each cell.
+        dt_over_dx: The time step over the grid spacing along ``axis``.
+        config: The simulation configuration.
+        axis: The spatial axis of the divergence (0 = x).
+        rhs_accumulator: Optional accumulator, updated in place.
+        scale_in: The factor applied to the accumulator (may be traced).
+
+    Returns:
+        The updated accumulator, or the divergence term without one.
+    """
+    # Multi-GPU: the divergence reads F[i] - F[i - 1] along ``axis``, so the
+    # only halo needed is one cell on that axis (rounded up to the Pallas block
+    # size by ``_pallas_call_sharded``).
     ndim = int(config.dimensionality)
-    block_shape = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=dF.shape[1:])
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=interface_flux.shape[1:],
+    )
     halo_list = [0, 0, 0]
     if 0 <= axis < ndim:
         halo_list[axis] = 1
     halo = tuple(halo_list[:ndim])
 
     if rhs_accumulator is None:
-        def _local(dF_local):
-            return _hydro_flux_div_axis_pallas_local(
-                dF_local,
-                dt_over_dx,
-                config,
+
+        def pallas_branch(flux_in, dt_over_dx_in):
+            return _pallas_call_sharded(
+                lambda flux_local: _hydro_flux_div_axis_pallas_local(
+                    flux_local,
+                    dt_over_dx_in,
+                    config,
+                    axis=axis,
+                    rhs_accumulator=None,
+                    scale_in=scale_in,
+                ),
+                state_inputs=(flux_in,),
+                halo=halo,
+                block_shape=block_shape[:ndim],
+            )
+
+        def native_branch(flux_in, dt_over_dx_in):
+            return _hydro_flux_div_axis_native(
+                flux_in,
+                dt_over_dx_in,
                 axis=axis,
                 rhs_accumulator=None,
                 scale_in=scale_in,
             )
 
-        def _pallas_branch(dF_in, dt_over_dx_in):
-            return _pallas_call_sharded(
-                lambda d: _hydro_flux_div_axis_pallas_local(
-                    d, dt_over_dx_in, config,
-                    axis=axis, rhs_accumulator=None, scale_in=scale_in,
-                ),
-                state_inputs=(dF_in,),
-                halo=halo,
-                block_shape=block_shape[:ndim],
-            )
-
-        def _native_branch(dF_in, dt_over_dx_in):
-            return _hydro_flux_div_axis_native(
-                dF_in, dt_over_dx_in, axis=axis,
-                rhs_accumulator=None, scale_in=scale_in,
-            )
-
         return diffable_pallas_call(
-            dF, dt_over_dx,
-            pallas_branch=_pallas_branch, native_branch=_native_branch,
+            interface_flux,
+            dt_over_dx,
+            pallas_branch=pallas_branch,
+            native_branch=native_branch,
         )
 
     zero_halo = (0,) * ndim
 
-    def _pallas_branch_acc(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
+    def pallas_branch_accumulate(flux_in, dt_over_dx_in, rhs_in, scale_in_array):
         return _pallas_call_sharded(
-            lambda r, d: _hydro_flux_div_axis_pallas_local(
-                d, dt_over_dx_in, config,
-                axis=axis, rhs_accumulator=r, scale_in=scale_in_arr,
+            lambda rhs_local, flux_local: _hydro_flux_div_axis_pallas_local(
+                flux_local,
+                dt_over_dx_in,
+                config,
+                axis=axis,
+                rhs_accumulator=rhs_local,
+                scale_in=scale_in_array,
             ),
-            state_inputs=(rhs_in, dF_in),
+            state_inputs=(rhs_in, flux_in),
             halo=halo,
             # The accumulator is only read and written at the cell itself, so
             # only the flux is exchanged.
@@ -168,24 +211,27 @@ def _hydro_flux_div_axis_pallas(
             block_shape=block_shape[:ndim],
         )
 
-    def _native_branch_acc(dF_in, dt_over_dx_in, rhs_in, scale_in_arr):
+    def native_branch_accumulate(flux_in, dt_over_dx_in, rhs_in, scale_in_array):
         return _hydro_flux_div_axis_native(
-            dF_in, dt_over_dx_in, axis=axis,
-            rhs_accumulator=rhs_in, scale_in=scale_in_arr,
+            flux_in,
+            dt_over_dx_in,
+            axis=axis,
+            rhs_accumulator=rhs_in,
+            scale_in=scale_in_array,
         )
 
-    # ``scale_in`` may be a traced scalar (LSRK4 stage coefficient) so route
-    # it through the diffable primals tuple too.
-    scale_in_arr = jnp.asarray(scale_in)
+    # ``scale_in`` may be a traced scalar (the LSRK4 stage coefficient), so it
+    # is routed through the differentiable primals as well.
+    scale_in_array = jnp.asarray(scale_in)
     return diffable_pallas_call_n(
-        (dF, dt_over_dx, rhs_accumulator, scale_in_arr),
-        pallas_branch=_pallas_branch_acc,
-        native_branch=_native_branch_acc,
+        (interface_flux, dt_over_dx, rhs_accumulator, scale_in_array),
+        pallas_branch=pallas_branch_accumulate,
+        native_branch=native_branch_accumulate,
     )
 
 
 def _hydro_flux_div_axis_native_from_kept_halo_sharded(
-    dF,
+    interface_flux,
     dt_over_dx,
     config: SimulationConfig,
     *,
@@ -195,22 +241,23 @@ def _hydro_flux_div_axis_native_from_kept_halo_sharded(
     kept_halo: int = 1,
 ):
     """
-    Accumulate ``scale_in * rhs + (-dt/dx) * (F_{i+1/2} - F_{i-1/2})`` along x
+    Accumulate ``scale_in * rhs - dt/dx * (F_{i+1/2} - F_{i-1/2})`` along x
     from a flux that already carries ``kept_halo`` x-halo cells.
 
     The x-WENO kernel of the multi-GPU fast path keeps one x-halo cell of its
     flux, so the left face of each shard's first cell is already local and the
     divergence needs no further halo exchange; it runs as plain JAX inside a
-    shard_map (measured faster than a separate Pallas kernel).
+    shard_map, which is cheaper than launching a separate Pallas kernel.
 
     Args:
-        dF: The interface flux with ``kept_halo`` extra x cells per side.
+        interface_flux: The interface flux with ``kept_halo`` extra x cells per
+            side.
         dt_over_dx: The time step over the grid spacing.
         config: The simulation configuration.
         axis: The flux axis; only 0 (x) is supported.
         rhs_accumulator: The accumulator updated in place.
         scale_in: The factor applied to the accumulator (the LSRK coefficient).
-        kept_halo: The number of kept x-halo cells of ``dF``.
+        kept_halo: The number of kept x-halo cells of ``interface_flux``.
 
     Returns:
         The updated accumulator.
@@ -227,17 +274,17 @@ def _hydro_flux_div_axis_native_from_kept_halo_sharded(
     )
 
     return _pallas_call_sharded(
-        lambda r, f: _hydro_flux_div_axis_from_kept_halo_native(
-            f,
+        lambda rhs_local, flux_local: _hydro_flux_div_axis_from_kept_halo_native(
+            flux_local,
             dt_over_dx,
             axis=axis,
-            rhs_accumulator=r,
+            rhs_accumulator=rhs_local,
             scale_in=scale_in,
             kept_halo=kept_halo,
         ),
-        state_inputs=(rhs_accumulator, dF),
+        state_inputs=(rhs_accumulator, interface_flux),
         halo=zero_halo,
-        # Nothing is exchanged: dF already carries its x halo and the
+        # Nothing is exchanged: the flux already carries its x halo and the
         # accumulator is only written locally.
         input_halos=(zero_halo, zero_halo),
         block_shape=block_shape[:ndim],
@@ -245,7 +292,7 @@ def _hydro_flux_div_axis_native_from_kept_halo_sharded(
 
 
 def _hydro_flux_div_axis_from_kept_halo_native(
-    dF,
+    interface_flux,
     dt_over_dx,
     *,
     axis: int,
@@ -256,22 +303,29 @@ def _hydro_flux_div_axis_from_kept_halo_native(
     """
     Local x divergence of a flux with ``kept_halo`` x-halo cells, by slicing.
 
-    ``dF[kept_halo + i]`` is the flux through the right face of cell ``i`` and
-    ``dF[kept_halo - 1 + i]`` the one through its left face.
+    ``interface_flux[kept_halo + i]`` is the flux through the right face of
+    cell ``i`` and ``interface_flux[kept_halo - 1 + i]`` the one through its
+    left face.
     """
     array_axis = axis + 1
-    n = rhs_accumulator.shape[array_axis]
-    right = jax.lax.slice_in_dim(
-        dF, kept_halo, kept_halo + n, axis=array_axis
+    num_cells = rhs_accumulator.shape[array_axis]
+    right_face_flux = jax.lax.slice_in_dim(
+        interface_flux,
+        kept_halo,
+        kept_halo + num_cells,
+        axis=array_axis,
     )
-    left = jax.lax.slice_in_dim(
-        dF, kept_halo - 1, kept_halo - 1 + n, axis=array_axis
+    left_face_flux = jax.lax.slice_in_dim(
+        interface_flux,
+        kept_halo - 1,
+        kept_halo - 1 + num_cells,
+        axis=array_axis,
     )
-    return scale_in * rhs_accumulator + (-dt_over_dx) * (right - left)
+    return scale_in * rhs_accumulator + (-dt_over_dx) * (right_face_flux - left_face_flux)
 
 
 def _hydro_flux_div_axis_pallas_local(
-    dF,
+    interface_flux,
     dt_over_dx,
     config: SimulationConfig,
     *,
@@ -279,41 +333,65 @@ def _hydro_flux_div_axis_pallas_local(
     rhs_accumulator=None,
     scale_in: Union[float, jnp.ndarray] = 1.0,
 ):
-    """Single-shard ``pl.pallas_call`` build.  Called either directly or
-    inside a ``shard_map`` body; ``dF.shape`` is the *local* (halo-padded)
-    shape in the multi-device case so the kernel's grid/in-spec/out-spec
-    re-derive automatically."""
+    """
+    Single-shard ``pl.pallas_call`` build of the divergence kernel.
+
+    Called either directly or inside a ``shard_map`` body; in the multi-device
+    case ``interface_flux.shape`` is the local (halo-padded) shape, so the
+    kernel's grid and block specs are derived from it automatically.
+
+    Args:
+        interface_flux: The flux through the right face of each cell.
+        dt_over_dx: The time step over the grid spacing along ``axis``.
+        config: The simulation configuration.
+        axis: The spatial axis of the divergence (0 = x).
+        rhs_accumulator: Optional accumulator, aliased to the output.
+        scale_in: The factor applied to the accumulator.
+
+    Returns:
+        The updated accumulator, or the divergence term without one.
+    """
     ndim = int(config.dimensionality)
-    nvars = int(dF.shape[0])
-    spatial_shape = tuple(int(x) for x in dF.shape[1:])
+    num_vars = int(interface_flux.shape[0])
+    spatial_shape = tuple(int(extent) for extent in interface_flux.shape[1:])
     nx = spatial_shape[0]
     ny = spatial_shape[1] if ndim >= 2 else 1
     nz = spatial_shape[2] if ndim == 3 else 1
-    bx, by, bz = _as_3tuple_block_shape(config.backend_config.pallas_block_shape, ndim, spatial_shape=spatial_shape)
+    bx, by, bz = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=spatial_shape,
+    )
     grid = (nx // bx, ny // by, nz // bz)
 
     accumulate = rhs_accumulator is not None
 
+    # The output (and the aliased accumulator) is tiled over the spatial axes
+    # with the variable axis kept whole; the flux is passed whole so that each
+    # program can read its left neighbour across the block boundary.
     if ndim == 1:
-        block_shape = (nvars, bx)
+        block_shape = (num_vars, bx)
         out_spec = pl.BlockSpec(block_shape, lambda bi, bj, bk: (0, bi))
-        flux_spec = pl.BlockSpec(dF.shape, lambda bi, bj, bk: (0, 0))
+        flux_spec = pl.BlockSpec(interface_flux.shape, lambda bi, bj, bk: (0, 0))
     elif ndim == 2:
-        block_shape = (nvars, bx, by)
+        block_shape = (num_vars, bx, by)
         out_spec = pl.BlockSpec(block_shape, lambda bi, bj, bk: (0, bi, bj))
-        flux_spec = pl.BlockSpec(dF.shape, lambda bi, bj, bk: (0, 0, 0))
+        flux_spec = pl.BlockSpec(interface_flux.shape, lambda bi, bj, bk: (0, 0, 0))
     else:
-        block_shape = (nvars, bx, by, bz)
+        block_shape = (num_vars, bx, by, bz)
         out_spec = pl.BlockSpec(block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
-        flux_spec = pl.BlockSpec(dF.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+        flux_spec = pl.BlockSpec(interface_flux.shape, lambda bi, bj, bk: (0, 0, 0, 0))
 
     scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
 
     def kernel(*refs):
         if accumulate:
-            rhs_in_ref, f_ref, dtdx_ref, scale_in_ref, rhs_out_ref = refs
+            rhs_in_ref, flux_ref, dt_over_dx_ref, scale_in_ref, rhs_out_ref = refs
         else:
-            f_ref, dtdx_ref, rhs_out_ref = refs
+            flux_ref, dt_over_dx_ref, rhs_out_ref = refs
+
+        # Block program ids and the (periodically wrapped) cell indices of the
+        # block along each axis.
         bi = pl.program_id(0)
         bj = pl.program_id(1)
         bk = pl.program_id(2)
@@ -328,28 +406,31 @@ def _hydro_flux_div_axis_pallas_local(
             jj = (bj * by + jnp.arange(by)[None, :, None]) % ny
             kk = (bk * bz + jnp.arange(bz)[None, None, :]) % nz
 
-        dtdx = dtdx_ref[()]
+        dt_over_dx_value = dt_over_dx_ref[()]
 
-        def flux_diff(var):
+        def flux_difference(var):
+            """F_{i+1/2} - F_{i-1/2} of one variable along ``axis``."""
             if axis == 0:
                 if ndim == 1:
-                    return f_ref[var, ii] - f_ref[var, (ii - 1) % nx]
+                    return flux_ref[var, ii] - flux_ref[var, (ii - 1) % nx]
                 if ndim == 2:
-                    return f_ref[var, ii, jj] - f_ref[var, (ii - 1) % nx, jj]
-                return f_ref[var, ii, jj, kk] - f_ref[var, (ii - 1) % nx, jj, kk]
+                    return flux_ref[var, ii, jj] - flux_ref[var, (ii - 1) % nx, jj]
+                return flux_ref[var, ii, jj, kk] - flux_ref[var, (ii - 1) % nx, jj, kk]
             if axis == 1:
                 if ndim == 2:
-                    return f_ref[var, ii, jj] - f_ref[var, ii, (jj - 1) % ny]
-                return f_ref[var, ii, jj, kk] - f_ref[var, ii, (jj - 1) % ny, kk]
-            return f_ref[var, ii, jj, kk] - f_ref[var, ii, jj, (kk - 1) % nz]
+                    return flux_ref[var, ii, jj] - flux_ref[var, ii, (jj - 1) % ny]
+                return flux_ref[var, ii, jj, kk] - flux_ref[var, ii, (jj - 1) % ny, kk]
+            return flux_ref[var, ii, jj, kk] - flux_ref[var, ii, jj, (kk - 1) % nz]
 
         if accumulate:
             scale = scale_in_ref[()]
-            for var in range(nvars):
-                rhs_out_ref[var, ...] = scale * rhs_in_ref[var, ...] + (-dtdx) * flux_diff(var)
+            for var in range(num_vars):
+                rhs_out_ref[var, ...] = (
+                    scale * rhs_in_ref[var, ...] + (-dt_over_dx_value) * flux_difference(var)
+                )
         else:
-            for var in range(nvars):
-                rhs_out_ref[var, ...] = -dtdx * flux_diff(var)
+            for var in range(num_vars):
+                rhs_out_ref[var, ...] = -dt_over_dx_value * flux_difference(var)
 
     kwargs = {}
     compiler_params = _pallas_compiler_params(config)
@@ -360,18 +441,21 @@ def _hydro_flux_div_axis_pallas_local(
         in_specs = [out_spec, flux_spec, scalar_spec, scalar_spec]
         kernel_args = (
             rhs_accumulator,
-            dF,
-            jnp.asarray(dt_over_dx, dtype=dF.dtype),
-            jnp.asarray(scale_in, dtype=dF.dtype),
+            interface_flux,
+            jnp.asarray(dt_over_dx, dtype=interface_flux.dtype),
+            jnp.asarray(scale_in, dtype=interface_flux.dtype),
         )
         kwargs["input_output_aliases"] = {0: 0}
     else:
         in_specs = [flux_spec, scalar_spec]
-        kernel_args = (dF, jnp.asarray(dt_over_dx, dtype=dF.dtype))
+        kernel_args = (
+            interface_flux,
+            jnp.asarray(dt_over_dx, dtype=interface_flux.dtype),
+        )
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(dF.shape, dF.dtype),
+        out_shape=jax.ShapeDtypeStruct(interface_flux.shape, interface_flux.dtype),
         grid=grid,
         in_specs=in_specs,
         out_specs=out_spec,

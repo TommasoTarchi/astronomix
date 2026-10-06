@@ -26,23 +26,31 @@ from astronomix._stencil_operations._stencil_operations import _shift
 
 def _momentum_indices(config, registered_variables):
     """
-    The registry indices of the momentum components, one per spatial dimension.
+    The registry indices of the momentum components carried by the state.
+
+    Hydrodynamics carries one momentum component per spatial dimension.
+    Finite-difference MHD always carries all three (also in 1D and 2D): the
+    induction equation needs the out-of-plane velocity, and its kinetic energy
+    and fluxes belong to the face states like those of the in-plane ones.
 
     Args:
         config: The simulation configuration.
         registered_variables: The registered variables.
 
     Returns:
-        The list of momentum indices (x, y, z order, ``config.dimensionality``
-        entries).
+        The list of momentum indices in x, y, z order (three entries for MHD,
+        ``config.dimensionality`` entries for hydrodynamics).
     """
-    if config.dimensionality == 1:
+    if config.dimensionality == 1 and not config.mhd:
         return [registered_variables.velocity_index]
-    return [
+    momentum_indices = [
         registered_variables.velocity_index.x,
         registered_variables.velocity_index.y,
         registered_variables.velocity_index.z,
-    ][:config.dimensionality]
+    ]
+    if config.mhd:
+        return momentum_indices
+    return momentum_indices[:config.dimensionality]
 
 
 # -------------------------------------------------------------
@@ -542,8 +550,15 @@ def _coldcrush_blend_weight(
 # -------------------------------------------------------------
 
 
-def _blend_interface_flux(dF_weno, conserved_state, axis, dtdx, params, config,
-                          registered_variables, internal_energy_density=None):
+def _blend_interface_flux(
+    dF_weno,
+    conserved_state,
+    axis,
+    params,
+    config,
+    registered_variables,
+    internal_energy_density=None,
+):
     """
     Blend the WENO interface flux toward LLF along ``axis`` at cold interfaces
     under compression (``coldcrush_blend``; ideal gas only).
@@ -552,7 +567,6 @@ def _blend_interface_flux(dF_weno, conserved_state, axis, dtdx, params, config,
         dF_weno: The WENO interface flux along ``axis``.
         conserved_state: The conserved state.
         axis: The spatial axis of the interfaces.
-        dtdx: Unused; the blend needs no time-step information.
         params: The simulation parameters.
         config: The simulation configuration.
         registered_variables: The registered variables.

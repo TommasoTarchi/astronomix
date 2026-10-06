@@ -1,34 +1,54 @@
-"""Shared Pallas-backend utilities used across the FD and FV paths.
+"""
+Shared Pallas-backend utilities used across the finite-difference and
+finite-volume paths.
 
-This module is the single place that:
-- imports Pallas / Triton (and exposes ``pl is None`` if unavailable),
-- normalises ``config.backend_config.pallas_block_shape`` to a 3-tuple,
-- builds Triton ``CompilerParams`` from config knobs,
+This module is the single place that
+
+- imports Pallas / Triton (``pl is None`` / ``pltriton is None`` when they are
+  unavailable),
+- normalises ``config.backend_config.pallas_block_shape`` to a 3-tuple and
+  builds the Triton ``CompilerParams`` from the configuration,
 - exposes the ``backend == PALLAS`` predicate,
-- provides the ``_pallas_call_sharded`` multi-GPU wrapper that turns an
-  opaque ``pl.pallas_call`` into a ``shard_map`` + ppermute halo-exchange
-  body when the user runs on a multi-device mesh.
+- holds the active device mesh and state ``PartitionSpec`` of a sharded run
+  (``pallas_mesh_context``),
+- provides the multi-GPU wrapper ``_pallas_call_sharded``, which turns an
+  opaque ``pl.pallas_call`` into a ``shard_map`` body with a ppermute halo
+  exchange, and ``sharded_roll``, the same halo exchange for the periodic rolls
+  of the native-JAX stencils,
+- pairs every Pallas kernel with a native-JAX tangent so that the Pallas paths
+  are differentiable (``diffable_pallas_call``).
 
-Every Pallas kernel module under ``astronomix`` should import from here so
-new knobs / fallbacks only need to be added once.
+Every Pallas kernel module under ``astronomix`` imports from here, so new knobs
+and fallbacks only need to be added once.
 """
 
 # general
 import contextvars
-import os
 from contextlib import contextmanager
 
 # jax
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import (
+    NamedSharding,
+    PartitionSpec,
+)
+
+try:
+    from jax.shard_map import shard_map  # jax >= 0.8
+except ImportError:  # jax < 0.8
+    from jax.experimental.shard_map import shard_map
+
+# astronomix constants
+from astronomix.option_classes.simulation_config import PALLAS
 
 # astronomix containers
-from astronomix.option_classes.simulation_config import PALLAS, SimulationConfig
+from astronomix.option_classes.simulation_config import SimulationConfig
 
-# Pallas / Triton are optional: a CPU-only or older JAX install may lack one or
-# both. We import them defensively so the rest of the module loads (callers gate
-# on ``pl is None`` / ``pltriton is None``) rather than failing at import time.
+# Pallas and Triton are optional: a CPU-only or older JAX install may lack one
+# or both. They are imported defensively so that the rest of the module loads
+# (callers gate on ``pl is None`` / ``pltriton is None``) instead of failing at
+# import time.
 try:
     from jax.experimental import pallas as pl
 except Exception:  # pragma: no cover - Pallas optional
@@ -46,15 +66,21 @@ def _backend_is_pallas(config: SimulationConfig) -> bool:
 
 
 def _default_pallas_block_shape(ndim: int) -> tuple[int, int, int]:
-    """Return the default Pallas block shape ``(bx, by, bz)`` for ``ndim`` spatial
-    dimensions (inactive dimensions forced to 1).
+    """
+    Return the default Pallas block shape ``(bx, by, bz)`` for ``ndim`` spatial
+    dimensions (inactive dimensions set to 1).
 
-    The 3D default (2, 2, 32) keeps one element per thread at the default
-    ``num_warps=4`` (128-cell blocks) with a 256-byte-contiguous fast axis:
-    on an A100 this ran the dp MHD WENO kernel ~10% faster end-to-end than
-    the previous (4, 4, 8) at identical results (2026-07 Alfvén-wave sweep;
-    128-cell blocks with longer z-rows all tie within noise, larger or
-    smaller blocks register-spill or idle threads)."""
+    The 3D default (2, 2, 32) gives 128-cell blocks, one cell per thread at the
+    default ``num_warps=4``, with a 256-byte contiguous fast axis. Among the
+    128-cell shapes those with long z rows perform alike; larger blocks spill
+    registers and smaller ones leave threads idle.
+
+    Args:
+        ndim: The number of spatial dimensions.
+
+    Returns:
+        The block shape as a 3-tuple.
+    """
     if ndim == 1:
         return (128, 1, 1)
     if ndim == 2:
@@ -63,21 +89,31 @@ def _default_pallas_block_shape(ndim: int) -> tuple[int, int, int]:
 
 
 def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[int, int, int]:
-    """Normalise whatever the user supplied (None / str / tuple) to
-    ``(bx, by, bz)`` with the inactive dims forced to 1.  Pallas grid
-    construction depends on this tuple being canonical.
+    """
+    Normalise a user-supplied block shape (None, a string or a tuple) to
+    ``(bx, by, bz)`` with the inactive dimensions set to 1. The Pallas grid
+    construction relies on this tuple being canonical.
 
-    When ``spatial_shape`` is given, each active block dimension is clamped
-    to its grid extent, so a default tuned for production grids (e.g. bz=32)
-    stays a valid tiling on small grids (bz -> nz) instead of tripping the
-    grid-divisibility support predicates and silently dropping the whole run
-    to the native backend."""
+    When ``spatial_shape`` is given, each active block dimension is clamped to
+    its grid extent, so that a default tuned for production grids (e.g.
+    ``bz = 32``) stays a valid tiling on small grids (``bz -> nz``) instead of
+    failing the grid-divisibility support predicates, which would silently drop
+    the whole run to the native backend.
+
+    Args:
+        block_shape: The configured block shape (None, "bx,by,bz" or a tuple).
+        ndim: The number of spatial dimensions.
+        spatial_shape: Optional spatial shape of the array to be tiled.
+
+    Returns:
+        The block shape as a 3-tuple.
+    """
     if block_shape is None:
         parts = _default_pallas_block_shape(ndim)
     elif isinstance(block_shape, str):
-        parts = tuple(int(p.strip()) for p in block_shape.split(",") if p.strip())
+        parts = tuple(int(part.strip()) for part in block_shape.split(",") if part.strip())
     else:
-        parts = tuple(int(x) for x in block_shape)
+        parts = tuple(int(size) for size in block_shape)
     if len(parts) == 1:
         parts = (parts[0], 1, 1)
     elif len(parts) == 2:
@@ -92,15 +128,18 @@ def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[
         parts = (parts[0], parts[1], 1)
     if spatial_shape is not None:
         parts = tuple(
-            min(int(b), int(n)) for b, n in zip(parts, tuple(spatial_shape) + (1, 1))
+            min(int(block_size), int(extent))
+            for block_size, extent in zip(parts, tuple(spatial_shape) + (1, 1))
         )[:3]
         parts = tuple(parts) + (1,) * (3 - len(parts))
     return parts
 
 
 def _pallas_compiler_params(config: SimulationConfig):
-    """Return Triton ``CompilerParams`` (or None if the Triton backend is
-    not available / the user opted out via ``pallas_use_triton=False``)."""
+    """
+    Return the Triton ``CompilerParams``, or None if the Triton backend is not
+    available or the user opted out via ``pallas_use_triton=False``.
+    """
     use_triton = config.backend_config.pallas_use_triton
     if use_triton and pltriton is not None:
         return pltriton.CompilerParams(
@@ -109,69 +148,71 @@ def _pallas_compiler_params(config: SimulationConfig):
     return None
 
 
-# -----------------------------------------------------------------------------
-# Multi-GPU shard_map + halo wrapper.
+# -------------------------------------------------------------
+# =========== ↓ Multi-GPU shard_map + halo wrapper ↓ ==========
+# -------------------------------------------------------------
 #
-# Every Pallas kernel in this codebase passes its state-shape input(s) to
+# Every Pallas kernel in this codebase passes its state-shaped input(s) to
 # ``pl.pallas_call`` via ``BlockSpec(state.shape, lambda ...: (0, 0, 0, 0))``.
-# That tells Pallas/Triton "each block program can read anywhere in the
-# array", which is the correct (and fast) shape on a single device — but
-# it makes the call entirely opaque to GSPMD.  When the input is sharded
-# across a device mesh, XLA's only legal lowering is to ``all-gather`` the
-# whole state on every device before each ``pallas_call``, which dominates
-# every kernel hot-loop and kills strong scaling (~0.95× on the FD Pallas
-# sound-wave benchmark before this fix).
+# That tells Pallas/Triton that each block program may read anywhere in the
+# array, which is the correct (and fast) layout on a single device, but it
+# makes the call entirely opaque to GSPMD. When the input is sharded across a
+# device mesh, XLA's only legal lowering is to all-gather the whole state on
+# every device before each ``pallas_call``, which dominates every kernel and
+# removes any strong scaling.
 #
-# The fix is mechanical: wrap each ``pl.pallas_call`` in a ``shard_map``
-# body that
-#   1. ppermutes a halo of ``stencil_reach`` cells from each neighbour
-#      shard along every sharded spatial axis (periodic ring),
+# Instead, each ``pl.pallas_call`` is wrapped in a ``shard_map`` body that
+#   1. ppermutes a halo of ``stencil_reach`` cells from each neighbour shard
+#      along every sharded spatial axis (periodic ring),
 #   2. concatenates [left_halo, local, right_halo] on each sharded axis,
-#   3. calls the existing kernel on the local-padded shard (its modular
-#      indexing wraps within the padded shape; halo cells provide the
-#      correct neighbour values for interior reads),
+#   3. calls the unchanged kernel on the halo-padded local shard (its modular
+#      indexing wraps within the padded shape; the halo cells provide the
+#      correct neighbour values for the interior reads),
 #   4. strips the halo from the output.
 #
-# So the user-facing knob is just: ``pallas_mesh_context(mesh)`` around
-# the JIT trace, plus each kernel calling ``_pallas_call_sharded`` instead
-# of ``pl.pallas_call(...)(args)`` directly.  No kernel arithmetic changes.
-# -----------------------------------------------------------------------------
+# The user-facing knob is ``pallas_mesh_context(mesh, spec)`` around the JIT
+# trace, plus each kernel calling ``_pallas_call_sharded`` instead of
+# ``pl.pallas_call(...)(args)`` directly. No kernel arithmetic changes.
 
 
 _pallas_mesh_ctx: contextvars.ContextVar = contextvars.ContextVar(
-    "astronomix_pallas_mesh", default=None
+    "astronomix_pallas_mesh",
+    default=None,
 )
 _pallas_spec_ctx: contextvars.ContextVar = contextvars.ContextVar(
-    "astronomix_pallas_state_spec", default=None
+    "astronomix_pallas_state_spec",
+    default=None,
 )
 
 
 @contextmanager
 def pallas_mesh_context(mesh, spec=None):
-    """Set the active mesh for Pallas kernel sharding.
+    """
+    Set the active mesh (and state PartitionSpec) for Pallas kernel sharding.
 
-    ``time_integration`` enters this context around the JIT trace whenever
-    the user supplies a ``sharding`` argument.  Inside the context every
-    Pallas kernel that calls ``_pallas_call_sharded`` will route through
-    a ``shard_map`` + ppermute halo exchange instead of the bare
-    ``pl.pallas_call``.
+    ``time_integration`` enters this context around the JIT trace whenever the
+    user supplies a ``sharding`` argument. Inside the context every Pallas
+    kernel that calls ``_pallas_call_sharded`` runs as a ``shard_map`` with a
+    ppermute halo exchange instead of a bare ``pl.pallas_call``.
 
-    ``spec``: the ``PartitionSpec`` of the ``(var, x, y, z)`` state (the
-    user's ``sharding.spec``). Inside a JIT trace the kernel inputs are
-    tracers, which carry no ``.sharding`` under ``AxisType.Auto`` meshes, so
-    without it the wrapper had to guess ``P(*mesh.axis_names)`` -- right only
-    for the 4-axis ``(var, x, y, z)`` benchmark mesh; for a 1-axis ``("x",)``
-    mesh with ``P(None, "x")`` that guess shards NO spatial axis and every
-    kernel silently fell back to the bare ``pallas_call`` (GSPMD all-gather
-    of the full state per kernel).
+    Inside a JIT trace the kernel inputs are tracers, which carry no
+    ``.sharding`` under ``AxisType.Auto`` meshes, so the wrapper needs ``spec``
+    to know which spatial axes are split; the mesh axis names alone do not say
+    that (a 1-axis ``("x",)`` mesh with ``P(None, "x")`` splits x, which
+    ``P(*mesh.axis_names)`` would not).
 
     Callers that differentiate a sharded ``time_integration`` must hold this
-    context around the OUTER trace as well: reverse-mode rules (custom_jvp
-    primals, the checkpointed loop's backward sweep) are traced after
+    context around the outer trace as well: reverse-mode rules (custom_jvp
+    primals, the backward sweep of the checkpointed loop) are traced after
     ``time_integration`` has returned.
 
-    When ``mesh`` is ``None`` (single-device run) or has size 1, the
-    helper is a no-op — the kernel runs exactly as before.
+    When ``mesh`` is ``None`` (single-device run) or has size 1, the context has
+    no effect and the kernels run unwrapped.
+
+    Args:
+        mesh: The device mesh, or None.
+        spec: The PartitionSpec of the ``(var, x, y, z)`` state (the user's
+            ``sharding.spec``), or None.
     """
     token = _pallas_mesh_ctx.set(mesh)
     token_spec = _pallas_spec_ctx.set(spec)
@@ -183,162 +224,225 @@ def pallas_mesh_context(mesh, spec=None):
 
 
 def _current_pallas_mesh():
+    """Return the mesh of the active Pallas mesh context (or None)."""
     return _pallas_mesh_ctx.get()
 
 
 def _current_pallas_spec():
+    """Return the state PartitionSpec of the active Pallas mesh context (or None)."""
     return _pallas_spec_ctx.get()
 
 
 def sharded_roll(x, shift: int, axis: int):
-    """``jnp.roll(x, shift, axis)`` along the SPLIT axis of the active Pallas
-    mesh context as a shard_map + ppermute of the ``|shift|`` boundary planes,
-    or ``None`` when there is nothing to do differently (no multi-device
-    context, ``axis`` not the split axis, a shape that does not split evenly,
-    ``|shift|`` beyond one shard): the caller then rolls as before.
+    """
+    Periodic roll along the split axis of the active Pallas mesh, computed as a
+    halo exchange.
 
-    Why: GSPMD partitions the slice + concatenate of a periodic roll along a
-    split axis as TWO all-to-all reshards of the whole local block, not as a
-    halo exchange -- 900+ all-to-alls per 4D-Var gradient step at 256^3 on 4
-    GPUs (``casa_4dvar_shard --hlo-audit``); a 20-yr 256^3 forward on 4 A100s
-    took 205.8 s with them against 45.6 s on ONE GPU, and 26.2 s with this.
-    The values are the same as the concatenate's (a pure data movement), so
-    results are bitwise unchanged. (In a reverse sweep one ppermute per
-    stencil shift is itself slow -- the native WENO tangent is therefore
-    shard-local as a whole, ``_weno._native_tangent_sharded``.)
+    Inside a multi-device ``pallas_mesh_context``, ``jnp.roll(x, shift, axis)``
+    along the axis that the state PartitionSpec distributes over devices is
+    computed in a ``shard_map`` in which every shard passes its ``|shift|``
+    boundary planes to its neighbour by ppermute. GSPMD partitions the slice +
+    concatenate of a periodic roll along a split axis as two all-to-all
+    reshards of the whole local block instead, which costs far more
+    communication than the halo. The roll is a pure data movement, so the
+    result is bitwise identical to the single-device roll.
 
-    The split axis is read from the context spec: for an array with as many
-    dims as the ``(var, x, y, z)`` state spec, the spec's own position; with
-    one dim fewer (a single field ``(x, y, z)``), shifted by one.
+    In a reverse sweep even one ppermute per stencil shift is costly, which is
+    why the native WENO tangent runs shard-local as a whole
+    (``_weno._native_tangent_sharded``).
+
+    The split axis is read from the context spec: an array with as many
+    dimensions as the ``(var, x, y, z)`` state spec uses the spec's own axis
+    position, an array with one dimension fewer (a single field ``(x, y, z)``)
+    the position shifted by one.
+
+    Args:
+        x: The array to roll.
+        shift: The signed number of positions to roll by.
+        axis: The axis along which to roll.
+
+    Returns:
+        The rolled array, or ``None`` when the caller should roll as usual: no
+        multi-device context, ``axis`` is not the split axis, the axis does not
+        divide evenly over the devices, ``|shift|`` exceeds one shard, or the
+        split axis has only two devices (see the note in the body).
     """
     mesh = _current_pallas_mesh()
     spec = _current_pallas_spec()
     if mesh is None or mesh.size <= 1 or spec is None:
         return None
-    mode = os.environ.get("ASTRONOMIX_SHARDED_ROLL", "auto")    # auto | 1 | 0 (GSPMD's concatenate)
-    if mode == "0":
+
+    # --------------- ↓ Locate the split axis ↓ ----------------
+    spec_axis_names = list(spec)
+    split_positions = [
+        position for position, axis_name in enumerate(spec_axis_names) if axis_name is not None
+    ]
+    if len(split_positions) != 1:
         return None
-    names = [nm for nm in spec]
-    split = [i for i, nm in enumerate(names) if nm is not None]
-    if len(split) != 1:
-        return None
-    sa = split[0]
-    name = names[sa]
-    if isinstance(name, tuple):
-        if len(name) != 1:
+    split_axis = split_positions[0]
+    mesh_axis_name = spec_axis_names[split_axis]
+    if isinstance(mesh_axis_name, tuple):
+        if len(mesh_axis_name) != 1:
             return None
-        name = name[0]
-    nd = x.ndim
-    if nd == len(names):
-        pass
-    elif nd == len(names) - 1 and sa >= 1:
-        sa -= 1
-    else:
+        mesh_axis_name = mesh_axis_name[0]
+    num_dims = x.ndim
+    if num_dims == len(spec_axis_names) - 1 and split_axis >= 1:
+        split_axis -= 1
+    elif num_dims != len(spec_axis_names):
         return None
-    axis = axis % nd
-    if axis != sa:
+    axis = axis % num_dims
+    if axis != split_axis:
         return None
-    ndev = mesh.shape[name]
-    n = x.shape[axis]
-    if ndev <= 1 or n % ndev:
+    # --------------- ↑ Locate the split axis ↑ ----------------
+
+    num_devices = mesh.shape[mesh_axis_name]
+    axis_length = x.shape[axis]
+    if num_devices <= 1 or axis_length % num_devices:
         return None
-    if ndev == 2 and mode != "1":
-        # 2026-09-27: with 2 devices, rolls of this form inside the native WENO
-        # TANGENT (a custom_jvp rule, transposed) gave a gradient 5 % off at a
-        # few cells (4 devices: exact to 5e-7; the forward bitwise right; a
-        # standalone roll-in-a-loop VJP exact on 2 GPUs too).
-        # Review (shard_review/, state-level 128^3 tests of the 4D-Var solver):
-        # deterministic, compile-dependent (XLA collective-permute combining
-        # off changes it but does not remove it), in the bulk of the hot
-        # ejecta, NOT on the seam planes -- so not a data-movement error, but
-        # a different rounding of the GSPMD-partitioned native tangent that the
-        # non-smooth tangent amplifies; 2-yr: vel. gradients 1-2 % (rel L2) vs a
-        # 2.8-4.8 % change of the 1-GPU gradient under a 1e-7 input jitter.
-        # With the tangent shard-local (``_native_tangent_sharded``) forcing
-        # ASTRONOMIX_SHARDED_ROLL=1 on 2 devices gives a gradient BITWISE equal
-        # to the default below (and 1.5e-7 of the 1-GPU one over 2 yr), so this
-        # guard now only matters for native tangents that are not shard-local
-        # (the MHD fluxes); 2-device meshes keep GSPMD's roll (slower: ~450
-        # whole-block all-to-alls per 128^3 4D-Var gradient) unless
-        # ASTRONOMIX_SHARDED_ROLL=1.
+
+    # NOTE: with two devices along the split axis, native-JAX tangents that are
+    # not shard-local (currently the MHD WENO fluxes) round differently under
+    # this roll than under GSPMD's, and the non-smooth WENO tangent amplifies
+    # the difference to percent-level changes of reverse-mode gradients at a
+    # few cells. Such meshes therefore keep GSPMD's roll.
+    if num_devices == 2:
         return None
-    loc = n // ndev
-    s = int(shift) % n
-    if s > n // 2:
-        s -= n
-    if s == 0:
+
+    local_length = axis_length // num_devices
+    signed_shift = int(shift) % axis_length
+    if signed_shift > axis_length // 2:
+        signed_shift -= axis_length
+    if signed_shift == 0:
         return x
-    if abs(s) > loc:
+    if abs(signed_shift) > local_length:
         return None
 
-    try:
-        from jax.shard_map import shard_map  # jax >= 0.8
-    except ImportError:  # jax < 0.8
-        from jax.experimental.shard_map import shard_map
+    array_spec = [None] * num_dims
+    array_spec[split_axis] = mesh_axis_name
+    array_spec = PartitionSpec(*array_spec)
+    send_to_right = [(device, (device + 1) % num_devices) for device in range(num_devices)]
+    send_to_left = [(device, (device - 1) % num_devices) for device in range(num_devices)]
 
-    pspec = [None] * nd
-    pspec[sa] = name
-    pspec = PartitionSpec(*pspec)
-    right = [(j, (j + 1) % ndev) for j in range(ndev)]
-    left = [(j, (j - 1) % ndev) for j in range(ndev)]
+    def roll_local_block(local_block):
+        """Roll one shard, receiving the wrapped planes from its neighbour."""
+        if signed_shift > 0:
+            # out[i] = in[i - shift]: the first ``shift`` planes come from the
+            # left neighbour.
+            received_planes = jax.lax.ppermute(
+                jax.lax.slice_in_dim(
+                    local_block,
+                    local_length - signed_shift,
+                    local_length,
+                    axis=axis,
+                ),
+                mesh_axis_name,
+                perm=send_to_right,
+            )
+            return jax.lax.concatenate(
+                [
+                    received_planes,
+                    jax.lax.slice_in_dim(local_block, 0, local_length - signed_shift, axis=axis),
+                ],
+                axis,
+            )
+        # out[i] = in[i + |shift|]: the last ``|shift|`` planes come from the
+        # right neighbour.
+        planes_from_right = -signed_shift
+        received_planes = jax.lax.ppermute(
+            jax.lax.slice_in_dim(local_block, 0, planes_from_right, axis=axis),
+            mesh_axis_name,
+            perm=send_to_left,
+        )
+        return jax.lax.concatenate(
+            [
+                jax.lax.slice_in_dim(local_block, planes_from_right, local_length, axis=axis),
+                received_planes,
+            ],
+            axis,
+        )
 
-    def body(xl):
-        if s > 0:           # out[i] = in[i - s]: the first s planes come from the left neighbour
-            recv = jax.lax.ppermute(jax.lax.slice_in_dim(xl, loc - s, loc, axis=axis), name, perm=right)
-            return jax.lax.concatenate([recv, jax.lax.slice_in_dim(xl, 0, loc - s, axis=axis)], axis)
-        t = -s              # out[i] = in[i + t]: the last t planes come from the right neighbour
-        recv = jax.lax.ppermute(jax.lax.slice_in_dim(xl, 0, t, axis=axis), name, perm=left)
-        return jax.lax.concatenate([jax.lax.slice_in_dim(xl, t, loc, axis=axis), recv], axis)
-
-    return shard_map(body, mesh=mesh, in_specs=(pspec,), out_specs=pspec, check_rep=False)(x)
+    return shard_map(
+        roll_local_block,
+        mesh=mesh,
+        in_specs=(array_spec,),
+        out_specs=array_spec,
+        check_rep=False,
+    )(x)
 
 
 def _round_halo_up_to_block(halo, block_shape) -> tuple[int, ...]:
-    """Round each natural halo width up to a multiple of the corresponding
-    Pallas block size.  The kernel's internal ``grid = (nx // bx, ...)``
-    must remain block-divisible after halo padding, so we always grow the
-    halo to the nearest block multiple."""
-    out = []
-    for h, b in zip(halo, block_shape, strict=False):
-        h_i = int(h)
-        b_i = max(int(b), 1)
-        if h_i <= 0:
-            out.append(0)
+    """
+    Round each natural halo width up to a multiple of the corresponding Pallas
+    block size. The kernel's internal ``grid = (nx // bx, ...)`` must remain
+    block-divisible after the halo padding, so the halo always grows to the
+    nearest block multiple.
+
+    Args:
+        halo: The natural halo width per spatial axis.
+        block_shape: The Pallas block size per spatial axis.
+
+    Returns:
+        The block-rounded halo width per spatial axis.
+    """
+    rounded_halo = []
+    for width, block_size in zip(halo, block_shape, strict=False):
+        width = int(width)
+        block_size = max(int(block_size), 1)
+        if width <= 0:
+            rounded_halo.append(0)
         else:
-            q, r = divmod(h_i, b_i)
-            out.append(b_i * (q + (1 if r else 0)))
-    return tuple(out)
+            num_blocks, remainder = divmod(width, block_size)
+            rounded_halo.append(block_size * (num_blocks + (1 if remainder else 0)))
+    return tuple(rounded_halo)
 
 
 def _spatial_sharded_axes(mesh, pspec, ndim):
-    """Return a list of ``(array_axis_idx, mesh_axis_name, num_dev)`` for
-    every spatial array axis that is split across more than one device.
-    The variable axis (index 0) is always skipped."""
-    out = []
-    for ax in range(1, ndim + 1):
-        if ax >= len(pspec):
+    """
+    List every spatial array axis that is split across more than one device.
+    The variable axis (array axis 0) is always skipped.
+
+    Args:
+        mesh: The device mesh.
+        pspec: The PartitionSpec of the ``(var, x, y, z)`` array.
+        ndim: The number of spatial dimensions.
+
+    Returns:
+        A list of ``(array_axis, mesh_axis_name, num_devices)`` tuples.
+    """
+    sharded_axes = []
+    for array_axis in range(1, ndim + 1):
+        if array_axis >= len(pspec):
             break
-        name = pspec[ax]
-        if name is None:
+        mesh_axis_entry = pspec[array_axis]
+        if mesh_axis_entry is None:
             continue
-        if isinstance(name, tuple):
-            for nm in name:
-                n = mesh.shape[nm]
-                if n > 1:
-                    out.append((ax, nm, n))
+        if isinstance(mesh_axis_entry, tuple):
+            for mesh_axis_name in mesh_axis_entry:
+                num_devices = mesh.shape[mesh_axis_name]
+                if num_devices > 1:
+                    sharded_axes.append((array_axis, mesh_axis_name, num_devices))
         else:
-            n = mesh.shape[name]
-            if n > 1:
-                out.append((ax, name, n))
-    return out
+            num_devices = mesh.shape[mesh_axis_entry]
+            if num_devices > 1:
+                sharded_axes.append((array_axis, mesh_axis_entry, num_devices))
+    return sharded_axes
 
 
 def _default_state_pspec(mesh, ndim) -> PartitionSpec:
-    """Best-effort PartitionSpec when an input array's ``.sharding`` is an
-    ``UnspecifiedValue`` (which can happen for intermediates inside a
-    JIT trace).  Assumes the standard ``(VARAXIS, XAXIS, YAXIS, ZAXIS)``
-    mesh emitted by ``pytests/_benchmark_utils.py::_build_sharding`` and
-    by callers that mirror it."""
+    """
+    Fallback PartitionSpec for an array whose sharding is unknown (for example
+    an intermediate inside a JIT trace with no ``pallas_mesh_context`` spec).
+    Assumes the standard ``(VARAXIS, XAXIS, YAXIS, ZAXIS)`` mesh built by
+    ``pytests/_benchmark_utils.py::_build_sharding`` and by callers that mirror
+    it.
+
+    Args:
+        mesh: The device mesh.
+        ndim: The number of spatial dimensions.
+
+    Returns:
+        ``PartitionSpec(*mesh.axis_names[: 1 + ndim])``.
+    """
     axis_names = tuple(mesh.axis_names)
     return PartitionSpec(*axis_names[: 1 + ndim])
 
@@ -363,7 +467,8 @@ def _resolve_state_pspec(state, mesh) -> PartitionSpec:
     try:
         sharding = getattr(state, "sharding", None)
     except Exception:
-        # Tracers raise "use jax.typeof(x)", not always as an AttributeError.
+        # Reading ``.sharding`` of a tracer raises ("use jax.typeof(x)"), and
+        # not always as an AttributeError.
         sharding = None
     context_spec = _current_pallas_spec()
     if isinstance(sharding, NamedSharding):
@@ -521,35 +626,36 @@ def _pallas_call_sharded(
     input_halos=None,
     output_halo=None,
 ):
-    """Optionally wrap a Pallas-kernel build-and-call in ``shard_map``.
+    """
+    Optionally wrap a Pallas kernel build-and-call in ``shard_map``.
 
     Args:
         kernel_build_fn:
             Callable ``(state_inputs_local_padded..., other_args...) -> out``
-            whose body builds and calls ``pl.pallas_call``.  When the call
+            whose body builds and calls ``pl.pallas_call``. When the call
             runs inside a ``shard_map`` body, each invocation sees the
             *local* (halo-padded) shape and the kernel's internal
             ``grid``/``BlockSpec`` are built for that shape automatically.
         state_inputs:
             Tuple of state-shape arrays that all share the same sharding
-            (same ``PartitionSpec``).  Each one is padded with halo cells
+            (same ``PartitionSpec``). Each one is padded with halo cells
             from neighbour shards along every sharded spatial axis.
         other_args:
             Tuple of replicated arrays (scalar dt, scalar gamma, ...)
             passed through as ``PartitionSpec()``.
         halo:
             Per-spatial-axis natural stencil reach ``(hx, hy, hz)``.
-            Pointwise kernels pass ``(0, 0, 0)`` — they still get the
+            Pointwise kernels pass ``(0, 0, 0)``; they still get the
             ``shard_map`` (so the kernel runs locally on each shard),
             just with no ppermute.
         block_shape:
-            Per-spatial-axis Pallas block size ``(bx, by, bz)``.  The
+            Per-spatial-axis Pallas block size ``(bx, by, bz)``. The
             halo is rounded up to the nearest block multiple so the
             padded shard remains block-divisible.
         num_state_outputs:
             Number of state-shape outputs of ``kernel_build_fn`` (1 for
-            most kernels; >1 for the CT staged kernels which return
-            tuples of single-channel arrays).
+            most kernels; more for kernels that return tuples of state-shaped
+            arrays).
         input_halos:
             Optional per-input halo widths ``((hx, hy, hz), ...)``. Every input
             is still padded to the same block-rounded shape, but only the
@@ -573,16 +679,16 @@ def _pallas_call_sharded(
     if mesh is None or mesh.size <= 1:
         return kernel_build_fn(*state_inputs, *other_args)
 
-    state0 = state_inputs[0]
-    ndim = state0.ndim - 1
-    pspec = _resolve_state_pspec(state0, mesh)
+    first_state_input = state_inputs[0]
+    ndim = first_state_input.ndim - 1
+    pspec = _resolve_state_pspec(first_state_input, mesh)
 
     sharded_axes = _spatial_sharded_axes(mesh, pspec, ndim)
     if not sharded_axes:
         return kernel_build_fn(*state_inputs, *other_args)
 
-    block_3 = tuple(block_shape) + (1,) * max(0, 3 - len(block_shape))
-    halo_3 = tuple(halo) + (0,) * max(0, 3 - len(halo))
+    block_shape_3d = tuple(block_shape) + (1,) * max(0, 3 - len(block_shape))
+    halo_3d = tuple(halo) + (0,) * max(0, 3 - len(halo))
     requested_input_halos = _normalize_input_halos(input_halos, len(state_inputs), ndim)
     kept_output_halos = _normalize_output_halos(output_halo, int(num_state_outputs), ndim)
 
@@ -590,72 +696,73 @@ def _pallas_call_sharded(
     # to the kernel; ``exchanged_halos`` are the widths actually received from
     # the neighbours, per input.
     if requested_input_halos is None:
-        shape_halo = _round_halo_up_to_block(halo_3[:ndim], block_3[:ndim])
+        shape_halo = _round_halo_up_to_block(halo_3d[:ndim], block_shape_3d[:ndim])
         exchanged_halos = tuple(shape_halo for _ in state_inputs)
     else:
         largest_halo = tuple(
-            max([int(halo_3[axis])] + [input_halo[axis] for input_halo in requested_input_halos])
+            max([int(halo_3d[axis])] + [input_halo[axis] for input_halo in requested_input_halos])
             for axis in range(ndim)
         )
-        shape_halo = _round_halo_up_to_block(largest_halo, block_3[:ndim])
+        shape_halo = _round_halo_up_to_block(largest_halo, block_shape_3d[:ndim])
         exchanged_halos = requested_input_halos
 
     for kept_halo in kept_output_halos:
         if any(kept > padded for kept, padded in zip(kept_halo, shape_halo)):
             raise ValueError("output_halo cannot exceed the padded shape halo.")
 
-    try:
-        from jax.shard_map import shard_map  # jax >= 0.8 (promoted out of experimental)
-    except ImportError:  # jax < 0.8
-        from jax.experimental.shard_map import shard_map
-
     def body(*all_args):
+        """Pad the local shards, run the kernel build, strip the halo."""
         state_arrays = list(all_args[: len(state_inputs)])
-        others = all_args[len(state_inputs):]
+        replicated_args = all_args[len(state_inputs):]
 
-        for array_axis_idx, mesh_axis_name, num_dev in sharded_axes:
-            spatial_idx = array_axis_idx - 1
-            if spatial_idx >= len(shape_halo):
+        for array_axis, mesh_axis_name, num_devices in sharded_axes:
+            spatial_axis = array_axis - 1
+            if spatial_axis >= len(shape_halo):
                 continue
-            h = shape_halo[spatial_idx]
-            if h <= 0:
+            padded_width = shape_halo[spatial_axis]
+            if padded_width <= 0:
                 continue
-            for i, arr in enumerate(state_arrays):
-                state_arrays[i] = _pad_axis_with_halo(
-                    arr,
-                    array_axis_idx,
-                    h,
-                    exchanged_halos[i][spatial_idx],
+            for input_index, array in enumerate(state_arrays):
+                state_arrays[input_index] = _pad_axis_with_halo(
+                    array,
+                    array_axis,
+                    padded_width,
+                    exchanged_halos[input_index][spatial_axis],
                     mesh_axis_name,
-                    num_dev,
+                    num_devices,
                 )
 
         # Re-enter the wrapper with mesh=None so the recursive
-        # ``kernel_build_fn`` call goes through the no-wrap path.  Without
+        # ``kernel_build_fn`` call goes through the no-wrap path. Without
         # this, a kernel that calls ``_pallas_call_sharded`` from its body
         # would wrap itself forever.
         with pallas_mesh_context(None):
-            out = kernel_build_fn(*state_arrays, *others)
+            out = kernel_build_fn(*state_arrays, *replicated_args)
 
-        def _strip(o, kept_halo):
-            for array_axis_idx, _, _ in sharded_axes:
-                spatial_idx = array_axis_idx - 1
-                if spatial_idx >= len(shape_halo):
+        def strip_halo(output, kept_halo):
+            """Remove all but ``kept_halo`` of the padding from one output."""
+            for array_axis, _, _ in sharded_axes:
+                spatial_axis = array_axis - 1
+                if spatial_axis >= len(shape_halo):
                     continue
-                stripped_width = shape_halo[spatial_idx] - kept_halo[spatial_idx]
+                stripped_width = shape_halo[spatial_axis] - kept_halo[spatial_axis]
                 if stripped_width <= 0:
                     continue
-                size = o.shape[array_axis_idx]
-                o = jax.lax.slice_in_dim(
-                    o, stripped_width, size - stripped_width, axis=array_axis_idx
+                size = output.shape[array_axis]
+                output = jax.lax.slice_in_dim(
+                    output,
+                    stripped_width,
+                    size - stripped_width,
+                    axis=array_axis,
                 )
-            return o
+            return output
 
         if isinstance(out, tuple):
             return tuple(
-                _strip(o, kept_halo) for o, kept_halo in zip(out, kept_output_halos, strict=True)
+                strip_halo(output, kept_halo)
+                for output, kept_halo in zip(out, kept_output_halos, strict=True)
             )
-        return _strip(out, kept_output_halos[0])
+        return strip_halo(out, kept_output_halos[0])
 
     state_specs = tuple(pspec for _ in state_inputs)
     other_specs = tuple(PartitionSpec() for _ in other_args)
@@ -674,114 +781,160 @@ def _pallas_call_sharded(
     return wrapped(*state_inputs, *other_args)
 
 
-# -----------------------------------------------------------------------------
-# Differentiability: pair every Pallas entry with a native-JAX backward.
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------
+# =========== ↑ Multi-GPU shard_map + halo wrapper ↑ ==========
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# == ↓ Differentiability: native-JAX tangents for Pallas ↓ ====
+# -------------------------------------------------------------
 #
 # Pallas kernels in this codebase use ``input_output_aliases`` for memory
-# efficiency. JAX cannot transpose an aliased ``pl.pallas_call`` (``JVP with
-# aliasing not supported``), so any path that hits a Pallas kernel is
-# non-differentiable by default. We bridge that gap with a ``jax.custom_jvp``
-# whose primal still calls the (aliased, fast) Pallas branch and whose
-# tangent rule delegates to the equivalent native-JAX branch — which is
-# already JVP-differentiable. Reverse-mode (``jax.grad``) is then derived by
-# JAX via transposition.
+# efficiency. JAX cannot transpose an aliased ``pl.pallas_call`` ("JVP with
+# aliasing not supported"), so any path that hits a Pallas kernel is
+# non-differentiable by default. The gap is bridged with a ``jax.custom_jvp``
+# whose primal still calls the (aliased, fast) Pallas branch and whose tangent
+# rule delegates to the equivalent native-JAX branch, which is
+# JVP-differentiable. Reverse mode (``jax.grad``) is then derived by JAX via
+# transposition.
 #
-# Forward simulation perf is unaffected: outside of AD the custom_jvp
-# rule isn't invoked and the call collapses to the bare Pallas branch.
+# Forward simulation performance is unaffected: outside of AD the custom_jvp
+# rule is not invoked and the call collapses to the bare Pallas branch.
 #
 # Both branches must produce the same pytree-structured output. The Pallas
-# guide promises bit-identical primal outputs for the existing kernels, so
-# the gradient computed by transposing the native JVP at the Pallas-evaluated
-# inputs is the correct gradient of the Pallas operation.
+# kernels reproduce their native counterparts to round-off, so the gradient
+# obtained by transposing the native JVP at the Pallas-evaluated inputs is the
+# gradient of the Pallas operation.
 #
-# Hand-rolled Pallas adjoint kernels can later replace the native tangent
-# branch on a per-kernel basis without changing call sites.
+# A hand-written Pallas adjoint can replace the native tangent branch of a
+# single kernel without changing its call sites (``pallas_vjp_call``).
+
 
 def diffable_pallas_call(state, params, *, pallas_branch, native_branch):
-    """Run ``pallas_branch(state, params)`` with a custom_jvp boundary that
-    routes tangent computation through ``native_branch``.
+    """
+    Run ``pallas_branch(state, params)`` behind a custom_jvp boundary that
+    routes the tangent computation through ``native_branch``.
 
     Both branches must accept the same positional ``(state, params)`` pair
     and produce the same pytree structure. Anything static (config,
     registered_variables, axis index, ...) should be closed over.
 
     Outside of AD the call collapses to ``pallas_branch(state, params)``
-    directly — no overhead. Under ``jax.jvp`` / ``jax.jacfwd`` /
+    directly, with no overhead. Under ``jax.jvp`` / ``jax.jacfwd`` /
     ``jax.grad`` / ``jax.vjp`` / ``jax.jacrev`` the custom rule fires and
     the tangent goes through ``native_branch``.
-    """
-    @jax.custom_jvp
-    def _f(s, p):
-        return pallas_branch(s, p)
 
-    @_f.defjvp
-    def _f_jvp(primals, tangents):
+    Args:
+        state: The (differentiable) state argument.
+        params: The (differentiable) parameter argument.
+        pallas_branch: The Pallas implementation, ``(state, params) -> out``.
+        native_branch: The native-JAX implementation with the same signature.
+
+    Returns:
+        ``pallas_branch(state, params)``.
+    """
+
+    @jax.custom_jvp
+    def pallas_with_native_tangent(state_argument, params_argument):
+        return pallas_branch(state_argument, params_argument)
+
+    @pallas_with_native_tangent.defjvp
+    def native_tangent(primals, tangents):
         primal_out = pallas_branch(*primals)
         _, tangent_out = jax.jvp(native_branch, primals, tangents)
         return primal_out, tangent_out
 
-    return _f(state, params)
+    return pallas_with_native_tangent(state, params)
 
 
 def diffable_pallas_call_n(primals, *, pallas_branch, native_branch):
-    """Same as :func:`diffable_pallas_call` but takes a tuple of arbitrary
-    differentiable primals (so callers with more than two diff args, e.g.
-    extra rhs/accumulator buffers, can still get a custom_jvp boundary)."""
-    @jax.custom_jvp
-    def _f(*args):
-        return pallas_branch(*args)
+    """
+    Same as :func:`diffable_pallas_call` for a tuple of arbitrary
+    differentiable primals (callers with more than two differentiable
+    arguments, e.g. extra right-hand-side / accumulator buffers).
 
-    @_f.defjvp
-    def _f_jvp(args, tangents):
-        primal_out = pallas_branch(*args)
-        _, tangent_out = jax.jvp(native_branch, args, tangents)
+    Args:
+        primals: The tuple of differentiable arguments.
+        pallas_branch: The Pallas implementation, ``(*primals) -> out``.
+        native_branch: The native-JAX implementation with the same signature.
+
+    Returns:
+        ``pallas_branch(*primals)``.
+    """
+
+    @jax.custom_jvp
+    def pallas_with_native_tangent(*arguments):
+        return pallas_branch(*arguments)
+
+    @pallas_with_native_tangent.defjvp
+    def native_tangent(arguments, tangents):
+        primal_out = pallas_branch(*arguments)
+        _, tangent_out = jax.jvp(native_branch, arguments, tangents)
         return primal_out, tangent_out
 
-    return _f(*primals)
+    return pallas_with_native_tangent(*primals)
 
 
 def pallas_vjp_call(state, aux, *, pallas_forward, pallas_backward):
-    """Run ``pallas_forward(state, aux)`` with a ``jax.custom_vjp`` boundary
-    whose reverse rule is a *native Pallas adjoint kernel* ``pallas_backward``.
-
-    Unlike :func:`diffable_pallas_call` (which routes the tangent — and hence
-    the transposed gradient — through native JAX), this keeps the entire
-    backward pass on the Pallas/GPU backend: ``pallas_backward(state, aux, cot)``
-    returns the input cotangent ``d(loss)/d(state)`` directly from a
-    hand-built adjoint kernel.
-
-    Differentiates w.r.t. ``state`` only.  ``aux`` (e.g. the traced
-    ``SimulationParams``) is threaded *through* the boundary and given a zero
-    cotangent — it must be passed explicitly rather than closed over because
-    ``jax.custom_vjp`` cannot capture traced values in its forward/backward
-    closures (only static/concrete data — config, axis — may be closed over by
-    the two branches).  Treating the physical constants as non-differentiable
-    matches the inverse-problem regime (gradients w.r.t. the state, not params).
-
-    NOTE: ``jax.custom_vjp`` supports reverse-mode only — ``jax.jvp`` /
-    forward-mode AD on this boundary raises.  Use it for reverse-mode
-    (``jax.grad`` / ``differentiation_mode = BACKWARDS``); for forward-mode keep
-    :func:`diffable_pallas_call`.
     """
+    Run ``pallas_forward(state, aux)`` behind a ``jax.custom_vjp`` boundary
+    whose reverse rule is a hand-written Pallas adjoint kernel
+    ``pallas_backward``.
+
+    Unlike :func:`diffable_pallas_call` (which routes the tangent, and hence
+    the transposed gradient, through native JAX), this keeps the entire
+    backward pass on the Pallas/GPU backend: ``pallas_backward(state, aux,
+    cotangent)`` returns the input cotangent ``d(loss)/d(state)`` directly.
+
+    Differentiates with respect to ``state`` only. ``aux`` (e.g. the traced
+    ``SimulationParams``) is threaded through the boundary and given a zero
+    cotangent; it must be passed explicitly rather than closed over because
+    ``jax.custom_vjp`` cannot capture traced values in its forward/backward
+    closures (only static data such as config or axis may be closed over by
+    the two branches). Treating the physical constants as non-differentiable
+    matches the inverse-problem regime (gradients with respect to the state,
+    not the parameters).
+
+    NOTE: ``jax.custom_vjp`` supports reverse mode only; ``jax.jvp`` /
+    forward-mode AD on this boundary raises. For forward mode use
+    :func:`diffable_pallas_call`.
+
+    Args:
+        state: The differentiable state argument.
+        aux: Non-differentiable traced data (e.g. the simulation parameters).
+        pallas_forward: The Pallas forward kernel, ``(state, aux) -> out``.
+        pallas_backward: The Pallas adjoint kernel,
+            ``(state, aux, cotangent) -> state_cotangent``.
+
+    Returns:
+        ``pallas_forward(state, aux)``.
+    """
+
     @jax.custom_vjp
-    def _f(s, a):
-        return pallas_forward(s, a)
+    def pallas_with_pallas_adjoint(state_argument, aux_argument):
+        return pallas_forward(state_argument, aux_argument)
 
-    def _f_fwd(s, a):
-        return pallas_forward(s, a), (s, a)
+    def forward_with_residuals(state_argument, aux_argument):
+        return pallas_forward(state_argument, aux_argument), (state_argument, aux_argument)
 
-    def _f_bwd(residual, cotangent):
-        s, a = residual
-        state_bar = pallas_backward(s, a, cotangent)
+    def backward(residuals, cotangent):
+        state_argument, aux_argument = residuals
+        state_cotangent = pallas_backward(state_argument, aux_argument, cotangent)
 
-        def _zero(x):  # correctly-typed zero cotangent (float0 for non-inexact)
-            x = jnp.asarray(x)
-            if jnp.issubdtype(x.dtype, jnp.inexact):
-                return jnp.zeros_like(x)
-            return jnp.zeros(x.shape, dtype=jax.dtypes.float0)
+        def zero_cotangent(leaf):
+            """Correctly typed zero cotangent (float0 for non-inexact leaves)."""
+            leaf = jnp.asarray(leaf)
+            if jnp.issubdtype(leaf.dtype, jnp.inexact):
+                return jnp.zeros_like(leaf)
+            return jnp.zeros(leaf.shape, dtype=jax.dtypes.float0)
 
-        return (state_bar, jax.tree_util.tree_map(_zero, a))
+        return (state_cotangent, jax.tree_util.tree_map(zero_cotangent, aux_argument))
 
-    _f.defvjp(_f_fwd, _f_bwd)
-    return _f(state, aux)
+    pallas_with_pallas_adjoint.defvjp(forward_with_residuals, backward)
+    return pallas_with_pallas_adjoint(state, aux)
+
+
+# -------------------------------------------------------------
+# == ↑ Differentiability: native-JAX tangents for Pallas ↑ ====
+# -------------------------------------------------------------
