@@ -6,9 +6,12 @@ Transcriptions of the interface solvers of AthenaPK (and hence Athena++): HLLD
 HLLE and local Lax-Friedrichs for adiabatic hydrodynamics. The GLM-MHD solvers
 first solve the decoupled ``(B_normal, psi)`` subsystem exactly (Mignone &
 Tzeferacos 2010, eq. 24) and use the resulting interface normal field in the
-MHD solver. The expressions follow the C++ closely (including its
-floating-point grouping and its special cases), so that the scheme agrees with
-AthenaPK to round-off.
+MHD solver. The expressions follow AthenaPK's formulation, including its
+special cases (the HLLD degeneracy check, the wave-speed clamps), and the
+scheme agrees with AthenaPK to round-off
+(``pytests/mhd/vl2_athenapk_regression.py``). These solvers serve the VL2
+scheme only; the classic finite-volume schemes use ``hll.py``,
+``_lax_friedrichs.py`` and the dispatch in ``_riemann_solver.py``.
 
 Every function is purely elementwise on its operands — it never indexes,
 reduces or reshapes — so the same code is evaluated on whole arrays by the
@@ -21,7 +24,10 @@ y then z; for a y-interface: z then x; for a z-interface: x then y).
 """
 
 # typing
-from typing import NamedTuple, Any
+from typing import (
+    Any,
+    NamedTuple,
+)
 
 # jax
 import jax.numpy as jnp
@@ -47,7 +53,12 @@ class MHDFaceState(NamedTuple):
 
 
 class MHDFlux(NamedTuple):
-    """Interface flux of the GLM-MHD conserved variables (interface frame)."""
+    """
+    Interface flux of the GLM-MHD conserved variables (interface frame).
+
+    The fields are ordered like :class:`MHDFaceState`; the integrator scatters
+    them back to state order by position.
+    """
 
     mass: Any
     momentum_normal: Any
@@ -71,7 +82,12 @@ class HydroFaceState(NamedTuple):
 
 
 class HydroFlux(NamedTuple):
-    """Interface flux of the hydrodynamic conserved variables (interface frame)."""
+    """
+    Interface flux of the hydrodynamic conserved variables (interface frame).
+
+    The fields are ordered like :class:`HydroFaceState`; the integrator
+    scatters them back to state order by position.
+    """
 
     mass: Any
     momentum_normal: Any
@@ -84,22 +100,30 @@ class HydroFlux(NamedTuple):
 # ======================= ↑ Containers ↑ ======================
 # -------------------------------------------------------------
 
-#: AthenaPK's ``SMALL_NUMBER`` of the HLLD degeneracy check.
+#: Relative threshold of the HLLD degeneracy check (AthenaPK's ``SMALL_NUMBER``).
 _HLLD_SMALL_NUMBER = 1.0e-8
 
-#: Parthenon's ``TINY_NUMBER``, used by the hydro HLLE / HLLC wave speeds.
+#: Parthenon's ``TINY_NUMBER``: the outer wave speeds of the hydro HLLE / HLLC
+#: solvers are clamped to at least this magnitude.
 _TINY_NUMBER = 1.0e-20
 
 
 def _square(value):
-    """AthenaPK's ``SQR(x)``: ``x * x``."""
+    """Return ``value * value``."""
     return value * value
 
 
-def fast_magnetosonic_speed(gamma, density, pressure, field_normal, field_transverse_1, field_transverse_2):
+def fast_magnetosonic_speed(
+    gamma,
+    density,
+    pressure,
+    field_normal,
+    field_transverse_1,
+    field_transverse_2,
+):
     """
-    Fast magnetosonic speed along the ``field_normal`` direction, exactly as
-    ``AdiabaticGLMMHDEOS::FastMagnetosonicSpeed``.
+    Fast magnetosonic speed along the ``field_normal`` direction (AthenaPK:
+    ``AdiabaticGLMMHDEOS::FastMagnetosonicSpeed``).
 
     Args:
         gamma: The adiabatic index.
@@ -126,7 +150,7 @@ def fast_magnetosonic_speed(gamma, density, pressure, field_normal, field_transv
 
 
 def adiabatic_sound_speed(gamma, density, pressure):
-    """``AdiabaticHydroEOS::SoundSpeed``: ``sqrt(gamma * p / rho)``."""
+    """Return the adiabatic sound speed ``sqrt(gamma * p / rho)``."""
     return jnp.sqrt(gamma * pressure / density)
 
 
@@ -143,11 +167,11 @@ def _glm_interface_field_and_psi(left: MHDFaceState, right: MHDFaceState, cleani
     Returns:
         The interface normal field and the interface psi.
     """
-    interface_field_normal = 0.5 * (left.field_normal + right.field_normal) - 0.5 / cleaning_speed * (
-        right.psi - left.psi
+    interface_field_normal = 0.5 * (left.field_normal + right.field_normal) - (
+        0.5 / cleaning_speed * (right.psi - left.psi)
     )
-    interface_psi = 0.5 * (left.psi + right.psi) - 0.5 * cleaning_speed * (
-        right.field_normal - left.field_normal
+    interface_psi = 0.5 * (left.psi + right.psi) - (
+        0.5 * cleaning_speed * (right.field_normal - left.field_normal)
     )
     return interface_field_normal, interface_psi
 
@@ -158,7 +182,10 @@ def _glm_interface_field_and_psi(left: MHDFaceState, right: MHDFaceState, cleani
 
 
 class _MHDConserved(NamedTuple):
-    """The seven conserved quantities HLLD tracks across its fan (Athena's Cons1D)."""
+    """
+    The seven conserved quantities HLLD carries across its wave fan (the
+    normal field and psi are handled by the GLM subsystem).
+    """
 
     density: Any
     momentum_normal: Any
@@ -169,9 +196,22 @@ class _MHDConserved(NamedTuple):
     field_transverse_2: Any
 
 
+def _conserved_sum(first: _MHDConserved, second: _MHDConserved) -> _MHDConserved:
+    """Return the component-wise sum ``first + second``."""
+    return _MHDConserved(
+        *(first_value + second_value for first_value, second_value in zip(first, second))
+    )
+
+
 def _scaled_jump(speed, upper: _MHDConserved, lower: _MHDConserved) -> _MHDConserved:
-    """Return ``speed * (upper - lower)`` component-wise (Athena's step 6)."""
-    return _MHDConserved(*(speed * (upper_value - lower_value) for upper_value, lower_value in zip(upper, lower)))
+    """
+    Return the wave jump ``S_k * (U_k - U_{k-1})`` that turns the flux of one
+    region of the wave fan into the flux of the next (``F*_L = F_L + S_L
+    (U*_L - U_L)``).
+    """
+    return _MHDConserved(
+        *(speed * (upper_value - lower_value) for upper_value, lower_value in zip(upper, lower))
+    )
 
 
 def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) -> MHDFlux:
@@ -194,17 +234,24 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     gamma_minus_one = gamma - 1.0
     inverse_gamma_minus_one = 1.0 / gamma_minus_one
 
-    field_normal, psi_interface = _glm_interface_field_and_psi(left, right, cleaning_speed)
-    field_normal_squared = field_normal * field_normal
+    # The MHD fan uses the normal field of the exact GLM interface solution;
+    # the reconstructed ``left.field_normal`` / ``right.field_normal`` only
+    # enter the fast speeds below.
+    interface_field_normal, interface_psi = _glm_interface_field_and_psi(
+        left,
+        right,
+        cleaning_speed,
+    )
+    interface_field_normal_squared = interface_field_normal * interface_field_normal
 
     # The transverse components are grouped first for floating-point
     # associativity symmetry between the left and right states.
     magnetic_pressure_left = 0.5 * (
-        field_normal_squared
+        interface_field_normal_squared
         + (_square(left.field_transverse_1) + _square(left.field_transverse_2))
     )
     magnetic_pressure_right = 0.5 * (
-        field_normal_squared
+        interface_field_normal_squared
         + (_square(right.field_transverse_1) + _square(right.field_transverse_2))
     )
     kinetic_energy_left = 0.5 * left.density * (
@@ -221,7 +268,11 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         momentum_normal=left.velocity_normal * left.density,
         momentum_transverse_1=left.velocity_transverse_1 * left.density,
         momentum_transverse_2=left.velocity_transverse_2 * left.density,
-        energy=left.pressure * inverse_gamma_minus_one + kinetic_energy_left + magnetic_pressure_left,
+        energy=(
+            left.pressure * inverse_gamma_minus_one
+            + kinetic_energy_left
+            + magnetic_pressure_left
+        ),
         field_transverse_1=left.field_transverse_1,
         field_transverse_2=left.field_transverse_2,
     )
@@ -230,7 +281,11 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         momentum_normal=right.velocity_normal * right.density,
         momentum_transverse_1=right.velocity_transverse_1 * right.density,
         momentum_transverse_2=right.velocity_transverse_2 * right.density,
-        energy=right.pressure * inverse_gamma_minus_one + kinetic_energy_right + magnetic_pressure_right,
+        energy=(
+            right.pressure * inverse_gamma_minus_one
+            + kinetic_energy_right
+            + magnetic_pressure_right
+        ),
         field_transverse_1=right.field_transverse_1,
         field_transverse_2=right.field_transverse_2,
     )
@@ -271,26 +326,39 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     total_pressure_right = right.pressure + magnetic_pressure_right
 
     def side_flux(state: MHDFaceState, conserved: _MHDConserved, total_pressure) -> _MHDConserved:
+        """The physical flux ``F(U)`` of one outer state."""
         return _MHDConserved(
             density=conserved.momentum_normal,
-            momentum_normal=conserved.momentum_normal * state.velocity_normal
-            + total_pressure
-            - field_normal_squared,
-            momentum_transverse_1=conserved.momentum_transverse_1 * state.velocity_normal
-            - field_normal * conserved.field_transverse_1,
-            momentum_transverse_2=conserved.momentum_transverse_2 * state.velocity_normal
-            - field_normal * conserved.field_transverse_2,
-            energy=state.velocity_normal
-            * (conserved.energy + total_pressure - field_normal_squared)
-            - field_normal
-            * (
-                state.velocity_transverse_1 * conserved.field_transverse_1
-                + state.velocity_transverse_2 * conserved.field_transverse_2
+            momentum_normal=(
+                conserved.momentum_normal * state.velocity_normal
+                + total_pressure
+                - interface_field_normal_squared
             ),
-            field_transverse_1=conserved.field_transverse_1 * state.velocity_normal
-            - field_normal * state.velocity_transverse_1,
-            field_transverse_2=conserved.field_transverse_2 * state.velocity_normal
-            - field_normal * state.velocity_transverse_2,
+            momentum_transverse_1=(
+                conserved.momentum_transverse_1 * state.velocity_normal
+                - interface_field_normal * conserved.field_transverse_1
+            ),
+            momentum_transverse_2=(
+                conserved.momentum_transverse_2 * state.velocity_normal
+                - interface_field_normal * conserved.field_transverse_2
+            ),
+            energy=(
+                state.velocity_normal
+                * (conserved.energy + total_pressure - interface_field_normal_squared)
+                - interface_field_normal
+                * (
+                    state.velocity_transverse_1 * conserved.field_transverse_1
+                    + state.velocity_transverse_2 * conserved.field_transverse_2
+                )
+            ),
+            field_transverse_1=(
+                conserved.field_transverse_1 * state.velocity_normal
+                - interface_field_normal * state.velocity_transverse_1
+            ),
+            field_transverse_2=(
+                conserved.field_transverse_2 * state.velocity_normal
+                - interface_field_normal * state.velocity_transverse_2
+            ),
         )
 
     flux_left = side_flux(left, conserved_left, total_pressure_left)
@@ -303,8 +371,8 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     speed_minus_velocity_left = speed_left_outer - left.velocity_normal
     speed_minus_velocity_right = speed_right_outer - right.velocity_normal
 
-    # S_M, Miyoshi & Kusano eq. (38); the pressure terms are grouped for
-    # floating-point associativity symmetry.
+    # The contact speed S_M (Miyoshi & Kusano 2005, eq. 38); the pressure terms
+    # are grouped for floating-point associativity symmetry.
     contact_speed = (
         speed_minus_velocity_right * conserved_right.momentum_normal
         - speed_minus_velocity_left * conserved_left.momentum_normal
@@ -319,8 +387,11 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     inverse_speed_minus_contact_left = 1.0 / speed_minus_contact_left
     inverse_speed_minus_contact_right = 1.0 / speed_minus_contact_right
 
-    # Eq. (43): the star-state densities.
-    star_density_left = conserved_left.density * speed_minus_velocity_left * inverse_speed_minus_contact_left
+    # The star-state densities follow from mass conservation across the outer
+    # waves (eq. 43).
+    star_density_left = (
+        conserved_left.density * speed_minus_velocity_left * inverse_speed_minus_contact_left
+    )
     star_density_right = (
         conserved_right.density * speed_minus_velocity_right * inverse_speed_minus_contact_right
     )
@@ -329,21 +400,25 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     sqrt_star_density_left = jnp.sqrt(star_density_left)
     sqrt_star_density_right = jnp.sqrt(star_density_right)
 
-    # Eq. (51): the rotational (Alfvén) speeds.
-    speed_left_alfven = contact_speed - jnp.abs(field_normal) / sqrt_star_density_left
-    speed_right_alfven = contact_speed + jnp.abs(field_normal) / sqrt_star_density_right
+    # The rotational (Alfvén) waves move at S_M -+ |B_n| / sqrt(rho*) (eq. 51).
+    speed_left_alfven = contact_speed - jnp.abs(interface_field_normal) / sqrt_star_density_left
+    speed_right_alfven = contact_speed + jnp.abs(interface_field_normal) / sqrt_star_density_right
 
     # --------------- ↑ Contact and Alfvén speeds ↑ ----------------
 
     # --------------- ↓ Star (*) states ↓ ----------------
 
-    # Eq. (41): the total pressure of the star states, averaged over the two
-    # sides (which agree analytically).
-    star_total_pressure_left = total_pressure_left + conserved_left.density * speed_minus_velocity_left * (
-        contact_speed - left.velocity_normal
+    # The total pressure is constant across the star region (eq. 41); its two
+    # one-sided estimates agree analytically and are averaged.
+    star_total_pressure_left = total_pressure_left + (
+        conserved_left.density
+        * speed_minus_velocity_left
+        * (contact_speed - left.velocity_normal)
     )
-    star_total_pressure_right = total_pressure_right + conserved_right.density * speed_minus_velocity_right * (
-        contact_speed - right.velocity_normal
+    star_total_pressure_right = total_pressure_right + (
+        conserved_right.density
+        * speed_minus_velocity_right
+        * (contact_speed - right.velocity_normal)
     )
     star_total_pressure = 0.5 * (star_total_pressure_right + star_total_pressure_left)
 
@@ -357,29 +432,53 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         speed_minus_contact,
         inverse_speed_minus_contact,
     ):
+        """
+        The star state between an outer fast wave and the adjacent Alfvén wave
+        (Miyoshi & Kusano 2005, eqs. 43-48).
+
+        Args:
+            state: The primitive outer state.
+            conserved: The conserved outer state.
+            total_pressure: The total (gas + magnetic) pressure of the outer state.
+            star_density: The star-state density.
+            inverse_star_density: ``1 / star_density``.
+            speed_minus_velocity: ``S_outer - v_normal`` of the outer state.
+            speed_minus_contact: ``S_outer - S_M``.
+            inverse_speed_minus_contact: ``1 / (S_outer - S_M)``.
+
+        Returns:
+            The conserved star state and its ``v* . B*``.
+        """
         star_momentum_normal = star_density * contact_speed
 
         # Eqs. (44)-(47), with the Athena++ guard against the degenerate case
         # in which the denominator vanishes (the star state then keeps the
         # transverse velocity and field of the outer state).
-        denominator = conserved.density * speed_minus_velocity * speed_minus_contact - field_normal_squared
+        denominator = (
+            conserved.density * speed_minus_velocity * speed_minus_contact
+            - interface_field_normal_squared
+        )
         degenerate = jnp.abs(denominator) < _HLLD_SMALL_NUMBER * star_total_pressure
         safe_denominator = jnp.where(degenerate, 1.0, denominator)
 
-        velocity_factor = field_normal * (speed_minus_velocity - speed_minus_contact) / safe_denominator
+        velocity_factor = (
+            interface_field_normal * (speed_minus_velocity - speed_minus_contact) / safe_denominator
+        )
         field_factor = (
-            conserved.density * _square(speed_minus_velocity) - field_normal_squared
+            conserved.density * _square(speed_minus_velocity) - interface_field_normal_squared
         ) / safe_denominator
 
         star_momentum_transverse_1 = jnp.where(
             degenerate,
             star_density * state.velocity_transverse_1,
-            star_density * (state.velocity_transverse_1 - conserved.field_transverse_1 * velocity_factor),
+            star_density
+            * (state.velocity_transverse_1 - conserved.field_transverse_1 * velocity_factor),
         )
         star_momentum_transverse_2 = jnp.where(
             degenerate,
             star_density * state.velocity_transverse_2,
-            star_density * (state.velocity_transverse_2 - conserved.field_transverse_2 * velocity_factor),
+            star_density
+            * (state.velocity_transverse_2 - conserved.field_transverse_2 * velocity_factor),
         )
         star_field_transverse_1 = jnp.where(
             degenerate,
@@ -394,21 +493,22 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
 
         # v* . B*, with the transverse terms grouped for associativity symmetry.
         star_velocity_dot_field = (
-            star_momentum_normal * field_normal
+            star_momentum_normal * interface_field_normal
             + (
                 star_momentum_transverse_1 * star_field_transverse_1
                 + star_momentum_transverse_2 * star_field_transverse_2
             )
         ) * inverse_star_density
 
-        # Eq. (48): the star energy.
+        # The star energy follows from energy conservation across the outer
+        # wave (eq. 48).
         star_energy = (
             speed_minus_velocity * conserved.energy
             - total_pressure * state.velocity_normal
             + star_total_pressure * contact_speed
-            + field_normal
+            + interface_field_normal
             * (
-                state.velocity_normal * field_normal
+                state.velocity_normal * interface_field_normal
                 + (
                     state.velocity_transverse_1 * conserved.field_transverse_1
                     + state.velocity_transverse_2 * conserved.field_transverse_2
@@ -457,10 +557,11 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     inverse_sum_sqrt_density = 1.0 / (sqrt_star_density_left + sqrt_star_density_right)
     # The sign is built from a typed operand: a select between two bare
     # literals would enter the Pallas/Triton lowering as the default float type.
-    unit = jnp.ones_like(field_normal)
-    field_normal_sign = jnp.where(field_normal > 0.0, unit, -unit)
+    ones = jnp.ones_like(interface_field_normal)
+    field_normal_sign = jnp.where(interface_field_normal > 0.0, ones, -ones)
 
-    # Eqs. (59) and (60): the common transverse velocity.
+    # The two double-star states share their transverse velocity (eqs. 59, 60)
+    # and transverse field (eqs. 61, 62).
     double_star_velocity_transverse_1 = inverse_sum_sqrt_density * (
         sqrt_star_density_left * (star_left.momentum_transverse_1 * inverse_star_density_left)
         + sqrt_star_density_right * (star_right.momentum_transverse_1 * inverse_star_density_right)
@@ -472,7 +573,6 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         + field_normal_sign * (star_right.field_transverse_2 - star_left.field_transverse_2)
     )
 
-    # Eqs. (61) and (62): the common transverse field.
     double_star_field_transverse_1 = inverse_sum_sqrt_density * (
         sqrt_star_density_left * star_right.field_transverse_1
         + sqrt_star_density_right * star_left.field_transverse_1
@@ -499,8 +599,9 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
     double_star_left_momentum_transverse_1 = star_left.density * double_star_velocity_transverse_1
     double_star_left_momentum_transverse_2 = star_left.density * double_star_velocity_transverse_2
 
-    # Eq. (63): the double-star energies.
-    double_star_velocity_dot_field = contact_speed * field_normal + (
+    # The double-star energies follow from energy conservation across the
+    # Alfvén waves (eq. 63).
+    double_star_velocity_dot_field = contact_speed * interface_field_normal + (
         double_star_left_momentum_transverse_1 * double_star_field_transverse_1
         + double_star_left_momentum_transverse_2 * double_star_field_transverse_2
     ) / star_left.density
@@ -511,7 +612,9 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         momentum_transverse_1=double_star_left_momentum_transverse_1,
         momentum_transverse_2=double_star_left_momentum_transverse_2,
         energy=star_left.energy
-        - sqrt_star_density_left * field_normal_sign * (star_velocity_dot_field_left - double_star_velocity_dot_field),
+        - sqrt_star_density_left
+        * field_normal_sign
+        * (star_velocity_dot_field_left - double_star_velocity_dot_field),
         field_transverse_1=double_star_field_transverse_1,
         field_transverse_2=double_star_field_transverse_2,
     )
@@ -521,7 +624,9 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
         momentum_transverse_1=star_right.density * double_star_velocity_transverse_1,
         momentum_transverse_2=star_right.density * double_star_velocity_transverse_2,
         energy=star_right.energy
-        + sqrt_star_density_right * field_normal_sign * (star_velocity_dot_field_right - double_star_velocity_dot_field),
+        + sqrt_star_density_right
+        * field_normal_sign
+        * (star_velocity_dot_field_right - double_star_velocity_dot_field),
         field_transverse_1=double_star_field_transverse_1,
         field_transverse_2=double_star_field_transverse_2,
     )
@@ -530,39 +635,67 @@ def hlld_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed) ->
 
     # --------------- ↓ Flux selection ↓ ----------------
 
-    # The jumps across the individual waves, S_k * (U_k - U_{k-1}).
+    # The flux of each region of the wave fan is the flux of its outer
+    # neighbour plus the jump S_k * (U_k - U_{k-1}) across the separating wave.
     jump_left_alfven = _scaled_jump(speed_left_alfven, double_star_left, star_left)
     jump_left_outer = _scaled_jump(speed_left_outer, star_left, conserved_left)
     jump_right_alfven = _scaled_jump(speed_right_alfven, double_star_right, star_right)
     jump_right_outer = _scaled_jump(speed_right_outer, star_right, conserved_right)
 
-    flux_left_star = _MHDConserved(*(f + j for f, j in zip(flux_left, jump_left_outer)))
-    flux_right_star = _MHDConserved(*(f + j for f, j in zip(flux_right, jump_right_outer)))
-    flux_left_double_star = _MHDConserved(*(f + j for f, j in zip(flux_left_star, jump_left_alfven)))
-    flux_right_double_star = _MHDConserved(*(f + j for f, j in zip(flux_right_star, jump_right_alfven)))
+    flux_left_star = _conserved_sum(flux_left, jump_left_outer)
+    flux_right_star = _conserved_sum(flux_right, jump_right_outer)
+    flux_left_double_star = _conserved_sum(flux_left_star, jump_left_alfven)
+    flux_right_double_star = _conserved_sum(flux_right_star, jump_right_alfven)
 
-    def select(component: int):
-        selected = jnp.where(contact_speed >= 0.0, flux_left_double_star[component], flux_right_double_star[component])
-        selected = jnp.where(speed_right_alfven <= 0.0, flux_right_star[component], selected)
-        selected = jnp.where(speed_left_alfven >= 0.0, flux_left_star[component], selected)
-        selected = jnp.where(speed_right_outer <= 0.0, flux_right[component], selected)
-        selected = jnp.where(speed_left_outer >= 0.0, flux_left[component], selected)
+    def select_upwind_flux(
+        left_flux,
+        left_star_flux,
+        left_double_star_flux,
+        right_double_star_flux,
+        right_star_flux,
+        right_flux,
+    ):
+        """
+        Pick (for one component) the flux of the wave-fan region that contains
+        the interface. Later selections take precedence, so the inner waves are
+        tested first and the outer waves last.
+        """
+        selected = jnp.where(contact_speed >= 0.0, left_double_star_flux, right_double_star_flux)
+        selected = jnp.where(speed_right_alfven <= 0.0, right_star_flux, selected)
+        selected = jnp.where(speed_left_alfven >= 0.0, left_star_flux, selected)
+        selected = jnp.where(speed_right_outer <= 0.0, right_flux, selected)
+        selected = jnp.where(speed_left_outer >= 0.0, left_flux, selected)
         return selected
 
-    selected_flux = _MHDConserved(*(select(component) for component in range(7)))
+    selected_flux = _MHDConserved(
+        *(
+            select_upwind_flux(*region_fluxes)
+            for region_fluxes in zip(
+                flux_left,
+                flux_left_star,
+                flux_left_double_star,
+                flux_right_double_star,
+                flux_right_star,
+                flux_right,
+            )
+        )
+    )
 
     # --------------- ↑ Flux selection ↑ ----------------
 
+    # The decoupled GLM subsystem contributes F(B_normal) = psi* and
+    # F(psi) = c_h^2 B_normal* (Dedner et al. 2002); the MHD solver does not
+    # touch these components.
     return MHDFlux(
         mass=selected_flux.density,
         momentum_normal=selected_flux.momentum_normal,
         momentum_transverse_1=selected_flux.momentum_transverse_1,
         momentum_transverse_2=selected_flux.momentum_transverse_2,
         energy=selected_flux.energy,
-        field_normal=psi_interface,
+        field_normal=interface_psi,
         field_transverse_1=selected_flux.field_transverse_1,
         field_transverse_2=selected_flux.field_transverse_2,
-        psi=cleaning_speed * cleaning_speed * field_normal,
+        psi=cleaning_speed * cleaning_speed * interface_field_normal,
     )
 
 
@@ -590,8 +723,16 @@ def hlle_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed
         The GLM-MHD interface flux.
     """
     gamma_minus_one = gamma - 1.0
+    gamma_minus_two = gamma_minus_one - 1.0
 
-    field_normal, psi_interface = _glm_interface_field_and_psi(left, right, cleaning_speed)
+    # The fluxes use the normal field of the exact GLM interface solution; the
+    # reconstructed ``left.field_normal`` / ``right.field_normal`` only enter
+    # the fast speeds below.
+    interface_field_normal, interface_psi = _glm_interface_field_and_psi(
+        left,
+        right,
+        cleaning_speed,
+    )
 
     # --------------- ↓ Roe-averaged state ↓ ----------------
 
@@ -604,34 +745,45 @@ def hlle_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed
         sqrt_density_left * left.velocity_normal + sqrt_density_right * right.velocity_normal
     ) * inverse_sum_sqrt_density
     roe_velocity_transverse_1 = (
-        sqrt_density_left * left.velocity_transverse_1 + sqrt_density_right * right.velocity_transverse_1
+        sqrt_density_left * left.velocity_transverse_1
+        + sqrt_density_right * right.velocity_transverse_1
     ) * inverse_sum_sqrt_density
     roe_velocity_transverse_2 = (
-        sqrt_density_left * left.velocity_transverse_2 + sqrt_density_right * right.velocity_transverse_2
+        sqrt_density_left * left.velocity_transverse_2
+        + sqrt_density_right * right.velocity_transverse_2
     ) * inverse_sum_sqrt_density
     # The Roe average of the field weights the sides the other way round.
     roe_field_transverse_1 = (
-        sqrt_density_right * left.field_transverse_1 + sqrt_density_left * right.field_transverse_1
+        sqrt_density_right * left.field_transverse_1
+        + sqrt_density_left * right.field_transverse_1
     ) * inverse_sum_sqrt_density
     roe_field_transverse_2 = (
-        sqrt_density_right * left.field_transverse_2 + sqrt_density_left * right.field_transverse_2
+        sqrt_density_right * left.field_transverse_2
+        + sqrt_density_left * right.field_transverse_2
     ) * inverse_sum_sqrt_density
-    x_term = (
+
+    # The terms X (transverse field jump) and Y (density ratio) of the
+    # Roe-averaged MHD eigensystem (Stone et al. 2008, appendix B).
+    transverse_field_jump_term = (
         0.5
         * (
             _square(left.field_transverse_1 - right.field_transverse_1)
             + _square(left.field_transverse_2 - right.field_transverse_2)
         )
-        / (_square(sqrt_density_left + sqrt_density_right))
+        / _square(sqrt_density_left + sqrt_density_right)
     )
-    y_term = 0.5 * (left.density + right.density) / roe_density
+    density_ratio_term = 0.5 * (left.density + right.density) / roe_density
 
     # Roe (1981): average the enthalpy H = (E + P) / rho rather than E or P.
     magnetic_pressure_left = 0.5 * (
-        field_normal * field_normal + _square(left.field_transverse_1) + _square(left.field_transverse_2)
+        _square(interface_field_normal)
+        + _square(left.field_transverse_1)
+        + _square(left.field_transverse_2)
     )
     magnetic_pressure_right = 0.5 * (
-        field_normal * field_normal + _square(right.field_transverse_1) + _square(right.field_transverse_2)
+        _square(interface_field_normal)
+        + _square(right.field_transverse_1)
+        + _square(right.field_transverse_2)
     )
     energy_left = (
         left.pressure / gamma_minus_one
@@ -683,26 +835,44 @@ def hlle_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed
 
     # The Roe-averaged fast speed (Stone et al. 2008, eq. B18).
     roe_transverse_field_squared = _square(roe_field_transverse_1) + _square(roe_field_transverse_2)
-    normal_alfven_speed_squared = field_normal * field_normal / roe_density
-    transverse_field_star_squared = (gamma_minus_one - (gamma_minus_one - 1.0) * y_term) * roe_transverse_field_squared
-    enthalpy_minus_magnetic = roe_enthalpy - (normal_alfven_speed_squared + roe_transverse_field_squared / roe_density)
+    normal_alfven_speed_squared = _square(interface_field_normal) / roe_density
+    transverse_field_star_squared = (
+        gamma_minus_one - gamma_minus_two * density_ratio_term
+    ) * roe_transverse_field_squared
+    enthalpy_minus_magnetic = roe_enthalpy - (
+        normal_alfven_speed_squared + roe_transverse_field_squared / roe_density
+    )
     roe_velocity_squared = (
-        _square(roe_velocity_normal) + _square(roe_velocity_transverse_1) + _square(roe_velocity_transverse_2)
+        _square(roe_velocity_normal)
+        + _square(roe_velocity_transverse_1)
+        + _square(roe_velocity_transverse_2)
     )
     sound_speed_squared_tilde = jnp.maximum(
-        (gamma_minus_one * (enthalpy_minus_magnetic - 0.5 * roe_velocity_squared) - (gamma_minus_one - 1.0) * x_term),
+        gamma_minus_one * (enthalpy_minus_magnetic - 0.5 * roe_velocity_squared)
+        - gamma_minus_two * transverse_field_jump_term,
         0.0,
     )
     transverse_alfven_speed_squared = transverse_field_star_squared / roe_density
-    speed_sum = normal_alfven_speed_squared + transverse_alfven_speed_squared + sound_speed_squared_tilde
-    speed_difference = normal_alfven_speed_squared + transverse_alfven_speed_squared - sound_speed_squared_tilde
-    discriminant_root = jnp.sqrt(
-        speed_difference * speed_difference + 4.0 * sound_speed_squared_tilde * transverse_alfven_speed_squared
+    squared_speed_sum = (
+        normal_alfven_speed_squared + transverse_alfven_speed_squared + sound_speed_squared_tilde
     )
-    roe_fast_speed = jnp.sqrt(0.5 * (speed_sum + discriminant_root))
+    squared_speed_difference = (
+        normal_alfven_speed_squared + transverse_alfven_speed_squared - sound_speed_squared_tilde
+    )
+    discriminant_root = jnp.sqrt(
+        squared_speed_difference * squared_speed_difference
+        + 4.0 * sound_speed_squared_tilde * transverse_alfven_speed_squared
+    )
+    roe_fast_speed = jnp.sqrt(0.5 * (squared_speed_sum + discriminant_root))
 
-    speed_left = jnp.minimum((roe_velocity_normal - roe_fast_speed), (left.velocity_normal - fast_speed_left))
-    speed_right = jnp.maximum((roe_velocity_normal + roe_fast_speed), (right.velocity_normal + fast_speed_right))
+    speed_left = jnp.minimum(
+        roe_velocity_normal - roe_fast_speed,
+        left.velocity_normal - fast_speed_left,
+    )
+    speed_right = jnp.maximum(
+        roe_velocity_normal + roe_fast_speed,
+        right.velocity_normal + fast_speed_right,
+    )
 
     speed_plus = jnp.where(speed_right > 0.0, speed_right, 0.0)
     speed_minus = jnp.where(speed_left < 0.0, speed_left, 0.0)
@@ -717,28 +887,41 @@ def hlle_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed
     relative_velocity_right = right.velocity_normal - speed_plus
 
     def side_flux(state: MHDFaceState, relative_velocity, magnetic_pressure, energy):
-        momentum_normal_flux = (
-            state.density * state.velocity_normal * relative_velocity
-            + magnetic_pressure
-            - _square(field_normal)
-        )
-        energy_flux = energy * relative_velocity + state.velocity_normal * (
-            state.pressure + magnetic_pressure - field_normal * field_normal
-        )
-        energy_flux = energy_flux - field_normal * (
-            state.field_transverse_1 * state.velocity_transverse_1
-            + state.field_transverse_2 * state.velocity_transverse_2
-        )
-        return (
-            state.density * relative_velocity,
-            momentum_normal_flux + state.pressure,
-            state.density * state.velocity_transverse_1 * relative_velocity
-            - field_normal * state.field_transverse_1,
-            state.density * state.velocity_transverse_2 * relative_velocity
-            - field_normal * state.field_transverse_2,
-            energy_flux,
-            state.field_transverse_1 * relative_velocity - field_normal * state.velocity_transverse_1,
-            state.field_transverse_2 * relative_velocity - field_normal * state.velocity_transverse_2,
+        """``F - S U`` of one outer state, with ``relative_velocity = v_normal - S``."""
+        return _MHDConserved(
+            density=state.density * relative_velocity,
+            momentum_normal=(
+                state.density * state.velocity_normal * relative_velocity
+                + magnetic_pressure
+                - _square(interface_field_normal)
+                + state.pressure
+            ),
+            momentum_transverse_1=(
+                state.density * state.velocity_transverse_1 * relative_velocity
+                - interface_field_normal * state.field_transverse_1
+            ),
+            momentum_transverse_2=(
+                state.density * state.velocity_transverse_2 * relative_velocity
+                - interface_field_normal * state.field_transverse_2
+            ),
+            energy=(
+                energy * relative_velocity
+                + state.velocity_normal
+                * (state.pressure + magnetic_pressure - _square(interface_field_normal))
+                - interface_field_normal
+                * (
+                    state.field_transverse_1 * state.velocity_transverse_1
+                    + state.field_transverse_2 * state.velocity_transverse_2
+                )
+            ),
+            field_transverse_1=(
+                state.field_transverse_1 * relative_velocity
+                - interface_field_normal * state.velocity_transverse_1
+            ),
+            field_transverse_2=(
+                state.field_transverse_2 * relative_velocity
+                - interface_field_normal * state.velocity_transverse_2
+            ),
         )
 
     flux_left = side_flux(left, relative_velocity_left, magnetic_pressure_left, energy_left)
@@ -746,25 +929,34 @@ def hlle_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed
 
     speeds_differ = speed_plus != speed_minus
     safe_speed_difference = jnp.where(speeds_differ, speed_plus - speed_minus, 1.0)
-    weight = jnp.where(speeds_differ, 0.5 * (speed_plus + speed_minus) / safe_speed_difference, 0.0)
+    weight = jnp.where(
+        speeds_differ,
+        0.5 * (speed_plus + speed_minus) / safe_speed_difference,
+        0.0,
+    )
 
-    hlle = tuple(
-        0.5 * (value_left + value_right) + (value_left - value_right) * weight
-        for value_left, value_right in zip(flux_left, flux_right)
+    hlle_flux = _MHDConserved(
+        *(
+            0.5 * (value_left + value_right) + (value_left - value_right) * weight
+            for value_left, value_right in zip(flux_left, flux_right)
+        )
     )
 
     # --------------- ↑ HLLE flux ↑ ----------------
 
+    # The decoupled GLM subsystem contributes F(B_normal) = psi* and
+    # F(psi) = c_h^2 B_normal* (Dedner et al. 2002); the MHD solver does not
+    # touch these components.
     return MHDFlux(
-        mass=hlle[0],
-        momentum_normal=hlle[1],
-        momentum_transverse_1=hlle[2],
-        momentum_transverse_2=hlle[3],
-        energy=hlle[4],
-        field_normal=psi_interface,
-        field_transverse_1=hlle[5],
-        field_transverse_2=hlle[6],
-        psi=cleaning_speed * cleaning_speed * field_normal,
+        mass=hlle_flux.density,
+        momentum_normal=hlle_flux.momentum_normal,
+        momentum_transverse_1=hlle_flux.momentum_transverse_1,
+        momentum_transverse_2=hlle_flux.momentum_transverse_2,
+        energy=hlle_flux.energy,
+        field_normal=interface_psi,
+        field_transverse_1=hlle_flux.field_transverse_1,
+        field_transverse_2=hlle_flux.field_transverse_2,
+        psi=cleaning_speed * cleaning_speed * interface_field_normal,
     )
 
 
@@ -784,17 +976,28 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
     """
     inverse_gamma_minus_one = 1.0 / (gamma - 1.0)
 
-    field_normal, psi_interface = _glm_interface_field_and_psi(left, right, cleaning_speed)
+    # The fluxes use the normal field of the exact GLM interface solution; the
+    # reconstructed ``left.field_normal`` / ``right.field_normal`` only enter
+    # the fast speeds below.
+    interface_field_normal, interface_psi = _glm_interface_field_and_psi(
+        left,
+        right,
+        cleaning_speed,
+    )
 
     # --------------- ↓ Sum of the left and right fluxes ↓ ----------------
 
     mass_flux_left = left.density * left.velocity_normal
     mass_flux_right = right.density * right.velocity_normal
     magnetic_term_left = 0.5 * (
-        _square(left.field_transverse_1) + _square(left.field_transverse_2) - _square(field_normal)
+        _square(left.field_transverse_1)
+        + _square(left.field_transverse_2)
+        - _square(interface_field_normal)
     )
     magnetic_term_right = 0.5 * (
-        _square(right.field_transverse_1) + _square(right.field_transverse_2) - _square(field_normal)
+        _square(right.field_transverse_1)
+        + _square(right.field_transverse_2)
+        - _square(interface_field_normal)
     )
 
     sum_mass = mass_flux_left + mass_flux_right
@@ -803,26 +1006,27 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
         + mass_flux_right * right.velocity_normal
         + magnetic_term_left
         + magnetic_term_right
+        + (left.pressure + right.pressure)
     )
     sum_momentum_transverse_1 = (
         mass_flux_left * left.velocity_transverse_1
         + mass_flux_right * right.velocity_transverse_1
-        - field_normal * (left.field_transverse_1 + right.field_transverse_1)
+        - interface_field_normal * (left.field_transverse_1 + right.field_transverse_1)
     )
     sum_momentum_transverse_2 = (
         mass_flux_left * left.velocity_transverse_2
         + mass_flux_right * right.velocity_transverse_2
-        - field_normal * (left.field_transverse_2 + right.field_transverse_2)
+        - interface_field_normal * (left.field_transverse_2 + right.field_transverse_2)
     )
     sum_field_transverse_1 = (
         left.field_transverse_1 * left.velocity_normal
         + right.field_transverse_1 * right.velocity_normal
-        - field_normal * (left.velocity_transverse_1 + right.velocity_transverse_1)
+        - interface_field_normal * (left.velocity_transverse_1 + right.velocity_transverse_1)
     )
     sum_field_transverse_2 = (
         left.field_transverse_2 * left.velocity_normal
         + right.field_transverse_2 * right.velocity_normal
-        - field_normal * (left.velocity_transverse_2 + right.velocity_transverse_2)
+        - interface_field_normal * (left.velocity_transverse_2 + right.velocity_transverse_2)
     )
 
     energy_left = (
@@ -835,7 +1039,7 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
             + _square(left.velocity_transverse_2)
         )
         + magnetic_term_left
-        + _square(field_normal)
+        + _square(interface_field_normal)
     )
     energy_right = (
         right.pressure * inverse_gamma_minus_one
@@ -847,19 +1051,21 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
             + _square(right.velocity_transverse_2)
         )
         + magnetic_term_right
-        + _square(field_normal)
+        + _square(interface_field_normal)
     )
-    sum_momentum_normal = sum_momentum_normal + (left.pressure + right.pressure)
-    sum_energy = (energy_left + left.pressure + magnetic_term_left) * left.velocity_normal + (
-        energy_right + right.pressure + magnetic_term_right
-    ) * right.velocity_normal
-    sum_energy = sum_energy - field_normal * (
-        left.field_transverse_1 * left.velocity_transverse_1
-        + left.field_transverse_2 * left.velocity_transverse_2
-    )
-    sum_energy = sum_energy - field_normal * (
-        right.field_transverse_1 * right.velocity_transverse_1
-        + right.field_transverse_2 * right.velocity_transverse_2
+    sum_energy = (
+        (energy_left + left.pressure + magnetic_term_left) * left.velocity_normal
+        + (energy_right + right.pressure + magnetic_term_right) * right.velocity_normal
+        - interface_field_normal
+        * (
+            left.field_transverse_1 * left.velocity_transverse_1
+            + left.field_transverse_2 * left.velocity_transverse_2
+        )
+        - interface_field_normal
+        * (
+            right.field_transverse_1 * right.velocity_transverse_1
+            + right.field_transverse_2 * right.velocity_transverse_2
+        )
     )
 
     # --------------- ↑ Sum of the left and right fluxes ↑ ----------------
@@ -883,8 +1089,8 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
         right.field_transverse_2,
     )
     maximum_speed = jnp.maximum(
-        (jnp.abs(left.velocity_normal) + fast_speed_left),
-        (jnp.abs(right.velocity_normal) + fast_speed_right),
+        jnp.abs(left.velocity_normal) + fast_speed_left,
+        jnp.abs(right.velocity_normal) + fast_speed_right,
     )
 
     jump_mass = maximum_speed * (right.density - left.density)
@@ -903,16 +1109,19 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
 
     # --------------- ↑ Dissipation ↑ ----------------
 
+    # The decoupled GLM subsystem contributes F(B_normal) = psi* and
+    # F(psi) = c_h^2 B_normal* (Dedner et al. 2002); the MHD solver does not
+    # touch these components.
     return MHDFlux(
         mass=0.5 * (sum_mass - jump_mass),
         momentum_normal=0.5 * (sum_momentum_normal - jump_momentum_normal),
         momentum_transverse_1=0.5 * (sum_momentum_transverse_1 - jump_momentum_transverse_1),
         momentum_transverse_2=0.5 * (sum_momentum_transverse_2 - jump_momentum_transverse_2),
         energy=0.5 * (sum_energy - jump_energy),
-        field_normal=psi_interface,
+        field_normal=interface_psi,
         field_transverse_1=0.5 * (sum_field_transverse_1 - jump_field_transverse_1),
         field_transverse_2=0.5 * (sum_field_transverse_2 - jump_field_transverse_2),
-        psi=cleaning_speed * cleaning_speed * field_normal,
+        psi=cleaning_speed * cleaning_speed * interface_field_normal,
     )
 
 
@@ -926,11 +1135,37 @@ def llf_mhd_flux(left: MHDFaceState, right: MHDFaceState, gamma, cleaning_speed)
 
 
 def _hydro_energy(state: HydroFaceState, inverse_gamma_minus_one):
-    """Total energy density ``p/(gamma-1) + rho v^2 / 2`` in AthenaPK's order."""
+    """Return the total energy density ``p / (gamma - 1) + rho v^2 / 2``."""
     return state.pressure * inverse_gamma_minus_one + 0.5 * state.density * (
         _square(state.velocity_normal)
         + _square(state.velocity_transverse_1)
         + _square(state.velocity_transverse_2)
+    )
+
+
+def _hydro_flux_minus_speed_times_state(
+    state: HydroFaceState,
+    relative_velocity,
+    energy,
+) -> HydroFlux:
+    """
+    Return ``F - S U`` of one outer state, the flux through a surface moving
+    with the wave speed ``S``.
+
+    Args:
+        state: The primitive outer state.
+        relative_velocity: ``v_normal - S``.
+        energy: The total energy density of the outer state.
+
+    Returns:
+        ``F - S U`` (interface frame).
+    """
+    return HydroFlux(
+        mass=state.density * relative_velocity,
+        momentum_normal=state.density * state.velocity_normal * relative_velocity + state.pressure,
+        momentum_transverse_1=state.density * state.velocity_transverse_1 * relative_velocity,
+        momentum_transverse_2=state.density * state.velocity_transverse_2 * relative_velocity,
+        energy=energy * relative_velocity + state.pressure * state.velocity_normal,
     )
 
 
@@ -965,7 +1200,8 @@ def hllc_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
         + (left.velocity_normal - right.velocity_normal) * average_density * average_sound_speed
     )
 
-    # Shock-strength corrections of the outer wave speeds.
+    # A shock (middle pressure above the outer one) moves faster than sound;
+    # these factors correct the outer wave speeds for its strength.
     shock_factor_left = jnp.where(
         middle_pressure <= left.pressure,
         1.0,
@@ -987,39 +1223,36 @@ def hllc_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
 
     # --------------- ↓ Contact wave ↓ ----------------
 
-    relative_velocity_left = left.velocity_normal - speed_left
-    relative_velocity_right = right.velocity_normal - speed_right
+    # The contact speed and pressure use the unclamped outer wave speeds.
+    velocity_minus_speed_left = left.velocity_normal - speed_left
+    velocity_minus_speed_right = right.velocity_normal - speed_right
 
-    momentum_term_left = left.pressure + relative_velocity_left * left.density * left.velocity_normal
-    momentum_term_right = right.pressure + relative_velocity_right * right.density * right.velocity_normal
+    momentum_term_left = (
+        left.pressure + velocity_minus_speed_left * left.density * left.velocity_normal
+    )
+    momentum_term_right = (
+        right.pressure + velocity_minus_speed_right * right.density * right.velocity_normal
+    )
 
-    mass_term_left = left.density * relative_velocity_left
-    mass_term_right = -(right.density * relative_velocity_right)
+    mass_term_left = left.density * velocity_minus_speed_left
+    mass_term_right = -(right.density * velocity_minus_speed_right)
 
     contact_speed = (momentum_term_left - momentum_term_right) / (mass_term_left + mass_term_right)
-    contact_pressure = (mass_term_left * momentum_term_right + mass_term_right * momentum_term_left) / (
-        mass_term_left + mass_term_right
-    )
+    contact_pressure = (
+        mass_term_left * momentum_term_right + mass_term_right * momentum_term_left
+    ) / (mass_term_left + mass_term_right)
     contact_pressure = jnp.where(contact_pressure > 0.0, contact_pressure, 0.0)
 
     # --------------- ↑ Contact wave ↑ ----------------
 
     # --------------- ↓ HLLC flux ↓ ----------------
 
+    # The outer fluxes use the clamped wave speeds.
     relative_velocity_left = left.velocity_normal - speed_minus
     relative_velocity_right = right.velocity_normal - speed_plus
 
-    def side_flux(state: HydroFaceState, relative_velocity, energy):
-        return (
-            state.density * relative_velocity,
-            state.density * state.velocity_normal * relative_velocity + state.pressure,
-            state.density * state.velocity_transverse_1 * relative_velocity,
-            state.density * state.velocity_transverse_2 * relative_velocity,
-            energy * relative_velocity + state.pressure * state.velocity_normal,
-        )
-
-    flux_left = side_flux(left, relative_velocity_left, energy_left)
-    flux_right = side_flux(right, relative_velocity_right, energy_right)
+    flux_left = _hydro_flux_minus_speed_times_state(left, relative_velocity_left, energy_left)
+    flux_right = _hydro_flux_minus_speed_times_state(right, relative_velocity_right, energy_right)
 
     # The weights of the left, right and contact contributions.
     contact_moves_right = contact_speed >= 0.0
@@ -1036,13 +1269,25 @@ def hllc_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
     # --------------- ↑ HLLC flux ↑ ----------------
 
     return HydroFlux(
-        mass=weight_left * flux_left[0] + weight_right * flux_right[0],
-        momentum_normal=weight_left * flux_left[1] + weight_right * flux_right[1] + weight_contact * contact_pressure,
-        momentum_transverse_1=weight_left * flux_left[2] + weight_right * flux_right[2],
-        momentum_transverse_2=weight_left * flux_left[3] + weight_right * flux_right[3],
-        energy=weight_left * flux_left[4]
-        + weight_right * flux_right[4]
-        + weight_contact * contact_pressure * contact_speed,
+        mass=weight_left * flux_left.mass + weight_right * flux_right.mass,
+        momentum_normal=(
+            weight_left * flux_left.momentum_normal
+            + weight_right * flux_right.momentum_normal
+            + weight_contact * contact_pressure
+        ),
+        momentum_transverse_1=(
+            weight_left * flux_left.momentum_transverse_1
+            + weight_right * flux_right.momentum_transverse_1
+        ),
+        momentum_transverse_2=(
+            weight_left * flux_left.momentum_transverse_2
+            + weight_right * flux_right.momentum_transverse_2
+        ),
+        energy=(
+            weight_left * flux_left.energy
+            + weight_right * flux_right.energy
+            + weight_contact * contact_pressure * contact_speed
+        ),
     )
 
 
@@ -1051,8 +1296,9 @@ def hlle_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
     The HLLE flux for adiabatic hydrodynamics with Roe-averaged (Einfeldt) wave
     speeds, as AthenaPK's ``hydro_hlle.hpp``.
 
-    NOTE: AthenaPK clamps the left speed to ``+TINY_NUMBER`` (not ``-TINY``)
-    when it is non-negative; this is kept to stay faithful to AthenaPK.
+    NOTE: AthenaPK clamps a non-negative left speed to ``+TINY_NUMBER`` (HLLC
+    uses ``-TINY_NUMBER``); the clamp only affects the result at the level of
+    1e-20, and AthenaPK's sign is kept.
 
     Args:
         left: The primitive state left of the interface.
@@ -1065,6 +1311,8 @@ def hlle_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
     gamma_minus_one = gamma - 1.0
     inverse_gamma_minus_one = 1.0 / gamma_minus_one
 
+    # --------------- ↓ Roe-averaged state ↓ ----------------
+
     sqrt_density_left = jnp.sqrt(left.density)
     sqrt_density_right = jnp.sqrt(right.density)
     inverse_sum_sqrt_density = 1.0 / (sqrt_density_left + sqrt_density_right)
@@ -1073,12 +1321,15 @@ def hlle_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
         sqrt_density_left * left.velocity_normal + sqrt_density_right * right.velocity_normal
     ) * inverse_sum_sqrt_density
     roe_velocity_transverse_1 = (
-        sqrt_density_left * left.velocity_transverse_1 + sqrt_density_right * right.velocity_transverse_1
+        sqrt_density_left * left.velocity_transverse_1
+        + sqrt_density_right * right.velocity_transverse_1
     ) * inverse_sum_sqrt_density
     roe_velocity_transverse_2 = (
-        sqrt_density_left * left.velocity_transverse_2 + sqrt_density_right * right.velocity_transverse_2
+        sqrt_density_left * left.velocity_transverse_2
+        + sqrt_density_right * right.velocity_transverse_2
     ) * inverse_sum_sqrt_density
 
+    # Roe (1981): average the enthalpy H = (E + p) / rho rather than E or p.
     energy_left = _hydro_energy(left, inverse_gamma_minus_one)
     energy_right = _hydro_energy(right, inverse_gamma_minus_one)
     roe_enthalpy = (
@@ -1086,41 +1337,58 @@ def hlle_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
         + (energy_right + right.pressure) / sqrt_density_right
     ) * inverse_sum_sqrt_density
 
+    # --------------- ↑ Roe-averaged state ↑ ----------------
+
+    # --------------- ↓ Wave speeds ↓ ----------------
+
     sound_speed_left = adiabatic_sound_speed(gamma, left.density, left.pressure)
     sound_speed_right = adiabatic_sound_speed(gamma, right.density, right.pressure)
     enthalpy_term = roe_enthalpy - 0.5 * (
-        _square(roe_velocity_normal) + _square(roe_velocity_transverse_1) + _square(roe_velocity_transverse_2)
+        _square(roe_velocity_normal)
+        + _square(roe_velocity_transverse_1)
+        + _square(roe_velocity_transverse_2)
     )
+    # The double where keeps the Roe sound speed and its derivatives finite
+    # where the enthalpy term is negative: the inner where keeps the square
+    # root's argument non-negative, the outer one discards the infinite
+    # derivative of the square root at zero.
     roe_sound_speed = jnp.where(
         enthalpy_term < 0.0,
         0.0,
         jnp.sqrt(gamma_minus_one * jnp.where(enthalpy_term < 0.0, 0.0, enthalpy_term)),
     )
 
-    speed_left = jnp.minimum((roe_velocity_normal - roe_sound_speed), (left.velocity_normal - sound_speed_left))
-    speed_right = jnp.maximum((roe_velocity_normal + roe_sound_speed), (right.velocity_normal + sound_speed_right))
+    speed_left = jnp.minimum(
+        roe_velocity_normal - roe_sound_speed,
+        left.velocity_normal - sound_speed_left,
+    )
+    speed_right = jnp.maximum(
+        roe_velocity_normal + roe_sound_speed,
+        right.velocity_normal + sound_speed_right,
+    )
 
     speed_plus = jnp.where(speed_right > 0.0, speed_right, _TINY_NUMBER)
     speed_minus = jnp.where(speed_left < 0.0, speed_left, _TINY_NUMBER)
 
+    # --------------- ↑ Wave speeds ↑ ----------------
+
+    # --------------- ↓ HLLE flux ↓ ----------------
+
     relative_velocity_left = left.velocity_normal - speed_minus
     relative_velocity_right = right.velocity_normal - speed_plus
 
-    def side_flux(state: HydroFaceState, relative_velocity, energy):
-        return (
-            state.density * relative_velocity,
-            state.density * state.velocity_normal * relative_velocity + state.pressure,
-            state.density * state.velocity_transverse_1 * relative_velocity,
-            state.density * state.velocity_transverse_2 * relative_velocity,
-            energy * relative_velocity + state.pressure * state.velocity_normal,
-        )
-
-    flux_left = side_flux(left, relative_velocity_left, energy_left)
-    flux_right = side_flux(right, relative_velocity_right, energy_right)
+    flux_left = _hydro_flux_minus_speed_times_state(left, relative_velocity_left, energy_left)
+    flux_right = _hydro_flux_minus_speed_times_state(right, relative_velocity_right, energy_right)
 
     speeds_differ = speed_plus != speed_minus
     safe_speed_difference = jnp.where(speeds_differ, speed_plus - speed_minus, 1.0)
-    weight = jnp.where(speeds_differ, 0.5 * (speed_plus + speed_minus) / safe_speed_difference, 0.0)
+    weight = jnp.where(
+        speeds_differ,
+        0.5 * (speed_plus + speed_minus) / safe_speed_difference,
+        0.0,
+    )
+
+    # --------------- ↑ HLLE flux ↑ ----------------
 
     return HydroFlux(
         *(
@@ -1145,52 +1413,63 @@ def llf_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> HydroF
     """
     inverse_gamma_minus_one = 1.0 / (gamma - 1.0)
 
+    # --------------- ↓ Sum of the left and right fluxes ↓ ----------------
+
     mass_flux_left = left.density * left.velocity_normal
     mass_flux_right = right.density * right.velocity_normal
 
     sum_mass = mass_flux_left + mass_flux_right
-    sum_momentum_normal = mass_flux_left * left.velocity_normal + mass_flux_right * right.velocity_normal
+    sum_momentum_normal = (
+        mass_flux_left * left.velocity_normal
+        + mass_flux_right * right.velocity_normal
+        + (left.pressure + right.pressure)
+    )
     sum_momentum_transverse_1 = (
-        mass_flux_left * left.velocity_transverse_1 + mass_flux_right * right.velocity_transverse_1
+        mass_flux_left * left.velocity_transverse_1
+        + mass_flux_right * right.velocity_transverse_1
     )
     sum_momentum_transverse_2 = (
-        mass_flux_left * left.velocity_transverse_2 + mass_flux_right * right.velocity_transverse_2
+        mass_flux_left * left.velocity_transverse_2
+        + mass_flux_right * right.velocity_transverse_2
     )
 
     energy_left = _hydro_energy(left, inverse_gamma_minus_one)
     energy_right = _hydro_energy(right, inverse_gamma_minus_one)
-    sum_momentum_normal = sum_momentum_normal + (left.pressure + right.pressure)
     sum_energy = (energy_left + left.pressure) * left.velocity_normal + (
         energy_right + right.pressure
     ) * right.velocity_normal
 
+    # --------------- ↑ Sum of the left and right fluxes ↑ ----------------
+
+    # --------------- ↓ Dissipation ↓ ----------------
+
     sound_speed_left = adiabatic_sound_speed(gamma, left.density, left.pressure)
     sound_speed_right = adiabatic_sound_speed(gamma, right.density, right.pressure)
     maximum_speed = jnp.maximum(
-        (jnp.abs(left.velocity_normal) + sound_speed_left),
-        (jnp.abs(right.velocity_normal) + sound_speed_right),
+        jnp.abs(left.velocity_normal) + sound_speed_left,
+        jnp.abs(right.velocity_normal) + sound_speed_right,
     )
 
+    jump_mass = maximum_speed * (right.density - left.density)
+    jump_momentum_normal = maximum_speed * (
+        right.density * right.velocity_normal - left.density * left.velocity_normal
+    )
+    jump_momentum_transverse_1 = maximum_speed * (
+        right.density * right.velocity_transverse_1 - left.density * left.velocity_transverse_1
+    )
+    jump_momentum_transverse_2 = maximum_speed * (
+        right.density * right.velocity_transverse_2 - left.density * left.velocity_transverse_2
+    )
+    jump_energy = maximum_speed * (energy_right - energy_left)
+
+    # --------------- ↑ Dissipation ↑ ----------------
+
     return HydroFlux(
-        mass=0.5 * (sum_mass - maximum_speed * (right.density - left.density)),
-        momentum_normal=0.5
-        * (
-            sum_momentum_normal
-            - maximum_speed * (right.density * right.velocity_normal - left.density * left.velocity_normal)
-        ),
-        momentum_transverse_1=0.5
-        * (
-            sum_momentum_transverse_1
-            - maximum_speed
-            * (right.density * right.velocity_transverse_1 - left.density * left.velocity_transverse_1)
-        ),
-        momentum_transverse_2=0.5
-        * (
-            sum_momentum_transverse_2
-            - maximum_speed
-            * (right.density * right.velocity_transverse_2 - left.density * left.velocity_transverse_2)
-        ),
-        energy=0.5 * (sum_energy - maximum_speed * (energy_right - energy_left)),
+        mass=0.5 * (sum_mass - jump_mass),
+        momentum_normal=0.5 * (sum_momentum_normal - jump_momentum_normal),
+        momentum_transverse_1=0.5 * (sum_momentum_transverse_1 - jump_momentum_transverse_1),
+        momentum_transverse_2=0.5 * (sum_momentum_transverse_2 - jump_momentum_transverse_2),
+        energy=0.5 * (sum_energy - jump_energy),
     )
 
 

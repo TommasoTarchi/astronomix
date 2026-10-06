@@ -112,7 +112,6 @@ def get_wave_speeds(
     return max_wave_speed
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _maximum_signal_speed_vl2(
     primitive_state: STATE_TYPE,
@@ -143,17 +142,20 @@ def _maximum_signal_speed_vl2(
     density = primitive_state[registered_variables.density_index]
     pressure = primitive_state[registered_variables.pressure_index]
 
-    if config.dimensionality == 1 and not config.mhd:
+    # The 1D hydro layout stores a single velocity component as a plain index.
+    if isinstance(registered_variables.velocity_index, int):
         velocity_indices = (registered_variables.velocity_index,)
     else:
         velocity_indices = tuple(registered_variables.velocity_index)[: config.dimensionality]
 
+    if config.mhd:
+        magnetic_indices = tuple(registered_variables.magnetic_index)
+
     maximum_speed = None
     for axis in range(config.dimensionality):
         if config.mhd:
-            # the fast speed along the axis: the axis' own field component is
-            # the normal one, the other two are transverse
-            magnetic_indices = tuple(registered_variables.magnetic_index)
+            # The fast speed along an axis treats that axis' field component
+            # as the normal one and the other two as transverse.
             signal_speed = fast_magnetosonic_speed(
                 params.gamma,
                 density,
@@ -165,7 +167,10 @@ def _maximum_signal_speed_vl2(
         else:
             signal_speed = adiabatic_sound_speed(params.gamma, density, pressure)
         axis_maximum = jnp.max(jnp.abs(primitive_state[velocity_indices[axis]]) + signal_speed)
-        maximum_speed = axis_maximum if maximum_speed is None else jnp.maximum(maximum_speed, axis_maximum)
+        if maximum_speed is None:
+            maximum_speed = axis_maximum
+        else:
+            maximum_speed = jnp.maximum(maximum_speed, axis_maximum)
 
     return maximum_speed
 
@@ -197,7 +202,12 @@ def _cfl_time_step(
     gamma = params.gamma
 
     if config.time_integrator == VL2:
-        maximum_speed = _maximum_signal_speed_vl2(primitive_state, config, params, registered_variables)
+        maximum_speed = _maximum_signal_speed_vl2(
+            primitive_state,
+            config,
+            params,
+            registered_variables,
+        )
         dt = C_CFL * grid_spacing / maximum_speed
         if config.use_max_adaptive_timestep:
             dt = jnp.minimum(dt, dt_max)

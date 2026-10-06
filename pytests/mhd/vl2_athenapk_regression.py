@@ -13,17 +13,13 @@ of magnitude above the round-off differences actually observed (1e-15 to 1e-12)
 and several orders below the effect of any change to the discretization.
 """
 
-# general
+# ==== GPU selection ====
 import os
-import sys
-
-# ==== GPU selection (skipped when a queue has already assigned one) ====
 if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
     from autocvd import autocvd
-
     autocvd(num_gpus=1)
 # ruff: noqa: E402
-# =====================================================================
+# =======================
 
 # numerics
 import numpy as np
@@ -45,13 +41,10 @@ from astronomix import SnapshotSettings
 
 # astronomix functions
 from astronomix import time_integration
-
-# the validation cases live with the full AthenaPK comparison
-VALIDATION_DIRECTORY = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "scripts", "validation", "athenapk_vl2"
+from astronomix.test_setups.mhd.athenapk_vl2_cases import (
+    REGRESSION_CASES,
+    astronomix_setup,
 )
-sys.path.insert(0, VALIDATION_DIRECTORY)
-from cases import REGRESSION_CASES, astronomix_setup  # noqa: E402
 
 DATA_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "athenapk_vl2")
 

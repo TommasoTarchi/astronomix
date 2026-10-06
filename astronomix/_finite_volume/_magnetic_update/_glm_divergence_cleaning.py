@@ -12,7 +12,10 @@ time step.
 """
 
 # typing
-from jaxtyping import Array, Float
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax.numpy as jnp
@@ -77,9 +80,48 @@ def _psi_damping_factor(
     return jnp.exp(-params.glm_alpha * cleaning_speed * stage_time_step / config.grid_spacing)
 
 
-def _centered_difference(field, axis: int):
-    """``field[i+1] - field[i-1]`` along a spatial axis of a single field."""
+def _central_difference(field, axis: int):
+    """Return the undivided central difference ``field[i+1] - field[i-1]`` along an axis."""
     return jnp.roll(field, -1, axis=axis) - jnp.roll(field, 1, axis=axis)
+
+
+def _extended_dedner_source_terms(
+    field_components,
+    field_differences,
+    psi_differences,
+    grid_spacing,
+):
+    """
+    The divergence ``div B`` and ``B . grad(psi)`` of the extended Dedner
+    source (Dedner et al. 2002) from second-order central differences. The
+    function is elementwise, so the native path (whole arrays) and the Pallas
+    stage kernel (register tiles) share it; each supplies the differences from
+    its own stencil.
+
+    Args:
+        field_components: The magnetic field components ``(B_x, B_y, B_z)`` of
+            the stage's starting state in the cell.
+        field_differences: For every active axis ``d``, the undivided central
+            difference ``B_d[i+1] - B_d[i-1]`` along ``d``.
+        psi_differences: For every active axis ``d``, the undivided central
+            difference ``psi[i+1] - psi[i-1]`` along ``d``.
+        grid_spacing: The cell width.
+
+    Returns:
+        ``(div B, B . grad(psi))``.
+    """
+    # Inactive axes contribute nothing. The factor 1/2 of the central
+    # derivative is applied once to the sums.
+    divergence_sum = 0.0
+    field_dot_psi_gradient = 0.0
+    for axis, (field_difference, psi_difference) in enumerate(
+        zip(field_differences, psi_differences)
+    ):
+        divergence_sum = divergence_sum + field_difference / grid_spacing
+        field_dot_psi_gradient = field_dot_psi_gradient + (
+            field_components[axis] * psi_difference / grid_spacing
+        )
+    return 0.5 * divergence_sum, 0.5 * field_dot_psi_gradient
 
 
 def _dedner_source(
@@ -93,11 +135,13 @@ def _dedner_source(
     """
     Apply AthenaPK's Dedner source to the freshly updated conserved state.
 
-    The plain variant (AthenaPK's default ``dedner_plain``) only damps psi. The
-    extended variant (``dedner_extended``) additionally adds the
-    non-conservative ``-(div B) B`` momentum and ``-B . grad(psi)`` energy
-    sources (Dedner et al. 2002), evaluated with central differences from the
-    primitive state the stage started from, as in AthenaPK.
+    The plain variant (default; AthenaPK's ``dedner_plain``) only damps psi.
+    With ``config.glm_extended_source`` (AthenaPK's ``dedner_extended``) the
+    non-conservative sources ``-(div B) B`` (momentum) and ``-B . grad(psi)``
+    (energy) of Dedner et al. (2002) are added as well, evaluated with central
+    differences of the primitive state the stage started from, as in AthenaPK.
+    The Pallas stage kernel (``_van_leer_pallas``) applies the same source with
+    the shared ``_extended_dedner_source_terms``.
 
     Args:
         conserved_state: The conserved state after the stage's flux update.
@@ -115,23 +159,27 @@ def _dedner_source(
     if config.glm_extended_source:
         magnetic_indices = tuple(registered_variables.magnetic_index)
         momentum_indices = tuple(registered_variables.momentum_index)
+        field_components = [primitive_state[index] for index in magnetic_indices]
         psi = primitive_state[psi_index]
 
-        # div(B) and B . grad(psi) from central differences over the active axes
-        divergence_sum = 0.0
-        field_dot_psi_gradient = 0.0
-        for axis in range(config.dimensionality):
-            field_component = primitive_state[magnetic_indices[axis]]
-            divergence_sum = divergence_sum + _centered_difference(field_component, axis) / config.grid_spacing
-            field_dot_psi_gradient = field_dot_psi_gradient + (
-                field_component * _centered_difference(psi, axis) / config.grid_spacing
-            )
-        magnetic_divergence = 0.5 * divergence_sum
-        field_dot_psi_gradient = 0.5 * field_dot_psi_gradient
+        # The fields carry no variable axis, so spatial axis d is array axis d.
+        field_differences = [
+            _central_difference(field_components[axis], axis)
+            for axis in range(config.dimensionality)
+        ]
+        psi_differences = [
+            _central_difference(psi, axis) for axis in range(config.dimensionality)
+        ]
+        magnetic_divergence, field_dot_psi_gradient = _extended_dedner_source_terms(
+            field_components,
+            field_differences,
+            psi_differences,
+            config.grid_spacing,
+        )
 
-        for component in range(3):
-            conserved_state = conserved_state.at[momentum_indices[component]].add(
-                -stage_time_step * magnetic_divergence * primitive_state[magnetic_indices[component]]
+        for momentum_index, field_component in zip(momentum_indices, field_components):
+            conserved_state = conserved_state.at[momentum_index].add(
+                -stage_time_step * magnetic_divergence * field_component
             )
         conserved_state = conserved_state.at[registered_variables.energy_index].add(
             -stage_time_step * field_dot_psi_gradient

@@ -22,10 +22,10 @@ with the flux divergence ``L(W)_i = (1/dx) Σ_d (F_{i+½} - F_{i-½})``.
 
 The per-face physics (reconstruction, Riemann solvers, conversions) is written as
 elementwise functions that the Pallas kernels in :mod:`._van_leer_pallas` call as
-well, so both backends evaluate the same expressions. The scheme has been
-verified against AthenaPK itself: started from AthenaPK's conserved state, a
-CPU run without fused multiply-adds reproduced AthenaPK bit for bit over whole
-simulations (see ``examples/scripts/validation/athenapk_vl2``).
+well, so both backends evaluate the same expressions. The scheme reproduces
+AthenaPK to round-off on its standard test problems
+(``pytests/mhd/vl2_athenapk_regression.py``; the full comparison is documented in
+``examples/scripts/validation/athenapk_vl2/README.md``).
 """
 
 # general
@@ -33,7 +33,10 @@ from functools import partial
 
 # typing
 from typing import Union
-from jaxtyping import Array, Float
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax
@@ -55,11 +58,13 @@ from astronomix.data_classes.simulation_helper_data import HelperData
 from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
-
-# astronomix functions
 from astronomix._finite_volume._riemann_solver._athena_riemann_solvers import (
     HydroFaceState,
     MHDFaceState,
+)
+
+# astronomix functions
+from astronomix._finite_volume._riemann_solver._athena_riemann_solvers import (
     hllc_hydro_flux,
     hlld_flux,
     hlle_hydro_flux,
@@ -72,19 +77,52 @@ from astronomix._finite_volume._magnetic_update._glm_divergence_cleaning import 
     _glm_cleaning_speed,
     _psi_damping_factor,
 )
+from astronomix._finite_volume._state_evolution._van_leer_pallas import (
+    _vl2_pallas_supported,
+    _vl2_stage_pallas,
+)
 from astronomix._geometry.boundaries import _boundary_handler
 
+
+# -------------------------------------------------------------
+# =================== ↓ Module constants ↓ ====================
+# -------------------------------------------------------------
+
+#: Failure code of a cell whose update keeps density and pressure positive.
+POSITIVE = 0
+
+#: Failure code of a cell whose update keeps the density positive but not the
+#: pressure.
+PRESSURE_FAILURE = 1
+
+#: Failure code of every other failing cell (mainly a non-positive density).
+DENSITY_FAILURE = 2
+
+#: Number of check-and-correct passes of the first-order flux correction, as in
+#: AthenaPK. Correcting a face also changes the neighbour's update, so the
+#: check is repeated; the last pass only corrects density failures.
+NUM_FLUX_CORRECTION_ATTEMPTS = 4
+
+# -------------------------------------------------------------
+# =================== ↑ Module constants ↑ ====================
+# -------------------------------------------------------------
 
 # -------------------------------------------------------------
 # ===================== ↓ State layout ↓ ======================
 # -------------------------------------------------------------
 
 
-def _velocity_component_indices(config: SimulationConfig, registered_variables: RegisteredVariables):
+def _velocity_component_indices(registered_variables: RegisteredVariables):
     """
-    The state indices of the x, y and z velocity, ``None`` for components the
-    layout does not carry (the dimension-reduced hydro layouts). A missing
+    The state indices of the x, y and z velocity. Components the layout does
+    not carry (the dimension-reduced hydro layouts) are ``None``; a missing
     component behaves exactly like a component that is zero everywhere.
+
+    Args:
+        registered_variables: The registered variables.
+
+    Returns:
+        A tuple of three state indices (``None`` for absent components).
     """
     velocity_index = registered_variables.velocity_index
     if isinstance(velocity_index, int):
@@ -92,7 +130,11 @@ def _velocity_component_indices(config: SimulationConfig, registered_variables: 
     return tuple(component if component >= 0 else None for component in tuple(velocity_index))
 
 
-def _interface_frame_indices(axis: int, config: SimulationConfig, registered_variables: RegisteredVariables):
+def _interface_frame_indices(
+    axis: int,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
     """
     The state indices of the variables in the frame of an interface normal to
     ``axis`` (1-based), in AthenaPK's cyclic order: normal, then transverse 1
@@ -107,7 +149,7 @@ def _interface_frame_indices(axis: int, config: SimulationConfig, registered_var
         A tuple of state indices (``None`` for components the layout lacks),
         ordered like :class:`MHDFaceState` (MHD) or :class:`HydroFaceState`.
     """
-    velocity = _velocity_component_indices(config, registered_variables)
+    velocity = _velocity_component_indices(registered_variables)
     normal = axis - 1
     transverse_1 = axis % 3
     transverse_2 = (axis + 1) % 3
@@ -132,7 +174,18 @@ def _interface_frame_indices(axis: int, config: SimulationConfig, registered_var
 
 
 def _state_components_from_frame(frame_values, frame_indices, num_vars: int):
-    """Scatter interface-frame values back to state order (dropping absent components)."""
+    """
+    Scatter interface-frame values back to state order.
+
+    Args:
+        frame_values: The values in the interface frame (e.g. a flux tuple).
+        frame_indices: The state index of every frame value (``None`` for
+            components the layout lacks, which are dropped).
+        num_vars: The number of state variables.
+
+    Returns:
+        A list of the values indexed like the state.
+    """
     state_components = [None] * num_vars
     for index, value in zip(frame_indices, frame_values):
         if index is not None:
@@ -151,10 +204,12 @@ def _state_components_from_frame(frame_values, frame_indices, num_vars: int):
 
 def _uses_floors(config: SimulationConfig) -> bool:
     """
-    AthenaPK's density / pressure floors are active (they are off by default).
+    Return whether the density / pressure floors of the VL2 scheme are active.
 
-    They are switched on by the per-step hard floor; like AthenaPK, the VL2
-    scheme then also applies them in every stage's conversion to primitives.
+    The floors (off by default, as in AthenaPK) are switched on by the per-step
+    hard floor, ``positivity_config.per_step_mode == POSITIVITY_HARD_FLOOR``;
+    like AthenaPK, the VL2 scheme then also applies them in every stage's
+    conversion to primitives.
     """
     return config.positivity_config.per_step_mode == POSITIVITY_HARD_FLOOR
 
@@ -181,7 +236,7 @@ def _conserved_components_from_primitive(
     """
     density = primitive_components[registered_variables.density_index]
     velocity_indices = [
-        index for index in _velocity_component_indices(config, registered_variables) if index is not None
+        index for index in _velocity_component_indices(registered_variables) if index is not None
     ]
 
     conserved_components = list(primitive_components)
@@ -191,7 +246,9 @@ def _conserved_components_from_primitive(
         conserved_components[index] = density * velocity
         kinetic_energy = kinetic_energy + 0.5 * density * velocity * velocity
 
-    energy = primitive_components[registered_variables.pressure_index] / (gamma - 1.0) + kinetic_energy
+    energy = (
+        primitive_components[registered_variables.pressure_index] / (gamma - 1.0) + kinetic_energy
+    )
     if config.mhd:
         for index in tuple(registered_variables.magnetic_index):
             field = primitive_components[index]
@@ -210,11 +267,12 @@ def _primitive_components_from_conserved(
     registered_variables: RegisteredVariables,
 ):
     """
-    AthenaPK's ``ConsToPrim`` on per-variable values (lists indexed like the
-    state). With the floors active, the density floor leaves momentum and energy
-    untouched and the pressure floor raises the pressure (AthenaPK also resets
-    the energy accordingly, which is implicit here as the conserved state is not
-    kept).
+    The conversion from conserved to primitive values with optional floors
+    (AthenaPK: ``ConsToPrim``) on per-variable values (lists indexed like the
+    state). With the floors active, the density floor leaves momentum and
+    energy untouched and the pressure floor raises the pressure (AthenaPK also
+    resets the energy accordingly, which is implicit here as the conserved
+    state is not kept).
 
     Args:
         conserved_components: The conserved values, indexed like the state.
@@ -236,7 +294,7 @@ def _primitive_components_from_conserved(
     primitive_components[registered_variables.density_index] = density
 
     internal_energy = conserved_components[registered_variables.energy_index]
-    for index in _velocity_component_indices(config, registered_variables):
+    for index in _velocity_component_indices(registered_variables):
         if index is not None:
             momentum = conserved_components[index]
             primitive_components[index] = momentum * inverse_density
@@ -293,7 +351,8 @@ def _primitive_from_conserved_vl2(
     """
     The primitive state of a conserved state, with AthenaPK's density and
     pressure floors (``params.minimum_density`` and ``params.minimum_pressure``)
-    when a HARD_FLOOR per-stage positivity mode is configured.
+    when the per-step positivity mode is ``POSITIVITY_HARD_FLOOR`` (see
+    ``_uses_floors``).
 
     Args:
         conserved_state: The conserved state.
@@ -327,10 +386,10 @@ def _primitive_from_conserved_vl2(
 
 def _van_leer_slopes(cell_minus, cell, cell_plus):
     """
-    AthenaPK's piecewise-linear reconstruction (``plm_simple.hpp``) of one
-    cell: the van Leer (harmonic mean) limited half slope
-    ``Δ_L Δ_R / (Δ_L + Δ_R)`` where the one-sided differences agree in sign,
-    zero otherwise.
+    The piecewise-linear reconstruction of one cell with the van Leer
+    (harmonic mean) limited half slope ``Δ_L Δ_R / (Δ_L + Δ_R)`` where the
+    one-sided differences agree in sign, zero otherwise (AthenaPK:
+    ``plm_simple.hpp``).
 
     Args:
         cell_minus: The value in the left neighbour.
@@ -358,7 +417,7 @@ def _reconstructed_face_states(primitive_state: STATE_TYPE, axis: int, piecewise
     Args:
         primitive_state: The primitive state.
         axis: The spatial axis (1-based, i.e. the array axis).
-        piecewise_linear: Use AthenaPK's PLM; otherwise donor cell.
+        piecewise_linear: Use the van Leer limited PLM; otherwise donor cell.
 
     Returns:
         The (left, right) interface states, each shaped like the state.
@@ -394,7 +453,8 @@ def _interface_flux_from_states(
         mhd: Whether this is GLM-MHD.
 
     Returns:
-        The interface flux tuple (interface frame).
+        The interface flux (:class:`MHDFlux` or :class:`HydroFlux`, interface
+        frame).
     """
     if mhd:
         left = MHDFaceState(*left_values)
@@ -448,9 +508,14 @@ def _interface_fluxes(
     left_states, right_states = _reconstructed_face_states(primitive_state, axis, piecewise_linear)
     frame_indices = _interface_frame_indices(axis, config, registered_variables)
 
-    zero = jnp.zeros_like(primitive_state[0])
-    left_values = tuple(left_states[index] if index is not None else zero for index in frame_indices)
-    right_values = tuple(right_states[index] if index is not None else zero for index in frame_indices)
+    # Velocity components the layout lacks enter the solver as zeros.
+    zero = jnp.zeros_like(primitive_state[registered_variables.density_index])
+    left_values = tuple(
+        left_states[index] if index is not None else zero for index in frame_indices
+    )
+    right_values = tuple(
+        right_states[index] if index is not None else zero for index in frame_indices
+    )
 
     flux_values = _interface_flux_from_states(
         left_values,
@@ -493,22 +558,31 @@ def _flux_divergence(fluxes_per_axis, config: SimulationConfig):
 
 
 def _interior_mask(primitive_state: STATE_TYPE, config: SimulationConfig):
-    """Boolean mask of the interior (non-ghost) cells of the spatial grid."""
+    """
+    Boolean mask of the interior (non-ghost) cells of the spatial grid.
+
+    Args:
+        primitive_state: The (padded) primitive state.
+        config: The simulation configuration.
+
+    Returns:
+        The mask, shaped like one variable of the state.
+    """
     spatial_shape = primitive_state.shape[1:]
     if config.boundary_handling != GHOST_CELLS:
         return jnp.ones(spatial_shape, dtype=bool)
-    ghosts = config.num_ghost_cells
-    interior = tuple(slice(ghosts, extent - ghosts) for extent in spatial_shape)
+    num_ghost_cells = config.num_ghost_cells
+    interior = tuple(
+        slice(num_ghost_cells, extent - num_ghost_cells) for extent in spatial_shape
+    )
     return jnp.zeros(spatial_shape, dtype=bool).at[interior].set(True)
 
 
-#: Positivity failure codes of a cell's update (see ``_positivity_failure_code``).
-POSITIVE = 0
-PRESSURE_FAILURE = 1
-DENSITY_FAILURE = 2
-
-
-def _positivity_failure_code(conserved_components, config: SimulationConfig, registered_variables: RegisteredVariables):
+def _positivity_failure_code(
+    conserved_components,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
     """
     Classify an updated conserved state as AthenaPK's flux correction does:
     ``POSITIVE`` if density and pressure are positive, ``PRESSURE_FAILURE`` if
@@ -526,9 +600,10 @@ def _positivity_failure_code(conserved_components, config: SimulationConfig, reg
     """
     density = conserved_components[registered_variables.density_index]
 
-    # the internal energy (times 1 / (gamma - 1)); only its sign matters
+    # This is the internal energy density p / (gamma - 1); only its sign is
+    # needed.
     internal_energy = conserved_components[registered_variables.energy_index]
-    for index in _velocity_component_indices(config, registered_variables):
+    for index in _velocity_component_indices(registered_variables):
         if index is not None:
             internal_energy = internal_energy - 0.5 * conserved_components[index] ** 2 / density
     if config.mhd:
@@ -537,40 +612,86 @@ def _positivity_failure_code(conserved_components, config: SimulationConfig, reg
 
     is_positive = (density > 0.0) & (internal_energy > 0.0)
     only_pressure_negative = (density > 0.0) & (internal_energy < 0.0)
-    return jnp.where(is_positive, POSITIVE, jnp.where(only_pressure_negative, PRESSURE_FAILURE, DENSITY_FAILURE))
+    return jnp.where(
+        is_positive,
+        POSITIVE,
+        jnp.where(only_pressure_negative, PRESSURE_FAILURE, DENSITY_FAILURE),
+    )
 
 
 def _newly_flagged_cells(failure_codes, attempt: int):
-    """The cells AthenaPK corrects in a given attempt (pressure-only failures are left to the floors in the last)."""
-    if attempt < 3:
+    """
+    The cells the flux correction flags in a given attempt: every failing
+    cell, except in the last attempt, which leaves pressure-only failures to
+    the floors (as AthenaPK).
+
+    Args:
+        failure_codes: The positivity failure codes of the attempt's update.
+        attempt: The attempt number (0-based).
+
+    Returns:
+        A boolean mask of the flagged cells.
+    """
+    if attempt < NUM_FLUX_CORRECTION_ATTEMPTS - 1:
         return failure_codes != POSITIVE
     return failure_codes == DENSITY_FAILURE
 
 
-def _corrected_fluxes(high_order_fluxes, first_order_fluxes, correction_mask, config: SimulationConfig):
+def _corrected_fluxes(high_order_fluxes, first_order_fluxes, correction_mask):
     """
     Replace the fluxes of every face bordering a cell of ``correction_mask`` by
-    the first-order ones (the interface ``i - 1/2`` borders cells ``i - 1`` and ``i``).
+    the first-order ones (the interface ``i - 1/2`` borders cells ``i - 1`` and
+    ``i``).
+
+    Args:
+        high_order_fluxes: The stage's interface fluxes per axis.
+        first_order_fluxes: The donor-cell LLF interface fluxes per axis.
+        correction_mask: Boolean mask of the flagged cells (no variable axis).
+
+    Returns:
+        The corrected interface fluxes per axis.
     """
-    corrected = []
-    for axis, (high_order, first_order) in enumerate(zip(high_order_fluxes, first_order_fluxes)):
-        face_mask = correction_mask | jnp.roll(correction_mask, 1, axis=axis)
-        corrected.append(jnp.where(face_mask[None], first_order, high_order))
-    return corrected
+    corrected_fluxes = []
+    # The mask has no variable axis, so spatial axis d (1-based in the state)
+    # is array axis d - 1 here.
+    for mask_axis, (high_order, first_order) in enumerate(
+        zip(high_order_fluxes, first_order_fluxes)
+    ):
+        face_mask = correction_mask | jnp.roll(correction_mask, 1, axis=mask_axis)
+        corrected_fluxes.append(jnp.where(face_mask[None], first_order, high_order))
+    return corrected_fluxes
 
 
-def _first_order_fluxes(stage_primitive_state, gamma, cleaning_speed, config, registered_variables):
-    """The donor-cell local Lax-Friedrichs fluxes of every axis."""
+def _first_order_fluxes(
+    stage_primitive_state: STATE_TYPE,
+    gamma,
+    cleaning_speed,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """
+    The donor-cell local Lax-Friedrichs fluxes of every axis.
+
+    Args:
+        stage_primitive_state: The primitive state the stage started from.
+        gamma: The adiabatic index.
+        cleaning_speed: The GLM cleaning speed (MHD only).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The interface fluxes per axis.
+    """
     return [
         _interface_fluxes(
             stage_primitive_state,
             axis,
-            False,
-            LAX_FRIEDRICHS,
-            gamma,
-            cleaning_speed,
-            config,
-            registered_variables,
+            piecewise_linear=False,
+            riemann_solver=LAX_FRIEDRICHS,
+            gamma=gamma,
+            cleaning_speed=cleaning_speed,
+            config=config,
+            registered_variables=registered_variables,
         )
         for axis in range(1, config.dimensionality + 1)
     ]
@@ -587,13 +708,13 @@ def _first_order_flux_correction(
     registered_variables: RegisteredVariables,
 ):
     """
-    AthenaPK's ``FirstOrderFluxCorrect``: every interior cell whose update
-    would leave a non-positive density or pressure gets all its face fluxes
-    replaced by donor-cell LLF fluxes of the stage's primitive state. Replacing
-    a face flux also changes the neighbour's update, so the check is repeated
-    (with the corrected fluxes) up to four times; in the last attempt only
-    density failures are corrected, pure pressure failures are left to the
-    floors.
+    The first-order flux correction (AthenaPK: ``first_order_flux_correct``):
+    every interior cell whose update would leave a non-positive density or
+    pressure gets all its face fluxes replaced by donor-cell LLF fluxes of the
+    stage's primitive state. Replacing a face flux also changes the
+    neighbour's update, so the check is repeated (with the corrected fluxes)
+    ``NUM_FLUX_CORRECTION_ATTEMPTS`` times; in the last attempt only density
+    failures are corrected, pure pressure failures are left to the floors.
 
     Args:
         fluxes_per_axis: The stage's interface fluxes per axis.
@@ -609,17 +730,23 @@ def _first_order_flux_correction(
     Returns:
         The corrected interface fluxes per axis.
     """
-    first_order_fluxes = _first_order_fluxes(stage_primitive_state, gamma, cleaning_speed, config, registered_variables)
+    first_order_fluxes = _first_order_fluxes(
+        stage_primitive_state,
+        gamma,
+        cleaning_speed,
+        config,
+        registered_variables,
+    )
     interior = _interior_mask(stage_primitive_state, config)
 
     correction_mask = jnp.zeros_like(interior)
-    for attempt in range(4):
-        fluxes = _corrected_fluxes(fluxes_per_axis, first_order_fluxes, correction_mask, config)
+    for attempt in range(NUM_FLUX_CORRECTION_ATTEMPTS):
+        fluxes = _corrected_fluxes(fluxes_per_axis, first_order_fluxes, correction_mask)
         new_state = base_conserved_state - stage_time_step * _flux_divergence(fluxes, config)
         failure_codes = _positivity_failure_code(list(new_state), config, registered_variables)
         correction_mask = correction_mask | (_newly_flagged_cells(failure_codes, attempt) & interior)
 
-    return _corrected_fluxes(fluxes_per_axis, first_order_fluxes, correction_mask, config)
+    return _corrected_fluxes(fluxes_per_axis, first_order_fluxes, correction_mask)
 
 
 # -------------------------------------------------------------
@@ -689,7 +816,10 @@ def _vl2_stage(
             registered_variables,
         )
 
-    conserved_state = base_conserved_state - stage_time_step * _flux_divergence(fluxes_per_axis, config)
+    conserved_state = base_conserved_state - stage_time_step * _flux_divergence(
+        fluxes_per_axis,
+        config,
+    )
 
     if config.mhd:
         conserved_state = _dedner_source(
@@ -729,11 +859,32 @@ def _native_stage_from_primitive_base(
     first-order flux correction, if any, uses the given cell mask (the Pallas
     path runs the correction attempts outside the kernel).
 
+    Args:
+        stage_primitive_state: The primitive state the fluxes are computed from.
+        base_primitive_state: The primitive state ``W^n`` whose conserved form
+            the update starts from.
+        stage_time_step: The stage's time-step weight ``beta * dt``.
+        piecewise_linear: PLM (corrector) or donor-cell (predictor) fluxes.
+        cleaning_speed: The GLM cleaning speed (MHD only).
+        damping_factor: The stage's psi damping factor (MHD only).
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+        correction_mask: ``None``, or a float ``(1, *grid)`` array that is
+            larger than 0.5 in the cells whose faces take first-order LLF
+            fluxes.
+
     Returns:
         The primitive state after the stage, and with a ``correction_mask`` also
-        the positivity failure codes of the update.
+        the ``(1, *grid)`` positivity failure codes of the update.
     """
-    base_conserved_state = _conserved_from_primitive_vl2(base_primitive_state, gamma, config, registered_variables)
+    base_conserved_state = _conserved_from_primitive_vl2(
+        base_primitive_state,
+        gamma,
+        config,
+        registered_variables,
+    )
     fluxes_per_axis = [
         _interface_fluxes(
             stage_primitive_state,
@@ -748,17 +899,34 @@ def _native_stage_from_primitive_base(
         for axis in range(1, config.dimensionality + 1)
     ]
     if correction_mask is not None:
+        first_order_fluxes = _first_order_fluxes(
+            stage_primitive_state,
+            gamma,
+            cleaning_speed,
+            config,
+            registered_variables,
+        )
         fluxes_per_axis = _corrected_fluxes(
             fluxes_per_axis,
-            _first_order_fluxes(stage_primitive_state, gamma, cleaning_speed, config, registered_variables),
+            first_order_fluxes,
             correction_mask[0] > 0.5,
-            config,
         )
 
-    conserved_state = base_conserved_state - stage_time_step * _flux_divergence(fluxes_per_axis, config)
+    conserved_state = base_conserved_state - stage_time_step * _flux_divergence(
+        fluxes_per_axis,
+        config,
+    )
     if correction_mask is not None:
-        failure_codes = _positivity_failure_code(list(conserved_state), config, registered_variables)
-        failure_codes = jnp.where(_interior_mask(stage_primitive_state, config), failure_codes, POSITIVE)
+        failure_codes = _positivity_failure_code(
+            list(conserved_state),
+            config,
+            registered_variables,
+        )
+        failure_codes = jnp.where(
+            _interior_mask(stage_primitive_state, config),
+            failure_codes,
+            POSITIVE,
+        )
     if config.mhd:
         conserved_state = _dedner_source(
             conserved_state,
@@ -768,16 +936,38 @@ def _native_stage_from_primitive_base(
             config,
             registered_variables,
         )
-    primitive_state = _primitive_from_conserved_vl2(conserved_state, gamma, config, params, registered_variables)
+    primitive_state = _primitive_from_conserved_vl2(
+        conserved_state,
+        gamma,
+        config,
+        params,
+        registered_variables,
+    )
     if correction_mask is None:
         return primitive_state
     return primitive_state, failure_codes[None].astype(primitive_state.dtype)
 
 
-def _cleaning_speed_and_damping(primitive_state, dt, config, params, registered_variables):
+def _cleaning_speed_and_damping(
+    primitive_state: STATE_TYPE,
+    dt,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+):
     """
     The step's GLM cleaning speed and the psi damping factors of the two stages
     (``c_h = 0`` and no damping for hydrodynamics).
+
+    Args:
+        primitive_state: The primitive state at the start of the step.
+        dt: The time step.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The cleaning speed and the (predictor, corrector) damping factors.
     """
     if not config.mhd:
         zero = jnp.zeros((), dtype=primitive_state.dtype)
@@ -790,8 +980,24 @@ def _cleaning_speed_and_damping(primitive_state, dt, config, params, registered_
     return cleaning_speed, damping_factors
 
 
-def _update_ghost_cells(primitive_state, config, params, registered_variables):
-    """Refill the ghost cells after a stage (no-op for the periodic-roll layout)."""
+def _update_ghost_cells(
+    primitive_state: STATE_TYPE,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+) -> STATE_TYPE:
+    """
+    Refill the ghost cells after a stage (no-op for the periodic-roll layout).
+
+    Args:
+        primitive_state: The (padded) primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The primitive state with up-to-date ghost cells.
+    """
     if config.boundary_handling == GHOST_CELLS:
         primitive_state = _boundary_handler(primitive_state, config, registered_variables, params)
     return primitive_state
@@ -809,10 +1015,10 @@ def _evolve_state_vl2(
 ) -> STATE_TYPE:
     """
     Advance the primitive state by one VL2 step: a donor-cell predictor to the
-    half step, then the corrector with the configured reconstruction (AthenaPK's
-    ``dc`` reconstruction, ``first_order_fallback``, uses donor cell in both).
-    Runs on the Pallas backend when it supports the configuration and natively
-    otherwise.
+    half step, then the corrector with the van Leer limited PLM, or with donor
+    cell when ``config.first_order_fallback`` is set (``config.limiter`` is not
+    read). Runs on the Pallas backend when it supports the configuration and
+    natively otherwise.
 
     Args:
         primitive_state: The primitive state ``W^n``.
@@ -839,73 +1045,94 @@ def _evolve_state_vl2(
         params,
         registered_variables,
     )
+    predictor_damping_factor, corrector_damping_factor = damping_factors
 
     if _vl2_pallas_supported(primitive_state, config):
+
+        # --------------- ↓ Pallas stages ↓ ----------------
+
         # The Pallas stages take the base register in primitive form and
-        # recompute U^n in-kernel, which saves a state-sized buffer.
+        # recompute U^n in-kernel, which saves a state-sized buffer. In the
+        # predictor the base state is the stage state itself.
         half_step_primitive_state = _vl2_stage_pallas(
             primitive_state,
-            None,
-            0.5 * dt,
-            cleaning_speed,
-            damping_factors[0],
-            gamma,
-            False,
+            base_primitive_state=None,
+            stage_time_step=0.5 * dt,
+            piecewise_linear=False,
+            cleaning_speed=cleaning_speed,
+            damping_factor=predictor_damping_factor,
+            gamma=gamma,
+            config=config,
+            params=params,
+            registered_variables=registered_variables,
+        )
+        half_step_primitive_state = _update_ghost_cells(
+            half_step_primitive_state,
             config,
             params,
             registered_variables,
         )
-        half_step_primitive_state = _update_ghost_cells(half_step_primitive_state, config, params, registered_variables)
         new_primitive_state = _vl2_stage_pallas(
             half_step_primitive_state,
-            primitive_state,
-            dt,
-            cleaning_speed,
-            damping_factors[1],
-            gamma,
-            corrector_piecewise_linear,
-            config,
-            params,
-            registered_variables,
+            base_primitive_state=primitive_state,
+            stage_time_step=dt,
+            piecewise_linear=corrector_piecewise_linear,
+            cleaning_speed=cleaning_speed,
+            damping_factor=corrector_damping_factor,
+            gamma=gamma,
+            config=config,
+            params=params,
+            registered_variables=registered_variables,
         )
+
+        # --------------- ↑ Pallas stages ↑ ----------------
+
         return _update_ghost_cells(new_primitive_state, config, params, registered_variables)
 
-    initial_conserved_state = _conserved_from_primitive_vl2(primitive_state, gamma, config, registered_variables)
+    # --------------- ↓ Native stages ↓ ----------------
+
+    initial_conserved_state = _conserved_from_primitive_vl2(
+        primitive_state,
+        gamma,
+        config,
+        registered_variables,
+    )
     half_step_primitive_state = _vl2_stage(
         primitive_state,
         initial_conserved_state,
-        0.5 * dt,
-        False,
-        cleaning_speed,
-        damping_factors[0],
-        gamma,
+        stage_time_step=0.5 * dt,
+        piecewise_linear=False,
+        cleaning_speed=cleaning_speed,
+        damping_factor=predictor_damping_factor,
+        gamma=gamma,
+        config=config,
+        params=params,
+        registered_variables=registered_variables,
+    )
+    half_step_primitive_state = _update_ghost_cells(
+        half_step_primitive_state,
         config,
         params,
         registered_variables,
     )
-    half_step_primitive_state = _update_ghost_cells(half_step_primitive_state, config, params, registered_variables)
     new_primitive_state = _vl2_stage(
         half_step_primitive_state,
         initial_conserved_state,
-        dt,
-        corrector_piecewise_linear,
-        cleaning_speed,
-        damping_factors[1],
-        gamma,
-        config,
-        params,
-        registered_variables,
+        stage_time_step=dt,
+        piecewise_linear=corrector_piecewise_linear,
+        cleaning_speed=cleaning_speed,
+        damping_factor=corrector_damping_factor,
+        gamma=gamma,
+        config=config,
+        params=params,
+        registered_variables=registered_variables,
     )
+
+    # --------------- ↑ Native stages ↑ ----------------
+
     return _update_ghost_cells(new_primitive_state, config, params, registered_variables)
 
 
 # -------------------------------------------------------------
 # ===================== ↑ VL2 time step ↑ =====================
 # -------------------------------------------------------------
-
-
-# The Pallas module imports the native helpers lazily, so it is imported last.
-from astronomix._finite_volume._state_evolution._van_leer_pallas import (  # noqa: E402
-    _vl2_pallas_supported,
-    _vl2_stage_pallas,
-)

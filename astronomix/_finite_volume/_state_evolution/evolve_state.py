@@ -577,7 +577,10 @@ def _evolve_state_fv(
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
 ) -> STATE_TYPE:
-    # The AthenaPK-equivalent VL2 scheme (hydro and GLM-MHD) is self-contained.
+    # The AthenaPK-equivalent VL2 scheme (hydro and GLM-MHD) replaces the whole
+    # finite-volume step with its own Cartesian update. It has no self-gravity
+    # or geometric source terms (applied by the split / unsplit schemes below);
+    # finalize_config rejects those combinations.
     if config.time_integrator == VL2:
         return _evolve_state_vl2(
             primitive_state,

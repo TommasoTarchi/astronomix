@@ -23,9 +23,9 @@ donor-cell local Lax-Friedrichs fluxes. In the common case that no cell fails,
 this costs only one reduction over the reported codes.
 
 The physics is not re-implemented here: the kernel calls the same elementwise
-functions as the native path (``_athena_riemann_solvers`` and the component
-helpers of ``_van_leer_integrator``), so both backends evaluate the same
-expressions.
+functions as the native path (``_athena_riemann_solvers``, the component
+helpers of ``_van_leer_integrator`` and the extended Dedner source terms of
+``_glm_divergence_cleaning``), so both backends evaluate the same expressions.
 """
 
 # jax
@@ -47,6 +47,9 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._finite_volume._magnetic_update._glm_divergence_cleaning import (
+    _extended_dedner_source_terms,
+)
 from astronomix._pallas_helpers import (
     _as_3tuple_block_shape,
     _backend_is_pallas,
@@ -67,8 +70,8 @@ def _interior_spatial_shape(state, config: SimulationConfig):
     """The spatial shape of the cells the kernel updates (ghost cells excluded)."""
     spatial_shape = tuple(int(extent) for extent in state.shape[1:])
     if config.boundary_handling == GHOST_CELLS:
-        ghosts = config.num_ghost_cells
-        return tuple(extent - 2 * ghosts for extent in spatial_shape)
+        num_ghost_cells = config.num_ghost_cells
+        return tuple(extent - 2 * num_ghost_cells for extent in spatial_shape)
     return spatial_shape
 
 
@@ -171,7 +174,8 @@ def _vl2_stage_pallas_local(
         The primitive state after the stage (ghost cells not updated), and with
         ``report_failures`` the ``(1, *grid)`` failure codes.
     """
-    # Imported lazily: the native module imports this one at its bottom.
+    # Imported here because the integrator module imports this module at its
+    # top.
     from astronomix._finite_volume._state_evolution._van_leer_integrator import (
         _conserved_components_from_primitive,
         _interface_flux_from_states,
@@ -182,15 +186,19 @@ def _vl2_stage_pallas_local(
         _van_leer_slopes,
     )
 
+    # -------------------------------------------------------------
+    # ===================== ↓ Static layout ↓ =====================
+    # -------------------------------------------------------------
+
     ndim = int(config.dimensionality)
     num_vars = int(stage_primitive_state.shape[0])
     dtype = stage_primitive_state.dtype
     spatial_shape = tuple(int(extent) for extent in stage_primitive_state.shape[1:])
-    padded_extents = spatial_shape + (1,) * (3 - ndim)
+    extents_3d = spatial_shape + (1,) * (3 - ndim)
     ghost_cells = config.boundary_handling == GHOST_CELLS
     cell_offset = config.num_ghost_cells if ghost_cells else 0
     block_extents = _vl2_block_shape(stage_primitive_state, config)
-    interior_extents = tuple(extent - 2 * cell_offset for extent in padded_extents[:ndim])
+    interior_extents = _interior_spatial_shape(stage_primitive_state, config)
     grid = tuple(interior_extents[axis] // block_extents[axis] for axis in range(ndim))
 
     frame_indices_per_axis = [
@@ -201,17 +209,28 @@ def _vl2_stage_pallas_local(
     has_mask = correction_mask is not None
     mhd = config.mhd
 
-    # --------------- ↓ Block specifications ↓ ----------------
+    # -------------------------------------------------------------
+    # ===================== ↑ Static layout ↑ =====================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ================= ↓ Block specifications ↓ ==================
+    # -------------------------------------------------------------
 
     def whole_array_spec(array):
+        """A block that is the whole array (read with explicit indices)."""
         return pl.BlockSpec(array.shape, lambda *program_ids: (0,) * array.ndim)
 
     def cell_block_spec(leading_extent):
+        """The output block of a program: its cells (all of them with ghost cells)."""
         if ghost_cells:
             # Ghost-cell layout: the interior starts at an offset that is not a
             # multiple of the block, so the kernel stores with explicit indices
             # into the whole array; the ghost cells are filled afterwards.
-            return pl.BlockSpec((leading_extent,) + spatial_shape, lambda *program_ids: (0,) * (ndim + 1))
+            return pl.BlockSpec(
+                (leading_extent,) + spatial_shape,
+                lambda *program_ids: (0,) * (ndim + 1),
+            )
         return pl.BlockSpec(
             (leading_extent,) + tuple(block_extents[:ndim]),
             lambda *program_ids: (0,) + tuple(program_ids[:ndim]),
@@ -219,32 +238,44 @@ def _vl2_stage_pallas_local(
 
     scalar_spec = pl.BlockSpec((), lambda *program_ids: ())
 
-    # --------------- ↑ Block specifications ↑ ----------------
+    # -------------------------------------------------------------
+    # ================= ↑ Block specifications ↑ ==================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ======================== ↓ Kernel ↓ =========================
+    # -------------------------------------------------------------
 
     def kernel(*refs):
+
+        # --------------- ↓ Ref unpacking ↓ ----------------
+
         refs = list(refs)
         stage_ref = refs.pop(0)
         base_ref = refs.pop(0) if has_base else stage_ref
         mask_ref = refs.pop(0) if has_mask else None
-        initial_codes_ref = refs.pop(0) if report_failures and ghost_cells else None
-        (
-            stage_time_step_ref,
-            cleaning_speed_ref,
-            damping_factor_ref,
-            gamma_ref,
-            density_floor_ref,
-            pressure_floor_ref,
-        ) = refs[:6]
-        output_ref = refs[6]
-        codes_ref = refs[7] if report_failures else None
-        del initial_codes_ref  # only aliased to codes_ref (zero ghost cells)
+        if report_failures and ghost_cells:
+            # The zero-initialised codes input is never read; it is aliased to
+            # ``codes_ref`` so that the ghost cells, which the kernel does not
+            # write, report POSITIVE.
+            refs.pop(0)
+        stage_time_step_ref = refs.pop(0)
+        cleaning_speed_ref = refs.pop(0)
+        damping_factor_ref = refs.pop(0)
+        gamma_ref = refs.pop(0)
+        density_floor_ref = refs.pop(0)
+        pressure_floor_ref = refs.pop(0)
+        output_ref = refs.pop(0)
+        codes_ref = refs.pop(0) if report_failures else None
 
-        stage_dt = stage_time_step_ref[()]
-        cleaning = cleaning_speed_ref[()]
-        damping = damping_factor_ref[()]
-        adiabatic_index = gamma_ref[()]
+        stage_time_step_value = stage_time_step_ref[()]
+        cleaning_speed_value = cleaning_speed_ref[()]
+        damping_factor_value = damping_factor_ref[()]
+        gamma_value = gamma_ref[()]
         minimum_density = density_floor_ref[()]
         minimum_pressure = pressure_floor_ref[()]
+
+        # --------------- ↑ Ref unpacking ↑ ----------------
 
         # --------------- ↓ Cell indices ↓ ----------------
 
@@ -261,11 +292,12 @@ def _vl2_stage_pallas_local(
             if offset != 0:
                 shifted = indices[axis] + offset
                 if not ghost_cells:
-                    shifted = shifted % padded_extents[axis]
+                    shifted = shifted % extents_3d[axis]
                 indices[axis] = shifted
             return ref[(variable_index, *indices)]
 
         def store(ref, variable_index, value):
+            """Write ``value`` of ``variable_index`` to the block's cells."""
             if ghost_cells:
                 ref[(variable_index, *cell_indices)] = value
             else:
@@ -276,13 +308,15 @@ def _vl2_stage_pallas_local(
         # --------------- ↓ Flux divergence ↓ ----------------
 
         def interface_flux(left_values, right_values, frame_indices, riemann_solver):
-            zero = jnp.zeros_like(left_values[0])
+            """The flux (indexed like the state) of one face from its two states."""
+            # Velocity components the layout lacks enter the solver as zeros.
+            zero = jnp.zeros_like(left_values[registered_variables.density_index])
             return _state_components_from_frame(
                 _interface_flux_from_states(
                     tuple(left_values[index] if index is not None else zero for index in frame_indices),
                     tuple(right_values[index] if index is not None else zero for index in frame_indices),
-                    adiabatic_index,
-                    cleaning,
+                    gamma_value,
+                    cleaning_speed_value,
                     riemann_solver,
                     mhd,
                 ),
@@ -300,7 +334,7 @@ def _vl2_stage_pallas_local(
             }
             stencil_per_axis.append(stencil)
 
-            # the (left, right) states of the faces at i - 1/2 and i + 1/2
+            # The (left, right) states of the faces at i - 1/2 and i + 1/2.
             if piecewise_linear:
                 right_face_values = {}
                 left_face_values = {}
@@ -313,8 +347,7 @@ def _vl2_stage_pallas_local(
                         )
                         for variable in range(num_vars)
                     ]
-                    right_face_values[center] = [face[0] for face in faces]
-                    left_face_values[center] = [face[1] for face in faces]
+                    right_face_values[center], left_face_values[center] = zip(*faces)
                 minus_face = (right_face_values[-1], left_face_values[0])
                 plus_face = (right_face_values[0], left_face_values[1])
             else:
@@ -325,14 +358,24 @@ def _vl2_stage_pallas_local(
             plus_flux = interface_flux(*plus_face, frame_indices, config.riemann_solver)
 
             if has_mask:
-                # faces bordering a flagged cell take donor-cell LLF fluxes
+                # The faces bordering a flagged cell take donor-cell LLF fluxes.
                 mask_minus = load(mask_ref, 0, axis, -1)
                 mask_center = load(mask_ref, 0, axis, 0)
                 mask_plus = load(mask_ref, 0, axis, 1)
                 correct_minus = (mask_minus > 0.5) | (mask_center > 0.5)
                 correct_plus = (mask_center > 0.5) | (mask_plus > 0.5)
-                minus_first_order = interface_flux(stencil[-1], stencil[0], frame_indices, LAX_FRIEDRICHS)
-                plus_first_order = interface_flux(stencil[0], stencil[1], frame_indices, LAX_FRIEDRICHS)
+                minus_first_order = interface_flux(
+                    stencil[-1],
+                    stencil[0],
+                    frame_indices,
+                    LAX_FRIEDRICHS,
+                )
+                plus_first_order = interface_flux(
+                    stencil[0],
+                    stencil[1],
+                    frame_indices,
+                    LAX_FRIEDRICHS,
+                )
                 minus_flux = [
                     jnp.where(correct_minus, first_order, high_order)
                     for first_order, high_order in zip(minus_first_order, minus_flux)
@@ -353,15 +396,19 @@ def _vl2_stage_pallas_local(
 
         # --------------- ↓ Conserved update and sources ↓ ----------------
 
-        base_primitive = [load(base_ref, variable, 0, 0) for variable in range(num_vars)]
+        # The base state is read at the cell itself (offset 0).
+        base_primitive = [
+            load(base_ref, variable, axis=0, offset=0) for variable in range(num_vars)
+        ]
         base_conserved = _conserved_components_from_primitive(
             base_primitive,
-            adiabatic_index,
+            gamma_value,
             config,
             registered_variables,
         )
         conserved = [
-            base_conserved[variable] - stage_dt * (flux_difference[variable] / config.grid_spacing)
+            base_conserved[variable]
+            - stage_time_step_value * (flux_difference[variable] / config.grid_spacing)
             for variable in range(num_vars)
         ]
 
@@ -372,39 +419,42 @@ def _vl2_stage_pallas_local(
         if mhd:
             psi_index = registered_variables.magnetic_psi_index
             if config.glm_extended_source:
-                # div(B) and B . grad(psi) from central differences of the
-                # stage state, as in the native ``_dedner_source``
+                # The extended Dedner source from central differences of the
+                # stage state, as in the native ``_dedner_source``. Offset 0
+                # of any axis' stencil is the cell itself.
                 magnetic_indices = tuple(registered_variables.magnetic_index)
                 momentum_indices = tuple(registered_variables.momentum_index)
-                divergence_sum = 0.0
-                field_dot_psi_gradient = 0.0
-                for axis in range(ndim):
-                    stencil = stencil_per_axis[axis]
-                    field_index = magnetic_indices[axis]
-                    divergence_sum = divergence_sum + (
-                        (stencil[1][field_index] - stencil[-1][field_index]) / config.grid_spacing
-                    )
-                    field_dot_psi_gradient = field_dot_psi_gradient + (
-                        stencil[0][field_index]
-                        * (stencil[1][psi_index] - stencil[-1][psi_index])
-                        / config.grid_spacing
-                    )
-                magnetic_divergence = 0.5 * divergence_sum
-                field_dot_psi_gradient = 0.5 * field_dot_psi_gradient
-                stage_center = stencil_per_axis[0][0]
-                for component in range(3):
-                    conserved[momentum_indices[component]] = (
-                        conserved[momentum_indices[component]]
-                        - stage_dt * magnetic_divergence * stage_center[magnetic_indices[component]]
-                    )
-                conserved[registered_variables.energy_index] = (
-                    conserved[registered_variables.energy_index] - stage_dt * field_dot_psi_gradient
+                stage_center_values = stencil_per_axis[0][0]
+                field_components = [stage_center_values[index] for index in magnetic_indices]
+                field_differences = [
+                    stencil_per_axis[axis][1][magnetic_indices[axis]]
+                    - stencil_per_axis[axis][-1][magnetic_indices[axis]]
+                    for axis in range(ndim)
+                ]
+                psi_differences = [
+                    stencil_per_axis[axis][1][psi_index] - stencil_per_axis[axis][-1][psi_index]
+                    for axis in range(ndim)
+                ]
+                magnetic_divergence, field_dot_psi_gradient = _extended_dedner_source_terms(
+                    field_components,
+                    field_differences,
+                    psi_differences,
+                    config.grid_spacing,
                 )
-            conserved[psi_index] = conserved[psi_index] * damping
+                for momentum_index, field_component in zip(momentum_indices, field_components):
+                    conserved[momentum_index] = (
+                        conserved[momentum_index]
+                        - stage_time_step_value * magnetic_divergence * field_component
+                    )
+                energy_index = registered_variables.energy_index
+                conserved[energy_index] = (
+                    conserved[energy_index] - stage_time_step_value * field_dot_psi_gradient
+                )
+            conserved[psi_index] = conserved[psi_index] * damping_factor_value
 
         primitive = _primitive_components_from_conserved(
             conserved,
-            adiabatic_index,
+            gamma_value,
             minimum_density,
             minimum_pressure,
             config,
@@ -413,10 +463,20 @@ def _vl2_stage_pallas_local(
 
         # --------------- ↑ Conserved update and sources ↑ ----------------
 
+        # --------------- ↓ Output ↓ ----------------
+
         for variable in range(num_vars):
             store(output_ref, variable, primitive[variable])
 
-    # --------------- ↓ Kernel call ↓ ----------------
+        # --------------- ↑ Output ↑ ----------------
+
+    # -------------------------------------------------------------
+    # ======================== ↑ Kernel ↑ =========================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====================== ↓ Kernel call ↓ ======================
+    # -------------------------------------------------------------
 
     state_arguments = [stage_primitive_state]
     in_specs = [whole_array_spec(stage_primitive_state)]
@@ -427,7 +487,8 @@ def _vl2_stage_pallas_local(
         state_arguments.append(correction_mask)
         in_specs.append(whole_array_spec(correction_mask))
     if report_failures and ghost_cells:
-        # zero-initialised codes, so that the untouched ghost cells read as positive
+        # Zero-initialise the codes so that the ghost cells, which the kernel
+        # never writes, read as POSITIVE.
         state_arguments.append(jnp.zeros((1,) + spatial_shape, dtype=dtype))
         in_specs.append(whole_array_spec(state_arguments[-1]))
 
@@ -455,14 +516,24 @@ def _vl2_stage_pallas_local(
         # The base state is only read at the cell being written, so the output
         # can reuse its buffer (in the ghost-cell layout its ghost cells keep
         # the old values until the boundary handler overwrites them).
-        input_output_aliases[1] = 0
+        base_state_input_position = 1
+        primitive_output_position = 0
+        input_output_aliases[base_state_input_position] = primitive_output_position
     if report_failures and ghost_cells:
-        input_output_aliases[len(state_arguments) - 1] = 1
+        initial_codes_input_position = len(state_arguments) - 1
+        failure_codes_output_position = 1
+        input_output_aliases[initial_codes_input_position] = failure_codes_output_position
 
     keyword_arguments = {}
     compiler_params = _pallas_compiler_params(config)
     if compiler_params is not None:
         keyword_arguments["compiler_params"] = compiler_params
+
+    stage_name = "corrector" if has_base else "predictor"
+    reconstruction_name = "piecewise_linear" if piecewise_linear else "donor_cell"
+    kernel_name = f"vl2_{stage_name}_{reconstruction_name}"
+    if has_mask:
+        kernel_name += "_flux_correction"
 
     outputs = pl.pallas_call(
         kernel,
@@ -472,12 +543,13 @@ def _vl2_stage_pallas_local(
         out_specs=tuple(out_specs) if report_failures else out_specs[0],
         input_output_aliases=input_output_aliases,
         interpret=config.backend_config.pallas_interpret,
-        name=f"vl2_{'corrector' if has_base else 'predictor'}_{'plm' if piecewise_linear else 'dc'}"
-        + ("_fofc" if has_mask else ""),
+        name=kernel_name,
         **keyword_arguments,
     )(*state_arguments, *scalar_arguments)
 
-    # --------------- ↑ Kernel call ↑ ----------------
+    # -------------------------------------------------------------
+    # ====================== ↑ Kernel call ↑ ======================
+    # -------------------------------------------------------------
 
     return outputs
 
@@ -487,7 +559,7 @@ def _vl2_stage_pallas_local(
 # -------------------------------------------------------------
 
 # -------------------------------------------------------------
-# ====================== ↓ Public stage ↓ =====================
+# =================== ↓ Stage entry points ↓ ==================
 # -------------------------------------------------------------
 
 
@@ -512,6 +584,26 @@ def _vl2_stage_pallas_once(
     every shard receives a periodic halo of the stencil reach instead of an
     all-gather. Derivatives are taken through the native stage
     (``diffable_pallas_call_n``), which evaluates the same expressions.
+
+    Args:
+        stage_primitive_state: The primitive state the fluxes are computed from.
+        base_primitive_state: ``W^n``, or ``None`` when it is the stage state
+            (the predictor stage).
+        correction_mask: ``None``, or a ``(1, *grid)`` array that is one in the
+            cells whose faces take first-order LLF fluxes.
+        stage_time_step: The stage's time-step weight ``beta * dt``.
+        cleaning_speed: The GLM cleaning speed (zero for hydrodynamics).
+        damping_factor: The stage's psi damping factor.
+        gamma: The adiabatic index.
+        piecewise_linear: PLM (else donor-cell) reconstruction.
+        report_failures: Also return the positivity failure codes.
+        config: The simulation configuration.
+        params: The simulation parameters (floors).
+        registered_variables: The registered variables.
+
+    Returns:
+        The primitive state after the stage (ghost cells not updated), and with
+        ``report_failures`` the ``(1, *grid)`` failure codes.
     """
     ndim = int(config.dimensionality)
     block_shape = _vl2_block_shape(stage_primitive_state, config)
@@ -523,10 +615,23 @@ def _vl2_stage_pallas_once(
 
     # Everything traced enters as a primal (closing over traced values inside a
     # custom_jvp is not allowed); config and the flags are static.
-    def pallas_branch(stage_state, base_state, mask, stage_dt, cleaning, damping, adiabatic_index, parameters):
-        state_inputs = [stage_state] + ([base_state] if has_base else []) + ([mask] if has_mask else [])
+    def pallas_branch(
+        stage_state,
+        base_state,
+        mask,
+        stage_time_step_value,
+        cleaning_speed_value,
+        damping_factor_value,
+        gamma_value,
+        simulation_params,
+    ):
+        """The stage on the Pallas backend (sharded over the device mesh)."""
+        state_inputs = (
+            [stage_state] + ([base_state] if has_base else []) + ([mask] if has_mask else [])
+        )
 
         def local_build(*local_states):
+            """The kernel on one halo-padded shard."""
             local_states = list(local_states)
             local_stage = local_states.pop(0)
             local_base = local_states.pop(0) if has_base else None
@@ -535,12 +640,12 @@ def _vl2_stage_pallas_once(
                 local_stage,
                 local_base,
                 local_mask,
-                stage_dt,
-                cleaning,
-                damping,
-                adiabatic_index,
-                parameters.minimum_density,
-                parameters.minimum_pressure,
+                stage_time_step_value,
+                cleaning_speed_value,
+                damping_factor_value,
+                gamma_value,
+                simulation_params.minimum_density,
+                simulation_params.minimum_pressure,
                 piecewise_linear=piecewise_linear,
                 report_failures=report_failures,
                 config=config,
@@ -555,22 +660,42 @@ def _vl2_stage_pallas_once(
             num_state_outputs=2 if report_failures else 1,
         )
 
-    def native_branch(stage_state, base_state, mask, stage_dt, cleaning, damping, adiabatic_index, parameters):
+    def native_branch(
+        stage_state,
+        base_state,
+        mask,
+        stage_time_step_value,
+        cleaning_speed_value,
+        damping_factor_value,
+        gamma_value,
+        simulation_params,
+    ):
+        """The same stage in native JAX, whose tangent serves as the Pallas tangent."""
+        # Imported here because the integrator module imports this module at
+        # its top.
         from astronomix._finite_volume._state_evolution._van_leer_integrator import (
             _native_stage_from_primitive_base,
         )
 
-        native_mask = mask if has_mask else (jnp.zeros((1,) + stage_state.shape[1:], dtype) if report_failures else None)
+        if has_mask:
+            native_mask = mask
+        elif report_failures:
+            # Failures are reported before any correction: an all-zero mask
+            # corrects nothing but makes the native stage return the failure
+            # codes as well, matching the Pallas outputs.
+            native_mask = jnp.zeros((1,) + stage_state.shape[1:], dtype)
+        else:
+            native_mask = None
         return _native_stage_from_primitive_base(
             stage_state,
             base_state if has_base else stage_state,
-            stage_dt,
+            stage_time_step_value,
             piecewise_linear,
-            cleaning,
-            damping,
-            adiabatic_index,
+            cleaning_speed_value,
+            damping_factor_value,
+            gamma_value,
             config,
-            parameters,
+            simulation_params,
             registered_variables,
             correction_mask=native_mask,
         )
@@ -595,10 +720,10 @@ def _vl2_stage_pallas(
     stage_primitive_state,
     base_primitive_state,
     stage_time_step,
+    piecewise_linear: bool,
     cleaning_speed,
     damping_factor,
     gamma,
-    piecewise_linear: bool,
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
@@ -607,8 +732,8 @@ def _vl2_stage_pallas(
     One VL2 stage on the Pallas backend, including AthenaPK's first-order flux
     correction when it is configured.
 
-    The flux correction mirrors AthenaPK's four attempts: after an evaluation,
-    the cells whose update lost positivity are added to the correction mask and
+    The flux correction mirrors AthenaPK's attempts: after an evaluation, the
+    cells whose update lost positivity are added to the correction mask and
     the stage is re-evaluated with first-order fluxes around them (in the last
     attempt only density failures are added). An attempt that flags no new
     cell is skipped, so a stage without positivity problems costs one kernel
@@ -619,10 +744,10 @@ def _vl2_stage_pallas(
         base_primitive_state: ``W^n`` (``None`` in the predictor stage, where it
             is the stage state).
         stage_time_step: The stage's time-step weight ``beta * dt``.
+        piecewise_linear: PLM (else donor-cell) reconstruction.
         cleaning_speed: The GLM cleaning speed (zero for hydrodynamics).
         damping_factor: The stage's psi damping factor.
         gamma: The adiabatic index.
-        piecewise_linear: PLM (else donor-cell) reconstruction.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -630,9 +755,15 @@ def _vl2_stage_pallas(
     Returns:
         The primitive state after the stage (ghost cells not updated).
     """
-    from astronomix._finite_volume._state_evolution._van_leer_integrator import _newly_flagged_cells
+    # Imported here because the integrator module imports this module at its
+    # top.
+    from astronomix._finite_volume._state_evolution._van_leer_integrator import (
+        NUM_FLUX_CORRECTION_ATTEMPTS,
+        _newly_flagged_cells,
+    )
 
     def evaluate(correction_mask, report_failures):
+        """One kernel evaluation with the given correction mask."""
         return _vl2_stage_pallas_once(
             stage_primitive_state,
             base_primitive_state,
@@ -653,8 +784,9 @@ def _vl2_stage_pallas(
 
     primitive_state, failure_codes = evaluate(None, True)
     correction_mask = jnp.zeros_like(failure_codes)
-    for attempt in range(4):
+    for attempt in range(NUM_FLUX_CORRECTION_ATTEMPTS):
         new_mask = jnp.where(_newly_flagged_cells(failure_codes, attempt), 1.0, correction_mask)
+        # An attempt that flags no new cell keeps the previous evaluation.
         primitive_state, failure_codes = jax.lax.cond(
             jnp.any(new_mask != correction_mask),
             lambda mask: evaluate(mask, True),
@@ -666,5 +798,5 @@ def _vl2_stage_pallas(
 
 
 # -------------------------------------------------------------
-# ====================== ↑ Public stage ↑ =====================
+# =================== ↑ Stage entry points ↑ ==================
 # -------------------------------------------------------------
