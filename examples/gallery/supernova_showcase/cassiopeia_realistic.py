@@ -25,7 +25,7 @@ Orlando et al. (2021, 2025) Cas A models:
     hot bubble is expensive.
 
 Same high-order finite-difference (WENO) solver and single-precision
-positivity-preserving flux limiter as the rest of the showcase.
+positivity-preserving WENO as the rest of the showcase.
 
 Resolution matters here: the instabilities and filaments are resolution-limited,
 so the structure sharpens with ``--n``. The default 128^3 shows the clumpy shell
@@ -151,7 +151,7 @@ def build(num_cells, t_end, cooling=True, conduction=False, kappa=0.05,
           shell_density=SHELL_PEAK_DENSITY, num_snapshots=5,
           dual_energy=False, low_mem=False, jet=False, ni_bubbles=True,
           knot_sigma=EJECTA_SMALL_SIGMA, energy_erg=EXPLOSION_ENERGY,
-          ambient_nc=N_C, limiter_alpha=4.0, tfloor=False, tfloor_stage=False,
+          ambient_nc=N_C, limiter_alpha=4.0, tfloor=False,
           ambient_from=None, sharding=None):
     code_units = snr_code_units()
     cooling_config, cooling_params = (None, None)
@@ -180,14 +180,12 @@ def build(num_cells, t_end, cooling=True, conduction=False, kappa=0.05,
         from astronomix.option_classes.simulation_config import RK4_LSRK
         extra["time_integrator"] = RK4_LSRK
         extra["donate_state"] = True
-    if tfloor or tfloor_stage:
+    if tfloor:
         # density-scaled pressure floor (Athena tfloor at the cooling floor
         # temperature) — the isothermal support that stops radiatively cooled
         # shock layers from ram-crushing without bound. Only for runs with
-        # real cooling; the adiabatic hero recipe stays floor-free. The
-        # per-stage variant closes the intra-step crush window.
-        extra["positivity_config"] = fd_positivity(
-            tfloor=tfloor, tfloor_stage=tfloor_stage)
+        # real cooling; the adiabatic hero recipe stays floor-free.
+        extra["positivity_config"] = fd_positivity(tfloor=True)
     config = make_fd_config(BOX_SIZE, num_cells, mhd=False,
                             cooling_config=cooling_config,
                             snapshot_settings=snaps, num_snapshots=num_snapshots,
@@ -395,10 +393,6 @@ def main():
                     help="per-step density-scaled pressure floor at the "
                          "cooling floor temperature (isothermal support for "
                          "radiatively cooled dense layers; use with cooling)")
-    ap.add_argument("--tfloor-stage", action="store_true",
-                    help="apply the density-scaled floor inside every RK "
-                         "stage as well (closes the intra-step crush window; "
-                         "only with real cooling)")
     ap.add_argument("--ambient-from", type=str, default=None,
                     help="npz from casa_turb_phase.py: modulate the driven-"
                          "turbulence box onto the smooth wind+shell profile "
@@ -413,7 +407,7 @@ def main():
     ap.add_argument("--low-mem", action="store_true",
                     help="LSRK4 low-storage integrator + donated state buffers. "
                          "CAUTION: LSRK4 is not SSP, so the positivity-"
-                         "preserving flux limiter's guarantee does not hold on "
+                         "preserving WENO's guarantee does not hold on "
                          "this cold-blast problem -- observed to inflate energy "
                          "at N=64 and collapse dt at 512^3. Prefer the default "
                          "SSP integrator on larger GPUs.")
@@ -453,7 +447,7 @@ def main():
         ni_bubbles=not args.no_bubbles, knot_sigma=args.knot_sigma,
         energy_erg=args.energy_51 * 1e51, ambient_nc=args.ambient_nc,
         limiter_alpha=args.limiter_alpha, tfloor=args.tfloor,
-        tfloor_stage=args.tfloor_stage, ambient_from=args.ambient_from,
+        ambient_from=args.ambient_from,
         sharding=sharding,
     )
     snaps = time_integration(state, config, params, rv, sharding=sharding)

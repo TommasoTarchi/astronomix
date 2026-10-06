@@ -31,7 +31,6 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     GravityConfig,
-    PositivityConfig,
 )
 
 # astronomix functions
@@ -62,10 +61,13 @@ config = SimulationConfig(
     gravity_config = GravityConfig(
         self_gravity = True,
         poisson_manual_open_boundaries = True,
+        # flux-corrected gravitational work (the default coupling is the
+        # conservative FOURTH_ORDER_CONSERVATIVE one)
+        work_flux_correction = True,
     ),
-    # positivity-preserving flux limiter keeps the low-resolution collapse from
-    # driving density / pressure below their floors
-    positivity_config = PositivityConfig(preserving_flux = True),
+    # positivity-preserving WENO keeps the low-resolution collapse from
+    # driving density / pressure negative
+    weno_positivity_preserving = True,
     boundary_settings = BoundarySettings(
         BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
         BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),

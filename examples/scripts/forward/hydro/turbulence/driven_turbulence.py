@@ -116,7 +116,6 @@ def build_config(args):
             ou_forcing=True,              # temporally correlated, like AthenaK
             ou_exact_injection=True,      # inject exactly dedt * dt per step
             banded_spectrum=True,         # discrete nlow..nhigh band
-            vacuum_protection=False,
         ),
         return_snapshots=True,
         num_snapshots=args.nsnap,

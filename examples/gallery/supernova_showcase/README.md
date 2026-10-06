@@ -114,7 +114,9 @@ attributed to the integrator not being SSP while the positivity-flux limiter's
 guarantee needs SSP stage convexity. **That diagnosis was only half right.** The
 fused Pallas path did not exclude the flux-blending flags, so every `--low-mem`
 run silently skipped the positivity limiter altogether (`OVERVIEW.md` §6). The
-exclusion is fixed; LSRK4 + limiter is plausible again and remains untested, so
+exclusion is fixed (and that limiter has since been replaced by the
+positivity-preserving WENO, whose guarantee likewise needs SSP stages); LSRK4 +
+positivity preservation remains untested, so
 prefer GPUs the SSP integrator fits on (~58 GiB/GPU at 512³ across 4 GPUs) until
 someone measures it. The queued-log progress lines
 include the per-step `dt`, and the time loop aborts with a loud
@@ -151,19 +153,22 @@ NaN within a handful of steps — in *both* single and double precision, so it i
 not a floating-point problem but a missing positivity mechanism. Two ingredients
 fix it while keeping the scheme high-order:
 
-1. **Positivity-preserving flux limiter** (`PositivityConfig(preserving_flux=True)`):
-   the Hu–Adams–Shu / Zalesak FCT limiter blends each WENO interface flux toward
-   the first-order Lax–Friedrichs flux by the *minimal* amount that keeps density
-   and pressure positive. This is a high-order positivity technique, **not** the
-   FOFC / first-order fallback. It makes all setups here stable and
-   energy-conserving in float32.
+1. **Positivity-preserving WENO** (`SimulationConfig(weno_positivity_preserving=True)`,
+   switched on by `_common.make_fd_config`; Zhang & Shu 2012): each WENO face
+   value is pulled toward its first-order Lax–Friedrichs split state by the
+   *minimal* amount that keeps density and pressure positive, provably so for
+   `C_cfl ≤ 0.75` with SSPRK4. This is a high-order positivity technique,
+   **not** the FOFC / first-order fallback. The runs documented here were made
+   with its predecessor, the Hu–Adams–Shu / Zalesak FCT flux limiter
+   (`PositivityConfig(preserving_flux=True)`, since removed from the library),
+   which made all setups here stable and energy-conserving in float32.
 2. **A well-resolved, tanh-tapered injection region** with exact mass/energy
    renormalisation (a single-cell top-hat NaNs regardless of the limiter).
 
 ### Precision and the dual-energy formalism (`--dual-energy`)
 
-The blast instability itself is not a precision effect — the positivity-flux
-limiter fixes it in both precisions. But the cold, un-shocked, freely-expanding
+The blast instability itself is not a precision effect — the positivity
+mechanism fixes it in both precisions. But the cold, un-shocked, freely-expanding
 ejecta **core** is: the pressure recovered as `p = (γ−1)(E − E_kin)` there is a
 tiny difference of large numbers (catastrophic cancellation). At moderate
 resolution this only corrupts the (dynamically negligible, cosmetically dark)

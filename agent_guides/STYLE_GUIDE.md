@@ -225,8 +225,9 @@ conversion:
 - Commented-out code blocks kept "just in case".
 - Scratch variables, dead branches, `# TEMPORARY` hacks without a tracked reason.
 
-Genuine, configurable features are **not** cruft (e.g. `deepvoid_blend` /
-`preserving_flux` are real `PositivityConfig` options and stay).
+Genuine, configurable features are **not** cruft (e.g. `coldcrush_blend` is a
+real `PositivityConfig` option and `weno_positivity_preserving` a real
+`SimulationConfig` option; both stay).
 
 ---
 

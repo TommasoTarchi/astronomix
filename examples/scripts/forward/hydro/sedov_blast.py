@@ -67,7 +67,6 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
 )
 
 # astronomix functions
@@ -153,11 +152,11 @@ def make_config(solver_mode, riemann_solver, num_cells):
         mhd=is_finite_difference,  # the FD/WENO backend runs in MHD mode (B = 0 here)
     )
     if is_finite_difference:
-        # Periodic box + positivity protection for the strong point explosion.
-        # The FD/WENO backend runs ~10x faster through the Pallas (Triton)
-        # backend; results are bit-compatible with native JAX.
+        # Periodic box + positivity-preserving WENO for the strong point
+        # explosion. The FD/WENO backend runs ~10x faster through the Pallas
+        # (Triton) backend; results are bit-compatible with native JAX.
         kwargs.update(
-            positivity_config=PositivityConfig(default_positivity_protection=True),
+            weno_positivity_preserving=True,
             boundary_settings=BoundarySettings(
                 BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
                 BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),

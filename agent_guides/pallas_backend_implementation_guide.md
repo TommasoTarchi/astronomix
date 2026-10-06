@@ -397,9 +397,10 @@ two full-state buffers (`q`, `dq`) instead of SSPRK4's three (`q0`,
 `astronomix/_finite_difference/_time_integrators/_ssprk.py`.
 
 Empirical CFL on WENO5+LSRK4: `C_cfl ≈ 1.4` (vs SSPRK4's 1.5).  LSRK4
-has **no SSP property**, so very strong shocks may want
-`enforce_positivity=True` and a slightly looser `minimum_density` /
-`minimum_pressure` floor.
+has **no SSP property**, so the positivity guarantee of
+`weno_positivity_preserving=True` (a convex combination of forward-Euler
+stages, i.e. SSPRK4 with `C_cfl <= 0.75`) does not carry over; very strong
+shocks should prefer SSPRK4.
 
 ---
 
@@ -656,9 +657,15 @@ pointwise Pallas kernel with `input_output_aliases={0: 0}` so the
 floored conserved state is written back into the input buffer
 in-place. Supports 1/2/3D, IDEAL_GAS and ISOTHERMAL, with or without
 MHD. Files:
-`astronomix/_finite_difference/_fluid_equations/_enforce_positivity.py`
+`astronomix/_fluid_equations/_enforce_positivity.py`
 (dispatch + native fallback) and `_enforce_positivity_pallas.py`
-(kernel).
+(kernel). **Since removed** together with the per-stage floors: FD
+positivity now comes from `weno_positivity_preserving`, and the remaining
+per-step floor (`PositivityConfig.per_step_mode`) is a native
+`jnp.maximum` in `astronomix/_modules/_iteration_level_updates.py`. The
+kernel is still the reference skeleton for pointwise leaf ops; recover it
+from the parent of the commit that deleted it
+(`git log --diff-filter=D -- astronomix/_fluid_equations/_enforce_positivity_pallas.py`).
 
 **MHD CFL fast path.** `_cfl_time_step_fd` used to materialise the full
 seven-mode characteristic eigenvalue array for every cell at every
@@ -839,7 +846,7 @@ happens.  The ``pallasify`` skill must enforce this — see its
 | `astronomix/_finite_difference/_time_integrators/_ssprk.py` | SSPRK4 (native), LSRK4 (Pallas-friendly 2N-storage), per-axis Pallas divergence kernel with `scale_in` + `input_output_aliases`, shared `_hydro_step_rhs`. |
 | `astronomix/_finite_difference/_state_evolution/_evolve_state.py` | Top-level FD dispatch; picks SSPRK4 vs LSRK4 based on `config.time_integrator`. |
 | `astronomix/_finite_difference/_timestep_estimation/_timestep_estimator.py` | Backend-aware CFL estimator; Pallas mode skips the full-state characteristic eigenvalue arrays. Hydro path reads primitive `|v| + c`; MHD path uses `_cfl_time_step_fd_mhd_fast` for the per-cell fast-magnetosonic speed. |
-| `astronomix/_finite_difference/_fluid_equations/_enforce_positivity.py` + `_enforce_positivity_pallas.py` | Pointwise floor on ρ and p; Pallas kernel writes back in-place via `input_output_aliases={0:0}`. |
+| `astronomix/_finite_difference/_interface_fluxes/_weno_positivity_pallas.py` | Positivity-preserving WENO (`weno_positivity_preserving`) Pallas kernels. (The pointwise `_enforce_positivity_pallas.py` floor kernel was removed; see §4.5.) |
 | `astronomix/_finite_difference/_magnetic_update/_constrained_transport_pallas.py` | Optional Pallas CT (3 bounded-halo kernels). Gated by `config.pallas_ct` (default False — see §4.5 for the compile/runtime tradeoff). |
 | `astronomix/option_classes/simulation_config.py` | `backend`, `pallas_block_shape`, `pallas_use_triton`, `pallas_interpret`, `pallas_num_warps`, `pallas_ct`, `donate_state`, `time_integrator` knobs. |
 | `tests/pallas/sedov3D.py` | The canonical hydro Pallas benchmark — produces the figure + memory/runtime printout. |

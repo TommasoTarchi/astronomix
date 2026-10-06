@@ -368,9 +368,10 @@ than the stencil+accumulator pattern in §4:
   ``shard_map``, which is what tells GSPMD "this kernel can run
   locally on each shard, no collective needed".
 
-`_enforce_positivity_pallas` in
-`_finite_difference/_fluid_equations/` is the canonical example;
-copy its skeleton for new leaf ops.
+`_enforce_positivity_pallas` (formerly `astronomix/_fluid_equations/`)
+is the canonical example; it was removed with the per-stage positivity
+floors, so recover its skeleton from the parent of the commit that deleted
+it (`git log --diff-filter=D -- astronomix/_fluid_equations/_enforce_positivity_pallas.py`) and copy it for new leaf ops.
 
 ### 4b'. Multi-GPU: always route through `_pallas_call_sharded`
 

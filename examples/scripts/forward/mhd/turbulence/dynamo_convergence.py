@@ -116,7 +116,6 @@ def build_config(args, num_snapshots):
         turbulent_forcing_config=TurbulentForcingConfig(
             turbulent_forcing=True,
             ou_forcing=True,              # temporally correlated, like AthenaPK
-            vacuum_protection=False,
         ),
         # In-flight reduction: no snapshot buffer, so the memory cost does not
         # grow with num_snapshots (see module docstring).

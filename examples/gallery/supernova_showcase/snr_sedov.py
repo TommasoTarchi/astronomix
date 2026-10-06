@@ -18,7 +18,7 @@ problem of Guo, Kim & Stone (2025, ApJ 990, 49), distributed as
 Where the Athena setup uses ``ppm4 + hllc`` finite-volume reconstruction with a
 first-order flux correction (``fofc``), this uses astronomix's high-order WENO
 finite-difference solver instead -- the "consistent high-order scheme" -- kept
-stable on the Sedov-strength bomb by the positivity-preserving flux limiter (no
+stable on the Sedov-strength bomb by the positivity-preserving WENO (no
 finite-volume path, no first-order fallback). See ``_common.py`` for the
 solver-configuration rationale and ``README.md`` for the full athinput mapping.
 

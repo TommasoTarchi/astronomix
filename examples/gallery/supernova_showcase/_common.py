@@ -6,8 +6,9 @@ share the same solver configuration, code-unit conventions and initial-condition
 builders, which live here:
 
   * :func:`fd_positivity` / :func:`make_fd_config`  -- the FD/WENO solver config
-    with the positivity-preserving flux limiter that keeps a Sedov-strength or
-    cold-ejecta blast stable in single precision (see the module note below).
+    with the positivity-preserving WENO reconstruction that keeps a
+    Sedov-strength or cold-ejecta blast stable in single precision (see the
+    module note below).
   * :func:`athena_code_units`   -- the Guo, Kim & Stone (2025) ``snr.athinput``
     code units, used by ``snr_sedov.py``.
   * :func:`snr_code_units`      -- pc / Msun / 1000 km s^-1, used by the
@@ -17,20 +18,21 @@ builders, which live here:
     (flat core + power-law envelope) laid on top of an arbitrary ambient,
     renormalised so the ejecta mass and kinetic energy hit their targets exactly.
 
-Numerics note (why the positivity-preserving flux limiter)
------------------------------------------------------------
+Numerics note (why the positivity-preserving WENO)
+---------------------------------------------------
 A supernova blast is a Sedov-strength (thermal bomb) or cold-high-Mach (freely
 expanding ejecta) flow. A pure high-order WENO scheme with only a hard
 density/pressure floor NaNs within a handful of steps -- in *both* single and
 double precision, so it is not a floating-point issue but a missing
-positivity mechanism. Enabling the Hu-Adams-Shu / Zalesak FCT
-positivity-preserving *flux* limiter (``PositivityConfig(preserving_flux=True)``)
-blends each WENO interface flux toward the first-order Lax-Friedrichs flux by the
-minimal amount that keeps density and pressure positive; it is a high-order
-technique (no finite-volume / first-order fallback) and makes every setup here
-stable and energy-conserving in float32. Two further requirements: a
-well-resolved, tanh-tapered injection region (a single-cell top-hat NaNs
-regardless), and an exact mass/energy renormalisation of that region.
+positivity mechanism. The positivity-preserving WENO reconstruction
+(``SimulationConfig(weno_positivity_preserving=True)``, Zhang & Shu 2012) pulls
+each WENO face value toward its first-order Lax-Friedrichs split state by the
+minimal amount that keeps density and pressure positive (provably positive for
+``C_cfl <= 0.75`` with SSPRK4); it is a high-order technique (no finite-volume
+/ first-order fallback), conservative, and makes every setup here stable in
+float32. Two further requirements: a well-resolved, tanh-tapered injection
+region (a single-cell top-hat NaNs regardless), and an exact mass/energy
+renormalisation of that region.
 """
 
 # general
@@ -58,9 +60,8 @@ from astronomix import (
     PERIODIC_BOUNDARY,
 )
 from astronomix.option_classes.simulation_config import (
+    POSITIVITY_NONE,
     POSITIVITY_HARD_FLOOR,
-    POSITIVITY_REDISTRIBUTE,
-    POSITIVITY_CONSERVATIVE,
 )
 
 # astronomix containers
@@ -96,33 +97,28 @@ GAMMA = 5.0 / 3.0
 # =============================================================================
 # ============ ↓ Solver configuration (high-order FD/WENO) ↓ ==================
 # =============================================================================
-def fd_positivity(tfloor=False, tfloor_stage=False, coldcrush_factor=8.0,
-                  mode=POSITIVITY_HARD_FLOOR):
-    """The positivity configuration that keeps the blast stable in float32.
+def fd_positivity(tfloor=False, coldcrush_factor=8.0):
+    """The ``PositivityConfig`` of the showcase runs.
 
-    The positivity-preserving flux limiter (``preserving_flux``) is the key
-    ingredient; a plain hard floor alone NaNs a strong blast in ~3 steps. The
-    remaining flags are cheap backstops (``nan_safe``) and a vacuum handling that
-    stops recovered velocities from spiking in floored cells (``vacuum_rest``).
+    Positivity itself comes from the positivity-preserving WENO
+    (``SimulationConfig(weno_positivity_preserving=True)``, set by
+    :func:`make_fd_config`), not from this config; a plain hard floor alone
+    NaNs a strong blast in ~3 steps. What is left here:
 
-    ``tfloor=True`` additionally upgrades the per-STEP pressure floor to the
-    density-scaled temperature floor (``p >= rho * minimum_specific_pressure``,
-    Athena tfloor) -- required for runs with REAL radiative cooling, where the
-    cooled shock layer compresses to the isothermal jump and the constant floor
-    leaves it pressureless against ram crushing. Keep it off for adiabatic runs
-    (the proven hero recipe).
+    ``tfloor=True`` applies a per-STEP ``HARD_FLOOR`` with the density-scaled
+    temperature floor (``p >= rho * minimum_specific_pressure``, Athena tfloor)
+    -- only for runs with REAL radiative cooling, where the cooled shock layer
+    compresses to the isothermal jump and would otherwise be pressureless
+    against ram crushing. Keep it off for adiabatic runs (HARD_FLOOR is not
+    conservative).
+
+    The cold-crush blend is kept for radiatively cooled crushes at high
+    resolution (see the comment below); it is inert without a temperature floor
+    (``params.minimum_specific_pressure == 0``).
     """
     return PositivityConfig(
-        # HARD_FLOOR is documented as NON-CONSERVATIVE and it is how these
-        # runs manufacture mass: a drained cell is refilled from nothing, its
-        # neighbour drains it again, and rho runs to 1e16+ while the box goes
-        # from 17 Msun to 1e12 Msun. Selectable so the alternatives can be
-        # tested against that.
-        per_stage_mode=mode,
-        per_step_mode=mode,
+        per_step_mode=POSITIVITY_HARD_FLOOR if tfloor else POSITIVITY_NONE,
         per_step_specific_floor=tfloor,
-        per_stage_specific_floor=tfloor_stage,
-        preserving_flux=True,
         # First-order (LLF) blending at radiatively cooled, ram-pressure-crushed
         # cells (interface T within 8x of the minimum_specific_pressure
         # temperature floor). Without it, once the grid resolves the cooling
@@ -135,8 +131,6 @@ def fd_positivity(tfloor=False, tfloor_stage=False, coldcrush_factor=8.0,
         # the failure it guards against (rho running to 1e10+ and dt -> 0 in
         # the piston wakes) reappears at 8 once cooling is actually solved.
         coldcrush_blend_factor=float(coldcrush_factor),
-        nan_safe=True,
-        vacuum_rest=True,
     )
 
 
@@ -171,6 +165,7 @@ def make_fd_config(box_size, num_cells, mhd=False, cooling_config=None,
         box_size=box_size,
         num_cells=num_cells,
         boundary_settings=periodic_box(),
+        weno_positivity_preserving=True,     # positivity-preserving WENO
         positivity_config=fd_positivity(),
         progress_bar=True,                   # live progress (t / t_end)
     )

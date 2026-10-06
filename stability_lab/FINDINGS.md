@@ -578,6 +578,41 @@ documented as read-only but is not:
 * Pallas kernels silently fall back to native when a grid extent is not
   divisible by the block shape.
 
+## Phase-out of the patchwork (5f23a0a and the migration commit)
+
+**Removed** (FD; superseded by `weno_positivity_preserving`):
+* per-stage positivity in all its modes (HARD_FLOOR / REDISTRIBUTE /
+  CONSERVATIVE, native + Pallas) and `per_stage_specific_floor`;
+* `vacuum_rest`, `nan_safe`, `cons_*`, `default_positivity_protection`,
+  `positivity_max_velocity`;
+* the forcing `prot` (`vacuum_protection` + params);
+* the deep-void blend, the Zalesak `preserving_flux`, the HLLC fallback and
+  `ad_tangent_llf_cold_factor`;
+* the gravity work backstop.
+
+**Kept**, none of them a positivity patch:
+* the per-step HARD_FLOOR: the finite-volume solver's floor and the
+  temperature floor of cooled runs;
+* the read-only `clamp_in_estimates` (fixed: it no longer writes into the
+  carried MHD state);
+* the cold-crush blend: radiative crushes at >= 512³ with cooling;
+  unvalidated without it;
+* dual energy (accuracy);
+* the conservative `work_flux_correction`.
+
+**Validation of the switch:**
+* Showcase recipe vs PP-WENO only, 128³:
+  * cooled SNR: final T min 1.9 K -> 6.6e3 K, the same energy;
+  * Cas A: total energy within 0.01 %.
+* Smoke runs at 64³, all complete and finite:
+  * cooled SNR, Cas A, Cas A with cooling + tfloor;
+  * the TI phase;
+  * paper turbulence, iso and adiabatic (M10);
+  * both self-gravity examples (the Evrard energy budget is unchanged).
+* Asserting suite: 25 passed.
+* Gradients (`pp_gradient_check.py`): reverse = forward = finite difference
+  through PP for hydro, ideal and isothermal MHD.
+
 ## Costs
 
 * Accuracy (smooth advected waves, x64, `smooth1d.py` / `smooth2d.py`): all

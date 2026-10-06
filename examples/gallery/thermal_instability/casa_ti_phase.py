@@ -49,7 +49,7 @@ from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
 from astronomix.units.unit_helpers import CodeUnits
 
 from _tipaths import FIGURES_DIR          # also puts the showcase's _common on sys.path
-from _common import GAMMA, make_fd_config, ism_ti_cooling_setup
+from _common import GAMMA, make_fd_config, fd_positivity, ism_ti_cooling_setup
 
 # ↓───────────────────────────────────────────────────────────────────────↓
 # GKS unit system (ti.athinput <units>): length pc, time Myr, and the mass
@@ -131,11 +131,11 @@ def main():
                          "1e7 cgs at n=1). Sets a resolved Field length so "
                          "TI clump survival is physics, not grid dissipation")
     ap.add_argument("--no-positivity", action="store_true",
-                    help="run WITHOUT the showcase positivity stack (no "
-                         "floors, no preserving_flux LLF blending — the "
-                         "blending diffuses forming cold clumps; transonic "
-                         "TI does not need blast armour). NOTE: NaN'd at "
-                         "x32/64^3 — floors ARE needed; see --no-ppflux")
+                    help="run WITHOUT positivity preservation (control): "
+                         "weno_positivity_preserving off and a default "
+                         "PositivityConfig() (no floor, no cold-crush "
+                         "blend). The old floor-free variant NaN'd at "
+                         "x32/64^3")
     ap.add_argument("--n0", type=float, default=10.0,
                     help="mean number density (cm^-3). GKS use n0 = 10, which "
                          "is the UNSTABLE thermal equilibrium at T = 471 K "
@@ -150,33 +150,12 @@ def main():
                          "equilibrium, no driving needed)")
     ap.add_argument("--rho-floor", type=float, default=0.0,
                     help="override minimum_density (AthenaK ti.athinput uses "
-                         "1e-4; paper_turbulence uses 0.02). 0 = use the default")
+                         "1e-4). 0 = use the default")
     ap.add_argument("--tfloor-K", type=float, default=0.0,
                     help="hard Athena-style temperature floor in K (p >= rho*T~), "
-                         "applied per step AND per stage like AthenaK's EOS "
-                         "tfloor; ti.athinput uses 5 K. 0 = off")
-    ap.add_argument("--pos-mode", choices=("floor","redist","conservative"),
-                    default="floor",
-                    help="per-stage/per-step positivity mode (HARD_FLOOR / "
-                         "REDISTRIBUTE / CONSERVATIVE). The pp flux limiter "
-                         "stays ON in all of them.")
-    ap.add_argument("--deepvoid", action="store_true",
-                    help="also enable the deep-void LLF blend (high-Mach "
-                         "void overshoot guard)")
-    ap.add_argument("--turb-positivity", action="store_true",
-                    help="use the paper_turbulence.py high-Mach recipe instead "
-                         "of the blast recipe: prot vacuum_protection + "
-                         "hard floor per stage/step + vacuum_rest, NO "
-                         "preserving_flux, density floor 0.02 (validated to "
-                         "M_turb ~ 10)")
-    ap.add_argument("--hllc-blend", action="store_true",
-                    help="blend the positivity limiter toward HLLC instead of "
-                         "first-order LLF (preserves contacts, so cold "
-                         "condensations survive the blend)")
-    ap.add_argument("--no-ppflux", action="store_true",
-                    help="keep the floors/nan_safe/vacuum_rest but disable "
-                         "the positivity-preserving flux limiter (its LLF "
-                         "blending at extrema diffuses forming cold clumps)")
+                         "applied once per step (per_step_specific_floor); it "
+                         "also sets the cold-crush blend's temperature scale. "
+                         "ti.athinput uses 5 K. 0 = off")
     ap.add_argument("--nsnap", type=int, default=26)
     ap.add_argument("--gpus", type=int, default=1)
     ap.add_argument("--save-state", type=str,
@@ -200,23 +179,9 @@ def main():
         return_internal_energy=True, return_kinetic_energy=True,
     )
     extra = {}
-    if args.turb_positivity:
-        from astronomix.option_classes.simulation_config import (
-            PositivityConfig, POSITIVITY_HARD_FLOOR, POSITIVITY_REDISTRIBUTE,
-            POSITIVITY_CONSERVATIVE)
-        _M = {"floor": POSITIVITY_HARD_FLOOR, "redist": POSITIVITY_REDISTRIBUTE,
-              "conservative": POSITIVITY_CONSERVATIVE}
-        extra["positivity_config"] = PositivityConfig(
-            default_positivity_protection=True,
-            per_stage_mode=_M[args.pos_mode],
-            per_step_mode=_M[args.pos_mode],
-            vacuum_rest=True,
-            preserving_flux=True,          # pp limiter ON (user directive)
-            deepvoid_blend=args.deepvoid,
-            per_step_specific_floor=args.tfloor_K > 0.0,
-            per_stage_specific_floor=args.tfloor_K > 0.0,
-            nan_safe=True,
-        )
+    if args.tfloor_K > 0.0:
+        # per-step density-scaled temperature floor (Athena tfloor)
+        extra["positivity_config"] = fd_positivity(tfloor=True)
     if args.native or args.weno_eps_rel > 0.0:
         from astronomix.option_classes.simulation_config import (
             BackendConfig, NATIVE_JAX)
@@ -228,19 +193,7 @@ def main():
     if args.no_positivity:
         from astronomix.option_classes.simulation_config import PositivityConfig
         extra["positivity_config"] = PositivityConfig()
-    elif args.hllc_blend:
-        from _common import fd_positivity as _fdp
-        extra["positivity_config"] = _fdp()._replace(blend_fallback_hllc=True)
-    elif args.no_ppflux:
-        from astronomix.option_classes.simulation_config import (
-            PositivityConfig, POSITIVITY_HARD_FLOOR)
-        extra["positivity_config"] = PositivityConfig(
-            per_stage_mode=POSITIVITY_HARD_FLOOR,
-            per_step_mode=POSITIVITY_HARD_FLOOR,
-            preserving_flux=False,
-            nan_safe=True,
-            vacuum_rest=True,
-        )
+        extra["weno_positivity_preserving"] = False
     config = make_fd_config(
         BOX_SIZE, args.n, mhd=False,
         cooling_config=cooling_config,
@@ -249,7 +202,6 @@ def main():
         turbulent_forcing_config=TurbulentForcingConfig(
             turbulent_forcing=True, ou_forcing=args.ou,
             ou_exact_injection=args.ou_exact,
-            vacuum_protection=args.turb_positivity,
             banded_spectrum=args.band is not None),
         thermal_conduction=args.conduction > 0.0,
         conduction_density_weighted=True,
@@ -322,8 +274,7 @@ def main():
     einj = args.einj if args.einj > 0 else M_box * v_target ** 3 / L_f
     params = SimulationParams(
         gamma=GAMMA, C_cfl=args.cfl, t_end=args.t_end,
-        minimum_density=(args.rho_floor if args.rho_floor > 0.0
-                         else (0.02 if args.turb_positivity else DFLOOR)),
+        minimum_density=(args.rho_floor if args.rho_floor > 0.0 else DFLOOR),
         minimum_pressure=PFLOOR,
         # Athena tfloor: p >= rho * (k T_floor / (mu m_u)) in code units
         minimum_specific_pressure=(args.tfloor_K / temp_unit_K
@@ -338,8 +289,6 @@ def main():
             forcing_nlow=(args.band[0] if args.band else 0),
             forcing_nhigh=(args.band[1] if args.band else 0),
             forcing_expo=args.expo,
-            protection_density_threshold=0.02,
-            protection_max_velocity=50.0,
         ),
     )
     print(f"[casa-ti] N={N} box={BOX_SIZE} pc  T0={T_INIT_K:.0f} K (p0={p0:.4f}) "

@@ -32,7 +32,6 @@ from astronomix.option_classes.simulation_config import SECOND_ORDER_CONSERVATIV
 # astronomix containers
 from astronomix import (
     GravityConfig,
-    PositivityConfig,
     SnapshotSettings,
     SimulationConfig,
     SimulationParams,
@@ -70,10 +69,13 @@ config = SimulationConfig(
         self_gravity = True,
         self_gravity_version = SECOND_ORDER_CONSERVATIVE,
         poisson_manual_open_boundaries = True,
+        # flux-corrected gravitational work: keeps the conservative energy
+        # coupling from driving cold receiving cells to negative pressure
+        work_flux_correction = True,
     ),
-    # positivity-preserving (Hu-Adams-Shu / Zalesak FCT) flux limiter keeps the
-    # low-resolution collapse from driving density/pressure below their floors
-    positivity_config = PositivityConfig(preserving_flux = True),
+    # positivity-preserving WENO (Zhang & Shu) keeps the low-resolution
+    # collapse from driving density/pressure negative
+    weno_positivity_preserving = True,
     boundary_settings = BoundarySettings(
         BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
         BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),

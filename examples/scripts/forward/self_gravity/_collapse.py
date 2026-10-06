@@ -34,7 +34,6 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     GravityConfig,
-    PositivityConfig,
     SnapshotSettings,
     BackendConfig,
 )
@@ -140,7 +139,6 @@ def collapse_config(
         )
 
     return SimulationConfig(
-        positivity_config=PositivityConfig(default_positivity_protection=False),
         **_backend_kwargs(backend),
         **common,
     )

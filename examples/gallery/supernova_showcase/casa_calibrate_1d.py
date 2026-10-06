@@ -195,8 +195,7 @@ def build_1d(cfg):
         # ambient n_c and only ever bites deep inside the reverse shock, where
         # it cannot touch the calibration targets -- ``--verbose`` prints the
         # mass it injects so that stays checkable.
-        positivity_config=PositivityConfig(
-            per_step_mode=POSITIVITY_HARD_FLOOR, nan_safe=True, vacuum_rest=True),
+        positivity_config=PositivityConfig(per_step_mode=POSITIVITY_HARD_FLOOR),
         return_snapshots=True,
         snapshot_settings=snaps,
         num_snapshots=cfg["num_snapshots"],

@@ -13,7 +13,7 @@ The contrast is instructive:
     a thinner, denser shell.
 
 Same high-order finite-difference (WENO, RK4-SSP) solver and single-precision
-positivity-preserving flux limiter as the rest of the showcase.
+positivity-preserving WENO as the rest of the showcase.
 
 Default resolution (128^3) finishes in a few minutes on one GPU. Writes
 ``figures/young_snr_ism.png``.

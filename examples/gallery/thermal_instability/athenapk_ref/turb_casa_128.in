@@ -6,7 +6,7 @@
 # Known physics deltas vs the astronomix leg (accepted for tier 1, see
 # README): cooling-floor band (astronomix gates < 1e4 K, this table ends at
 # log T = 4.2), forcing implementation (few-mode OU vs full-spectrum white),
-# PPM+HLLC+FOFC vs WENO+preserving_flux.
+# PPM+HLLC+FOFC vs positivity-preserving WENO (weno_positivity_preserving).
 
 <comment>
 problem = Cas A two-phase pipeline, phase A reference (driven turbulent box)

@@ -70,14 +70,9 @@ def main():
                          "EXACT mass/energy renormalisation (the showcase "
                          "recipe: a sharp injection edge NaNs regardless). "
                          "0 = sharp sphere (AthenaK-matched)")
-    ap.add_argument("--deepvoid", action="store_true",
-                    help="deep-void LLF blend: kills the high-Mach WENO "
-                         "overshoot in blast-evacuated near-vacuum cells")
     ap.add_argument("--rho-floor", type=float, default=0.0,
                     help="override minimum_density (blast voids spike as "
                          "mom/rho_floor; paper_turbulence uses 0.02)")
-    ap.add_argument("--vmax-cap", type=float, default=0.0,
-                    help="positivity_max_velocity cap (code units); 0 = off")
     ap.add_argument("--dual-energy", action="store_true",
                     help="Bryan+95 dual energy. The SN is KE-dominated and the "
                          "ambient contains 70 K clumps, so E - KE cancels "
@@ -139,9 +134,6 @@ def main():
         return_internal_energy=True, return_kinetic_energy=True,
     )
     extra = {}
-    if args.deepvoid:
-        pc = fd_positivity(tfloor=not args.no_tfloor)
-        extra["positivity_config"] = pc._replace(deepvoid_blend=True)
     if args.dual_energy:
         extra["dual_energy"] = True
     if not args.no_tfloor:
@@ -170,8 +162,6 @@ def main():
         minimum_density=(args.rho_floor if args.rho_floor > 0 else DFLOOR),
         minimum_pressure=PFLOOR,
         minimum_specific_pressure=spfloor,
-        positivity_max_velocity=(args.vmax_cap if args.vmax_cap > 0
-                                 else float("inf")),
         cooling_params=cooling_params,
     )
     print(f"[ti-snr] t_end={args.t_end} Myr  limiter={args.limiter_alpha} "
