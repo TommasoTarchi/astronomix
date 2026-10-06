@@ -119,7 +119,7 @@ CASA_4DVAR_MAX_HOST_GB (casa_4dvar_robust). Tests:
 work/ers/gpu_lbfgs/REPORT.md.
 
 CPU smoke test: ``JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= ... --cpu-test --coarsen 32 --x64``
-(NATIVE_JAX backend, no FCT flux limiter -- its XLA:CPU compile explodes).
+(NATIVE_JAX backend).
 """
 
 # ==== GPU selection ====
@@ -168,10 +168,13 @@ GLOBALS = ("ln_D", "psi", "dw", "dn", "ln_A", "ln_nh", "ln_sync", "g_nh_w", "g_n
 #: the likelihood terms of casa_xfit.residual_parts that are constants here
 #: (priors of the IC parameters) and are replaced by 'prior_glob'
 DROP_PARTS = ("prior", "prior_extra", "conv_wall")
-TANGENTS = {"exact": dict(weno_ad_frozen_weights=False, ad_tangent_llf_cold_factor=0.0),
-            "approx": dict(weno_ad_frozen_weights=True, ad_tangent_llf_cold_factor=1000.0),
-            # exact WENO-weight derivative, but the cold-knot flux derivative through LLF (stage 3)
-            "semi": dict(weno_ad_frozen_weights=False, ad_tangent_llf_cold_factor=1000.0)}
+#: tangent linearisations of the positivity-preserving WENO solver. Under PP,
+#: weno_ad_frozen_weights also freezes the admissibility scaling theta and the
+#: common splitting speed. (The cold-face LLF tangent of the pre-PP solver no longer
+#: exists; a PP-native cold-theta linearisation is the open item P2 of
+#: HANDOFF_LARGER_CLUSTER.md, to be added only if the long-window tangent gate needs it.)
+TANGENTS = {"exact": dict(weno_ad_frozen_weights=False),
+            "approx": dict(weno_ad_frozen_weights=True)}
 
 
 # =============================================================================
@@ -226,17 +229,7 @@ def solver_overrides(a, tangent):
               ad_smooth_shock_latch=bool(a.smooth_latch), **TANGENTS[tangent])
     if a.cpu_test:
         from astronomix.option_classes.simulation_config import BackendConfig, NATIVE_JAX
-        ov.update(backend_config=BackendConfig(backend=NATIVE_JAX),
-                  positivity_config=X.fd_positivity(mode=X.POSITIVITY_REDISTRIBUTE)._replace(
-                      preserving_flux=False))
-    if getattr(a, "positivity", "redistribute") != "redistribute":
-        # the 448^3 backgrounds need the mass-conserving mode (jetdbg 2026-10-03: REDISTRIBUTE
-        # refills sub-floor cells without debiting the donors -> single-cell runaway); same
-        # override as casa_xfit --positivity, the default leaves the solver bitwise unchanged
-        from astronomix.option_classes.simulation_config import POSITIVITY_CONSERVATIVE
-        pc = ov.get("positivity_config", X.fd_positivity(mode=POSITIVITY_CONSERVATIVE))
-        ov["positivity_config"] = pc._replace(per_stage_mode=POSITIVITY_CONSERVATIVE,
-                                              per_step_mode=POSITIVITY_CONSERVATIVE)
+        ov.update(backend_config=BackendConfig(backend=NATIVE_JAX))
     return ov
 
 
@@ -1095,10 +1088,10 @@ def main():
                     help="quasi-static schedule: training epochs <= each end year")
     ap.add_argument("--iters", type=int, nargs="+", default=[25, 25, 25, 25])
     ap.add_argument("--holdout", nargs="*", default=["2019", "2022"])
-    ap.add_argument("--tangent", choices=("auto", "exact", "approx", "semi"), default="approx",
-                    help="approx (default): frozen WENO weights + cold-LLF 1000; exact explodes at 128^3 "
-                         "even over 4 yr (|g| 4e16 in x64, NaN in f32); semi: exact WENO weights + cold-LLF "
-                         "1000; auto: exact <= --exact-max-years")
+    ap.add_argument("--tangent", choices=("auto", "exact", "approx"), default="approx",
+                    help="approx (default): frozen WENO weights and PP scaling; exact: the full "
+                         "derivative (exploded at 128^3 over 4 yr with the pre-PP solver, to be "
+                         "re-measured); auto: exact <= --exact-max-years")
     ap.add_argument("--exact-max-years", type=float, default=5.5)
     ap.add_argument("--remat", choices=("none", "stage", "axis"), default="axis")
     ap.add_argument("--ckpt", type=int, default=16, help="equinox checkpoints per integrate call")
@@ -1106,8 +1099,6 @@ def main():
                     help="--remat axis: each axis' flux as this many checkpointed slabs of a perpendicular "
                          "axis (memory; exact). 512^3 on 8 x A100-40GB needs it (see REPORT of ers/shard)")
     ap.add_argument("--smooth-latch", action="store_true", help="ad_smooth_shock_latch (straight-through)")
-    ap.add_argument("--positivity", choices=("redistribute", "conservative"), default="redistribute",
-                    help="solver positivity mode (casa_xfit --positivity); conservative for the 448^3 backgrounds")
     ap.add_argument("--ell", type=float, default=2.0, help="B^1/2 Gaussian sd, coarse cells")
     ap.add_argument("--fine-ctrl-ell", type=float, default=None,
                     help="two-level control: add a fine-scale white field chi_f on the same half-res grid, "

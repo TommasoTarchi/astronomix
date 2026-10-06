@@ -31,7 +31,7 @@ import astropy.constants as const
 
 from astronomix import (PositivityConfig, SimulationParams, finalize_config,
                         get_helper_data, get_registered_variables, time_integration)
-from _common import (GAMMA, MASS_PER_NUCLEUS, POSITIVITY_REDISTRIBUTE, make_fd_config,
+from _common import (GAMMA, MASS_PER_NUCLEUS, make_fd_config,
                      snr_code_units)
 from casa_pluto_diff import PARAM_NAMES, PRIOR, THETA0, make_initial_state, tangent_filter
 
@@ -48,12 +48,9 @@ def main():
                     help="conservative Gaussian low-pass on the tangent after each "
                          "stride (cells); 0 = off")
     ap.add_argument("--pos-off", nargs="*", default=[],
-                    choices=("redistribute", "coldcrush_blend", "vacuum_rest", "nan_safe",
-                             "dual_energy"),
+                    choices=("pp", "coldcrush_blend", "dual_energy"),
                     help="switch individual cold-gas protections off, to bisect "
                          "where the tangent is amplified")
-    ap.add_argument("--ad-llf-cold", type=float, default=0.0, metavar="FACTOR",
-                    help="SimulationConfig.ad_tangent_llf_cold_factor (0 = off)")
     args = ap.parse_args()
     if args.theta is not None and len(args.theta) < len(PARAM_NAMES):
         args.theta = list(args.theta) + [PRIOR[k][0] for k in PARAM_NAMES[len(args.theta):]]
@@ -76,19 +73,12 @@ def main():
                         dtype=jnp.float64 if x64 else jnp.float32)
     t = jnp.zeros_like(theta).at[PARAM_NAMES.index(args.param)].set(1.0)
 
-    full = dict(per_stage_mode=POSITIVITY_REDISTRIBUTE, per_step_mode=POSITIVITY_REDISTRIBUTE,
-                preserving_flux=True, coldcrush_blend=True, coldcrush_blend_factor=8.0,
-                nan_safe=True, vacuum_rest=True)
-    if "redistribute" in args.pos_off:
-        full.pop("per_stage_mode"); full.pop("per_step_mode")
-    for k in ("coldcrush_blend", "vacuum_rest", "nan_safe"):
-        if k in args.pos_off:
-            full[k] = False
+    full = dict(coldcrush_blend="coldcrush_blend" not in args.pos_off, coldcrush_blend_factor=8.0)
     config = make_fd_config(box, n, dual_energy="dual_energy" not in args.pos_off,
                             progress_bar=False,
                             positivity_config=PositivityConfig(**full),
                             weno_ad_frozen_weights=True,
-                            ad_tangent_llf_cold_factor=args.ad_llf_cold)
+                            weno_positivity_preserving="pp" not in args.pos_off)
     rv = get_registered_variables(config)
     hd = get_helper_data(config)
     c = hd.geometric_centers
@@ -113,7 +103,7 @@ def main():
     s, ds = s0, ds0
     age = float(ic["age"])
     print(f"[probe] d/d {args.param}, {n}^3, from {age:.1f} yr, strides of {args.stride} yr, "
-          f"tangent filter sigma = {args.filter_sigma} cells, protections off: {args.pos_off}, LLF-cold tangent factor {args.ad_llf_cold}, "
+          f"tangent filter sigma = {args.filter_sigma} cells, protections off: {args.pos_off}, "
           f"float{'64' if x64 else '32'}")
     for _ in range(args.strides):
         s1, ds1 = step(s, ds, args.stride * yr)

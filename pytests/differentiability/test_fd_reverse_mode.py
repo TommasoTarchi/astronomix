@@ -1,12 +1,12 @@
 """
-Reverse-mode AD through the finite-difference solver in its Cas A configuration.
+Reverse-mode AD through the finite-difference solver in a supernova-remnant
+configuration.
 
-The configuration is the one ``casa_xfit`` differentiates: FD/WENO hydro, the
-dual-energy formalism, five composition passive scalars with physical bounds,
-the library's shock history, redistribute positivity with the cold-crush blend
-and the cold-LLF tangent. The FCT positivity-preserving flux is off: on XLA:CPU
-its unrolled bisection makes the compile impractically large, and its weight is
-``stop_gradient``-ed, so it does not change the structure of the linearisation.
+The configuration is the one of the Cas A inference scripts: FD/WENO hydro with
+the positivity-preserving reconstruction, the dual-energy formalism, five
+composition passive scalars with physical bounds, the library's shock history,
+the cold-crush blend and frozen WENO weights (and admissibility scalings) in the
+tangent.
 
 What is checked (x64, NATIVE_JAX, a 16^3 periodic blast, a few steps):
 
@@ -16,12 +16,6 @@ What is checked (x64, NATIVE_JAX, a 16^3 periodic blast, a few steps):
 * the dot-product test ``<J^T w, u> == w . (J u)``: on one fixed-step function
   (JVP and VJP of the same code), and between the ``FORWARDS`` JVP (while loop,
   traced sub-step count) and the ``BACKWARDS`` VJP (adaptive steps);
-* the forward DEFAULT path is unchanged, bit for bit: against a reference hash
-  recorded with the library before the reverse-mode work (compared bitwise
-  only on the platform / jax version / XLA flags it was recorded with; to within
-  round-off otherwise), and, when ``ASTRONOMIX_BASELINE_ROOT`` points at a
-  directory holding an older ``astronomix/``, directly against that library in
-  a subprocess;
 * the masked sub-cycling reproduces the dynamic one when the flow needs several
   sub-steps; ``ad_remat`` does not change the gradient;
 * the bound clamps keep derivative 1 at their bounds (``jnp.clip`` gives 0.5
@@ -43,7 +37,7 @@ import sys
 if os.environ.get("JAX_PLATFORMS", "") == "cpu":
     # XLA:CPU compile economy: the unrolled FD step takes minutes and tens of GB
     # to optimise at the default LLVM level, seconds at level 0 (numerics differ
-    # at round-off only, which is why the reference hash records the flags)
+    # at round-off only)
     os.environ.setdefault(
         "XLA_FLAGS",
         "--xla_backend_optimization_level=0 --xla_llvm_disable_expensive_passes=true")
@@ -52,11 +46,6 @@ elif os.environ.get("CUDA_VISIBLE_DEVICES") is None:
     autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
-
-import hashlib
-import json
-import subprocess
-import textwrap
 
 import numpy as np
 import pytest
@@ -86,7 +75,6 @@ from astronomix import (
     get_registered_variables,
     time_integration,
 )
-from astronomix.option_classes.simulation_config import POSITIVITY_REDISTRIBUTE
 
 GAMMA = 5.0 / 3.0
 N = 16
@@ -103,21 +91,15 @@ DT_FIXED = 0.0025
 # problem
 # -----------------------------------------------------------------------------
 def _config(**extra):
-    """casa_xfit's solver configuration (minus the FCT flux) on a 16^3 box.
-
-    Only fields that already existed before the reverse-mode work are set by
-    default, so the same function builds the reference run on an old library.
-    """
+    """The Cas A inference solver configuration on a 16^3 box."""
     periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
     kw = dict(
         solver_mode=FINITE_DIFFERENCE, dimensionality=3, geometry=CARTESIAN,
         first_order_fallback=False, box_size=1.0, num_cells=N,
         boundary_settings=BoundarySettings(periodic, periodic, periodic),
-        positivity_config=PositivityConfig(
-            per_stage_mode=POSITIVITY_REDISTRIBUTE, per_step_mode=POSITIVITY_REDISTRIBUTE,
-            preserving_flux=False, coldcrush_blend=True, coldcrush_blend_factor=8.0,
-            nan_safe=True, vacuum_rest=True),
-        dual_energy=True, weno_ad_frozen_weights=True, ad_tangent_llf_cold_factor=1000.0,
+        positivity_config=PositivityConfig(coldcrush_blend=True, coldcrush_blend_factor=8.0),
+        weno_positivity_preserving=True,
+        dual_energy=True, weno_ad_frozen_weights=True,
         num_passive_scalars=N_SCALARS, track_shock_history=True,
         passive_scalar_bounds=tuple((0.0, 1.0) for _ in range(N_SCALARS)),
         backend_config=BackendConfig(backend=NATIVE_JAX),
@@ -162,37 +144,6 @@ def _setup(**extra):
         gas_pressure=p, gamma=GAMMA, passive_scalars=scalars)
     config = finalize_config(config, state.shape)
     return config, rv, state
-
-
-def _forward_final_state():
-    config, rv, state = _setup()
-    return np.asarray(time_integration(state, config, _params(), rv))
-
-
-def _fingerprint(a):
-    return dict(sha256=hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest(),
-                sums=[float(v) for v in a.reshape(a.shape[0], -1).sum(axis=1)])
-
-
-def _environment():
-    return dict(platform=jax.devices()[0].platform, jax=jax.__version__,
-                xla_flags=os.environ.get("XLA_FLAGS", ""))
-
-
-#: Recorded with the library as it was before the reverse-mode work
-#: (/export/data/lstorcks/casa_orlando150/work/astro_snapshot_2026_09_25),
-#: via ``python test_fd_reverse_mode.py --reference`` (JAX_PLATFORMS=cpu, the
-#: fast-compile XLA flags above).
-REFERENCE = {
-    "sha256": "a6d24871ae4f93ddf72da955f366a9f0cec696d753f786ea91f544c1af71a221",
-    "sums": [4640.0, -0.22193946977395385, 1.625701838204182e-14, -2.8321156455169555e-15,
-             54.49837673018368, 81.7475650952755, 165.73703846774563, 19.973211189561994,
-             40.985465269972735, 1024.0047148154458, 1130.2896742284643,
-             -19048.705637273328, 120.79094916818133, 1.3655649179425509,
-             1.771269036395911],
-    "env": {"platform": "cpu", "jax": "0.10.2",
-            "xla_flags": "--xla_backend_optimization_level=0 --xla_llvm_disable_expensive_passes=true"},
-}
 
 
 def _direction(state, rv, seed, scale=1e-3):
@@ -361,38 +312,6 @@ def test_masked_substeps_reverse_vs_dynamic_jvp():
     assert abs(lhs - rhs) <= 1e-12 * abs(rhs), (lhs, rhs)
 
 
-def test_forward_default_unchanged_vs_reference():
-    """The default forward path (FORWARDS, dynamic sub-steps, no remat, hard
-    latch) reproduces the pre-change library."""
-    if REFERENCE is None:
-        pytest.skip("no reference recorded (python test_fd_reverse_mode.py --reference)")
-    a = _forward_final_state()
-    fp = _fingerprint(a)
-    same_env = all(REFERENCE["env"][k] == v for k, v in _environment().items())
-    if same_env:
-        assert fp["sha256"] == REFERENCE["sha256"]
-    else:
-        np.testing.assert_allclose(fp["sums"], REFERENCE["sums"], rtol=1e-9, atol=1e-12)
-
-
-def test_forward_default_unchanged_vs_baseline_library():
-    root = os.environ.get("ASTRONOMIX_BASELINE_ROOT")
-    if not root:
-        pytest.skip("set ASTRONOMIX_BASELINE_ROOT to a directory containing a baseline astronomix/")
-    here = os.path.abspath(__file__)
-    code = textwrap.dedent(f"""
-        import importlib.util, json
-        spec = importlib.util.spec_from_file_location("t", {here!r})
-        t = importlib.util.module_from_spec(spec); spec.loader.exec_module(t)
-        print("FP" + json.dumps(t._fingerprint(t._forward_final_state())))
-    """)
-    env = dict(os.environ, PYTHONPATH=root)
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True,
-                         check=True).stdout
-    base = json.loads(out.split("FP", 1)[1].splitlines()[0])
-    assert _fingerprint(_forward_final_state())["sha256"] == base["sha256"]
-
-
 def test_masked_substeps_match_dynamic():
     """Force several sub-steps (small passive_scalar_cfl) and compare the
     reverse-differentiable masked loop against the traced-count one."""
@@ -518,8 +437,3 @@ def test_config_guards():
                               (15, N, N, N))
         assert cfg.backend_config.backend == NATIVE_JAX
 
-
-if __name__ == "__main__":
-    if "--reference" in sys.argv:
-        a = _forward_final_state()
-        print(json.dumps(dict(_fingerprint(a), env=_environment()), indent=1))

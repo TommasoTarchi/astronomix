@@ -162,7 +162,7 @@ def main():
     ap.add_argument("--x64", action="store_true")
     ap.add_argument("--windows", type=float, nargs="+", default=[2004.5])
     ap.add_argument("--holdout", nargs="*", default=["2019", "2022"])
-    ap.add_argument("--tangent", choices=("auto", "exact", "approx", "semi"), default="approx")
+    ap.add_argument("--tangent", choices=("auto", "exact", "approx"), default="approx")
     ap.add_argument("--exact-max-years", type=float, default=5.5)
     ap.add_argument("--remat", choices=("none", "stage", "axis"), default="axis")
     ap.add_argument("--ckpt", type=int, default=16)

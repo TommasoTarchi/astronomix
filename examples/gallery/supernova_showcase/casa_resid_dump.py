@@ -485,7 +485,7 @@ def main():
     ap.add_argument("--save-fields", nargs="*", default=["2000", "2009", "2019"])
     ap.add_argument("--sigma-model", type=float, default=5.0)
     ap.add_argument("--coarsen", type=int, default=None)
-    ap.add_argument("--cpu", action="store_true", help="CPU (NATIVE_JAX, no preserving_flux): tests only")
+    ap.add_argument("--cpu", action="store_true", help="CPU (NATIVE_JAX): tests only")
     ap.add_argument("--trace-only", action="store_true", help="eval_shape every function on epoch 0 and exit")
     X.add_fix_arguments(ap)
     a = ap.parse_args()

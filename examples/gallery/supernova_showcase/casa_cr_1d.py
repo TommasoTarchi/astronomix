@@ -161,7 +161,7 @@ def build(cfg):
         # same stabilisers as casa_calibrate_1d (see the comments there)
         first_order_fallback=True,
         positivity_config=PositivityConfig(
-            per_step_mode=POSITIVITY_HARD_FLOOR, nan_safe=True, vacuum_rest=True),
+            per_step_mode=POSITIVITY_HARD_FLOOR),
         riemann_solver=HLL,
         # CRs are native-FV only; also avoids the nvidia-smi backend probe
         backend_config=BackendConfig(backend=NATIVE_JAX),

@@ -116,7 +116,7 @@ import astropy.constants as const
 
 from astronomix import (SimulationParams, construct_primitive_state, finalize_config,
                         get_helper_data, get_registered_variables, time_integration)
-from _common import (GAMMA, MASS_PER_NUCLEUS, POSITIVITY_REDISTRIBUTE, fd_positivity,
+from _common import (GAMMA, MASS_PER_NUCLEUS, fd_positivity,
                      make_fd_config, snr_code_units)
 import _plasma as P
 import casa_jaxobs as J
@@ -823,7 +823,7 @@ def sky_sector_velocities(Sxz, E0, sky_w, sky_n, *, cell_arcsec, n_sec=24, annul
 # =============================================================================
 # ============ ↓ The forward model ↓ ==========================================
 # =============================================================================
-def make_forward_core(ic, obs, img, *, cfl=0.3, ad_llf_cold=0.0, subgrid=dict(chi=4.0, f_mass=0.34),
+def make_forward_core(ic, obs, img, *, cfl=0.3, subgrid=dict(chi=4.0, f_mass=0.34),
                       opts=None, config_overrides=None, ic_path=None):
     """What ``make_forward`` builds that does not depend on how the FIRST
     epoch's state is made: the solver config, the geometry, the observation
@@ -854,10 +854,9 @@ def make_forward_core(ic, obs, img, *, cfl=0.3, ad_llf_cold=0.0, subgrid=dict(ch
     rho_c = float((1.0 * cu.code_density).to(u.g / u.cm ** 3).value)
     yr = float((1.0 * u.yr).to(cu.code_time).value)
     kw = dict(dual_energy=True, progress_bar=False, weno_ad_frozen_weights=True,
-              positivity_config=fd_positivity(mode=POSITIVITY_REDISTRIBUTE),
+              positivity_config=fd_positivity(),
               num_passive_scalars=len(SCALAR_NAMES), track_shock_history=True,
-              passive_scalar_bounds=tuple((0.0, 1.0) for _ in SCALAR_NAMES),
-              ad_tangent_llf_cold_factor=float(ad_llf_cold))
+              passive_scalar_bounds=tuple((0.0, 1.0) for _ in SCALAR_NAMES))
     kw.update(config_overrides or {})
     config = make_fd_config(box, n, **kw)
     rv = get_registered_variables(config)
@@ -1206,7 +1205,7 @@ def make_forward_core(ic, obs, img, *, cfl=0.3, ad_llf_cold=0.0, subgrid=dict(ch
     return core
 
 
-def make_forward(ic_path, obs, img, *, cfl=0.3, ad_llf_cold=0.0, subgrid=dict(chi=4.0, f_mass=0.34),
+def make_forward(ic_path, obs, img, *, cfl=0.3, subgrid=dict(chi=4.0, f_mass=0.34),
                  opts=None, config_overrides=None):
     """``theta -> model observables`` (dict) at every epoch.
 
@@ -1229,7 +1228,7 @@ def make_forward(ic_path, obs, img, *, cfl=0.3, ad_llf_cold=0.0, subgrid=dict(ch
     146-yr initial condition and the evolution to the first epoch.
     """
     ic = dict(np.load(ic_path))
-    core = make_forward_core(ic, obs, img, cfl=cfl, ad_llf_cold=ad_llf_cold, subgrid=subgrid, opts=opts,
+    core = make_forward_core(ic, obs, img, cfl=cfl, subgrid=subgrid, opts=opts,
                              config_overrides=config_overrides, ic_path=ic_path)
     opts, config, rv = core.opts, core.config, core.rv
     # the traced functions read the IC fields and the geometry through H, so that
@@ -2636,7 +2635,6 @@ def main():
                          "emission beyond any model shock, which inflates the remnant)")
     ap.add_argument("--sigma-model", type=float, default=5.0)
     ap.add_argument("--doppler", action="store_true")
-    ap.add_argument("--ad-llf-cold", type=float, default=1000.0)
     ap.add_argument("--save-model", default=None)
     ap.add_argument("--devices", type=int, default=1,
                     help="evaluate the FD Jacobian's perturbed forward runs in parallel "
@@ -2664,17 +2662,8 @@ def main():
                          "proper motions (refitted from the per-epoch shifts without them); the forward "
                          "model still evolves through all epochs and --save-model keeps them all; the "
                          "held-out epochs are scored against the training set (EpochExclusion)")
-    ap.add_argument("--positivity", choices=("redistribute", "conservative"), default="redistribute",
-                    help="per-stage/per-step positivity mode (default redistribute: bitwise the fitted runs). "
-                         "REDISTRIBUTE refills a sub-floor cell with its 3x3x3 neighbour mean WITHOUT debiting "
-                         "the donors; next to a dense clump cell that manufactures mass and feeds a single-cell "
-                         "density runaway -> NaN at 448^3 (jetdbg 2026-10-03). 'conservative': the "
-                         "energy-conserving mode (density floor only)")
-    ap.add_argument("--deepvoid-blend", choices=("off", "on"), default="off",
-                    help="FOFC-style LLF flux blending in cells within 8x of the density floor (default off)")
     ap.add_argument("--cpu-test", action="store_true",
-                    help="PIPELINE TESTS ON CPU ONLY: NATIVE_JAX backend and no FCT flux limiter "
-                         "(the XLA:CPU compile of the limiter needs > 200 GB); not physics-grade. "
+                    help="PIPELINE TESTS ON CPU ONLY: NATIVE_JAX backend; not physics-grade. "
                          "Run with JAX_PLATFORMS=cpu and XLA_FLAGS=--xla_backend_optimization_level=0")
     add_fix_arguments(ap)
     args = ap.parse_args()
@@ -2764,21 +2753,9 @@ def main():
     overrides = None
     if args.cpu_test:
         from astronomix.option_classes.simulation_config import BackendConfig, NATIVE_JAX
-        overrides = dict(backend_config=BackendConfig(backend=NATIVE_JAX),
-                         positivity_config=fd_positivity(mode=POSITIVITY_REDISTRIBUTE)._replace(
-                             preserving_flux=False))
-        print("[xfit] --cpu-test: NATIVE_JAX backend, FCT flux limiter OFF (pipeline test only)")
-    if args.positivity != "redistribute" or args.deepvoid_blend == "on":
-        # opt-in robustness for the 448^3 backgrounds (jetdbg 2026-10-03); the default
-        # leaves config_overrides untouched, i.e. every fitted path bitwise unchanged
-        from astronomix.option_classes.simulation_config import POSITIVITY_CONSERVATIVE
-        mode = POSITIVITY_CONSERVATIVE if args.positivity == "conservative" else POSITIVITY_REDISTRIBUTE
-        pc = (overrides or {}).get("positivity_config", fd_positivity(mode=mode))
-        pc = pc._replace(per_stage_mode=mode, per_step_mode=mode, deepvoid_blend=args.deepvoid_blend == "on")
-        overrides = dict(overrides or {}, positivity_config=pc)
-        print(f"[xfit] positivity: {args.positivity}, deepvoid_blend {args.deepvoid_blend}", flush=True)
-    forward = make_forward(args.ic, obs, img, ad_llf_cold=args.ad_llf_cold, opts=opts,
-                           config_overrides=overrides)
+        overrides = dict(backend_config=BackendConfig(backend=NATIVE_JAX))
+        print("[xfit] --cpu-test: NATIVE_JAX backend (pipeline test only)")
+    forward = make_forward(args.ic, obs, img, opts=opts, config_overrides=overrides)
     dtype = jnp.float64 if args.x64 else jnp.float32
     theta = jnp.asarray(th, dtype=dtype)
     ic_diag = forward.lifted.jit(forward.ic_diag)

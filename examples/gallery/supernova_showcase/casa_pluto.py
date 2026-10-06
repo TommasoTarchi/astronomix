@@ -39,7 +39,7 @@ Usage::
 
     # evolve it (GPU)
     ./run.sh casa_orlando.py --from-state .../pluto146_n256.npz --composition \\
-        --age 342 --snapshot-ages 319 323 331 337 --positivity redistribute ...
+        --age 342 --snapshot-ages 319 323 331 337 ...
 """
 
 # ==== CPU only (as a script; importers such as casa_pluto_diff keep their GPU) ====

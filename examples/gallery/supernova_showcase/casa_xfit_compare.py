@@ -72,7 +72,7 @@ def main():
     ap.add_argument("--summarize", nargs="*", default=["old", "new"], help="variants to run casa_xfit.summarize on")
     ap.add_argument("--save-models", default=None, help="npz prefix: save each variant's model dict")
     ap.add_argument("--cpu-test", action="store_true",
-                    help="CPU pipeline test: NATIVE_JAX, FCT limiter off (tiny --ic only)")
+                    help="CPU pipeline test: NATIVE_JAX backend (tiny --ic only)")
     ap.add_argument("--table-dir", default=str(X.J.TABLE_DIR))
     a = ap.parse_args()
     largs = dict(sigma_static=0.5, sigma_temporal=0.075, img_weight=1.0 / 6.0, spectra=True,
@@ -88,9 +88,7 @@ def main():
     overrides = None
     if a.cpu_test:
         from astronomix.option_classes.simulation_config import BackendConfig, NATIVE_JAX
-        overrides = dict(backend_config=BackendConfig(backend=NATIVE_JAX),
-                         positivity_config=X.fd_positivity(mode=X.POSITIVITY_REDISTRIBUTE)._replace(
-                             preserving_flux=False))
+        overrides = dict(backend_config=BackendConfig(backend=NATIVE_JAX))
 
     # ---- data: the union of every variant's needs, loaded once ----
     t0 = time.time()
@@ -105,7 +103,7 @@ def main():
     print(f"[ab] data {time.time() - t0:.0f} s", flush=True)
 
     # ---- the hydro, once ----
-    fwd = X.make_forward(ic_path, obs0, img0, ad_llf_cold=1000.0, opts=base, config_overrides=overrides)
+    fwd = X.make_forward(ic_path, obs0, img0, opts=base, config_overrides=overrides)
     theta = jnp.asarray(theta0, dtype)
     t0 = time.time()
     st0, rest = jax.block_until_ready(jax.jit(fwd.evolve)(theta))
@@ -147,7 +145,7 @@ def run_variant(name, a, results, obs0, img0, base, ic, ic_path, overrides, thet
         if o.kte == "fixed":
             th[X.PARAM_NAMES.index("ln_kte")] = np.log(X.KTE_FIXED_KEV)
         thj = jnp.asarray(th, dtype)
-        core = X.make_forward_core(ic, obs, img, ad_llf_cold=1000.0, opts=o, config_overrides=overrides,
+        core = X.make_forward_core(ic, obs, img, opts=o, config_overrides=overrides,
                                    ic_path=ic_path)
         observe = jax.jit(lambda st, ep, t: core.observer(dict(zip(X.PARAM_NAMES, t)))(st, ep))
         outs = [observe(state_at(k), jax.tree.map(lambda v: v[k], core.xs_all), thj) for k in range(E)]

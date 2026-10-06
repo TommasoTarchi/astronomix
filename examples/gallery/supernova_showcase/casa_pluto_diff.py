@@ -119,7 +119,7 @@ from astronomix import (
 
 # shared showcase helpers
 from casa_pluto import radial_gaussian
-from _common import (GAMMA, MASS_PER_NUCLEUS, POSITIVITY_REDISTRIBUTE, fd_positivity,
+from _common import (GAMMA, MASS_PER_NUCLEUS, fd_positivity,
                      make_fd_config, snr_code_units)
 import astropy.constants as const
 
@@ -1104,7 +1104,7 @@ def vink22_model_rates(r_coe_arcsec, years):
 # ============ ↓ The forward model ↓ ==========================================
 # =============================================================================
 def make_forward(ic_path, obs, *, pa_flip=1.0, pa_offset=0.0, cfl=0.3,
-                 tangent_sigma=0.0, filter_every_yr=0.0, ad_llf_cold=0.0,
+                 tangent_sigma=0.0, filter_every_yr=0.0,
                  centre="coe", rs_estimator="unshocked", wind_dipole="exp",
                  recentre_iter=2, config_overrides=None, sim=None):
     """``theta -> model radii (arcsec) at every (epoch, observed cone)``.
@@ -1137,10 +1137,9 @@ def make_forward(ic_path, obs, *, pa_flip=1.0, pa_offset=0.0, cfl=0.3,
     # reverse-shock estimator; the shock history for "unshocked"
     n_sc = 2 if tracers else 1
     kw = dict(dual_energy=True, progress_bar=False, weno_ad_frozen_weights=True,
-              positivity_config=fd_positivity(mode=POSITIVITY_REDISTRIBUTE),
+              positivity_config=fd_positivity(),
               num_passive_scalars=n_sc, track_shock_history=track,
-              passive_scalar_bounds=tuple((0.0, 1.0) for _ in range(n_sc)),
-              ad_tangent_llf_cold_factor=float(ad_llf_cold))
+              passive_scalar_bounds=tuple((0.0, 1.0) for _ in range(n_sc)))
     kw.update(config_overrides or {})
     config = make_fd_config(box, n, **kw)
     rv = get_registered_variables(config)
@@ -1530,9 +1529,6 @@ def main():
     ap.add_argument("--sigma-model", type=float, default=5.0, help="per-cone shape error of the model (arcsec)")
     ap.add_argument("--free", nargs="*", default=list(PARAM_NAMES), choices=PARAM_NAMES)
     ap.add_argument("--out", default=None, help="json with the fit trajectory")
-    ap.add_argument("--ad-llf-cold", type=float, default=0.0, metavar="FACTOR",
-                    help="tangent-only LLF linearisation on faces colder than FACTOR x "
-                         "the 1e4 K floor (SimulationConfig.ad_tangent_llf_cold_factor)")
     ap.add_argument("--tangent-sigma", type=float, default=0.0, metavar="CELLS",
                     help="conservative low-pass of the forward-mode tangent (cells); "
                          "0 = off. Primal unchanged.")
@@ -1600,7 +1596,7 @@ def main():
     forward, aux = make_forward(args.ic, obs, pa_flip=args.pa_flip, pa_offset=args.pa_offset,
                                 tangent_sigma=args.tangent_sigma,
                                 filter_every_yr=args.filter_every,
-                                ad_llf_cold=args.ad_llf_cold, centre=centre,
+                                centre=centre,
                                 rs_estimator=rs_est, wind_dipole=wind_dipole, sim=args.sim)
     dtype = jnp.float64 if args.x64 else jnp.float32
     theta = jnp.asarray(args.theta if args.theta is not None else THETA0, dtype=dtype)

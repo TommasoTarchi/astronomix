@@ -149,12 +149,10 @@ config = SimulationConfig(
     turbulent_forcing_config=TurbulentForcingConfig(
         turbulent_forcing=True,
         ou_forcing=True,
-        vacuum_protection=False,
         synthesis_resolution=args.synth,
     ),
-    positivity_config=PositivityConfig(
-        default_positivity_protection=False,
-    ),
+    # Subsonic turbulence needs no positivity machinery: no floors, plain WENO.
+    positivity_config=PositivityConfig(),
     snapshot_storage_mode=TO_DISK,
     snapshot_storage_path=args.ckpt,
     num_snapshots=args.nseg,

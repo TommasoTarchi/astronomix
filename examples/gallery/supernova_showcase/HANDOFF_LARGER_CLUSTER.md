@@ -2,6 +2,20 @@
 
 **Read this first, then `AUDIT_2026_09_25.md` §5c–§8.**
 
+> **Status on `main` (consolidated 2026-10-06).** The port of §2.2 is done in the
+> repository: the solver is the positivity-preserving WENO of `weno-stability`,
+> every `casa_*` script and the reverse-mode pytests use it (no `--positivity`,
+> `--deepvoid-blend`, `--ad-llf-cold` flags any more; `casa_4dvar --tangent` is
+> `exact | approx | auto`), the `asym_field` fix is kept, and **P1** (finite
+> float32 derivatives of the admissibility scaling) is in the library
+> (`_weno_positivity._floored_ratio`). Still open: **P2** (PP-native cold-face
+> tangent, only if gate G2 needs it), **P3** (separate frozen-theta switch), the
+> gates G0–G2 on a GPU, and the callers outside the repository (`W/ers/**/*.sh`,
+> `W/run_fit{C,H}.sh`, `W/run_n512.sh` still pass `--positivity`; the `W/stage*`
+> harnesses still point at `~/jf1uids`). The `run.sh` wrapper now imports the
+> checkout it lives in. Flags and options mentioned below for the pre-PP solver
+> are historical.
+
 The three review reports behind this hand-off are in `/export/data/lstorcks/casa_orlando150/work/final_review/`:
 - `results.md`: state of the science, costs, data inventory;
 - `stability_port.md`: porting onto `weno-stability`, with the probes in `stability_port_probe/`;
