@@ -209,12 +209,16 @@ def build(args, sharding=None):
             clamp_to_floor=args.clamp_floor,
         )
 
+    # --snapshot-ages keeps the full state at each requested age (one run
+    # instead of one per epoch); ~1 GB per snapshot at 256^3 on the device
     snaps = SnapshotSettings(
-        return_states=False, return_final_state=True,
+        return_states=bool(args.snapshot_ages), return_final_state=True,
         return_total_mass=True, return_total_energy=True,
         return_internal_energy=True, return_kinetic_energy=True,
     )
     extra = dict(random_seed=SEED, dual_energy=True)
+    if args.snapshot_ages:
+        extra["use_specific_snapshot_timepoints"] = True
     if args.conduction:
         # Conduction supplies the physical length the pure-hydro model lacks.
         # An ideal optically-thin radiative shock collapses without bound, so
@@ -270,7 +274,9 @@ def build(args, sharding=None):
         tfloor=bool(args.cooling), coldcrush_factor=args.coldcrush_factor)
     config = make_fd_config(args.box, num_cells, mhd=args.mhd_b0 > 0,
                             cooling_config=cooling_config,
-                            snapshot_settings=snaps, num_snapshots=args.nsnap,
+                            snapshot_settings=snaps,
+                            num_snapshots=(len(set(args.snapshot_ages) | {float(args.age)})
+                                           if args.snapshot_ages else args.nsnap),
                             **extra)
     registered_variables = get_registered_variables(config)
     helper_data = get_helper_data(config, sharding)
@@ -281,12 +287,27 @@ def build(args, sharding=None):
     rho_per_n = float((MASS_PER_NUCLEUS * const.m_p / u.cm ** 3).to(code_units.code_density).value)
     p_per_n = float((const.k_B * WIND_TEMPERATURE_K * u.K / u.cm ** 3).to(code_units.code_pressure).value)
 
+    if args.from_state:
+        return build_from_state(args, config, registered_variables, helper_data,
+                                sharding, code_units, cooling_params,
+                                rho_per_n=rho_per_n, p_per_n=p_per_n)
+
     # -------------------------------------------------------------
     # ====== ↓ Stage 2a: map the calibrated 1D profile ↓ ==========
     # -------------------------------------------------------------
     rho, v_r, p, meta = map_1d_profile(r, args.profile)
     r_fs = meta["r_fs"]
     r_rs = meta["r_rs"]
+    # the adiabatic index the 1D profile was calibrated with, unless overridden:
+    # a profile made at an effective gamma < 5/3 (cosmic-ray pressure) must be
+    # evolved at the same gamma, or the mapped pressure is misread
+    _prof = np.load(args.profile)
+    gamma_eff = (float(args.gamma) if args.gamma
+                 else float(_prof["cfg_gamma"]) if "cfg_gamma" in _prof.files else GAMMA)
+    if abs(gamma_eff - GAMMA) > 1e-6:
+        print(f"[orlando] EFFECTIVE adiabatic index gamma = {gamma_eff:.4f} (5/3 = {GAMMA:.4f}): "
+              "a stand-in for cosmic-ray pressure; the thermodynamic diagnostics that "
+              "assume 5/3 (v = sqrt(16 p / 3 rho)) are then approximate")
     map_age = meta["measured_age_yr"]
     n_w = meta.get("cfg_n_w", 0.928)
     r_fs_ref = meta.get("cfg_r_fs_ref", 2.5)
@@ -330,9 +351,12 @@ def build(args, sharding=None):
             theta_deg=args.wind_asym_theta, phi_deg=args.wind_asym_phi)
         csm_clump = csm_clump * f_asym
         asym_field = np.asarray(f_asym)
+        _th, _ph = np.deg2rad(args.wind_asym_theta), np.deg2rad(args.wind_asym_phi)
+        _ax = (np.sin(_th) * np.cos(_ph), np.sin(_th) * np.sin(_ph), np.cos(_th))
         print(f"[orlando] wind asymmetry: dipole {args.wind_asym:+.2f}, "
               f"quadrupole {args.wind_asym_quad:+.2f} about "
-              f"(theta {args.wind_asym_theta:.0f}, phi {args.wind_asym_phi:.0f}) deg; "
+              f"(theta {args.wind_asym_theta:.0f}, phi {args.wind_asym_phi:.0f}) deg "
+              f"= axis ({_ax[0]:+.2f}, {_ax[1]:+.2f}, {_ax[2]:+.2f}) in (x, y=LOS, z); "
               f"ambient x{float(jnp.min(f_asym)):.2f}-{float(jnp.max(f_asym)):.2f}, "
               f"angle-averaged density UNCHANGED by construction (l = 1,2 are "
               f"mean-zero)")
@@ -650,7 +674,7 @@ def build(args, sharding=None):
               f"dynamical one)")
     initial_state = construct_primitive_state(
         config=config, registered_variables=registered_variables,
-        sharding=sharding, passive_scalars=scalars, gamma=GAMMA, **fields)
+        sharding=sharding, passive_scalars=scalars, gamma=gamma_eff, **fields)
 
     if args.composition:
         # Material shocked BEFORE the mapping time must not restart its clock at
@@ -680,12 +704,21 @@ def build(args, sharding=None):
     dfloor = float(n_c * rho_per_n) * 1e-3
     pfloor = float(n_c * p_per_n) * 1e-2
     params = SimulationParams(
-        gamma=GAMMA, C_cfl=0.3, t_end=t_end,
+        gamma=gamma_eff, C_cfl=0.3, t_end=t_end,
         minimum_density=dfloor, minimum_pressure=pfloor,
         minimum_specific_pressure=float(p_per_n / rho_per_n),
         cooling_params=cooling_params,
         thermal_conductivity=float(args.kappa) if args.conduction else 0.0,
     )
+    if args.snapshot_ages:
+        ages = sorted(set(float(a) for a in args.snapshot_ages) | {float(args.age)})
+        bad = [a for a in ages if a <= map_age or a > args.age]
+        if bad:
+            raise SystemExit(f"--snapshot-ages must lie in ({map_age:.0f}, {args.age:.0f}] yr; got {bad}")
+        t_snap = jnp.array([float(((a - map_age) * u.yr).to(code_units.code_time).value)
+                            for a in ages])
+        params = params._replace(snapshot_timepoints=t_snap)
+        print(f"[orlando] snapshots at {', '.join(f'{a:.0f}' for a in ages)} yr")
 
     ke = float(jnp.sum(0.5 * rho * (vx ** 2 + vy ** 2 + vz ** 2)) * cell_vol)
     print(f"[orlando] evolving {map_age:.0f} -> {args.age:.0f} yr "
@@ -696,7 +729,101 @@ def build(args, sharding=None):
             helper_data, dict(map_age=map_age, r_fs=r_fs, r_rs=r_rs,
                               n_w=n_w, r_fs_ref=r_fs_ref, n_c=n_c,
                               r_profile_max=meta.get("r_profile_max"),
-                              shell=shell_info, pistons=piston_info))
+                              shell=shell_info, pistons=piston_info,
+                              # the per-cone shock detector needs the SAME
+                              # angular reference the medium was given; a
+                              # spherical reference triggers on unshocked gas
+                              # on the dense side (CALIBRATION.md Result 25)
+                              asym_field=asym_field, gamma=gamma_eff,
+                              wind_asym=dict(dipole=float(args.wind_asym),
+                                             quadrupole=float(args.wind_asym_quad),
+                                             theta_deg=float(args.wind_asym_theta),
+                                             phi_deg=float(args.wind_asym_phi))))
+
+
+# =============================================================================
+# ============ ↓ Restart from a saved state (e.g. Orlando's, casa_pluto) ↓ ====
+# =============================================================================
+def load_state_fields(path, num_cells, box):
+    """The fields of a ``--save-state``-format npz, checked against the grid."""
+    d = np.load(path)
+    if int(d["num_cells"]) != num_cells or abs(float(d["box"]) - box) > 1e-9:
+        raise SystemExit(f"{path} is {int(d['num_cells'])}^3 in {float(d['box'])} pc; "
+                         f"run with --n {int(d['num_cells'])} --box {float(d['box'])}")
+    return d
+
+
+def build_from_state(args, config, registered_variables, helper_data, sharding,
+                     code_units, cooling_params, *, rho_per_n, p_per_n):
+    """Start from a saved state instead of mapping a 1D profile.
+
+    Everything the mapping path imposes (clumping, pistons, shell, composition,
+    shock history) is already IN the state, so none of those flags apply; the
+    solver recipe, snapshots, floors and diagnostics are the same as for a
+    mapped run, which is what makes the two directly comparable.
+    """
+    d = load_state_fields(args.from_state, args.n, args.box)
+    map_age = float(d["age"])
+    gamma_eff = float(args.gamma) if args.gamma else float(d.get("gamma", GAMMA))
+    fields = dict(density=jnp.asarray(d["rho"]), velocity_x=jnp.asarray(d["vx"]),
+                  velocity_y=jnp.asarray(d["vy"]), velocity_z=jnp.asarray(d["vz"]),
+                  gas_pressure=jnp.asarray(d["press"]))
+    scalars = None
+    if args.composition:
+        missing = [k for k in SCALAR_NAMES if k not in d.files]
+        if missing:
+            raise SystemExit(f"{args.from_state} lacks {missing}; cannot run --composition")
+        scalars = jnp.stack([jnp.asarray(d[k]) for k in SCALAR_NAMES])
+    initial_state = construct_primitive_state(
+        config=config, registered_variables=registered_variables,
+        sharding=sharding, passive_scalars=scalars, gamma=gamma_eff, **fields)
+    if args.composition and "time_since_shock" in d.files:
+        # entropy_initial was just seeded from the state itself; the other three
+        # carry the history the state arrived with
+        i_hist = (registered_variables.passive_scalar_index
+                  + registered_variables.num_passive_scalars - 4)
+        for j, name in enumerate(("shocked_fraction", "time_since_shock", "density_time")):
+            initial_state = initial_state.at[i_hist + 1 + j].set(jnp.asarray(d[name]))
+        print(f"[orlando] shock history carried over: "
+              f"{100 * float(np.mean(d['shocked_fraction'] > 0.5)):.2f}% of the box shocked, "
+              f"longest for {float((np.max(d['time_since_shock']) * code_units.code_time).to(u.yr).value):.0f} yr")
+    config = finalize_config(config, initial_state.shape)
+
+    t_end = float(((args.age - map_age) * u.yr).to(code_units.code_time).value)
+    # floors as in the mapped runs (the n_c = 0.1 cm^-3 ISM term they are scaled on)
+    n_floor = 0.1
+    params = SimulationParams(
+        gamma=gamma_eff, C_cfl=0.3, t_end=t_end,
+        minimum_density=float(n_floor * rho_per_n) * 1e-3,
+        minimum_pressure=float(n_floor * p_per_n) * 1e-2,
+        minimum_specific_pressure=float(p_per_n / rho_per_n),
+        cooling_params=cooling_params,
+        thermal_conductivity=float(args.kappa) if args.conduction else 0.0,
+    )
+    if args.snapshot_ages:
+        ages = sorted(set(float(a) for a in args.snapshot_ages) | {float(args.age)})
+        bad = [a for a in ages if a <= map_age or a > args.age]
+        if bad:
+            raise SystemExit(f"--snapshot-ages must lie in ({map_age:.0f}, {args.age:.0f}] yr; got {bad}")
+        params = params._replace(snapshot_timepoints=jnp.array(
+            [float(((a - map_age) * u.yr).to(code_units.code_time).value) for a in ages]))
+        print(f"[orlando] snapshots at {', '.join(f'{a:.0f}' for a in ages)} yr")
+
+    rho = np.asarray(d["rho"])
+    ke = float(np.sum(0.5 * rho * (np.asarray(d["vx"]) ** 2 + np.asarray(d["vy"]) ** 2
+                                   + np.asarray(d["vz"]) ** 2))) * (args.box / args.n) ** 3
+    print(f"[orlando] restart from {args.from_state} ({str(d['argv']) if 'argv' in d.files else ''}): "
+          f"evolving {map_age:.1f} -> {args.age:.0f} yr (t_end = {t_end:.4f} code), KE = "
+          f"{float((ke * code_units.code_energy).to(u.erg).value):.3e} erg")
+    n_w = float(d["n_w"]) if "n_w" in d.files else 0.928
+    r_fs_ref = float(d["r_fs_ref"]) if "r_fs_ref" in d.files else 2.5
+    return (initial_state, config, params, registered_variables, code_units,
+            helper_data, dict(map_age=map_age, r_fs=np.nan, r_rs=np.nan,
+                              n_w=n_w, r_fs_ref=r_fs_ref, n_c=float(d.get("n_c", 0.0)),
+                              r_profile_max=None, shell=None, pistons=None,
+                              asym_field=None, gamma=gamma_eff,
+                              wind_asym=dict(dipole=0.0, quadrupole=0.0,
+                                             theta_deg=0.0, phi_deg=0.0)))
 
 
 # =============================================================================
@@ -741,6 +868,25 @@ def _outermost_contiguous(above, seed):
     while i + 1 < len(above) and above[i + 1]:
         i += 1
     return i
+
+
+def _crossing_radius(rc, contrast, k, threshold):
+    """Radius where ``contrast`` falls through ``threshold`` just outside bin ``k``.
+
+    The bin centre ``rc[k]`` alone quantises every radius to the bin width --
+    one cell at 256^3 -- and a max-minus-min statistic over position angle then
+    moves in steps of one cell, which is what made the A1 = 0.3 / 0.4 / 0.5
+    ladder read 6 / 5 / 10 cells (CALIBRATION.md Result 26). Interpolating the
+    threshold crossing linearly between bins ``k`` and ``k + 1`` gives sub-bin
+    precision without changing which bin is identified as the shock.
+    """
+    if k + 1 >= len(rc) or not np.isfinite(contrast[k + 1]):
+        return float(rc[k])
+    c0, c1 = float(contrast[k]), float(contrast[k + 1])
+    if not (c0 > threshold >= c1) or c0 == c1:
+        return float(rc[k])
+    frac = (c0 - threshold) / (c0 - c1)
+    return float(rc[k] + frac * (rc[k + 1] - rc[k]))
 
 
 def measure_shocks_3d(rho, v_r, r, *, age_yr, code_units, n_w, r_fs_ref, n_c,
@@ -799,7 +945,9 @@ def measure_shocks_3d(rho, v_r, r, *, age_yr, code_units, n_w, r_fs_ref, n_c,
                                    flat_beyond=ambient_flat_beyond)
     contrast = np.where(cnt > 0, rho_mean / (n_amb * rho_per_n), 0.0)
     above = contrast > fs_contrast
-    r_fs = (float(rc[_outermost_contiguous(above, np.argmax(contrast))])
+    r_fs = (_crossing_radius(rc, contrast,
+                             _outermost_contiguous(above, np.argmax(contrast)),
+                             fs_contrast)
             if np.any(above) else np.nan)
     # reverse shock
     if shocked_fraction is not None and ejecta_fraction is not None:
@@ -886,8 +1034,35 @@ def shock_speed_vs_position_angle(rho, r, X, Y, Z, *, n_w, r_fs_ref, n_c,
         if np.any(hit):
             # same contiguity rule as the angle-averaged estimator: the outer
             # edge of the over-contrast region that contains this cone's peak
-            out[i] = rc[_outermost_contiguous(hit, np.argmax(contrast))]
+            out[i] = _crossing_radius(
+                rc, contrast, _outermost_contiguous(hit, np.argmax(contrast)),
+                fs_contrast)
     return angles, out
+
+
+def position_angle_statistics(angles_deg, r_pa):
+    """Summarise ``r_FS(PA)`` by more than its range.
+
+    ``max - min`` is an extreme-value statistic: two cones out of 36 decide it,
+    and with radii quantised to a cell it moves in cell-sized steps. Returned
+    alongside it are the standard deviation over position angle and the
+    amplitudes of the ``m = 1`` (lopsided) and ``m = 2`` (elliptical) Fourier
+    modes of ``r_FS(PA)`` -- the quantities a dipole or quadrupole ambient
+    actually predicts, and the ones to compare against an observed outline.
+    """
+    r = np.asarray(r_pa, dtype=np.float64)
+    ok = np.isfinite(r)
+    if ok.sum() < 4:
+        return dict(spread=np.nan, std=np.nan, m1=np.nan, m2=np.nan,
+                    m1_pa_deg=np.nan, mean=np.nan)
+    th = np.deg2rad(np.asarray(angles_deg, dtype=np.float64))[ok]
+    r = r[ok]
+    mean = float(r.mean())
+    c1 = 2.0 * np.mean((r - mean) * np.cos(th)); s1 = 2.0 * np.mean((r - mean) * np.sin(th))
+    c2 = 2.0 * np.mean((r - mean) * np.cos(2 * th)); s2 = 2.0 * np.mean((r - mean) * np.sin(2 * th))
+    return dict(spread=float(r.max() - r.min()), std=float(r.std()),
+                m1=float(np.hypot(c1, s1)), m2=float(np.hypot(c2, s2)),
+                m1_pa_deg=float(np.rad2deg(np.arctan2(s1, c1)) % 360.0), mean=mean)
 # =============================================================================
 # ============ ↑ Shock diagnostics on the 3D state ↑ ==========================
 # =============================================================================
@@ -896,7 +1071,11 @@ def shock_speed_vs_position_angle(rho, r, X, Y, Z, *, n_w, r_fs_ref, n_c,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("profile", help="casa_calibrate_1d.py --save-profile npz")
+    ap.add_argument("profile", nargs="?", default=None,
+                    help="casa_calibrate_1d.py --save-profile npz (not with --from-state)")
+    ap.add_argument("--from-state", default=None, metavar="NPZ",
+                    help="start from a saved state (casa_pluto.py convert, or a "
+                         "--save-state file) instead of mapping a 1D profile")
     ap.add_argument("--n", type=int, default=256, help="cells per axis")
     ap.add_argument("--box", type=float, default=BOX_SIZE,
                     help="box side (pc). The default 7 pc is sized for the "
@@ -906,6 +1085,16 @@ def main():
                          "when the pistons are imposed")
     ap.add_argument("--age", type=float, default=TARGET_AGE_YR, help="target age (yr)")
     ap.add_argument("--nsnap", type=int, default=21, help="number of snapshots")
+    ap.add_argument("--gamma", type=float, default=None,
+                    help="adiabatic index for the 3D evolution. Default: the one the "
+                         "1D profile was calibrated with (cfg_gamma), else 5/3. An "
+                         "EFFECTIVE index < 5/3 stands in for cosmic-ray pressure "
+                         "(CALIBRATION.md Result 3 tested the radii; Result 28 the "
+                         "temperatures and spectrum)")
+    ap.add_argument("--snapshot-ages", type=float, nargs="*", default=None, metavar="YR",
+                    help="also save the full state at these ages (yr), as "
+                         "<save-state stem>_age<YR>yr.npz -- one run for a whole "
+                         "multi-epoch comparison instead of one run per epoch")
     ap.add_argument("--gpus", type=int, default=1, help="number of GPUs (x-axis sharding)")
     ap.add_argument("--cooling", action="store_true", help="radiative cooling (+ limiter + tfloor)")
     ap.add_argument("--conduction", action="store_true",
@@ -1086,6 +1275,8 @@ def main():
     ap.add_argument("--save-state", type=str, default=None, help="write the final state npz")
     ap.add_argument("--ic-only", action="store_true", help="build and report the IC, do not run")
     args = ap.parse_args()
+    if (args.profile is None) == (args.from_state is None):
+        ap.error("give exactly one of PROFILE or --from-state")
 
     sharding = None
     if args.gpus > 1:
@@ -1161,14 +1352,59 @@ def main():
         # the run log, and the logs are not kept alongside the states. That cost
         # a control run's worth of doubt about whether an existing state was a
         # valid A/B partner for a new one.
-        np.savez_compressed(args.save_state, rho=rho, press=p, vx=vx, vy=vy, vz=vz,
-                            box=float(args.box), age=float(args.age),
-                            num_cells=args.n, map_age=meta["map_age"],
-                            argv=np.array(" ".join(sys.argv)),
-                            git_commit=np.array(_git_commit()),
-                            **extra_fields)
-        print(f"[orlando] saved state {args.save_state}"
-              + (f" (+ {len(extra_fields)} scalar fields)" if extra_fields else ""))
+        # The stamped age is the age the solver REACHED, not the target: on a
+        # dt-collapse abort the loop exits early and a state labelled 350 yr
+        # would otherwise be a state at whatever time it stalled.
+        t_pts = np.asarray(snaps.time_points, dtype=np.float64)
+        age_reached = float(meta["map_age"] + (t_pts[-1] * cu.code_time).to(u.yr).value)
+        if abs(age_reached - args.age) > 0.5:
+            print(f"[orlando] WARNING: the run reached {age_reached:.1f} yr, not the "
+                  f"{args.age:.0f} yr requested -- stamping the reached age.")
+        wa = meta["wind_asym"]
+        mass_ok = bool(not (good.size and good.max() > 1.01 * good[0]))
+
+        def scalar_fields(arr):
+            out = {}
+            if rv.passive_scalars_active:
+                i0 = rv.passive_scalar_index
+                for k, name in enumerate(SCALAR_NAMES):
+                    out[name] = arr[i0 + k]
+                i_hist = i0 + rv.num_passive_scalars - 4
+                for j, name in enumerate(("entropy_initial", "shocked_fraction",
+                                          "time_since_shock", "density_time")):
+                    out[name] = arr[i_hist + j]
+            return out
+
+        def save_npz(path, arr, age_yr, age_target):
+            sf = scalar_fields(arr)
+            np.savez_compressed(path, rho=arr[rv.density_index], press=arr[rv.pressure_index],
+                                vx=arr[rv.velocity_index.x], vy=arr[rv.velocity_index.y],
+                                vz=arr[rv.velocity_index.z],
+                                box=float(args.box), age=float(age_yr),
+                                age_target=float(age_target),
+                                num_cells=args.n, map_age=meta["map_age"],
+                                argv=np.array(" ".join(sys.argv)),
+                                git_commit=np.array(_git_commit()),
+                                mass_conserved=mass_ok,
+                                wind_asym_dipole=wa["dipole"], wind_asym_quadrupole=wa["quadrupole"],
+                                wind_asym_theta_deg=wa["theta_deg"], wind_asym_phi_deg=wa["phi_deg"],
+                                n_w=float(meta["n_w"]), r_fs_ref=float(meta["r_fs_ref"]),
+                                n_c=float(meta["n_c"]),
+                                r_profile_max=float(meta.get("r_profile_max") or np.nan),
+                                gamma=float(meta["gamma"]),
+                                **sf)
+            print(f"[orlando] saved state {path} at {age_yr:.1f} yr"
+                  + (f" (+ {len(sf)} scalar fields)" if sf else ""))
+
+        save_npz(args.save_state, fs, age_reached, args.age)
+        if args.snapshot_ages and snaps.states is not None:
+            # one file per requested age, named <stem>_age<AGE>yr.npz; the last
+            # snapshot is the final state and is already saved above
+            stem = args.save_state[:-4] if args.save_state.endswith(".npz") else args.save_state
+            states = snaps.states
+            for k in range(len(t_pts) - 1):
+                age_k = float(meta["map_age"] + (t_pts[k] * cu.code_time).to(u.yr).value)
+                save_npz(f"{stem}_age{age_k:.0f}yr.npz", np.asarray(states[k]), age_k, age_k)
 
     # ==== ↓ Refuse to report numbers from a state that has left the physical
     # regime ↓ ================================================================
@@ -1222,12 +1458,18 @@ def main():
     print(f"[orlando] measured at {args.age:.0f} yr: r_FS = {m['r_fs']:.3f} pc "
           f"(observed 2.52 +- 0.20), r_RS = {m['r_rs']:.3f} pc (observed 1.58 +- 0.16)")
 
+    # asym_field lives in build()'s meta: referencing a build() local here was a
+    # NameError that killed every --wind-asym run after the state was saved and
+    # before this line (CALIBRATION.md Result 26)
     angles, r_pa = shock_speed_vs_position_angle(
         rho, r_np, np.asarray(X), np.asarray(Y), np.asarray(Z),
-        asym=asym_field, rho_per_n=rho_per_n, r_max=0.5 * args.box,
+        asym=meta.get("asym_field"), rho_per_n=rho_per_n, r_max=0.5 * args.box,
         ambient_flat_beyond=meta.get("r_profile_max"), **wind)
+    pa = position_angle_statistics(angles, r_pa)
     print(f"[orlando] r_FS vs position angle: min {np.nanmin(r_pa):.3f}, "
-          f"max {np.nanmax(r_pa):.3f}, spread {np.nanmax(r_pa) - np.nanmin(r_pa):.3f} pc")
+          f"max {np.nanmax(r_pa):.3f}, spread {pa['spread']:.3f} pc; "
+          f"std {pa['std']:.3f}, m=1 amplitude {pa['m1']:.3f} pc at PA "
+          f"{pa['m1_pa_deg']:.0f} deg, m=2 amplitude {pa['m2']:.3f} pc")
 
     T = temperature_K(rho, p, cu)
     dx_cm = (args.box / args.n) * float((1.0 * cu.code_length).to(u.cm).value)

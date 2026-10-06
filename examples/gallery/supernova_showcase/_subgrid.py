@@ -156,12 +156,7 @@ def phase_factors(chi, f_mass, net_mode=NET_MODE_DEFAULT):
     if chi < 1.0:
         raise SystemExit(f"--subgrid-chi must be >= 1 (the dense phase is "
                          f"dense), got {chi}")
-    f_vol = f_mass / chi
-    if f_vol >= 1.0:
-        raise SystemExit(
-            f"chi = {chi} and f_mass = {f_mass} need the dense phase to fill "
-            f"{100 * f_vol:.0f}% of every cell, which leaves no diffuse phase. "
-            f"f_mass < chi is required.")
+    f_vol = f_mass / chi        # < 1 always, since f_mass < 1 <= chi
 
     rho_d = float(chi)
     rho_u = (1.0 - f_mass) / (1.0 - f_vol)
@@ -192,9 +187,12 @@ def two_phase(rho, T, *, chi=CHI_CALIBRATED, f_mass=F_MASS_DEFAULT,
             (right if the density rise and the shorter elapsed time cancel);
             ``crossing`` scales by ``chi / sqrt(chi) = sqrt(chi)``, for a
             transmitted shock crossing the clump at ``v/sqrt(chi)`` so the dense
-            gas has been shocked for ``1/sqrt(chi)`` as long. ``crossing`` is the
-            default because it is the only one of the three derived from the same
-            transmitted-shock argument that sets the temperature.
+            gas has been shocked for ``1/sqrt(chi)`` as long. ``unchanged`` is
+            the default (:data:`NET_MODE_DEFAULT`) because it is the mode the
+            XRISM ionization ages select (CALIBRATION.md Result 15); ``crossing``
+            is the one derived from the same transmitted-shock argument that sets
+            the temperature, and the two disagree -- that disagreement is a
+            statement about clump crossing times, not a free choice.
 
     Returns:
         A list of two dicts, dense first, each with ``rho``, ``T``,

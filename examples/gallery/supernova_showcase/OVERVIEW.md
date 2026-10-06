@@ -5,6 +5,13 @@ measurements and their derivations (Results 1–13); this says how the pieces fi
 together, what physics is in each, and — the part that matters most — what is
 still missing and why.*
 
+*2026-09-02: an audit of every recorded result (`CALIBRATION.md` Result 26)
+changed several numbers below — the synchrotron anchoring (§5.3) is withdrawn,
+the unshocked mass and the A1 ladder are re-measured, and three systematics
+on the comparison side (age vs epoch, response cycle, chip gap) are open.
+`ROADMAP.md` is the plan toward `vision.md` that follows from it. Read §4's
+caveat before quoting any single-epoch number.*
+
 *§5's ranking was revised on 2026-08-31 after a literature audit. One paper —
 **Vink et al., XRISM/Resolve mapping of Cas A (arXiv:2602.06952, ApJ 2026)**,
 published after every result in `CALIBRATION.md` — measures per element group
@@ -52,6 +59,10 @@ consequences drive every design choice below:
         ▼
  casa_morphology.py     structure vs scale + topology, against real evt2
  casa_morph_null.py     phase-randomised null: is the structure real?
+ casa_real_outline.py   the forward-shock OUTLINE and its expansion, with one
+                        detector on the real epoch images and the synthetic ones
+                        (Result 27: the data's m = 1 asymmetry is 0.2 pc at
+                        PA ~200 deg; the FS expands at 0.28-0.35"/yr)
  casa_analyze.py        shock radii, masses    casa_plasma.py  plasma diagnostics
  casa_xrism.py          per-element-group kT_e, n_e t, sigma_v and per-species
                         T_i against XRISM/Resolve -- the sharpest scoring in the
@@ -161,6 +172,32 @@ actual exposure. Output is an event list binnable exactly like real `evt2`.
 
 ## 4. Where the model stands
 
+**All of these are 350-yr models scored against ~320-yr data** (explosion
+1681 ± 19; the 2000/2004 epochs are 319/323 yr). That is a 6 % systematic in
+r_FS and a response-cycle mismatch in the soft band — Result 26, items 2–3 — and
+Result 27 shows the same configuration at the matched age scores differently on
+every axis (rate 0.99, IME bands 1.3–1.5, coherence 0.92). No number in this
+table has yet been reproduced at the data's epoch.
+
+**The candidate fiducial after the 2026-09-02/03 Stage-0 runs (Result 27) is
+scored at the data's epoch instead** — recalibrated at 319 yr (E 2.43e51, M_ej
+3.0, n_w 0.925, δ 0.82), A1 = 0.75 dipole wind, no shell, ejecta-only sub-grid
+split at χ = 4 / f_mass 0.34, `xrism_bulk` composition:
+
+| quantity | model | observed |
+|---|---|---|
+| r_FS / r_RS at 319 yr | 2.53 / 1.62 pc | 2.52 ± 0.20 / 1.58 ± 0.16 |
+| FS expansion 2000→2022, same image detector | 0.33″/yr | 0.32 (0.35 per cone) |
+| count rate vs 2000 | 1.03 | 1 |
+| bands 0.5–1.5 … 6–7 vs 2000 | 0.84 / 1.07 / 1.27 / 1.20 / 0.93 / 1.08 (rms 0.065 dex) | 1 |
+| outline, halo on, with the synchrotron rim (norm 4.6): ⟨r⟩ / std / m = 1 / PA | 2.620 / 0.168 / 0.226 pc / 201° | 2.619 / 0.209 / 0.195 / 202° |
+| non-thermal 4.2–6 keV | fitted efficiency ~15 on the radio-anchored chain | 8.7e-11 erg cm⁻² s⁻¹ (54 % of the observed band flux) |
+| bands with the rim at that level (thermal list f_mass 0.2) | 0.74 / 0.89 / 1.28 / 1.63 / **1.52** / **1.49** | 1 — the thermal 4–7 keV continuum is ~2× too bright (§5.0) |
+| σ_I/I real/syn 4.4″ / 8.4″ (A1 = 0.5 image) | 1.78 / 0.99 | 1 |
+| coherence 2.5″ | 0.87 | 0.61 |
+
+The table below it is the pre-audit scoreboard, kept for the record.
+
 **Two states carry these numbers and they are not interchangeable.** The
 dynamics and plasma diagnostics were measured on the 256³ fiducial
 `orl_n256_final`; the structural results and the halo-on spectrum on the 512³
@@ -173,7 +210,7 @@ them silently reads as one model when it is two.
 | r_FS | 2.494 pc | n256 | 2.52 ± 0.20 |
 | r_RS | 1.531 pc | n256 | 1.58 ± 0.16 |
 | shocked ejecta | 2.79 M☉ | n256 | 2.8–3.7 |
-| **unshocked ejecta** | **0.417 M☉** | n256 | **0.35 ± 0.10 — 0.67 σ, IN RANGE (was recorded as 0.21 and off; see §5.6)** |
+| **unshocked ejecta** | **0.417 M☉** | n256 | **0.35 ± 0.10 — 0.67 σ (the 1D value is 0.47 after Result 26's fix; 1D and 3D now agree)** |
 | shocked fraction of the ejecta | 87 % | n256 | 87–90 % |
 | EM-weighted kT_e | 3.05 keV | n256 | — |
 | EM-weighted n_e t | 2.3e11 | n256 | ~1e11 |
@@ -390,13 +427,17 @@ Cas A's ~500 µG rim field against a 350 yr remnant:
 | **observed filament width, 1–3″** | **0.19–0.58×** |
 | the model's **own** fresh fraction (0.0177) | **0.16×** |
 
-With the observed width supplying the thickness the prediction is **0.19–0.58×
-with nothing fitted**, and the model's own ram-pressure-weighted fresh fraction
-independently gives 0.16× — **the two routes to the emitting volume agree with
-each other to a factor ~1.2–3.5**, which is the substantive result. The shared
-offset from unity is open (η > 1 raises it). The width itself is not predicted:
-the observed filaments are 161–484× thicker than advection allows, which needs
-diffusive transport or magnetic damping and is an open problem.
+**WITHDRAWN 2026-09-02 (Result 26, item 5).** Two unit errors — a factor ~5
+in the band integral and a factor 2.5 in the loss-limited constant — inflated
+every number in the table above. Corrected, and against the corrected observed
+non-thermal flux (8.7e-11, Result 27): co-spatial 0.58× (not 9.3×), observed
+filament width **0.01–0.04×** (not 0.19–0.58×). The radio-anchored X-ray
+synchrotron is 25–100× too *faint* at the observed width; the normalisation is a
+fitted efficiency (~15 on the calibrated state) until a field-amplification
+model exists. The component is now wired as sub-band power laws and, at the
+fitted level, makes the observed outline visible through the halo (Result 27). The width itself is
+still not predicted (observed filaments are 161–484× thicker than advection
+allows).
 
 **Wired in** as a second pyXSIM source (`--synchrotron`, `--sync-eta`,
 `--sync-width`): verified end to end at 128³ — 2.7 % of cells emit, Γ comes out
@@ -406,11 +447,10 @@ the shape integral is the full `--emin/--emax` range rather than 4.2–6 keV whi
 TBabs is applied to the wired component and not to the standalone estimate — so
 the two are not yet the same comparison. Do not quote a non-thermal flux from it.
 
-**And one result with nothing adjustable at all:** inverting XRISM's
-Γ = 2.94–3.43 through the loss-limited relation at η = 1 gives a shock at
-**1708–2423 km s⁻¹** — Cas A's *reverse* shock (1800–2000), not its forward shock
-(~5000). The non-thermal continuum in those pointings is reverse-shock emission,
-and nothing was tuned to produce that.
+**The Γ → shock-speed inversion, corrected:** XRISM's Γ = 2.94–3.43 at η = 1
+gives **2725–3866 km s⁻¹** (the recorded 1708–2423 used the wrong constant) —
+between the reverse (1800–2000) and forward (~5000) shocks. It no longer singles
+out the reverse shock; that association rests on morphology alone.
 *Remaining:* reconcile the band definition and the absorption between the wired
 component and the standalone estimate, then scan η.
 
@@ -606,7 +646,7 @@ temperature); multi-temperature and multi-ionisation structure within a cell.
 
 | tested | result |
 |---|---|
-| cosmic-ray back-reaction (γ_eff) | pushes r_RS the **wrong way**; supports η < 10⁻⁴ (Result 3) |
+| cosmic-ray back-reaction (γ_eff) | pushes r_RS the **wrong way** (Result 3); scored on the temperatures at the data's epoch (Result 28): γ = 4/3 excluded by the post-shock density (compression 7 → n_post ≥ 5.4), γ = 1.5 leaves kT_e and the hard bands unchanged (< 0.1) because the compression gain cancels the temperature drop. The rim's field amplification is the only place cosmic rays matter, and it is a fitted efficiency |
 | magnetic fields | 20 µG (β = 3×10⁵): 0 %. 500 µG (25× over-strength): +2 % at 256³. Orlando et al. 2025 agree independently |
 | Ni bubbles at 150 yr | null, gentle *and* sharp walls — the real mechanism acts just after breakout, not at 150 yr |
 | clump amplitude **of the resolved log-normal** | χ saturates; coherence stalls at 0.787 vs 0.536; raising it degrades the hard continuum *and* drags r_RS off the observed value. **This does NOT close §5.1** — it says the *resolved, grid-clamped, species-independent* field cannot be pushed further, which is the reason §5.1 has to be sub-grid and two-phase |
@@ -828,7 +868,11 @@ at the images; see the note at the end of §5.
 ```bash
 cd examples/gallery/supernova_showcase
 
-# stage 1 — the calibration (seconds, CPU)
+# stage 1 — the calibration (seconds, CPU). The values below are the 350-yr
+# calibration every recorded result used; the recalibration at the data's age
+# (Result 27) is --energy-51 2.43 --ejecta-mass 3.0 --n-w 0.925 --inner-slope
+# 0.82, saved as casa_1d_map150_e319m.npz, and the 3D stage then takes
+# --age <epoch - 1681> (319 for the 2000 epoch) and --wind-asym 0.75.
 ./run.sh casa_calibrate_1d.py --n 4000 --energy-51 2.09 --ejecta-mass 3.0 \
     --n-w 0.928 --age 150 --save-profile casa_1d_map150.npz
 
@@ -843,9 +887,11 @@ pq sub -t a100 --gpus 1 -- ./run.sh casa_orlando.py casa_1d_map150.npz \
     --clump-region ejecta --save-state orl_n512_cd_adia.npz
 
 # stage 3 — the observation, in the OTHER env. --halo is not optional (§3).
+# Defaults since 2026-09-03: one-chip aimpoint, the epoch's ACIS array,
+# ejecta-only sub-grid split (chi 4, f_mass 0.34), xrism_bulk composition.
 S=/export/data/lstorcks/supernova_showcase
 /export/home/lstorcks/xrayobs/bin/python casa_observe.py $S/orl_n512_cd_adia.npz \
-    --exposure 20 --nei --halo --compare 2004 --out orl_n512_halo_uniform
+    --exposure 20 --nei --halo --subgrid-chi 4 --compare 2004 --out orl_n512_halo_uniform
 
 # stage 4 — the scores
 /export/home/lstorcks/xrayobs/bin/python casa_morphology.py \
@@ -883,3 +929,14 @@ against the state that owns the number (§4):**
 
 A change that improves the picture without improving a statistic is a failure,
 not a success.
+
+**Comparison-side systematics (Result 26) that every guardrail above inherits:**
+the model age (350 yr) vs the data epoch (~320 yr); the ACIS response cycle
+(2004 → cycle 0, five years of contamination unaccounted for); a constant N_H
+where the real column varies by a factor 2; and a synthetic chip gap at x ≈ −98″
+inside the morphology annulus — removing it moves the A1 = 0.5 model's 2.5″
+amplitude ratio from 1.15 to 1.74 and its 4.4″ from 0.76 to 1.04, so every
+recorded morphology number carries it (`--aimpt-shift`, now defaulting to the
+one-chip pointing). `ROADMAP.md` Stage 0 is the
+matched re-observation that removes them; until it is done, treat the soft
+bands and the 4.4″ morphology statistics as provisional.

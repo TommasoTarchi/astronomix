@@ -25,7 +25,7 @@ The whole chain, end to end::
     1D spherical hydro, ~200 yr of evolution        <- the solver itself
         |
         v
-    smooth observables: r_FS, r_RS, M_unshocked     <- see below
+    smooth observables: r_FS, r_RS, n_post, M_unshocked, v_rs_rel   <- see below
         |
         v
     chi^2 against the measured values
@@ -67,13 +67,15 @@ quantity.
 
 STATE OF THE OBSERVABLES (read before fitting anything)
 -------------------------------------------------------
-``r_FS`` is validated: 2.49 pc against 2.55 from the hard definition in
-``casa_calibrate_1d.py`` at matched parameters. ``r_RS`` and ``M_unshocked``
-are NOT yet reconciled with the definitions ``casa_analyze.py`` uses -- at
-delta = 0 the cold ejecta core is nearly exhausted, so "outer edge of the
-unshocked core" and "position of the reverse shock" are different quantities
-and this module currently measures the first. Do not fit against those two
-until that is settled; the gradient machinery is independent of it.
+All four smooth observables are transcribed from ``casa_calibrate_1d.
+measure_snapshot`` and reconciled against it by ``--validate`` (r_FS -1.6 %,
+r_RS +0.1 %, n_post +0.9 %, M_unshocked +5.7 %; CALIBRATION.md Result 19).
+Two caveats stand. (1) The 3D detector in ``casa_orlando.measure_shocks_3d``
+uses a LOOSER homology tolerance (0.08 vs 0.05) and a per-shell majority vote,
+so 1D and 3D r_RS are similar but not identical definitions. (2) The unshocked
+mass was biased low by ~0.08 Msun until 2026-09-02 (the whole interior wind
+mass was subtracted; see ``build_state``), so the fitted delta in Results 19
+and 22 was pushed high to compensate -- re-fit before quoting it.
 
 USAGE
 -----
@@ -151,8 +153,12 @@ from _common import GAMMA, MASS_PER_NUCLEUS, ejecta_radial_shape, snr_code_units
 PARAM_NAMES = ("log10_E51", "M_ej", "n_w", "inner_slope")
 PARAM_TRANSFORM = ("log10", "linear", "linear", "linear")
 
-#: Starting point: the hand-calibrated fiducial of CALIBRATION.md Result 2.
-THETA0 = jnp.array([np.log10(2.09), 3.0, 0.928, 0.0])
+#: Starting point: the hand-calibrated fiducial of CALIBRATION.md Result 2, at
+#: the PRODUCTION inner slope delta = 1 (the committed casa_1d_map150.npz
+#: carries cfg_inner_slope = 1.0; Result 20). Results 19/22 started from
+#: delta = 0 and reported the fit as a move away from the fiducial, which it
+#: was not.
+THETA0 = jnp.array([np.log10(2.09), 3.0, 0.928, 1.0])
 
 #: The measurements, with their uncertainties. These are the SAME numbers the
 #: scoreboard in OVERVIEW.md §4 is scored against, so a fit here is directly
@@ -298,9 +304,12 @@ def build_state(theta, config, helper_data, registered_variables, code_units,
     # ejecta is younger at the same radius. Carrying it as a traced quantity is
     # not pedantry: it is a real d(t_end)/dE term in every gradient below.
     t0 = 1.0 / s
-    # wind mass that was already inside the initial ejecta radius
-    m_wind_interior = jnp.sum(jnp.where(r < r0, rho_amb, 0.0) * cell_vol)
-    return state, rho_amb, p_amb, m_wind_interior, t0
+    # The Lagrangian map (total enclosed mass -> wind mass inside the same mass
+    # coordinate) on the initial profile. 1D flow preserves mass ordering, so it
+    # is exact later, and it is what separates unshocked EJECTA from the wind
+    # that started inside r0. Traced, so d(M_unshocked)/d(theta) sees it.
+    wind_mass_map = (jnp.cumsum(rho * cell_vol), jnp.cumsum(rho_amb * cell_vol))
+    return state, rho_amb, p_amb, wind_mass_map, t0
 
 
 # =============================================================================
@@ -363,7 +372,12 @@ def observables(final_state, rho_amb, p_amb, m_wind_interior,
     Args:
         rho_amb, p_amb: the INITIAL ambient profiles, which are the correct
             reference: the unshocked wind ahead of the blast has not moved.
-        m_wind_interior: wind mass that started inside the ejecta radius.
+        m_wind_interior: ``(M_total_cum, M_wind_cum)`` from ``build_state`` --
+            the wind mass inside each Lagrangian mass coordinate. (Until
+            2026-09-02 this was the SCALAR wind mass inside r0, all of which was
+            subtracted; but that wind sits at the ejecta's OUTER mass
+            coordinates, so ~0.08 Msun was wrongly removed from every unshocked
+            mass -- see ``casa_calibrate_1d.measure_snapshot``.)
         t_total_code: time since the EXPLOSION, in code units -- not the elapsed
             simulation time. Homology is ``v = r/t`` measured from the
             explosion, so this is the age and not ``t_end``.
@@ -450,7 +464,9 @@ def observables(final_state, rho_amb, p_amb, m_wind_interior,
     inside_rs = jax.nn.sigmoid((r_rs - r) / (4.0 * dr))
     m_inside = jnp.sum(rho * inside_rs * cell_vol)
     to_msun = float((1.0 * code_units.code_mass).to(u.Msun).value)
-    m_unshocked_msun = m_inside * to_msun - m_wind_interior * to_msun
+    m_tot_cum, m_wind_cum = m_wind_interior
+    m_wind_inside = jnp.interp(m_inside, m_tot_cum, m_wind_cum)
+    m_unshocked_msun = (m_inside - m_wind_inside) * to_msun
 
     # ---- post-shock density ----------------------------------------------
     # Mean density over the outer 5 % of the shocked region, matching
@@ -495,7 +511,7 @@ def observables(final_state, rho_amb, p_amb, m_wind_interior,
 # =============================================================================
 # ============ ↓ The forward model and the loss ↓ =============================
 # =============================================================================
-def make_forward(num_cells=2000, r_max=4.0, age_yr=AGE_YR, cfl=0.4):
+def make_forward(num_cells=2000, r_max=4.0, age_yr=AGE_YR, cfl=0.4, gamma=GAMMA):
     """Build ``theta -> observables``, with everything constant hoisted out."""
     code_units = snr_code_units()
     config = base_config(num_cells, r_max)
@@ -510,7 +526,7 @@ def make_forward(num_cells=2000, r_max=4.0, age_yr=AGE_YR, cfl=0.4):
             r_max=r_max, num_cells=num_cells)
         cfg = finalize_config(config, state.shape)
         params = SimulationParams(
-            C_cfl=cfl, gamma=GAMMA,
+            C_cfl=cfl, gamma=gamma,
             t_end=age_yr * yr_to_code - t0,     # traced: t0 depends on E
             minimum_density=1e-6, minimum_pressure=1e-12,
         )
@@ -520,7 +536,7 @@ def make_forward(num_cells=2000, r_max=4.0, age_yr=AGE_YR, cfl=0.4):
         # time since the EXPLOSION, which is what homology is measured from --
         # t0 is already inside age_yr * yr_to_code, so this is the age itself
         return observables(final, rho_amb, p_amb, m_wind_int, rv, helper_data,
-                           code_units, dr=dr,
+                           code_units, dr=dr, gamma=gamma,
                            t_total_code=age_yr * yr_to_code)
 
     return forward, dict(code_units=code_units, config=config,
@@ -582,7 +598,7 @@ def cmd_check_grad(args):
     still a useful descent direction is an empirical question, not a
     theoretical one, and it is answered here.
     """
-    forward, _ = make_forward(num_cells=args.n, age_yr=args.age)
+    forward, _ = make_forward(num_cells=args.n, age_yr=args.age, gamma=args.gamma)
     loss = make_loss(forward)
     theta = THETA0
 
@@ -611,7 +627,7 @@ def cmd_check_grad(args):
 
 def cmd_validate(args):
     """Compare the smooth observables against the hard (non-differentiable) ones."""
-    forward, ctx = make_forward(num_cells=args.n, age_yr=args.age)
+    forward, ctx = make_forward(num_cells=args.n, age_yr=args.age, gamma=args.gamma)
     code_units, hd, rv = ctx["code_units"], ctx["helper_data"], ctx["rv"]
     dr = ctx["dr"]
 
@@ -621,14 +637,14 @@ def cmd_validate(args):
         theta, config, hd, rv, code_units, r_max=4.0, num_cells=args.n)
     cfg = finalize_config(config, state.shape)
     yr_to_code = float((1.0 * u.yr).to(code_units.code_time).value)
-    params = SimulationParams(C_cfl=0.4, gamma=GAMMA,
+    params = SimulationParams(C_cfl=0.4, gamma=args.gamma,
                               t_end=args.age * yr_to_code - t0,
                               minimum_density=1e-6, minimum_pressure=1e-12)
     final = time_integration(state, cfg, params, rv)
 
     t_total = args.age * yr_to_code
     smooth = observables(final, rho_amb, p_amb, m_wind_int, rv, hd,
-                         code_units, dr=dr, t_total_code=t_total)
+                         code_units, dr=dr, t_total_code=t_total, gamma=args.gamma)
 
     # THE HARD DEFINITIONS, TRANSCRIBED FROM casa_calibrate_1d.measure_snapshot.
     # Transcribed and not approximated: an earlier version of this function used
@@ -652,9 +668,11 @@ def cmd_validate(args):
     hom = band & (np.abs(vel - v_hom) < HOMOLOGY_TOL * v_hom)
     hard_rs = float(r[np.max(np.where(hom)[0])]) if np.any(hom) else np.nan
 
-    # unshocked ejecta mass: all mass inside r_RS, minus the interior wind
-    hard_mu = (float(np.sum(np.where(r <= hard_rs, rho * cell_vol, 0.0)))
-               - float(m_wind_int)) * to_msun
+    # unshocked ejecta mass: all mass inside r_RS, minus the wind inside the
+    # same Lagrangian mass coordinate (casa_calibrate_1d.measure_snapshot)
+    hard_min = float(np.sum(np.where(r <= hard_rs, rho * cell_vol, 0.0)))
+    hard_mu = (hard_min - float(np.interp(hard_min, np.asarray(m_wind_int[0]),
+                                          np.asarray(m_wind_int[1])))) * to_msun
 
     # post-shock density: boolean shell over the outer 5% of the shocked region
     rho_per_n = float((MASS_PER_NUCLEUS * const.m_p / u.cm ** 3)
@@ -670,7 +688,7 @@ def cmd_validate(args):
               if np.any(sh_rs) else np.nan)
 
     # the OLD entropy definition, reported so the two are never confused again
-    log_s = np.log10(np.maximum(press, 1e-30)) - GAMMA * np.log10(np.maximum(rho, 1e-30))
+    log_s = np.log10(np.maximum(press, 1e-30)) - args.gamma * np.log10(np.maximum(rho, 1e-30))
     cold = log_s < (log_s.min() + np.log10(30.0))
     hard_cold = float(r[np.max(np.where(cold)[0])]) if np.any(cold) else np.nan
 
@@ -700,12 +718,14 @@ def cmd_fit(args):
     """Gauss-Newton fit of the parameters to the measurements.
 
     Gauss-Newton rather than Adam because the problem is a small weighted
-    least-squares with an exact Jacobian available: 4 parameters, 3
-    observables. The step is damped (Levenberg) since the system is
-    under-determined -- 3 measurements cannot fix 4 parameters, and pretending
-    otherwise would report a spuriously precise answer.
+    least-squares with an exact Jacobian available: 4 parameters against the
+    observables in ``TARGETS`` (5 at present, so over-determined by one). The
+    step is damped (Levenberg, unscaled lambda -- note that acts unevenly on
+    log10 E versus the linear parameters); when ``TARGETS`` has fewer entries
+    than parameters the note below says so, because an under-determined fit
+    returns a point on a degenerate valley, not a unique answer.
     """
-    forward, _ = make_forward(num_cells=args.n, age_yr=args.age)
+    forward, _ = make_forward(num_cells=args.n, age_yr=args.age, gamma=args.gamma)
     keys = list(TARGETS)
     sig = jnp.array([TARGETS[k][1] for k in keys])
     tgt = jnp.array([TARGETS[k][0] for k in keys])
@@ -732,10 +752,15 @@ def cmd_fit(args):
           "anti-correlated. n_post is in the target list\n[diff]   precisely "
           "to break that -- it pins n_w almost directly.")
 
+    frozen = jnp.array([n in (args.freeze or ()) for n in PARAM_NAMES])
+    if bool(frozen.any()):
+        print(f"[diff] frozen at their starting values: {list(args.freeze)} -- the "
+              "delta-M_ej valley is degenerate (Result 19), so a free M_ej wanders")
     for it in range(args.steps):
         obs = forward(theta)
         res = (jnp.array([obs[k] for k in keys]) - tgt) / sig
         J = jvp_jacobian(forward, theta, keys) / sig[:, None]
+        J = jnp.where(frozen[None, :], 0.0, J)      # a frozen parameter takes no step
         chi = float(jnp.sum(res ** 2))
         print(f"[diff] step {it}: chi^2 = {chi:8.3f}  " +
               "  ".join(f"{k} = {float(obs[k]):.3f}" for k in keys) + "  |  " +
@@ -761,12 +786,19 @@ def main():
                          "and a GPU wait costs more than the solve)")
     ap.add_argument("--n", type=int, default=2000, help="1D radial cells")
     ap.add_argument("--age", type=float, default=AGE_YR, help="age to evolve to (yr)")
+    ap.add_argument("--gamma", type=float, default=GAMMA,
+                    help="adiabatic index; an EFFECTIVE value < 5/3 stands in for "
+                         "cosmic-ray pressure (Result 3 on the radii; Result 28 on "
+                         "the temperatures)")
     ap.add_argument("--check-grad", action="store_true",
                     help="validate the JVP gradient against finite differences")
     ap.add_argument("--validate", action="store_true",
                     help="compare the smooth observables with the hard ones")
     ap.add_argument("--fit", action="store_true", help="run the Gauss-Newton fit")
     ap.add_argument("--steps", type=int, default=8, help="fit iterations")
+    ap.add_argument("--freeze", nargs="*", default=None, choices=PARAM_NAMES,
+                    help="hold these parameters at THETA0 (e.g. M_ej, which the "
+                         "targets do not determine)")
     ap.add_argument("--damping", type=float, default=1.0, help="Levenberg damping")
     ap.add_argument("--step-scale", type=float, default=0.5, help="step fraction")
     ap.add_argument("--eps", type=float, default=1e-3,

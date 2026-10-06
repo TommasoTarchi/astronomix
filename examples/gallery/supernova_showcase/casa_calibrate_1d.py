@@ -3,8 +3,8 @@ Cassiopeia A, step 1 of the Orlando ladder: calibrate the explosion in 1D.
 
 The 3D showcase runs (``cassiopeia_realistic.py``) start a cold, homologous
 ejecta ball already at 1.5 pc and tag it with an age ``R / v_max``. That skips
-the phase that actually sets the answer: an r^-2 wind with n_w = 0.8 cm^-3 at
-2.5 pc already contains ~3.3 M_sun -- an entire ejecta mass -- inside 1.5 pc, so
+the phase that actually sets the answer: an r^-2 wind with n_w ~ 0.9 cm^-3 at
+2.5 pc already contains ~3 M_sun -- an entire ejecta mass -- inside 1.5 pc, so
 by that radius the remnant should long since have swept up its own mass, driven
 a reverse shock and given a large part of its energy to the shocked wind.
 
@@ -273,6 +273,13 @@ def build_1d(cfg):
         M_wind_inside_r0=float(jnp.sum(jnp.where(r < cfg["r0"], rho_amb, 0.0) * cell_vol)),
         cells_across_ejecta=cfg["r0"] / dx,
         rho_per_n=rho_per_n,
+        # The Lagrangian map from TOTAL enclosed mass to the WIND mass inside
+        # the same mass coordinate, on the initial profile. A 1D spherical flow
+        # preserves mass ordering, so this is exact at every later time and is
+        # how the unshocked-ejecta mass separates ejecta from the wind that
+        # started inside r0 (see measure_snapshot).
+        wind_mass_map=(np.cumsum(np.asarray(rho * cell_vol, dtype=np.float64)),
+                       np.cumsum(np.asarray(rho_amb * cell_vol, dtype=np.float64))),
     )
     return state, config, params, registered_variables, helper_data, code_units, info
 # =============================================================================
@@ -284,12 +291,24 @@ def build_1d(cfg):
 # ============ ↓ Shock diagnostics ↓ ==========================================
 # =============================================================================
 def measure_snapshot(r, rho, v, p, *, age_yr, cfg, rho_per_n, code_units,
-                     homology_tol=0.05, fs_contrast=2.0):
+                     homology_tol=0.05, fs_contrast=2.0, wind_mass_map=None):
     """Measure r_FS, r_RS and the post-shock density on one radial profile.
 
     See the module docstring for the definitions. Radii come back in pc, the
     post-shock number density in cm^-3; ``None`` if a shock is not found (e.g.
     before the reverse shock has formed).
+
+    ``wind_mass_map`` is ``build_1d``'s ``(M_total_cum, M_wind_cum)`` on the
+    initial profile. The unshocked-ejecta mass is all the mass inside r_RS minus
+    the WIND inside the same Lagrangian mass coordinate. Until 2026-09-02 the
+    whole ``M_wind_inside_r0`` (0.084 Msun) was subtracted instead; but the wind
+    that started inside r0 is uniform in radius while the ejecta is centrally
+    peaked, so it sits at the OUTER mass coordinates of the ejecta and almost
+    none of it (~0.001 Msun) is inside the innermost ~0.4 Msun. That constant
+    biased every recorded 1D unshocked mass LOW by ~0.08 Msun (0.8 sigma of the
+    0.35 +- 0.10 target) -- which is exactly the offset between the 1D value and
+    the 3D tracer measurement (0.417 Msun). Without the map the old constant
+    is used and a warning printed.
     """
     r = np.asarray(r); rho = np.asarray(rho); v = np.asarray(v)
     t_code = float((age_yr * u.yr).to(code_units.code_time).value)
@@ -324,8 +343,17 @@ def measure_snapshot(r, rho, v, p, *, age_yr, cfg, rho_per_n, code_units,
     m_unshocked = None
     if r_rs is not None:
         shell = 4.0 * np.pi * r ** 2 * np.asarray(rho) * np.gradient(r)
-        m_unshocked = float(np.sum(np.where(r <= r_rs, shell, 0.0))
-                            - cfg.get("_m_wind_interior", 0.0))
+        m_inside = float(np.sum(np.where(r <= r_rs, shell, 0.0)))
+        if wind_mass_map is not None:
+            m_tot_cum, m_wind_cum = wind_mass_map
+            m_wind_inside = float(np.interp(m_inside, m_tot_cum, m_wind_cum))
+        else:
+            if not getattr(measure_snapshot, "_warned", False):
+                print("[calibrate] WARNING: no wind_mass_map; subtracting the whole "
+                      "interior wind mass, which biases M_unshocked low by ~0.08 Msun")
+                measure_snapshot._warned = True
+            m_wind_inside = cfg.get("_m_wind_interior", 0.0)
+        m_unshocked = m_inside - m_wind_inside
     return dict(r_fs=r_fs, r_rs=r_rs, n_post=n_post, m_unshocked=m_unshocked)
 
 
@@ -344,7 +372,7 @@ def measure_run(snaps, helper_data, registered_variables, code_units, cfg, info)
             st[registered_variables.velocity_index],
             st[registered_variables.pressure_index],
             age_yr=age[k], cfg=cfg, rho_per_n=info["rho_per_n"],
-            code_units=code_units)
+            code_units=code_units, wind_mass_map=info.get("wind_mass_map"))
         m["age_yr"] = float(age[k])
         rows.append(m)
 
@@ -403,9 +431,11 @@ def _enclosed_mass_at(snaps, helper_data, registered_variables, radii):
 def default_cfg(**over):
     """The baseline calibration configuration (the current showcase parameters)."""
     cfg = dict(
-        # explosion
-        energy_erg=1.5e51,
-        ejecta_mass_msun=3.3,
+        # explosion -- the CALIBRATED fiducial (CALIBRATION.md Result 2). The
+        # defaults used to be the pre-calibration showcase values (1.5e51, 3.3,
+        # 0.8), so a bare run reproduced the model this script exists to replace.
+        energy_erg=2.09e51,
+        ejecta_mass_msun=3.0,
         envelope_slope=9.0,
         inner_slope=1.0,   # standard core-collapse inner index; see CALIBRATION.md
         core_fraction=0.5,
@@ -413,7 +443,7 @@ def default_cfg(**over):
         ejecta_temperature_K=100.0,
         taper_cells=3.0,
         # circumstellar medium
-        n_w=0.8, r_fs_ref=2.5, n_c=0.1,
+        n_w=0.928, r_fs_ref=2.5, n_c=0.1,
         wind_temperature_K=1e4,
         # grid / integration
         r_max=4.0, num_cells=2000, cfl=0.4, gamma=GAMMA,
@@ -475,9 +505,9 @@ def main():
     ap.add_argument("--n", type=int, default=2000, help="number of radial cells")
     ap.add_argument("--r-max", type=float, default=4.0, help="outer radius (pc)")
     ap.add_argument("--r0", type=float, default=0.05, help="initial ejecta radius (pc)")
-    ap.add_argument("--energy-51", type=float, default=1.5, help="explosion energy / 1e51 erg")
-    ap.add_argument("--ejecta-mass", type=float, default=3.3, help="ejecta mass (Msun)")
-    ap.add_argument("--n-w", type=float, default=0.8, help="wind density at r_fs_ref (cm^-3)")
+    ap.add_argument("--energy-51", type=float, default=2.09, help="explosion energy / 1e51 erg (calibrated fiducial)")
+    ap.add_argument("--ejecta-mass", type=float, default=3.0, help="ejecta mass (Msun, calibrated fiducial)")
+    ap.add_argument("--n-w", type=float, default=0.928, help="wind density at r_fs_ref (cm^-3, calibrated fiducial)")
     ap.add_argument("--envelope-slope", type=float, default=9.0, help="ejecta envelope index")
     ap.add_argument("--inner-slope", type=float, default=1.0,
                     help="inner ejecta density index delta (rho ~ r^-delta inside "

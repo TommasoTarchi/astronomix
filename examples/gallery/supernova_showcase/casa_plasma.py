@@ -62,6 +62,7 @@ from _plasma import (
     CODE_DENSITY,
     CODE_LENGTH,
     KEV_IN_K,
+    TE_MODELS,
     TRACER_SPLIT_PRESETS,
     _self_check,
     load_diagnostic_state,
@@ -113,6 +114,13 @@ def main():
                          "disagree, and every mass and abundance below depends\n"
                          "on which is used")
     ap.add_argument("--out", default="casa_plasma", help="figure name stem")
+    ap.add_argument("--te-model", default="ghavamian", choices=TE_MODELS,
+                    help="electron-heating prescription (see _plasma); the "
+                         "printed T_e/T used to be ghavamian whatever was asked")
+    ap.add_argument("--kt-e-shock", type=float, default=0.3,
+                    help="post-shock kT_e (keV) for --te-model ghavamian")
+    ap.add_argument("--beta-shock", type=float, default=0.05,
+                    help="T_e/T_i at the shock for --te-model beta")
     args = ap.parse_args()
 
     _self_check()
@@ -129,7 +137,10 @@ def main():
     age, box, n = meta["age"], meta["box"], meta["num_cells"]
 
     # all of the physics, with the composition the run actually carried
-    ps = plasma_state(state)
+    ps = plasma_state(state, te_model=args.te_model,
+                      kT_e_shock_keV=args.kt_e_shock, beta_shock=args.beta_shock)
+    print(f"[plasma] electron heating: {args.te_model} "
+          f"(kT_e,shock {args.kt_e_shock} keV, beta {args.beta_shock})")
     T, T_e, T_i, net = ps["T"], ps["T_e"], ps["T_i"], ps["net"]
     n_e, shocked = ps["n_e"], ps["shocked"]
     if not ps["info"]["composition_tracked"]:

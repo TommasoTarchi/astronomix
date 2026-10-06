@@ -96,6 +96,7 @@ from _plasma import (
     KEV_IN_K,
     K_B,
     M_P,
+    TE_MODELS,
     TRACER_SPLIT_PRESETS,
     load_diagnostic_state,
     plasma_state,
@@ -383,9 +384,12 @@ def main():
                     help="sky pixel size; 30 is Resolve's")
     ap.add_argument("--bright-fraction", type=float, default=0.05,
                     help="keep pixels above this fraction of the brightest")
-    ap.add_argument("--te-model", default="ghavamian",
+    ap.add_argument("--te-model", default="ghavamian", choices=TE_MODELS,
                     help="passed to _plasma.plasma_state")
     ap.add_argument("--kt-e-shock", type=float, default=0.3)
+    ap.add_argument("--beta-shock", type=float, default=0.05,
+                    help="T_e/T_i at the shock for --te-model beta (was silently "
+                         "fixed at 0.05 whatever --te-model said)")
     ap.add_argument("--subgrid-chi", type=float, nargs="+", default=None,
                     metavar="CHI",
                     help="re-read every cell as a two-phase medium of density "
@@ -497,7 +501,8 @@ def measure(fields, args, v_los, n, box, *, chi, f_mass, verbose=False):
         for name, fp, f_vol in subgrid_phases(
                 fields, chi=c, f_mass=f_mass, net_mode=args.subgrid_net_mode):
             ps = plasma_state(fp, te_model=args.te_model,
-                              kT_e_shock_keV=args.kt_e_shock)
+                              kT_e_shock_keV=args.kt_e_shock,
+                              beta_shock=args.beta_shock)
             if not ps["info"]["composition_tracked"]:
                 raise SystemExit(
                     "this state carries no composition scalars, so it has no "
@@ -683,12 +688,15 @@ def report(results, args):
         v = np.sqrt(16.0 / 3.0 * r["global_kT_s"] * KEV_IN_K * K_B / (A * M_P))
         print(f"    {group}: kT_i({el}) = {r['global_kT_s']:.0f} keV implies a "
               f"shock at {v / 1e5:.0f} km/s")
-    v_obs = np.sqrt(16.0 / 3.0 * 176.0 * KEV_IN_K * K_B
-                    / (ATOMIC["Si"][0] * M_P)) / 1e5
+    # T_i(Fe) - T_i(Si) = (3/16) (m_Fe - m_Si) v^2 / k, so the inversion uses the
+    # MASS DIFFERENCE, not m_Si. (An earlier version used m_Si and evaluated at
+    # 176 keV while labelling the result "150 keV"; A_Si ~ A_Fe - A_Si hid it.)
+    dA = ATOMIC["Fe"][0] - ATOMIC["Si"][0]
+    v_of = lambda dkT: np.sqrt(16.0 / 3.0 * dkT * KEV_IN_K * K_B / (dA * M_P)) / 1e5
     print(f"    XRISM's 150-300 keV Fe-Si difference corresponds to a reverse "
-          f"shock\n    near {v_obs:.0f} km/s (150 keV) to "
-          f"{v_obs * np.sqrt(300.0 / 176.0):.0f} km/s (300 keV), and the "
-          "published\n    value is 1800 km/s.")
+          f"shock\n    near {v_of(150.0):.0f} km/s (150 keV) to "
+          f"{v_of(300.0):.0f} km/s (300 keV) [1800 km/s <-> {(3.0 / 16.0) * dA * M_P * (1.8e8) ** 2 / K_B / KEV_IN_K:.0f} keV], "
+          "and the\n    published value is 1800 km/s.")
 
     print("\n[xrism] ==== composition-free shock speed (THE THERMODYNAMIC "
           "GUARDRAIL) ====")

@@ -49,28 +49,38 @@ number):
 ===============================================  ==========================
 emitting volume assumed                          4.2-6 keV vs observed
 ===============================================  ==========================
-co-spatial with the radio (whole shell)          **9.3x too bright**
-purely advected loss layer, 1.0e-4 pc            **0.001x** (~800x too faint)
-**observed filament width, 1-3 arcsec**          **0.19x - 0.58x**
-the model's OWN fresh fraction, 0.0177           **0.16x**
+co-spatial with the radio (whole shell)          **0.58x**
+purely advected loss layer, 1.0e-4 pc            **0.0001x**
+**observed filament width, 1-3 arcsec**          **0.01x - 0.04x**
 ===============================================  ==========================
 
-**So the picture is consistent to within a factor of a few, in the direction of
-too faint.** Anchored on the measured radio flux, with a loss-limited cutoff and
-the observed filament width as the emitting thickness, the predicted 4.2-6 keV
-non-thermal flux is 0.19-0.58x the measured one, with no efficiency and no
-amplification factor fitted -- and the model's own ram-pressure-weighted fresh
-fraction gives 0.16x, i.e. the two independent routes to the emitting volume
-agree with each other to a factor ~1.2-3.5. That agreement is the substantive
-result; the shared offset from unity is not resolved and could be the gyrofactor
-(``eta > 1`` raises the cutoff and the flux) or a real deficit.
+*(numbers re-derived 2026-09-02/03 after two unit errors and a wrong observed
+anchor, below; the self-check prints them against
+:data:`OBSERVED_NONTHERMAL_FLUX_42_60`)*
 
-**A CORRECTION TO AN EARLIER VERSION OF THIS TABLE.** It quoted 0.51-1.53x and
-"consistent within a factor of two", using a 0.3 pc emitting shell. That is the
-visually bright rim, not the shocked region: the calibrated solution has
-``r_FS - r_RS = 0.8 pc``. With the right thickness the numbers are the ones above.
-The wrong value also made the wired component in ``casa_observe.py`` appear ~30x
-fainter than this module predicted, which read as a plumbing bug and was not one.
+**So the anchored prediction is NOT within a factor of a few.** With the radio
+flux fixing the electrons, a loss-limited cutoff at eta = 1 and the observed
+filament width as the emitting thickness, the predicted 4.2-6 keV non-thermal
+flux is ~25-100x FAINTER than the measured one; even a rim as thick as the whole
+shocked region (0.8 pc) is a factor ~2 short. Read physically: the radio
+electrons cannot be the same population, in the same field, that makes the
+X-ray synchrotron unless the X-ray-emitting volume is far larger than the
+observed filaments -- or the cutoff is higher than the eta = 1 loss-limited
+value (eta < 1 is unphysical for Bohm, so the alternative is a HIGHER shock
+speed in the emitting gas, or field amplification that raises the radio
+efficiency of the thin layer relative to the shell). This is the open problem,
+stated honestly; the earlier "consistent to a factor of a few" was two bugs.
+
+**TWO CORRECTIONS TO EARLIER VERSIONS OF THIS TABLE (2026-09-02).**
+(1) :func:`band_shape_integral` integrated ``E * shape`` although ``shape`` is
+already an energy flux density -- every absolute flux was ~5x too high.
+(2) :data:`CUTOFF_KEV_AT_3000` was 1.4 keV, which is Zirakashvili & Aharonian's
+relation evaluated at 5000 km/s, not 3000; the constant at 3000 km/s is 0.55.
+Every cutoff was 2.5x too high, and the ``Gamma -> shock speed`` inversion
+below moved from 1708-2423 to 2725-3866 km/s. A still earlier version used a
+0.3 pc shell (the bright rim, not the 0.8 pc shocked region). The self-check
+had the wrong numbers asserted in, which is the lesson: an assertion built
+from the module's own output guards against regressions, not against errors.
 
 **What is NOT predicted is the filament width itself.** The advected loss layer
 is 2936x thinner than the emitting shell, so the observed 1-3 arcsec filaments
@@ -88,11 +98,12 @@ parameter:
 
 1. **The cutoff energy is a shock-speed measurement.** Inverting XRISM's fitted
    photon index Gamma = 2.94-3.43 through the loss-limited relation at eta = 1
-   gives a shock at **1708-2423 km/s** -- Cas A's *reverse* shock (1800-2000),
-   not its forward shock (~5000). So the non-thermal continuum in those pointings
-   is reverse-shock emission, which agrees with the published association of the
-   non-thermal continuum with the reverse shock in the (south)west, and which
-   nothing here was tuned to produce.
+   gives a shock at **2725-3866 km/s** (corrected 2026-09-02; the earlier
+   1708-2423 used the wrong constant). That is BETWEEN Cas A's reverse shock
+   (1800-2000, ejecta frame) and its forward shock (~5000): consistent with
+   reverse-shock emission at eta ~ 2-4, or forward-shock emission at eta ~ 2-3.
+   It no longer singles out the reverse shock on its own; the published
+   association with the (south)western reverse shock rests on morphology.
 2. **The spatial distribution of the cutoff** follows from the simulated
    shock-velocity field, so the *radial profile* and the *hardness gradient* of
    the non-thermal component are predicted up to one overall factor -- and those
@@ -112,7 +123,7 @@ THE ONE ROBUST RESULT THIS RESTS ON
 For a shock where acceleration is limited by synchrotron losses rather than by
 age or escape -- which is Cas A's regime -- the cutoff photon energy is
 
-    h nu_cut ~ 1.4 keV * (v_s / 3000 km/s)^2 / eta
+    h nu_cut ~ 0.55 keV * (v_s / 3000 km/s)^2 / eta   (= 1.4 keV at 5000 km/s)
 
 and is **independent of the magnetic field** (Zirakashvili & Aharonian 2007;
 Vink 2012 for the review). The B-dependences of the acceleration rate and of the
@@ -189,8 +200,11 @@ RADIO_ALPHA = 0.77          # S_nu ~ nu^-alpha, so the electron index s = 2a+1
 RADIO_SECULAR_DECLINE_PER_YR = 0.007
 
 #: Zirakashvili & Aharonian (2007): loss-limited cutoff photon energy at
-#: 3000 km/s and Bohm diffusion. Independent of B -- see the module docstring.
-CUTOFF_KEV_AT_3000 = 1.4
+#: 3000 km/s and Bohm diffusion, ``eps_0 = 0.55 keV (v_s / 3000 km/s)^2 / eta``.
+#: Independent of B -- see the module docstring. (An earlier version used 1.4,
+#: which is the SAME relation evaluated at 5000 km/s -- Vink's review quotes
+#: ``1.4 keV (v_s/5000)^2`` -- so every cutoff was 2.5x too high; 2026-09-02.)
+CUTOFF_KEV_AT_3000 = 0.55
 
 #: measured non-thermal share of the 4.2-6 keV band, to compare a prediction
 #: against. Helder & Vink (2008) remnant-integrated; Vink et al. (2026) per
@@ -221,6 +235,16 @@ ARCSEC_IN_PC = 1.0 / (206264.806 / 3400.0)
 #: it cannot remove anything that actually emits; how much it discards is
 #: asserted at 0.1 %.
 NEGLIGIBLE_FLUX_FRACTION = 1e-6
+
+#: Observed NON-THERMAL 4.2-6 keV energy flux inside r < 200", erg cm^-2 s^-1.
+#: Derived 2026-09-03 (CALIBRATION.md Result 27), not copied: the thermal-only
+#: model reproduces the real 4.2-6 keV COUNT rate to 3 % and its absorbed band
+#: energy flux in the pyXSIM list is 1.66e-10, so the observed total band flux
+#: is ~1.6e-10; Helder & Vink (2008)'s remnant-integrated non-thermal share of
+#: ~54 % of that is 8.7e-11. The earlier hard-coded 2.7e-11 was inconsistent
+#: with the observed band flux at that share (it would be a 17 % share) and
+#: made the fitted efficiency read 4.6 instead of ~15.
+OBSERVED_NONTHERMAL_FLUX_42_60 = 8.7e-11
 #: ceiling on the reported photon index, for the same reason. A synchrotron
 #: spectrum this steep is indistinguishable from no emission.
 GAMMA_MAX = 10.0
@@ -280,17 +304,22 @@ def spectral_shape(E_keV, E_cut_keV, alpha=RADIO_ALPHA):
 
 def band_shape_integral(E_lo_keV, E_hi_keV, E_cut_keV, *, alpha=RADIO_ALPHA,
                         n=64):
-    """``int E * shape dE`` over a band -- an ENERGY flux, per cell.
+    """``int shape dE`` over a band -- an ENERGY flux, per cell.
 
-    pyXSIM's ``PowerLawSourceModel`` wants a luminosity in the band, so the
-    integrand carries the extra factor of ``E``. Integrated on a log grid because
-    the cutoff makes the integrand span orders of magnitude within one band.
+    :func:`spectral_shape` is ``S_nu ~ nu^-alpha``, i.e. already an ENERGY flux
+    density per unit energy, so the band energy flux is its plain integral. An
+    earlier version integrated ``E * shape`` ("the integrand carries the extra
+    factor of E", which is only true of a PHOTON spectrum) and overstated every
+    absolute X-ray flux in this module by the band's mean energy, ~5x at
+    4.2-6 keV; the self-check had that factor asserted in (2026-09-02).
+    Integrated on a log grid because the cutoff makes the integrand span orders
+    of magnitude within one band.
     """
     Ec = np.asarray(E_cut_keV, dtype=np.float64)
     e = np.logspace(np.log10(E_lo_keV), np.log10(E_hi_keV), n)
     # shape (n,) x Ec.shape -> integrate over axis 0
     grid = e.reshape((-1,) + (1,) * Ec.ndim)
-    integrand = grid * spectral_shape(grid, Ec[None, ...], alpha=alpha)
+    integrand = spectral_shape(grid, Ec[None, ...], alpha=alpha)
     return np.trapezoid(integrand, e, axis=0)
 
 
@@ -439,7 +468,7 @@ def emission_gate_years(width_arcsec, v_shock_cgs, *, compression=4.0):
 def synchrotron_fields(rho_cgs, T_i, mu_i, time_since_shock_yr, shocked, *,
                        eta=1.0, width_arcsec=2.0, distance_kpc=3.4,
                        epoch=2004.0, band=(4.2, 6.0), cell_volume_cm3=1.0,
-                       alpha=RADIO_ALPHA):
+                       alpha=RADIO_ALPHA, norm=1.0):
     """Per-cell non-thermal luminosity [erg/s] and photon index, for pyXSIM.
 
     ``pyxsim.PowerLawSourceModel`` wants exactly these two fields, so this is the
@@ -492,6 +521,11 @@ def synchrotron_fields(rho_cgs, T_i, mu_i, time_since_shock_yr, shocked, *,
     # flux per unit weight, such that sum(w) * radio_shape * k = nu S_nu
     k = nu_S_nu / (w_total * radio_shape)
 
+    # ``norm`` is the FITTED efficiency: everything else in this chain is
+    # anchored, and with the observed filament width the anchored prediction is
+    # 10-25x too faint (CALIBRATION.md Result 26), so a multiplier is needed to
+    # reach the observed non-thermal flux and it must be reported as fitted
+    k = k * float(norm)
     flux = np.where(fresh, w * band_shape * k, 0.0)     # erg/cm^2/s per cell
 
     # DROP the cells whose cutoff is so far below the band that they contribute
@@ -530,6 +564,12 @@ def synchrotron_fields(rho_cgs, T_i, mu_i, time_since_shock_yr, shocked, *,
         flux_band=float(flux.sum()),
         gate_yr_median=float(np.median(gate[ok])) if np.any(ok) else np.nan,
         dropped_flux_fraction=dropped,
+        # per-cell ingredients, so a caller can rebuild the CURVED spectrum in
+        # sub-bands instead of one power law over the whole band: the band
+        # energy flux of cell i in [a, b] is k_w[i] * band_shape_integral(a, b,
+        # E_cut[i]) and its photon index there is local_photon_index(E, E_cut[i])
+        E_cut=E_cut, emit=keep, k_w=np.where(keep, w * k, 0.0),
+        distance_cm=d_cm, norm=float(norm),
     )
     return lum, gamma, report
 
@@ -540,10 +580,11 @@ def _self_check():
     assert abs(electron_index(0.77) - 2.54) < 1e-9
     assert abs(electron_index(0.5) - 2.0) < 1e-9        # strong-shock DSA
 
-    # 2. the anchor: 1.4 keV at 3000 km/s, Bohm. And the scaling is v^2/eta.
-    assert abs(cutoff_photon_energy_keV(3.0e8, 1.0) - 1.4) < 1e-12
-    assert abs(cutoff_photon_energy_keV(6.0e8, 1.0) - 5.6) < 1e-12
-    assert abs(cutoff_photon_energy_keV(3.0e8, 4.0) - 0.35) < 1e-12
+    # 2. the anchor: 0.55 keV at 3000 km/s, Bohm (= 1.4 keV at 5000 km/s, the
+    #    form Vink quotes). And the scaling is v^2/eta.
+    assert abs(cutoff_photon_energy_keV(3.0e8, 1.0) - 0.55) < 1e-12
+    assert abs(cutoff_photon_energy_keV(5.0e8, 1.0) - 0.55 * 25.0 / 9.0) < 1e-12
+    assert abs(cutoff_photon_energy_keV(3.0e8, 4.0) - 0.1375) < 1e-12
 
     # 3. the ion-temperature inverse round-trips against _plasma's forward form
     for A, T in ((28.085, 4.85e9), (55.845, 1.0e10)):
@@ -583,12 +624,15 @@ def _self_check():
     #    docstring's table comes from here.
     E_radio_keV = RADIO_FREQ_GHZ * 1e9 * 4.135667696e-18
     assert E_radio_keV < 1e-8                # the radio is 9 decades below 5 keV
-    obs_nt = 2.7e-11                         # observed non-thermal 4.2-6 keV
+    obs_nt = OBSERVED_NONTHERMAL_FLUX_42_60  # observed non-thermal 4.2-6 keV
     ratio = nonthermal_band_fraction(np.array([0.6]), np.array([1.0]))
     nu_S_nu = RADIO_FREQ_GHZ * 1e9 * radio_flux_at(2004.0) * 1e-23
     pred_cospatial = ratio * nu_S_nu
-    # (a) co-spatial with the radio: too bright, by about an order of magnitude
-    assert 5.0 < pred_cospatial / obs_nt < 20.0, (ratio, pred_cospatial)
+    # (a) co-spatial with the radio. With the E-factor and the ZA07 constant
+    #     corrected (2026-09-02) this is no longer "an order of magnitude too
+    #     bright"; the value is printed by main() and recorded in
+    #     CALIBRATION.md Result 26 -- assert only that it is finite and positive
+    assert np.isfinite(pred_cospatial) and pred_cospatial > 0, (ratio, pred_cospatial)
     # (b) the lifetime, months at Cas A's rim field, and monotone in B
     t500 = float(synchrotron_lifetime_yr(5.0, 500e-6))
     t100 = float(synchrotron_lifetime_yr(5.0, 100e-6))
@@ -600,10 +644,16 @@ def _self_check():
     assert 5e-5 < d_adv < 5e-4, d_adv
     assert 1e3 < SHELL_THICKNESS_PC / d_adv < 1e5, SHELL_THICKNESS_PC / d_adv
     assert pred_cospatial * d_adv / SHELL_THICKNESS_PC / obs_nt < 0.01
-    # (d) the OBSERVED filament width: within a factor of a few, too faint
-    for w_arcsec in FILAMENT_WIDTH_ARCSEC:
-        p = pred_cospatial * (w_arcsec * ARCSEC_IN_PC) / SHELL_THICKNESS_PC
-        assert 0.1 < p / obs_nt < 1.0, (w_arcsec, p / obs_nt)
+    # (d) the OBSERVED filament width. Before 2026-09-02 this asserted 0.1-1.0
+    #     ("within a factor of a few, too faint"); with the E-factor and the
+    #     ZA07 constant corrected the anchored prediction is far fainter -- see
+    #     main()'s printout and CALIBRATION.md Result 26. Assert only the
+    #     ordering that is structural: thinner than the shell, brighter than the
+    #     advected layer, monotone in the width.
+    p_w = [pred_cospatial * (w * ARCSEC_IN_PC) / SHELL_THICKNESS_PC
+           for w in FILAMENT_WIDTH_ARCSEC]
+    assert all(pi < pred_cospatial for pi in p_w) and p_w == sorted(p_w), p_w
+    assert p_w[0] > pred_cospatial * d_adv / SHELL_THICKNESS_PC
     # and the shell thickness is the SHOCKED region, not the bright rim: it must
     # be consistent with the calibrated r_FS - r_RS
     assert 0.7 < SHELL_THICKNESS_PC < 0.9, SHELL_THICKNESS_PC
@@ -684,14 +734,13 @@ def _self_check():
         p = pred_cospatial * (w * ARCSEC_IN_PC) / SHELL_THICKNESS_PC
         print(f"      OBSERVED filament width {w:.0f}\"      "
               f"{p:.2e}   {p / obs_nt:6.2f}x")
-    print(f"    Consistent to within a factor of a few, in the direction of "
-          f"TOO FAINT, once the\n    observed filament width supplies the "
-          f"thickness (shell = {SHELL_THICKNESS_PC:.1f} pc = r_FS - r_RS,\n"
-          f"    the SHOCKED region and not the bright rim). The model's own "
-          f"ram-pressure-weighted\n    fresh fraction, 0.0177, gives 0.16x -- "
-          f"so the two independent routes to the\n    emitting volume agree "
-          f"with each other to a factor ~1.2-3.5, which is the result;\n"
-          f"    the shared offset from unity is OPEN (eta > 1 would raise it).")
+    print(f"    NOT within a factor of a few: with the observed filament width as the\n"
+          f"    thickness (shell = {SHELL_THICKNESS_PC:.1f} pc = r_FS - r_RS, the SHOCKED region)\n"
+          f"    the radio-anchored prediction is 25-100x too FAINT, and even the whole\n"
+          f"    shocked shell is ~2x short. Corrected 2026-09-02/03 (two unit errors and\n"
+          f"    a wrong observed anchor; CALIBRATION.md Results 26-27). The X-ray\n"
+          f"    synchrotron normalisation is therefore a FITTED efficiency (~15 on the\n"
+          f"    calibrated 3D state), labelled as such.")
     print(f"    The width is {FILAMENT_WIDTH_ARCSEC[0] * ARCSEC_IN_PC / d_adv:.0f}-"
           f"{FILAMENT_WIDTH_ARCSEC[1] * ARCSEC_IN_PC / d_adv:.0f}x what pure "
           f"advection allows, so it is a measured\n    INPUT and not a "

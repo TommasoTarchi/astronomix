@@ -4,7 +4,9 @@
 > [`OVERVIEW.md`](OVERVIEW.md), not here.** It maps the two-stage pipeline, what
 > physics each piece contains, where the model stands against Chandra and what
 > is missing; [`CALIBRATION.md`](CALIBRATION.md) holds the derivations
-> (Results 1–13). **This README covers the older *showcase* scripts**
+> (Results 1–26; Result 26 is the 2026-09-02 audit), and [`ROADMAP.md`](ROADMAP.md)
+> the plan from the calibrated model to the field-level inference of
+> [`vision.md`](vision.md). **This README covers the older *showcase* scripts**
 > (`cassiopeia*.py`, `snr_sedov.py`, `young_snr_ism.py`), which are tuned to
 > look right rather than to agree with data, plus the numerics and the pq
 > workflow that both tracks share. Where it says something is "not modelled",

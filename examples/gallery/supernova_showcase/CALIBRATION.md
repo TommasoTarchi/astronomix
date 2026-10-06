@@ -2424,3 +2424,716 @@ the pending refinement.
 improvement above is a raw comparison, and Result 12's lesson is that raw
 structure statistics can rank models in the wrong order. The +0.186 should be
 re-quoted as an excess over the null before it goes in a paper.
+
+---
+
+## Result 26 — the audit: what stood, what fell, and what was never checked
+
+*2026-09-02. A full read of `vision.md`, `janka_mails.md`, every handoff, this
+file and `OVERVIEW.md`, plus a line-level audit of all 17 k lines in the
+directory. Fixes are in the code; this records the findings that change a
+recorded number or a recorded conclusion. `ROADMAP.md` is the plan that
+follows from it.*
+
+### Errors in recorded results
+
+**1. The A1 ladder was measured with a broken tool, and survives anyway.**
+`casa_orlando.main()` referenced `asym_field`, a local of `build()`: every
+`--wind-asym` run raised `NameError` after saving its state and *before* the
+position-angle line, and `casa_analyze.py` never passed the anisotropic
+reference at all — the exact failure Result 25 describes as fixed. Both
+detectors also quantised radii to one bin (0.029 pc at 256³), so a max-minus-min
+statistic moved in cell-sized steps: the A1 = 0.4 run scored 0.146 pc (5 cells)
+against 0.175 (6) at A1 = 0.3, and the "identical to three decimals" agreement
+with the shell was two runs landing in the same bin. Fixed (crossing
+interpolated between bins, reference reconstructed from the stamped parameters,
+`std` and m = 1 / m = 2 Fourier amplitudes of r_FS(PA) reported):
+
+| A1 | spread | std | m = 1 | m = 2 | r_FS | r_RS |
+|---|---|---|---|---|---|---|
+| shell fiducial | 0.283 | 0.092 | 0.125 | 0.024 | 2.498 | 1.531 |
+| 0 (no shell) | 0.123 | 0.032 | 0.019 | 0.013 | 2.591 | 1.619 |
+| 0.3 | 0.173 | 0.053 | 0.062 | 0.020 | 2.590 | 1.619 |
+| **0.4** | **0.230** | 0.072 | 0.091 | 0.026 | 2.587 | 1.619 |
+| 0.5 | 0.300 | 0.094 | 0.123 | 0.034 | 2.581 | 1.619 |
+| 0.7 | 0.460 | 0.147 | 0.196 | 0.060 | 2.567 | 1.619 |
+
+Monotone, A1 = 0.4 lands on the predicted 0.23 pc, and A1 = 0.5 matches the
+shell on all three statistics, not just the range. **The conclusion of Result 25
+stands on corrected numbers.** Two caveats it did not carry: the observed
+"0.2–0.4 pc" has no source anywhere in this directory (measure r_FS(PA) on the
+2004 image with this estimator before using it), and the dipole axis is **not**
+in the shell's convention despite the docstring — the two are 80.6° apart, the
+shell's gradient along the line of sight (the Green Monster side), the dipole's
+in the plane of the sky. A sky-plane dipole is intrinsically better placed to
+deform the sky-plane outline, so "the same outline for a 3 % thermal cost" compares
+differently oriented asymmetries.
+
+**2. Every model is scored at 350 yr against data taken at ~320 yr.** The
+targets (Gotthelf et al. 2001) come from 2000 observations; the explosion date
+is 1681 ± 19 (Fesen et al. 2006), so the 2000/2004 epochs are at 319/323 yr, and
+`AGE_YR = 350` cites Fesen for a number Fesen does not give. At 5250 km/s the 27
+yr are 0.145 pc = 6 % of r_FS. The 1D fiducial at 323 yr: r_FS 2.40, r_RS 1.65
+against 2.55 / 1.74 at 350 — a shift of most of one tolerance. For the
+multi-epoch vision the age must be a parameter (`ROADMAP.md` §1).
+
+**3. The 2004 spectral comparison uses the launch response.** 2004 is
+equidistant from SOXS's cycle-0 and cycle-10 ACIS-S files and the tie fell to
+cycle 0. Contamination had removed tens of percent of the soft effective area
+by 2004, so the synthetic 0.5–1.5 keV band is *overstated* — the true soft
+deficit is larger than the 0.76–0.78 quoted in Results 24–25, and the residual
+attributed there to the dust grains is of the same size as this systematic (and
+as the effect of N_H, held at a constant 1.2 × 10²² while it spans 1–2 × 10²²
+across the remnant). A warning now fires; the fix is a per-obsid response.
+
+**4. The synthetic images carry a chip gap the real ones do not.** SOXS's
+ACIS-S puts the S2/S3 gap 101″ from the aimpoint; Cas A straddles it, and a
+dither-softened ~20 % stripe at x ≈ −98″ sits inside the 60–140″ annulus
+`casa_morphology.py` scores. Obsid 4636 has all its events on S3. Measured on
+the A1 = 0.5 photon list re-observed with the aimpoint shifted (+150″, 0), which
+puts the whole remnant on one chip (the dip at −105″ disappears; −150″ moves it
+to +52″ and makes it worse); halo off, count rate unchanged (1.00 vs 1.00):
+
+| real/syn amplitude | 2.5″ | 4.4″ | 8.4″ | 16.2″ | coherence 2.5″ (real 0.59) |
+|---|---|---|---|---|---|
+| with the gap (all recorded results) | 1.15 | 0.76 | 0.60 | 0.57 | 0.806 |
+| **one chip** | **1.74** | **1.04** | 0.69 | 0.60 | **0.851** |
+
+**The stripe was supplying small-scale power.** Result 25's "2.5″ essentially on
+target" was one third artefact; without it the small-scale deficit is back at
+1.74 (still the best in the study — the fiducial's 3.27 also contained the
+stripe), 4.4″ is now on target, the large-scale overshoot is milder, and the
+image is *more* ordered (0.85 vs 0.81 against Chandra's 0.59), so the coherence
+gain and the null-test margin below are both overstated. Every recorded
+morphology number was measured with the gap; relative rankings between models
+probably survive, absolute ones do not. `--aimpt-shift` now defaults to
+(150, 0); pass `0 0` to reproduce the recorded images.
+
+**5. Synchrotron: two unit errors, and the conclusion inverts.**
+`band_shape_integral` integrated `E · shape` although `shape` is already an
+energy flux density (×5 at 4.2–6 keV), and the loss-limited constant 1.4 keV is
+Zirakashvili & Aharonian's relation at 5000 km/s, not 3000 (0.55 keV; ×2.5 in
+every cutoff). Corrected: co-spatial with the radio 1.9× too bright (was 9.3×),
+observed filament width **0.04–0.12×** (was 0.19–0.58×) — and against the
+*corrected* observed anchor of Result 27 (8.7e-11 rather than 2.7e-11) these are
+0.58× and 0.01–0.04×. Result 16's "consistent
+within a factor of a few, two routes agree" is withdrawn: the radio-anchored
+X-ray synchrotron is 25–100× too faint at the observed width, and the XRISM
+Γ → shock-speed inversion moves from 1708–2423 to **2725–3866 km/s**, between
+the reverse and forward shocks — it no longer singles out the reverse shock. The
+self-check had the wrong numbers asserted in.
+
+**6. The 1D unshocked mass subtracted the wrong wind.** Both 1D scripts removed
+the *entire* 0.084 M☉ of wind inside r₀ from M(< r_RS). That wind is uniform in
+radius while the ejecta is centrally peaked, so it sits at the ejecta's *outer*
+mass coordinates and 1D flow preserves the ordering: ~0.001 M☉ of it is inside
+the innermost 0.4 M☉. Fixed with the Lagrangian map (total enclosed mass → wind
+mass inside it). The δ = 1 fiducial now gives **0.47 M☉ (1D)** against the 3D
+tracer's 0.42–0.46 — the two methods agree, both ~1σ above 0.35 ± 0.10 — and the
+δ ≈ 1.38 of Result 19 was fitted to the biased quantity. `casa_diff --validate`
+after the fix: smooth 0.410 vs hard 0.404 (1.6 %). Also: the 1D and 3D r_RS use
+different homology tolerances (0.05 vs 0.08) and the 3D one a per-shell vote,
+so "the same two criteria" is approximate.
+
+**7. XRISM inversion label.** `casa_xrism.py` inverted the Fe–Si ion-temperature
+difference with m_Si instead of m_Fe − m_Si and printed a 176 keV value as
+"150 keV" (A_Si ≈ A_Fe − A_Si hid it). 150–300 keV ↔ 1660–2350 km/s; 1800 km/s
+↔ 176 keV. Numerically small, but the recorded "free check that passes" was
+passing for the wrong reason.
+
+### Things that were never checked and should have been
+
+* **The sub-grid split cools and compresses the shocked *wind* too.** It is
+  applied to every cell; the XRISM χ it is calibrated to is an ejecta quantity;
+  79 % of the continuum emission measure is wind. `f_mass = 0.2` therefore acts
+  mostly on the wind. Run the ejecta-only variant before carrying (χ, f_mass)
+  forward as physics.
+* `casa_calibrate_1d.py`'s defaults were the *pre*-calibration values
+  (1.5 × 10⁵¹, 3.3, 0.8), so a bare run reproduced the model the script exists
+  to replace; now the fiducial.
+* Guards in `casa_orlando.py` printed but did not gate: an unphysical or
+  aborted state was saved with the *target* age stamped. Now the reached age,
+  a `mass_conserved` flag and the wind/asymmetry parameters are stamped.
+* `casa_xrism.py --te-model beta` never received β; `casa_plasma.py` could not
+  select a T_e model at all; `load_diagnostic_state` promised an ionization-age
+  check it did not make; the NEI cache was keyed on the file existing; the
+  real-spectrum cache was not keyed on its obsid set; `--events` ignored the
+  file's exposure. All fixed.
+* The phase-randomised null for the A1 = 0.5 configuration (flagged pending in
+  Result 25): coherence excess **+0.397 against Chandra's +0.359** (fiducial
+  +0.678, no-shell +0.636). The raw claim survives the rigorous version. Euler
+  excess −7.40 vs Chandra −10.20 is slightly *worse* than the fiducial's −7.74.
+
+### Verdict on the fiducial question
+
+The A1 = 0.5 configuration remains the best model on every statistic measured
+here, and the null confirms the coherence gain. It is **not** adopted as fiducial
+yet, because two soft-band systematics of the size of its remaining residual
+(response cycle, N_H) and one image artefact (chip gap) were found on the
+comparison side, and the whole comparison sits 27 yr off the data's epoch. Stage
+0 of `ROADMAP.md` is the matched re-observation that decides it.
+
+---
+
+## Result 27 — Stage 0 of the roadmap, the parts that ran the same day
+
+*2026-09-02, after Result 26. Everything here uses states and photon lists
+already on disk; the one GPU run (A1 = 0.5 at the 2000-epoch age of 319 yr) and
+its matched observation are queued and reported when done.*
+
+### The observed outline, finally measured — and the target changes
+
+`casa_real_outline.py` runs ONE detector on the real epoch images and on the
+synthetic ones: per 10° cone, the radius of steepest logarithmic decline of the
+surface brightness between 135″ and 200″ (a threshold-on-background definition
+lands at ~180″ because the halo and PSF wings never reach background; a 110″
+lower bound lets a third of the cones lock onto the bright ejecta shell at
+113–130″ — the per-cone radii are printed so this is visible).
+
+| image | ⟨r_FS⟩ pc | spread | std | m = 1 | m = 2 | PA(m = 1) |
+|---|---|---|---|---|---|---|
+| Chandra 2000 | 2.619 | 0.795 | 0.209 | 0.195 | 0.050 | 202° |
+| Chandra 2004 | 2.646 | 0.820 | 0.218 | 0.212 | 0.061 | 200° |
+| Chandra 2012 | 2.687 | 0.858 | 0.216 | 0.213 | 0.079 | 188° |
+| Chandra 2022 | 2.733 | 0.938 | 0.237 | 0.216 | 0.050 | 196° |
+| **A1 = 0.5, one chip** | 2.611 | 0.519 | **0.108** | **0.112** | 0.057 | 209° |
+| A1 = 0.5, with chip gap | 2.662 | 0.760 | 0.196 | 0.188 | 0.069 | 201° |
+| shell fiducial (gap) | 2.379 | 0.238 | 0.068 | 0.059 | 0.078 | 234° |
+| no shell (gap) | 2.448 | 0.290 | 0.060 | 0.014 | 0.057 | 39° |
+
+Three things. **(1) The recorded "0.2–0.4 pc" is not what the image shows**: on
+this detector the observed max−min spread is 0.8–0.9 pc and the robust
+statistics are std ≈ 0.21–0.24 pc and an m = 1 amplitude of 0.17–0.22 pc at
+PA ≈ 200°, stable across seven epochs. **(2) On the same detector the A1 = 0.5
+model is half as lopsided as the data** (std 0.108, m = 1 0.112): the ladder's
+in-simulation 0.292 pc "match" was a different detector on a different quantity
+(3D density contrast versus projected surface brightness). Extrapolating the
+ladder's m = 1 (0.123 at A1 = 0.5, 0.196 at 0.7) the data want **A1 ≈ 0.7–0.8**,
+or a shell-plus-dipole combination — and the dipole's PA should be set to the
+observed ~200°, not to the shell's default axis. **(3) The chip gap was inflating
+the model's apparent asymmetry** (0.188 → 0.112 in m = 1), the same artefact as
+in Result 26 item 4.
+
+### The first dynamical observable: the forward shock's expansion
+
+Same detector, 2000 → 2022: angle-averaged **0.283″/yr = 4550 km/s** in the
+plane of the sky at 3.4 kpc; per-cone median **0.348″/yr** (10–90 %:
+0.06–0.92). Consistent with published forward-shock proper motions (~0.3″/yr),
+and now measurable identically on the model between two of its own snapshots —
+the observable ROADMAP.md Stage 1 is built around. It also sizes the age
+systematic directly: a 350-yr model matched to a 2000 image is 27 yr × 0.28″/yr
+= **7.6″ (0.13 pc) too large**.
+
+### The response cycle and the chip gap, bracketed on one photon list
+
+The A1 = 0.5 photon list (350 yr, χ = 4, f_mass = 0.2, NEI) re-observed with the
+halo on and the remnant on one chip:
+
+| instrument / epoch | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| Result 25 (gap, cy0, vs 2004) | 0.86 | 0.78 | 0.79 | 1.08 | 1.21 | 0.87 | 0.91 |
+| one chip, cy0, vs 2004 | 0.90 | 0.80 | 0.82 | 1.12 | 1.24 | 0.90 | 0.94 |
+| one chip, **cy10**, vs 2004 | 0.78 | **0.62** | 0.73 | 1.03 | 1.14 | 0.81 | 0.83 |
+| one chip, cy0, **vs 2000** (exact cycle) | 0.84 | **0.70** | 0.80 | 1.11 | 1.19 | 0.83 | 0.82 |
+
+The cycle-10 ARF has 0.67× the cycle-0 effective area at 0.5–1.5 keV (0.50× at
+0.5–1.0), and 2004 sits between the two, so **the true 2004 soft-band ratio is
+~0.70, not 0.78**; against the 2000 epoch, where cycle 0 is the right response,
+it is 0.70 directly. The soft deficit is ~30 %, larger than Result 25 said, and
+it is now measured through the right filter. The chip gap itself moves the
+spectrum by ≤ 0.03 per band (it is a morphology artefact, not a spectral one).
+
+### δ re-fit with the corrected unshocked mass
+
+`casa_diff.py --fit`, five targets, from δ = 1: χ² 3.30, E 2.12 × 10⁵¹,
+M_ej 2.54, n_w 0.99, **δ 1.30** (Result 22: 3.62 / 1.38 from the biased mass and
+a δ = 0 start). The plateau is still v_rs_rel; M_ej keeps drifting down against
+δ, the degeneracy Result 19 named. Do not quote M_ej from it.
+
+### The matched comparison: same configuration at the 2000 epoch's age
+
+`orl_n256_wasym0.5_age319.npz` — identical to the A1 = 0.5 run but evolved to
+319 yr — observed with NEI, halo, χ = 4 / f_mass = 0.2 on one chip against the
+2000 image, which is the first comparison in this study at matched age, matched
+response (cycle 0 is exact for 2000) and matched detector footprint. Against the
+same 350-yr configuration observed the same way:
+
+| | 350 yr vs 2000 | **319 yr vs 2000** | observed |
+|---|---|---|---|
+| r_FS / r_RS (pc) | 2.581 / 1.619 | **2.406 / 1.531** | 2.52 ± 0.20 / 1.58 ± 0.16 |
+| count rate | 0.84 | **0.99** | 1 |
+| bands 0.5–1.5 … 6–7 | 0.70 / 0.80 / 1.11 / 1.19 / 0.83 / 0.82 | **0.80 / 0.93 / 1.33 / 1.51 / 1.08 / 1.21** | 1 |
+| rms (dex) | 0.096 | 0.105 | 0 |
+| outline on the image detector, std / m = 1 (pc) | 0.084 / 0.021 | **0.033 / 0.003** | 0.209 / 0.195 |
+| σ_I/I real/syn 2.5″ / 4.4″ / 8.4″ / 16.2″ | 1.65 / 1.01 / 0.69 / 0.61 | **2.13 / 1.22 / 0.71 / 0.57** | 1 |
+| coherence 2.5″ (real 0.61) | 0.837 | **0.922** | 0.61 |
+
+**The 27-yr age shift is not a small correction; it moves every score.** The
+younger remnant is 18 % brighter (rate 0.84 → 0.99, so the `f_mass` fitted at
+350 yr is age-dependent and now over-normalises the IME bands to 1.33–1.51),
+its forward shock is 0.57 σ *small* rather than 0.3 σ large, its image is
+smoother and markedly more ordered (coherence 0.92 against Chandra's 0.61 — the
+Rayleigh–Taylor structure has had 31 fewer years to grow from the 150-yr
+mapping), and its projected outline is essentially round (m = 1 of 0.003 pc
+against the data's 0.195). The spectral residual, with the normalisation now
+right, is again a hard excess in S, Ar/Ca and Fe-K — the "IMEs too hot"
+signature of Result 14, which the 350-yr comparison had hidden behind an
+over-aged, fainter remnant.
+
+*Position-angle conventions:* cross-correlating the in-simulation r_FS(PA) of
+the A1 = 0.5 state with the image detector's curve on its own synthetic image
+gives the best alignment at no reflection and a 30–40° shift, so the two
+conventions agree to that accuracy and the dipole's far side (in-sim PA ≈ 240°)
+is already within ~40° of the data's m = 1 direction (≈ 200°). The
+*orientation* is roughly right; the *projected amplitude* is not. Note also
+that the image detector sees m = 1 of 0.11 pc on the model without the halo and
+0.02 with it, while the data (which of course include the halo) show 0.20: the
+model's thin thermal rim is faint enough that the scattered light washes out its
+edge, whereas the real rim is bright non-thermal synchrotron. The outline test
+on images is therefore also a test of the missing non-thermal rim.
+
+**Consequences.** (1) The Result 25 verdict does not survive a matched-epoch
+comparison as it stands; the configuration must be re-calibrated *at the
+epoch's age* (1D calibration at 319–323 yr first, then f_mass), which is exactly
+why `ROADMAP.md` makes the age a parameter. (2) On a like-for-like image
+detector the model's outline asymmetry is an order of magnitude too weak, so the
+l = 1 ambient term at A1 = 0.5 along the current axis is not the outline's
+explanation in projection; the in-simulation density-contrast detector
+overstated its effect. (3) The morphology statistics depend on the evolution
+time since mapping as strongly as on anything tested so far, which adds the
+mapping epoch to the list of things the structure scores are sensitive to.
+
+### Recalibrating at the data's age — the first configuration built for 319 yr
+
+Two 1D gradient fits at 319 yr (5 targets, `casa_diff.py --fit --age 319`),
+each mapped at 150 yr and evolved in 3D (A1 = 0.5, no shell, pistons, clumping)
+to 319 yr, then observed identically (NEI, halo, χ = 4 / f_mass = 0.2, one chip,
+cycle 0) against the 2000 image:
+
+| | free 4-parameter fit | **M_ej frozen at 3.0** (`--freeze`, new) |
+|---|---|---|
+| E, M_ej, n_w, δ | 2.57e51, **2.37**, 1.03, 1.46 | **2.43e51**, 3.0, 0.925, **0.82** |
+| 1D χ² | 1.92 | 2.33 |
+| 3D r_FS / r_RS at 319 yr | 2.653 / 1.590 | **2.544 / 1.619** |
+| 3D outline spread / std / m = 1 (pc) | 0.287 / 0.090 / 0.121 | 0.269 / 0.083 / 0.110 |
+
+The free fit walks down the δ–M_ej valley to an ejecta mass the targets do not
+determine and a KEPLER progenitor does not support, so **the constrained fit is
+the recalibration**: the epoch correction is a 16 % higher E (2.09 → 2.43e51),
+n_w unchanged, and δ back below 1 once M_ej cannot compensate. Its 3D dynamics
+land on the 2000-epoch targets at the 2000-epoch age (r_FS 0.12 σ, r_RS 0.24 σ).
+
+Observed against 2000 (constrained recalibration): **rate 0.91; bands 0.77 /
+0.85 / 1.17 / 1.30 / 0.97 / 1.08; rms 0.078 dex** — the same rms as Result 25's
+0.077, now at the right age, response and footprint, with a ~20 % soft deficit
+and Ar/Ca 1.30 as the residuals. Morphology against 2000: σ_I/I real/syn 4.4″
+**1.78**, 8.4″ 0.99, 16.2″ 0.75, coherence 0.874 (real 0.61) — the small-scale
+structure deficit is back (169 yr of evolution since mapping instead of 200),
+8.4″ is on target. Outline on the image detector: std 0.075, **m = 1 0.026 pc at
+PA 201°** — the *direction* matches the data's 202° exactly, the amplitude is a
+seventh of the data's 0.195.
+
+### The sub-grid split restricted to the ejecta
+
+`--subgrid-population ejecta` (new) applies the two-phase re-reading to the
+ejecta fraction of each cell only and observes the circumstellar gas unsplit as
+a third component. On the 319-yr state of the *old* calibration against 2000
+(one chip, halo, cycle 0), against the all-cells split observed identically:
+
+| split applied to | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| every cell (all recorded results) | 0.99 | 0.80 | 0.93 | 1.33 | 1.51 | 1.08 | 1.21 |
+| **ejecta only** | 0.91 | 0.69 | 0.85 | 1.26 | 1.48 | 1.12 | 1.30 |
+
+Splitting the wind had been adding 8 % to the rate, almost all of it below
+2.1 keV: the χ = 4 layer applied to metal-free circumstellar gas manufactured
+soft continuum and made the soft bands look better than the ejecta physics
+warrants. With the split confined to the ejecta the residual is unambiguous — a
+~25 % soft deficit and a **hard excess of 1.3–1.5 in S, Ar/Ca and Fe-K** — the
+"intermediate-mass elements too hot" signature of Result 14, now visible at the
+right age, response and footprint. `f_mass` should be re-fitted for the
+ejecta-only split (it was set to 0.2 with the wind included), and the
+thermodynamic guardrail of Result 22 is again the quantity to work on.
+
+### The three 319-yr configurations side by side (all vs 2000, one chip, halo, χ = 4 / f_mass = 0.2, NEI)
+
+| configuration | E / M_ej / n_w / δ | r_FS / r_RS | rate | bands 0.5–1.5 … 6–7 | rms | σ_I/I 4.4″ / 8.4″ | coh. 2.5″ | outline m = 1 |
+|---|---|---|---|---|---|---|---|---|
+| old calibration, aged to 319 | 2.09 / 3.0 / 0.928 / 1.0 | 2.406 / 1.531 | 0.99 | 0.80 / 0.93 / 1.33 / 1.51 / 1.08 / 1.21 | 0.105 | 1.22 / 0.71 | 0.922 | 0.003 |
+| **recalibrated, M_ej = 3.0** | **2.43 / 3.0 / 0.925 / 0.82** | **2.544 / 1.619** | **0.91** | **0.77 / 0.85 / 1.17 / 1.30 / 0.97 / 1.08** | **0.078** | 1.78 / 0.99 | 0.874 | 0.026 at 201° |
+| recalibrated, free M_ej | 2.57 / 2.37 / 1.03 / 1.46 | 2.653 / 1.590 | 0.71 | 0.63 / 0.68 / 0.90 / 0.91 / 0.61 / 0.63 | 0.174 | 2.13 / 1.17 | 0.891 | 0.033 at 279° |
+| observed | — | 2.52 / 1.58 | 1 | 1 | 0 | 1 / 1 | 0.61 | 0.195 at 202° |
+
+The free fit's ejecta mass of 2.37 M☉ makes the remnant uniformly ~30 % too
+faint with the same sub-grid normalisation — an X-ray count rate is an ejecta-mass
+constraint that the 1D radii are not, which is the observable Result 19 said was
+needed to break the δ–M_ej degeneracy. It should enter the fit as a target rather
+than be checked afterwards. **The constrained recalibration is the configuration
+to carry forward**, with the ejecta-only sub-grid split (above) and a re-fitted
+f_mass as its next two changes.
+
+### `f_mass` for the ejecta-only split (recalibrated state, vs 2000)
+
+| f_mass (ejecta only) | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| 0.2 | 0.83 | 0.66 | 0.77 | 1.10 | 1.28 | 0.99 | 1.16 |
+| 0.4 | 1.07 | 0.91 | 1.01 | 1.37 | 1.46 | 0.99 | 1.06 |
+
+The rate is linear in f_mass to this precision, so **f_mass ≈ 0.34** puts it at
+unity for the ejecta-only split (0.2 did so only with the wind split as well).
+At that normalisation the soft bands and the continuum are near unity and the
+residual is confined to the **S and Ar/Ca lines (1.3–1.5)** — a composition
+signature, not a temperature one, which is what `--tracer-split xrism_bulk`
+(Result 17) exists for. Running at 0.34 with both presets.
+
+### The first two-epoch test: the model's own forward-shock expansion
+
+The recalibrated configuration evolved to 341 yr (the 2022 epoch) from the same
+150-yr profile: r_FS 2.544 → **2.678 pc**, r_RS 1.619 → 1.677 pc over 22 yr, i.e.
+**6.1 mpc/yr = 0.37″/yr = 5900 km/s** in the plane of the sky, against the data's
+0.283″/yr angle-averaged and 0.348″/yr per-cone median from the same 2000 → 2022
+baseline (image detector). The model expands 5–30 % faster than the data
+depending on which estimate is used — the first dynamical comparison in this
+study, and the outline on the *model images* at both epochs (same detector as
+the data) is what closes the definitional gap; that is running. The A1 = 0.75
+run at 319 yr gives r_FS 2.528 (unchanged), in-simulation std 0.148 and m = 1
+0.196 pc; its projected outline is running.
+
+### A1 = 0.75: the outline IS reproduced — and the halo was hiding it
+
+Recalibrated configuration, A1 = 0.75, 319 yr, observed identically (ejecta-only
+split, f_mass 0.2, halo, one chip) against 2000: rate 0.84 and bands
+0.67 / 0.78 / 1.12 / 1.31 / 1.03 / 1.18 — spectrally indistinguishable from
+A1 = 0.5 (0.83; 0.66 / 0.77 / 1.10 / 1.28 / 0.99 / 1.16), as the mean-zero
+construction predicts. The in-simulation outline doubled (m = 1 0.110 → 0.196 pc,
+std 0.083 → 0.148) **while the image detector's m = 1 did not move: 0.010 pc
+against 0.026 at A1 = 0.5 and 0.195 in the data.** Doubling the ambient dipole
+does nothing to the projected surface-brightness outline once the dust halo is
+on, because the model's thermal rim is too faint for its edge to register above
+the scattered light.
+
+**Re-observing the same A1 = 0.75 photon list without the halo settles it:**
+
+| image detector | ⟨r_FS⟩ | spread | std | m = 1 | m = 2 | PA(m = 1) |
+|---|---|---|---|---|---|---|
+| Chandra 2000 | 2.619 | 0.795 | 0.209 | 0.195 | 0.050 | 202° |
+| A1 = 0.5, no halo | 2.583 | 0.760 | 0.134 | 0.085 | 0.029 | 241° |
+| **A1 = 0.75, no halo** | **2.617** | **0.804** | **0.201** | **0.202** | 0.092 | **205°** |
+| A1 = 0.75, halo | 2.376 | 0.232 | 0.057 | 0.010 | 0.054 | 323° |
+
+*(The A1 = 0.5 row is the same recalibrated state re-observed without the halo,
+so the detector does discriminate: 0.085 → 0.202 pc in m = 1 for 0.5 → 0.75, and
+the projected m = 1 direction moves from 241° to the observed ~200° as well.)*
+
+The geometric outline of the A1 = 0.75 model matches the observed one in mean
+radius, range, standard deviation, m = 1 amplitude *and* direction, with nothing
+fitted to it (A1 was chosen from the 0.5 → 0.7 ladder's m = 1 extrapolation,
+the axis is the default). What the halo-on comparison measures is not the
+outline but the *brightness of the rim relative to the scattered light*: the
+real rim is bright non-thermal synchrotron and survives the halo, the model's
+thin thermal rim does not. So two separate things are now established — the
+ambient dipole at A1 ≈ 0.75 supplies the observed outline, and the missing
+synchrotron rim is what keeps it from showing in a halo-on image. The
+recalibrated, A1 = 0.75, ejecta-only-split configuration is the candidate
+fiducial, pending the f_mass = 0.34 / tracer-split runs and the 2022-epoch test.
+
+### The two-epoch test passes on the dynamics
+
+Recalibrated configuration (A1 = 0.5) at 319 and 341 yr, observed identically
+against the 2000 and 2022 epochs, and the forward-shock outline measured with the
+same image detector on model and data:
+
+| | 2000 / 319 yr | 2022 / 341 yr | expansion |
+|---|---|---|---|
+| Chandra ⟨r_FS⟩ (image detector) | 2.619 pc | 2.733 pc | **0.316″/yr** (per-cone median 0.348) |
+| model ⟨r_FS⟩ (same detector, halo on) | 2.393 pc | 2.512 pc | **0.33″/yr** |
+| model r_FS (3D density detector) | 2.544 pc | 2.678 pc | 0.37″/yr |
+
+**The model expands at the observed rate to ~5 % on a like-for-like detector** —
+the first dynamical observable this project has compared, and it holds for a
+configuration calibrated on single-epoch radii, so the *deceleration* of the 1D
+blast in the calibrated wind is right. (The absolute image-detector radii differ
+by ~0.22 pc between model and data at both epochs — the halo-washed thermal rim
+again; the 3D detector's 2.544 matches the observed 2.52 at the right age.)
+The 2022 *spectral* comparison needs the right array: obsid 26248 is an ACIS-I3
+pointing (front-illuminated, far less soft response than S3), and through the
+ACIS-S cycle-22 response the soft band came out 1.27. `instrument_for_epoch`
+now reads the epoch's DETNAM and picks the S or I array. Redone with
+`chandra_acisi_cy22` (same photon list, f_mass 0.2 ejecta-only, halo):
+
+| epoch (instrument) | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| 2000 (ACIS-S3, cy0), 319 yr | 0.83 | 0.66 | 0.77 | 1.10 | 1.28 | 0.99 | 1.16 |
+| **2022 (ACIS-I3, cy22), 341 yr** | **0.82** | 0.84 | 0.67 | 0.88 | 1.10 | 0.90 | 0.91 |
+
+**The count-rate ratio is the same at both epochs**, so the model's 22-year
+brightness decline matches the data's through two different detectors and
+responses — a second dynamical quantity that holds. The band pattern differs
+between epochs (Si 0.67 and Ar/Ca 1.10 in 2022 against 0.77 / 1.28 in 2000),
+which is partly the FI chip's response and partly real evolution; per-obsid
+responses (ROADMAP Stage 1) are needed before reading the 2022 bands.
+
+### f_mass = 0.34, ejecta only, both composition presets — the candidate fiducial's spectrum
+
+Recalibrated state (E 2.43e51, M_ej 3.0, n_w 0.925, δ 0.82), 319 yr, ejecta-only
+split at χ = 4, f_mass 0.34, NEI, halo, one chip, cycle 0, against the 2000 epoch:
+
+| `--tracer-split` | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 | rms |
+|---|---|---|---|---|---|---|---|---|
+| hwang_laming | 0.99 | 0.83 | 0.94 | 1.29 | 1.40 | 0.99 | 1.09 | 0.084 |
+| **xrism_bulk** | **1.03** | 0.84 | 1.07 | 1.27 | **1.20** | 0.93 | 1.08 | **0.065** |
+
+`xrism_bulk` (solar S/Si, Ar/Si, Ca/Si in the Si layer, Result 17) takes Ar/Ca
+from 1.40 to 1.20 and Si from 0.94 to 1.07, and gives the **best rms in the
+study, 0.065 dex, at matched age, response and footprint**, with the rate at
+1.03. What is left: the soft bands at 0.84 (N_H and the grain population are the
+open systematics), and **S He-α at 1.27** — the one band neither preset moves,
+because both put S/Si at solar-ish values while the model's S emission is 27 %
+high; a sulphur that is *less* than solar relative to silicon in the emitting
+gas, or S-bearing gas at a lower temperature than the Si, are the remaining
+candidates. One spectrally fitted number (f_mass), everything else fixed by
+XRISM's plasma diagnostics, the 1D fit at the right age, and the outline.
+
+### THE CANDIDATE FIDUCIAL after Stage 0
+
+`casa_calibrate_1d.py --energy-51 2.43 --ejecta-mass 3.0 --n-w 0.925
+--inner-slope 0.82 --age 150 --save-profile` → `casa_orlando.py --n 256
+--pistons --composition --positivity redistribute --clump-region ejecta
+--coldcrush-factor 16 --wind-asym 0.75 --age <epoch − 1681>` →
+`casa_observe.py --nei --halo --subgrid-chi 4 --subgrid-fmass 0.34
+--subgrid-population ejecta --tracer-split xrism_bulk --compare <epoch>`
+(one-chip aimpoint and the epoch's ACIS array are now defaults).
+
+| | value | observed |
+|---|---|---|
+| r_FS / r_RS at 319 yr | 2.53 / 1.62 pc | 2.52 ± 0.20 / 1.58 ± 0.16 |
+| FS expansion 2000 → 2022 (image detector) | 0.33″/yr | 0.32 (0.35 per-cone) |
+| count rate 2000 / 2022 | 1.03 (f_mass 0.34) / same ratio at both epochs | 1 |
+| bands 2000 | 0.84 / 1.07 / 1.27 / 1.20 / 0.93 / 1.08 (rms 0.065) | 1 |
+| outline, no halo (A1 = 0.75): ⟨r⟩ / std / m = 1 / PA | 2.617 / 0.201 / 0.202 / 205° | 2.619 / 0.209 / 0.195 / 202° |
+| σ_I/I real/syn 4.4″ / 8.4″ (A1 = 0.5 image) | 1.78 / 0.99 | 1 |
+| coherence 2.5″ | 0.87 | 0.61 |
+
+Morphology of the A1 = 0.75 image (halo on, f_mass 0.2, vs 2000): σ_I/I real/syn
+4.4″ **1.65**, 8.4″ **0.93**, 16.2″ 0.71 (2.5″ noise-dominated at 20 ks);
+coherence 0.877 against Chandra's 0.61. Phase-randomised null: **Euler excess
+−8.27 against Chandra's −8.13 — matched**; coherence excess **+0.61 against
++0.30 — twice too ordered**, unchanged from A1 = 0.5 (+0.63). So the dipole
+amplitude fixes the outline and leaves the ordering defect where it was: that
+is the explosion-era structure gap (§5.2 of `OVERVIEW.md`), not an ambient one.
+Open, in order: the
+synchrotron rim (gates every halo-on image comparison), N_H as a map, the S/Si
+question, per-obsid responses, and the count rate as a 1D fit target.
+
+### The synchrotron component rewired (2026-09-03)
+
+`casa_observe.py --synchrotron` now represents the loss-limited spectrum as one
+power law per sub-band (edges 0.6 / 1.0 / 1.6 / 2.5 / 3.5 / 5.0 / 7.0 / 9.5 keV,
+clipped to `--emin/--emax`), each with the curved spectrum's own energy flux in
+that sub-band and its local photon index at the sub-band centre, merged into
+one list — replacing a single power law over 0.3–12 keV with the index at one
+energy, which put 50–90 % of the 4.2–6 keV photons elsewhere (Result 26). The
+reported flux is now the 4.2–6 keV one, comparable with the observed non-thermal
+2.7e-11 erg cm⁻² s⁻¹, and `--sync-norm` is the **fitted efficiency** the anchored
+chain needs (the run prints the value that would match). The component can now
+be added to a cached thermal photon list (`--pyxsim-events`), so a norm scan
+costs minutes. First run: norm 1 on the A1 = 0.75 candidate (below).
+
+Norm 1 on the A1 = 0.75 candidate (thermal list f_mass 0.2, no halo, vs 2000):
+1.9 % of cells emit (ram-pressure-weighted fresh fraction 0.043, median gate
+30 yr), photon indices 2.2–8.0 across the emitting cells, **4.2–6 keV non-thermal
+flux 5.9e-12 = 0.22× the observed 2.7e-11 — a norm of 4.6 matches it.** So the
+anchored chain on this state is a factor ~5 short (better than the standalone
+estimate's 10–25× because the model's own fresh fraction exceeds the 1–3″
+filament assumption), and the efficiency to quote is **4.6, fitted**. With it in
+at norm 1 the bands vs 2000 are 0.89 / 0.87 / 1.18 / 1.35 / 1.07 / 1.21 at rate
+0.94 (no halo). At norm 4.6 the 4.2–6 keV band will carry the observed ~54 %
+non-thermal share on top of a thermal continuum that is already at 0.93–1.0 —
+the Result 16 tension made concrete; the halo-on run at norm 4.6 (for the
+spectrum and the rim-through-the-halo outline test) follows.
+
+### With the rim at the observed level, the outline shows through the halo
+
+Norm 4.6, halo on, one chip, cycle 0, vs 2000 (thermal list: A1 = 0.75,
+ejecta-only f_mass 0.2):
+
+| image detector | ⟨r_FS⟩ | spread | std | m = 1 | PA(m = 1) |
+|---|---|---|---|---|---|
+| Chandra 2000 | 2.619 | 0.795 | 0.209 | 0.195 | 202° |
+| **A1 = 0.75 + synchrotron rim, halo on** | **2.620** | 0.571 | **0.168** | **0.226** | **201°** |
+| A1 = 0.75, thermal only, halo on | 2.376 | 0.232 | 0.057 | 0.010 | 323° |
+
+**The like-for-like outline test now passes with the halo on**: a bright
+non-thermal rim is exactly what lets the edge register above the scattered
+light, as the no-halo experiment predicted. Mean radius, m = 1 amplitude and
+direction all match the data; the standard deviation is 20 % low.
+
+Spectrum with the rim (same run): rate 0.88; bands **0.69 / 0.81 / 1.17 / 1.41 /
+1.18 / 1.28** against 0.84; 0.67 / 0.78 / 1.12 / 1.31 / 1.03 / 1.18 without it.
+The 4.2–6 keV band rises 1.03 → 1.18: the thermal continuum is ~15–20 % too
+bright once the non-thermal is in — Result 16's tension, concrete but milder
+than feared, because in *counts* the non-thermal component is only ~13 % of the
+band, not the ~54 % Helder & Vink quote in energy flux. **That gap must be
+checked before the 4.2–6 keV residual is interpreted**: either the 2.7e-11
+erg cm⁻² s⁻¹ anchor (aperture, epoch) or the erg→counts conversion of a Γ ≈ 3.3
+spectrum through the ACIS response is responsible, and the synthetic event list
+can settle it (integrate the non-thermal events' energy flux in the band).
+Morphology of this image is below.
+
+Morphology of the full model (rim + halo, vs 2000): σ_I/I real/syn 4.4″ 1.71,
+8.4″ 0.96, 16.2″ 0.74; Euler excess −7.79 against Chandra's −7.27; coherence
+excess +0.61 against +0.32. The rim changes none of the structure statistics
+(they are computed in the 60–140″ annulus) — the ordering defect remains the
+explosion-era structure gap.
+
+### The non-thermal anchor was inconsistent with the observed band flux
+
+Integrating the pyXSIM photon lists (absorbed, r < 200″, 4.2–6 keV): thermal
+1.66e-10 erg cm⁻² s⁻¹, synchrotron at norm 4.6 **2.57e-11** — the rewired
+component delivers its intended flux to 5 %, so the wiring is right. But the
+thermal-only model reproduces the real 4.2–6 keV *count rate* to 3 %, so the
+observed total band flux is ~1.6e-10, and Helder & Vink's ~54 % non-thermal share
+of it is **~8.7e-11, not the 2.7e-11 hard-coded since Result 16** (which would be
+a 17 % share). Consequences: (1) `_synchrotron.OBSERVED_NONTHERMAL_FLUX_42_60`
+is now 8.7e-11 with its derivation; (2) the fitted efficiency is **~15, not 4.6**;
+(3) with the rim at that level the 4.2–6 keV band must come out near 1.5 unless
+the thermal continuum drops by ~2× — which is `OVERVIEW.md` §5.0's "thermal
+continuum ~2–4× too bright" restated with a working component. The norm-14.8 run
+(halo on, vs 2000) follows.
+
+### The rim at the corrected level (norm 14.8): outline holds, and the hard band says what is left
+
+Same thermal list (A1 = 0.75, ejecta-only f_mass 0.2), synchrotron delivering
+8.67e-11 erg cm⁻² s⁻¹ in 4.2–6 keV (the 54 % share of the observed band flux),
+halo on, one chip, cycle 0, vs 2000:
+
+| | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| thermal only | 0.84 | 0.67 | 0.78 | 1.12 | 1.31 | 1.03 | 1.18 |
+| + rim, norm 4.6 (17 % share) | 0.88 | 0.69 | 0.81 | 1.17 | 1.41 | 1.18 | 1.28 |
+| **+ rim, norm 14.8 (54 % share)** | 0.97 | 0.74 | 0.89 | 1.28 | 1.63 | **1.52** | **1.49** |
+
+Outline through the halo at norm 14.8: ⟨r_FS⟩ 2.638, std 0.158, **m = 1 0.209 pc
+at 204°** against the data's 2.619 / 0.209 / 0.195 / 202° — the match of the
+previous section holds at the corrected rim brightness.
+
+**What the hard band now says, with every component in.** With the non-thermal
+continuum at the observed share, the model's 4.2–6 keV is 1.52 and Fe-K 1.49:
+the *thermal* continuum in 4–7 keV is ~2× too bright, exactly `OVERVIEW.md`
+§5.0's inference from the XRISM electron temperatures ("the hard band is ~3.7×
+off, not 1.7×"), reached here by measurement. Since the sub-grid split (ejecta
+only, f_mass fitted to the total rate) and the composition are now fixed by
+other data, the remaining lever is the temperature distribution of the shocked
+gas — too much emitting material at 3–6 keV — which is the thermodynamic
+guardrail of Result 22 and the open physics item for the next stage. Note the
+soft deficit (0.74) and Ar/Ca (1.63) also worsen relative to the rate as the rim
+is added, because f_mass was fitted without it: re-fit f_mass with the rim in
+(the rate is 0.97, so it is close).
+
+### Nine epochs from one run: the multi-epoch scoreboard (2026-09-03)
+
+`casa_orlando.py --snapshot-ages` (new) evolved the candidate configuration once
+from 150 to 341 yr and saved the state at every epoch's age; each was observed
+against its own Chandra epoch through that epoch's ACIS array and cycle (NEI,
+halo, ejecta-only split f_mass 0.34, `xrism_bulk`, rim at norm 14.8). Ratios
+synthetic/real, r < 200″:
+
+| epoch (instrument) | rate | 0.5–1.5 | 1.5–2.1 | 2.1–2.8 | 2.8–4.2 | 4.2–6.0 | 6–7 |
+|---|---|---|---|---|---|---|---|
+| 2000 (S3 cy0) | 1.17 | 0.92 | 1.19 | 1.46 | 1.55 | 1.46 | 1.41 |
+| 2002 (S3 cy0) | 1.21 | 0.98 | 1.20 | 1.45 | 1.56 | 1.52 | 1.54 |
+| 2004 (S3 cy0; 143 ks real) | 1.22 | 1.03 | 1.19 | 1.43 | 1.56 | 1.52 | 1.52 |
+| 2007 (S3 cy10) | 1.06 | 0.82 | 1.06 | 1.30 | 1.45 | 1.42 | 1.36 |
+| 2010 (S3 cy10) | 1.08 | 0.86 | 1.06 | 1.30 | 1.44 | 1.42 | 1.35 |
+| 2013 (S3 cy10) | 1.11 | 0.94 | 1.07 | 1.28 | 1.42 | 1.37 | 1.30 |
+| 2016 (S3 cy22) | 1.00 | 0.67 | 0.96 | 1.26 | 1.50 | 1.52 | 1.45 |
+| 2019 (S3 cy22) | 1.08 | 0.84 | 1.01 | 1.26 | 1.50 | 1.51 | 1.42 |
+| 2022 (I3 cy22) | 1.18 | 1.21 | 1.05 | 1.19 | 1.37 | 1.35 | 1.18 |
+
+**The model tracks the observed 22-year decline of the count rate to within
+±10 % at every epoch, through three response cycles and two ACIS arrays**, with
+its normalisation ~10 % high because f_mass (0.34) and the rim (norm 14.8) were
+each fitted to the rate separately. The band pattern is stable across epochs:
+soft ~0.85 (cycle-dependent, as expected from the contaminant), and the hard
+bands 1.3–1.5 that the corrected non-thermal anchor made explicit — the thermal
+4–7 keV continuum ~1.5–2× too bright is a property of the model at every epoch,
+not of one comparison. `casa_timelapse.py` (new) renders all nine epochs side
+by side with the real images: `figures/casa_timelapse.mp4` / `.gif`, still in
+`figures/casa_timelapse_frame_2011.png`.
+
+---
+
+## Result 28 — cosmic-ray pressure as an effective adiabatic index, scored on the temperatures
+
+*2026-09-07. Result 3 tested γ_eff on the shock radii only. The question here is
+the one residual left after Result 27: the thermal 4–7 keV continuum is ~1.5–2×
+too bright and the shocked gas too hot. Energy that goes into cosmic rays is not
+in the thermal gas, so a softer effective EOS lowers the post-shock temperature
+at fixed shock speed — but it also raises the compression ratio (5 at γ = 1.5,
+7 at 4/3), so ⟨n²⟩ rises. `casa_diff.py --gamma` and `casa_orlando.py --gamma`
+(new; the 3D stage takes the profile's `cfg_gamma` by default) carry the same γ
+through the calibration and the 3D evolution.*
+
+### The 1D calibration at each γ (319 yr, M_ej frozen at 3.0, 5 targets)
+
+| γ | E (10⁵¹) | n_w | δ | r_FS | r_RS | n_post | M_unsh | v_rs | χ² |
+|---|---|---|---|---|---|---|---|---|---|
+| 5/3 | 2.43 | 0.925 | 0.82 | 2.49 | 1.68 | 4.00 | 0.36 | 1416 | 2.33 |
+| **1.5** | **2.91** | 0.919 | 0.95 | 2.41 | 1.77 | 4.37 | 0.36 | 1556 | **2.55** |
+| 4/3 | → 7.5 and diverging | 1.8 | 1.75 | 2.14 | 1.67 | **5.4** | 0.34 | 2009 | **6.4 → NaN** |
+
+**γ = 4/3 is excluded by the calibration alone.** With a compression ratio of 7
+the post-shock density cannot come down to the observed 4 ± 1 cm⁻³ without
+pushing n_w up and the radii down; the fit wanders to E ≈ 7.5 × 10⁵¹ erg with
+n_post still at 5.4 and then fails. A cosmic-ray-dominated forward shock is ruled
+out by Lee et al.'s post-shock density before any temperature is looked at.
+(The first, less damped attempts oscillated between two parameter sets at χ² ≈ 2.5
+and 3.5 for γ = 1.5 and diverged at 4/3; the damped fit — `--damping 4
+--step-scale 0.35`, 14 steps — is the one quoted.)
+
+**γ = 1.5 is admissible at the 1D level**, at a 20 % higher explosion energy
+(2.91 against 2.43 × 10⁵¹) and otherwise the same wind and inner slope, with
+χ² 2.55 against 2.33 for 5/3 — the radii and post-shock density do not
+discriminate between the two, which is Result 3's conclusion again. The 3D run,
+the XRISM diagnostics (kT_e per element group) and the spectrum against 2000 are
+what decide it, and they follow below.
+
+### The 3D run at γ = 1.5, scored on what the experiment was for
+
+Same configuration as the candidate (A1 = 0.75, pistons, clumping, no shell),
+mapped from the γ = 1.5 profile and evolved at γ = 1.5 to 319 yr; `casa_xrism.py`
+with the χ = 4 split on both states; observation vs 2000 with the full pipeline
+(ejecta-only f_mass 0.34, `xrism_bulk`, halo, rim at norm 14.8, one chip, cycle 0):
+
+| | γ = 5/3 (candidate) | **γ = 1.5** | XRISM / Chandra |
+|---|---|---|---|
+| r_FS / r_RS at 319 yr | 2.53 / 1.62 | 2.62 / 1.68 | 2.52 ± 0.20 / 1.58 ± 0.16 |
+| kT_e IME, 10–90 % per 30″ pixel | 1.54–2.94 keV | **1.65–3.11** | 1.3–2.1 |
+| kT_e Fe group | 1.29–2.72 | 1.57–3.03 | 2.4–8.4 |
+| n_e t IME | 1.7–2.7 × 10¹¹ | 1.1–2.2 × 10¹¹ | 1.0–3.4 × 10¹¹ |
+| Spearman(kT_e, n_e t) IME / Fe | −0.55 / −0.65 | **−0.26 / −0.06** | negative / negative |
+| line-weighted shock speed IME | 1870 km/s | 1993 | ~1800 |
+| count rate vs 2000 | 1.17 | 1.15 | 1 |
+| bands 0.5–1.5 … 6–7 | 0.92 / 1.19 / 1.46 / 1.55 / 1.46 / 1.41 | 0.90 / 1.18 / 1.43 / 1.48 / **1.34** / **1.46** | 1 |
+
+**The effective adiabatic index does not touch the residual.** The
+intermediate-mass electrons are marginally *hotter* at γ = 1.5, the hard bands
+move by < 0.1 (4.2–6 keV 1.46 → 1.34, Fe-K 1.41 → 1.46), the ionization ages drop
+and both n_e t–kT_e anticorrelations weaken toward zero. The reason is
+arithmetic once the radii are held: the post-shock temperature at fixed shock
+speed goes as 2(γ−1)/(γ+1)², i.e. 0.160 at γ = 1.5 against 0.1875 at 5/3, a 15 %
+drop — while the compression rises from 4 to 5 and ⟨n²⟩ by ~55 %, and the fit
+raises E by 20 % to keep r_FS, which returns most of the temperature. Any energy
+loss at a shock (cosmic rays, radiation) *increases* the compression, so this
+lever cannot lower the thermal continuum of the shocked gas; it redistributes the
+same emission measure at nearly the same temperature. Result 3 found γ_eff moves
+r_RS the wrong way; Result 28 finds it leaves the temperatures where they are.
+
+**Closed.** Cosmic-ray back-reaction on the hydrodynamics is not the missing
+physics for the hard continuum, and γ = 4/3 is excluded by the post-shock density
+outright. What cosmic rays *do* supply — the bright, thin non-thermal rim through
+field amplification — remains the fitted efficiency of Result 27. The "shocked
+gas too hot" residual is therefore back on the electron-heating and density
+structure of the shocked *ejecta* (Results 14, 15, 22): too much Si/S-bearing gas
+emitting at 3–6 keV, which the sub-grid split alone cannot cure without
+over-normalising.

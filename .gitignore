@@ -238,3 +238,4 @@ examples/gallery/supernova_showcase/figures/
 examples/gallery/thermal_instability/*.npz
 examples/gallery/thermal_instability/*.log
 examples/gallery/thermal_instability/figures/
+*.swp

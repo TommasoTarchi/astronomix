@@ -691,8 +691,19 @@ def wind_asymmetry_field(X, Y, Z, *, dipole=0.0, quadrupole=0.0,
         quadrupole: ``A2``. Denser in the equator (negative) or at the poles
             (positive) of the axis; an equatorially enhanced RSG wind is
             ``A2 < 0``.
-        theta_deg, phi_deg: the axis direction, in the same convention as
-            :func:`orlando_csm_shell` so the two are directly comparable.
+        theta_deg, phi_deg: the axis direction as ordinary spherical polar
+            angles, ``(sin th cos ph, sin th sin ph, cos th)``. NOTE this is NOT
+            the convention :func:`orlando_csm_shell` uses for its gradient
+            (``(cos th cos ph, -sin ph, sin th cos ph)``, Orlando's): for the
+            shared defaults (30, 50) deg the two axes are 80.6 deg apart -- the
+            shell's gradient points mostly along the line of sight (-y, the
+            near side, where the Green Monster is), the dipole mostly along z,
+            IN the plane of the sky. So the CSM shell and the A1 = 0.5 dipole
+            that reproduce the same position-angle spread (CALIBRATION.md
+            Result 25) are differently oriented asymmetries, and a sky-plane
+            dipole is intrinsically better placed to deform the sky-plane
+            outline. The axis vector is printed by ``casa_orlando`` so a run's
+            orientation is never implicit.
 
     Returns:
         The multiplicative field, strictly positive.

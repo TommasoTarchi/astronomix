@@ -74,8 +74,9 @@ What is still approximate, and must be stated with any figure:
     therefore assumed, not simulated.
   * **full ionization** in the mean molecular weights (see :mod:`_plasma`);
     ~10-20 % in ``mu_e`` for the Fe-rich cells only.
-  * no non-thermal (synchrotron) component: the blast-wave rim will be fainter
-    relative to the ejecta than in the real image.
+  * the non-thermal (synchrotron) component is optional (``--synchrotron``) and
+    NOT calibrated; without it the blast-wave rim is fainter relative to the
+    ejecta than in the real image.
   * **no scattering halo unless ``--halo`` is given**, so by default the model
     puts nothing at all outside the forward shock, where Chandra puts 8.8 % of
     its counts.
@@ -192,6 +193,35 @@ REAL_EPOCH_DIR = Path("/export/data/lstorcks/chandra_casa/epoch_images")
 
 #: species carried by ``casa_orlando.py --composition``
 TRACKED_SPECIES = ("Fe", "Si", "O", "He")
+
+
+def fix_projection_parity(state, los):
+    """Make pyXSIM's axis-aligned projection the view of an observer at -y.
+
+    For a string normal ``"y"`` pyXSIM projects with yt's axis-aligned image
+    axes, (z, x): sky x (RA offset, ``RA = RA0 - xsky``) is simulation +z and
+    sky y (Dec) is simulation +x, so image right (west) = +z and image up
+    (north) = +x. With its Doppler factor ``E (1 - v_y / c)`` (an observer at
+    -y) that is not any physical view: (west, north) = (z, x) is right-handed
+    only for an observer at +y. Every synthetic image before 2026-09-24 was
+    therefore the view from -y REFLECTED about the NW-SE diagonal
+    (PA -> 90 deg - PA), with correct Doppler signs. (A 2026-09-23 first attempt
+    reflected x instead, which flips the image north-south: wrong.)
+
+    Swapping x <-> z (and v_x <-> v_z) before the projection puts simulation +x
+    at image right (west) and +z at image up (north): the view from -y in the
+    convention of Orlando et al. and of ``casa_pluto_diff``. Doppler shifts use
+    v_y only and are unchanged.
+    """
+    if los != "y":
+        raise SystemExit("fix_projection_parity is derived for --los y only; "
+                         "check pyXSIM's image axes for this normal before using it")
+    fields = {k: np.ascontiguousarray(np.swapaxes(v, 0, 2)) for k, v in state["fields"].items()}
+    if "vx" in fields and "vz" in fields:
+        fields["vx"], fields["vz"] = fields["vz"], fields["vx"]
+    out = dict(state)
+    out["fields"] = fields
+    return out
 
 
 def load_state(path):
@@ -660,12 +690,19 @@ def simulate_instrument(h5_events, args):
     el.write_to_simput(simput, overwrite=True)
 
     evtfile = f"{prefix}_evt.fits"
+    # The SOXS ACIS-S layout is six chips with the aimpoint ~101" from the
+    # S2/S3 gap, and Cas A (r ~ 153") straddles it: the default synthetic
+    # image carries a dither-softened ~20 % stripe at x ~ -98", INSIDE the
+    # 60-140" annulus casa_morphology.py scores. The real obsid 4636 has every
+    # event on ccd 7 (S3). --aimpt-shift moves the aimpoint on the chip so the
+    # remnant sits on one CCD like the real pointing did.
     soxs.instrument_simulator(
         f"{simput}_simput.fits", evtfile, (args.exposure * 1e3, "s"),
         args.instrument, (RA0, DEC0), overwrite=True,
         instr_bkgnd=not args.no_background,
         foreground=not args.no_background,
         ptsrc_bkgnd=False,
+        aimpt_shift=args.aimpt_shift,
     )
     print(f"[casa-obs] wrote {evtfile}")
     return evtfile
@@ -702,12 +739,14 @@ def synchrotron_photon_events(state, args):
 
     n = state["num_cells"]
     dv = (state["box_pc"] * CODE_LENGTH / n) ** 3
+    # the REPORTED band is 4.2-6 keV so the flux below is comparable with the
+    # observed non-thermal flux there; the photons are made per sub-band below
     lum, gamma, sync_report = SY.synchrotron_fields(
         state["fields"]["rho"] * CODE_DENSITY, ps["T_i"],
         ps["moments"]["mu_i"], tss_yr, ps["shocked"],
         eta=args.sync_eta, width_arcsec=args.sync_width,
         distance_kpc=DISTANCE_KPC, epoch=float(args.compare or 2004),
-        band=(args.emin, args.emax), cell_volume_cm3=dv)
+        band=(4.2, 6.0), cell_volume_cm3=dv, norm=args.sync_norm)
 
     emitting = int(np.sum(lum > 0))
     _say(f"[casa-obs] synchrotron: eta = {args.sync_eta:g}, filament width "
@@ -722,10 +761,12 @@ def synchrotron_photon_events(state, args):
          f"{sync_report['w_fresh_fraction']:.4f} (ram-pressure-weighted fresh "
          f"fraction), median gate {sync_report['gate_yr_median']:.1f} yr, "
          f"band flux {sync_report['flux_band']:.3e} erg/cm^2/s")
-    _say("[casa-obs] synchrotron: NORMALISATION IS OPEN -- this comes out ~30x "
-         "below the module's\n[casa-obs]   own standalone estimate and the "
-         "discrepancy is unexplained. See _synchrotron's\n[casa-obs]   OPEN "
-         "note. Do not quote a non-thermal flux from this yet.")
+    obs_nt = SY.OBSERVED_NONTHERMAL_FLUX_42_60 if hasattr(SY, "OBSERVED_NONTHERMAL_FLUX_42_60") else 2.7e-11
+    _say(f"[casa-obs] synchrotron: 4.2-6 keV non-thermal flux {sync_report['flux_band']:.3e} "
+         f"erg/cm^2/s = {sync_report['flux_band'] / obs_nt:.2f}x the observed ~{obs_nt:.1e} "
+         f"at --sync-norm {args.sync_norm:g}; a norm of "
+         f"{args.sync_norm * obs_nt / max(sync_report['flux_band'], 1e-300):.1f} would match it. "
+         "THE NORM IS A FITTED EFFICIENCY (Result 26 item 5), not a prediction.")
     if emitting == 0:
         raise SystemExit(
             "--synchrotron produced no emitting cells: nothing was shocked "
@@ -744,25 +785,49 @@ def synchrotron_photon_events(state, args):
                       ("velocity_z", "vz")):
         data[("gas", name)] = ((f[key] * CODE_VELOCITY) if key in f else zero,
                               "cm/s")
-    ds = yt.load_uniform_grid(data, [n, n, n], length_unit="cm",
-                              bbox=np.array([[-half, half]] * 3), nprocs=1,
-                              default_species_fields="ionized")
-
-    source = pyxsim.PowerLawSourceModel(
-        1.0, args.emin, args.emax, ("gas", "sync_luminosity"),
-        ("gas", "sync_index"))
-    prefix = scratch_prefix(args) + "_sync"
-    n_ph, n_cell = pyxsim.make_photons(
-        f"{prefix}_photons", ds.all_data(), 0.0, args.area,
-        args.exposure * 1e3, source, dist=(DISTANCE_KPC, "kpc"),
-        velocity_fields=[("gas", "velocity_x"), ("gas", "velocity_y"),
-                         ("gas", "velocity_z")])
-    _say(f"[casa-obs] synchrotron: {n_ph:.3e} photons from {n_cell:.3e} cells")
-    pyxsim.project_photons(
-        f"{prefix}_photons", f"{prefix}_events", args.los, (RA0, DEC0),
-        absorb_model="tbabs", nH=args.nh, abund_table="angr",
-        kernel="gaussian")
-    return f"{prefix}_events.h5"
+    # THE CURVED SPECTRUM IN SUB-BANDS. pyXSIM's PowerLawSourceModel is one
+    # power law per cell over [emin, emax]; the loss-limited spectrum is
+    # E^-(alpha+1) exp(-sqrt(E/E_cut)) and its local index runs from ~1.8 to
+    # >4 across the ACIS band. Handing it the 0.3-12 keV luminosity with the
+    # index at one energy put most of the photons in the wrong place (Result 26:
+    # 0.11-0.5 of the true 4.2-6 keV share). So: one power law per sub-band,
+    # each with the curved spectrum's own energy flux in that sub-band and its
+    # local photon index at the sub-band's geometric centre, then merge.
+    edges = [e for e in SYNC_SUBBAND_EDGES if args.emin < e < args.emax]
+    edges = [args.emin] + edges + [args.emax]
+    d_cm = sync_report["distance_cm"]
+    E_cut, k_w, emit = sync_report["E_cut"], sync_report["k_w"], sync_report["emit"]
+    parts = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        lum_b = k_w * SY.band_shape_integral(lo, hi, E_cut) * 4.0 * np.pi * d_cm ** 2
+        lum_b = np.where(emit, lum_b, 0.0)
+        gam_b = SY.local_photon_index(np.sqrt(lo * hi), E_cut)
+        gam_b = np.where(emit, np.minimum(gam_b, SY.GAMMA_MAX), SY.RADIO_ALPHA + 1.0)
+        data[("gas", "sync_luminosity")] = (lum_b, "erg/s")
+        data[("gas", "sync_index")] = (gam_b, "dimensionless")
+        ds = yt.load_uniform_grid(data, [n, n, n], length_unit="cm",
+                                  bbox=np.array([[-half, half]] * 3), nprocs=1,
+                                  default_species_fields="ionized")
+        source = pyxsim.PowerLawSourceModel(
+            1.0, lo, hi, ("gas", "sync_luminosity"), ("gas", "sync_index"))
+        prefix = f"{scratch_prefix(args)}_sync_{lo:g}_{hi:g}".replace(".", "p")
+        n_ph, n_cell = pyxsim.make_photons(
+            f"{prefix}_photons", ds.all_data(), 0.0, args.area,
+            args.exposure * 1e3, source, dist=(DISTANCE_KPC, "kpc"),
+            velocity_fields=[("gas", "velocity_x"), ("gas", "velocity_y"),
+                             ("gas", "velocity_z")])
+        _say(f"[casa-obs] synchrotron {lo:g}-{hi:g} keV: {n_ph:.3e} photons from "
+             f"{n_cell:.3e} cells, {lum_b.sum():.3e} erg/s")
+        if n_ph == 0:
+            continue
+        pyxsim.project_photons(
+            f"{prefix}_photons", f"{prefix}_events", args.los, (RA0, DEC0),
+            absorb_model="tbabs", nH=args.nh, abund_table="angr",
+            kernel="gaussian")
+        parts.append(f"{prefix}_events.h5")
+    if not parts:
+        raise SystemExit("--synchrotron produced no photons in any sub-band")
+    return merge_event_lists(parts, f"{scratch_prefix(args)}_sync_events.h5")
 
 
 def subgrid_photon_events(state, args):
@@ -788,6 +853,24 @@ def subgrid_photon_events(state, args):
 
     parts = []
     base = state["fields"]
+    # WHICH GAS IS SPLIT. The XRISM contrast chi is an EJECTA quantity, but the
+    # split used to act on every cell -- and 79 % of the continuum emission
+    # measure is shocked wind, so f_mass was mostly re-normalising the wind
+    # (CALIBRATION.md Result 26). With --subgrid-population ejecta the two-phase
+    # re-reading applies to the ejecta fraction C_ej of each cell only, and the
+    # remaining (1 - C_ej) is observed unsplit as a third component. Emission is
+    # linear in the emission measure, so the three add up exactly.
+    if args.subgrid_population == "ejecta":
+        if "C_ej" not in base:
+            raise SystemExit("--subgrid-population ejecta needs the tracer C_ej")
+        split_w = np.clip(base["C_ej"], 0.0, 1.0)
+        _say(f"[casa-obs] sub-grid split applied to the EJECTA only "
+             f"(mean C_ej {float(split_w.mean()):.3f}); the circumstellar gas is "
+             f"observed unsplit")
+        parts.append(make_photon_events(state, args, suffix="_unsplit",
+                                        em_scale=1.0 - split_w))
+    else:
+        split_w = 1.0
     # the factors come from _subgrid, not from a copy here: density_time is
     # rho * t, so its factor is fixed once the other two are chosen, and a local
     # copy that broke that tie made two net_modes silently identical
@@ -804,7 +887,7 @@ def subgrid_photon_events(state, args):
             fields["density_time"] = base["density_time"] * net_f
         phase_state = dict(state, fields=fields)
         parts.append(make_photon_events(phase_state, args,
-                                        suffix=f"_{name}", em_scale=vol))
+                                        suffix=f"_{name}", em_scale=vol * split_w))
 
     return merge_event_lists(parts, f"{scratch_prefix(args)}_events.h5")
 
@@ -897,9 +980,12 @@ def make_events(state, args):
         h5 = subgrid_photon_events(state, args)
     else:
         h5 = make_photon_events(state, args)
-    if args.synchrotron and args.pyxsim_events is None:
+    if args.synchrotron:
         # a SECOND component, not a modification of the first: thermal and
-        # non-thermal are different source models over the same cells
+        # non-thermal are different source models over the same cells. Allowed
+        # with --pyxsim-events too: the cached THERMAL list is reused and only
+        # the (cheap) non-thermal one is regenerated, so a --sync-norm scan
+        # costs minutes rather than an hour per point.
         h5 = merge_event_lists([h5, synchrotron_photon_events(state, args)],
                               f"{scratch_prefix(args)}_events_total.h5")
     if _MPI_SIZE > 1:
@@ -996,22 +1082,72 @@ def read_events(evtfile, *, npix=NPIX_COMPARE, scale_arcsec=PIXEL_ARCSEC):
 #: detail: it is the difference between comparing plasma models and comparing
 #: filter thicknesses.
 ACIS_S_CYCLES = (0, 10, 22, 28)
+ACIS_I_CYCLES = (0, 22, 28)
+
+#: interior edges of the sub-bands the curved synchrotron spectrum is
+#: represented in (one power law each); clipped to --emin/--emax at run time
+SYNC_SUBBAND_EDGES = (0.6, 1.0, 1.6, 2.5, 3.5, 5.0, 7.0, 9.5)
+
+
+def epoch_detector(label):
+    """'aciss' or 'acisi' from the DETNAM of the epoch's evt2 files.
+
+    Not every Cas A epoch is an S3 pointing: 26248 (the 2022 epoch) is ACIS-I3,
+    a front-illuminated chip with far less soft response than S3. Comparing it
+    through an ACIS-S response overstated the 2022 soft band by ~30 %
+    (CALIBRATION.md Result 27). Falls back to ACIS-S if no evt2 is found.
+    """
+    import json
+    from astropy.io import fits
+    # reading a gzipped evt2 header decompresses the file, so the DETNAM of
+    # every obsid is cached next to the epoch images after the first pass
+    cache = REAL_EPOCH_DIR / "epoch_detectors.json"
+    table = json.loads(cache.read_text()) if cache.exists() else {}
+    if str(label) not in table:
+        evt_dir = REAL_EPOCH_DIR.parent / "evt2"
+        names = []
+        for path in sorted(evt_dir.glob("acisf*_evt2.fits.gz")):
+            with fits.open(path) as f:
+                h = f["EVENTS"].header
+            if str(h.get("DATE-OBS", "")).startswith(str(label)):
+                names.append(str(h.get("DETNAM", "")))
+        # ACIS-0..3 are the I array, 4..9 the S array
+        chips = [int(c) for n in names for c in n.replace("ACIS-", "") if c.isdigit()]
+        table[str(label)] = ("acisi" if chips and max(chips) <= 3 else "aciss") if names else "aciss"
+        try:
+            cache.write_text(json.dumps(table, indent=1))
+        except OSError:
+            pass
+    return table[str(label)]
 
 
 def instrument_for_epoch(label):
-    """The SOXS ACIS-S response closest in Chandra cycle to a data epoch."""
+    """The SOXS ACIS response (S or I array, nearest cycle) for a data epoch."""
     if label is None:
         return "chandra_aciss_cy0"
     try:
         year = int(str(label)[:4])
     except ValueError:
         return "chandra_aciss_cy0"
-    cycle = min(ACIS_S_CYCLES, key=lambda c: abs(1999 + c - year))
-    name = f"chandra_aciss_cy{cycle}"
+    det = epoch_detector(label)
+    cycles = ACIS_I_CYCLES if det == "acisi" else ACIS_S_CYCLES
+    cycle = min(cycles, key=lambda c: abs(1999 + c - year))
+    name = f"chandra_{det}_cy{cycle}"
     off = abs(1999 + cycle - year)
     print(f"[casa-obs] instrument {name} for epoch {label}"
           + (f" (nearest available cycle; {off} yr of contamination buildup "
              f"unaccounted for)" if off else " (exact match)"))
+    if off >= 3:
+        # 2004 is equidistant from cy0 (1999) and cy10 (2009) and the tie falls
+        # to the LAUNCH response: the contaminant had already removed tens of
+        # percent of the effective area below ~1 keV by 2004, so the synthetic
+        # 0.5-1.5 keV band is OVERSTATED relative to the real 2004 data by
+        # roughly that much. Prefer an epoch with a matching cycle (2000 -> cy0,
+        # 2009/2010 -> cy10, 2020-2022 -> cy22) for soft-band conclusions, or
+        # pass the real obsid's ARF/RMF as a custom SOXS instrument.
+        print(f"[casa-obs] WARNING: {off} yr of response drift is a soft-band "
+              "systematic of the same size as the residual being interpreted "
+              "(CALIBRATION.md Result 26). Use --instrument to override.")
     return name
 
 
@@ -1061,20 +1197,32 @@ def real_epoch_spectrum(label, *, radius_arcsec, ebins=SPECTRUM_EBINS):
     """
     from astropy.io import fits
 
-    cache = REAL_EPOCH_DIR / f"epoch_{label}_spectrum.npz"
-    if cache.exists():
-        d = np.load(cache)
-        if d["ebins"].shape == ebins.shape and np.allclose(d["ebins"], ebins) \
-                and float(d["radius"]) == radius_arcsec:
-            return np.asarray(d["counts"], dtype=np.float64), float(d["exposure"])
-
     evt_dir = REAL_EPOCH_DIR.parent / "evt2"
-    counts, exposure, used = np.zeros(len(ebins) - 1), 0.0, []
+    # which evt2 files belong to this epoch -- the cache is keyed on this set,
+    # because the image epoch is an explicit obsid list (make_epoch_images.py)
+    # while this picks every file whose DATE-OBS starts with the label; a file
+    # added to evt2/ later would otherwise leave a stale spectrum undetected
+    members = []
     for path in sorted(evt_dir.glob("acisf*_evt2.fits.gz")):
         with fits.open(path) as f:
             date = f["EVENTS"].header.get("DATE-OBS", "")
-        if not date.startswith(str(label)):
-            continue
+        if date.startswith(str(label)):
+            members.append(path)
+    member_names = np.array([p.name for p in members])
+
+    cache = REAL_EPOCH_DIR / f"epoch_{label}_spectrum.npz"
+    if cache.exists():
+        d = np.load(cache)
+        same_files = ("files" in d and d["files"].shape == member_names.shape
+                      and bool(np.all(d["files"] == member_names)))
+        if d["ebins"].shape == ebins.shape and np.allclose(d["ebins"], ebins) \
+                and float(d["radius"]) == radius_arcsec and same_files:
+            return np.asarray(d["counts"], dtype=np.float64), float(d["exposure"])
+        print(f"[casa-obs] real-spectrum cache for {label} is stale "
+              f"({'file set changed' if not same_files else 'bins/radius changed'}); rebuilding")
+
+    counts, exposure, used = np.zeros(len(ebins) - 1), 0.0, []
+    for path in members:
         px, py, energy, exp = read_events(path)
         counts += event_spectrum(px, py, energy, radius_arcsec=radius_arcsec,
                                  ebins=ebins)
@@ -1092,7 +1240,7 @@ def real_epoch_spectrum(label, *, radius_arcsec, ebins=SPECTRUM_EBINS):
     print(f"[casa-obs] real spectrum from {', '.join(used)} "
           f"({exposure / 1e3:.1f} ks)")
     np.savez_compressed(cache, counts=counts, exposure=exposure, ebins=ebins,
-                        radius=radius_arcsec)
+                        radius=radius_arcsec, files=member_names)
     return counts, exposure
 
 
@@ -1348,6 +1496,7 @@ def radial_profile_figure(syn, real, *, out_path, label, syn_exposure_s,
 
 
 def main():
+    global DISTANCE_KPC
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("state", help="showcase --save-state npz")
@@ -1377,6 +1526,12 @@ def main():
                     help="radius (arcsec) of the aperture the spectra are "
                          "extracted in, for both synthetic and real")
     ap.add_argument("--nh", type=float, default=NH_CASA, help="N_H / 1e22 cm^-2")
+    ap.add_argument("--legacy-parity", action="store_true",
+                    help="reproduce the pre-2026-09-24 images, which were the view from "
+                         "-y reflected about the NW-SE diagonal (see fix_projection_parity)")
+    ap.add_argument("--distance", type=float, default=DISTANCE_KPC, metavar="KPC",
+                    help="source distance (kpc); a fitted distance (casa_pluto_diff) "
+                         "must be observed at that distance, not the 3.4 default")
     ap.add_argument("--zmet", type=float, default=1.0, help="ambient metallicity (Zsun)")
     ap.add_argument("--ejecta-zmet", type=float, default=None,
                     help="crude metallicity for the dense hot (ejecta-like) gas, "
@@ -1441,11 +1596,18 @@ def main():
                     help="gyrofactor; 1 is Bohm diffusion. Enters ONLY through "
                          "the loss-limited cutoff, which is why it is the single "
                          "free physics parameter here")
+    ap.add_argument("--sync-norm", type=float, default=1.0, metavar="F",
+                    help="FITTED efficiency multiplier on the radio-anchored "
+                         "synchrotron flux (1 = the anchored prediction, which "
+                         "is 10-25x too faint at the observed filament width; "
+                         "Result 26). The run prints the norm that would match "
+                         "the observed 4.2-6 keV non-thermal flux.")
     ap.add_argument("--sync-width", type=float, default=2.0, metavar="ARCSEC",
                     help="observed non-thermal filament width, which sets the "
-                         "emitting thickness. Cas A's are 1-3 arcsec; the "
-                         "predicted flux spans 0.51-1.53x the observed over "
-                         "that range")
+                         "emitting thickness. Cas A's are 1-3 arcsec. The "
+                         "predicted flux over that range is printed by "
+                         "_synchrotron.py's self-check (it was re-derived on "
+                         "2026-09-02 after two unit errors)")
     ap.add_argument("--subgrid-chi", type=float, default=None, metavar="CHI",
                     help="re-read every cell as a two-phase medium of density "
                          "contrast CHI and observe both phases (see _subgrid). "
@@ -1453,17 +1615,28 @@ def main():
                          "structure. CALIBRATE IT WITH casa_xrism.py "
                          "--subgrid-scan FIRST: a row there costs minutes and "
                          "this costs 45")
-    ap.add_argument("--subgrid-fmass", type=float, default=0.5, metavar="F",
-                    help="mass fraction of the dense phase")
+    ap.add_argument("--subgrid-fmass", type=float, default=0.34, metavar="F",
+                    help="mass fraction of the dense phase. 0.34 puts the count "
+                         "rate at unity for the EJECTA-ONLY split on the "
+                         "recalibrated 319-yr state (CALIBRATION.md Result 27); "
+                         "results before 2026-09-03 used 0.2 with the wind split too")
+    ap.add_argument("--subgrid-population", default="ejecta", choices=("all", "ejecta"),
+                    help="apply the two-phase split to every cell ('all', the "
+                         "behaviour of every result before 2026-09-02) or to the "
+                         "ejecta fraction C_ej only, observing the circumstellar "
+                         "gas unsplit -- chi is an ejecta quantity (XRISM) while "
+                         "79%% of the continuum emission measure is wind")
     ap.add_argument("--subgrid-net-mode", default="unchanged",
                     choices=("density", "unchanged", "crossing"),
                     help="how the dense phase's ionization age follows from the "
                          "cell's; n_e t is already at the top of the observed "
                          "range with no boost, which bounds this")
-    ap.add_argument("--tracer-split", default="hwang_laming",
+    ap.add_argument("--tracer-split", default="xrism_bulk",
                     choices=sorted(TRACER_SPLIT_PRESETS),
                     help="how the Si and O tracers divide among the elements "
-                         "they stand for. HWANG_LAMING (default) reproduces the "
+                         "they stand for. XRISM_BULK is the default since "
+                         "2026-09-03 (Result 27: rms 0.065 vs 0.084 dex). "
+                         "HWANG_LAMING reproduces the "
                          "remnant-integrated shocked masses but puts Ar/Si and "
                          "Ca/Si at 1.7-2.7x solar everywhere; XRISM_BULK "
                          "matches the per-pixel line ratios XRISM measures "
@@ -1490,6 +1663,15 @@ def main():
     ap.add_argument("--compare", default=None,
                     help="also bin onto the real-data grid and compare with this epoch "
                          "(e.g. 2004)")
+    ap.add_argument("--aimpt-shift", type=float, nargs=2, default=(150.0, 0.0),
+                    metavar=("DX", "DY"),
+                    help="shift of the SOXS aimpoint on the detector (arcsec). "
+                         "The default (150, 0) puts the whole remnant on one CCD "
+                         "like the real pointings; every result recorded before "
+                         "2026-09-02 used 0 0 and carries the S2/S3 chip-gap "
+                         "stripe at x ~ -98 arcsec, which changed the 2.5 arcsec "
+                         "amplitude ratio from 1.74 to 1.15 (CALIBRATION.md "
+                         "Result 26). Pass 0 0 to reproduce those images.")
     ap.add_argument("--events", default=None,
                     help="skip the simulation and re-bin/compare an existing event file")
     ap.add_argument("--pyxsim-events", default=None,
@@ -1528,6 +1710,7 @@ def main():
                          "at the no-halo run's image and the sightline's effect "
                          "is one plot instead of two")
     args = ap.parse_args()
+    DISTANCE_KPC = float(args.distance)
 
     if args.out is None:
         args.out = str(FIGURES_DIR.parent / Path(args.state).stem)
@@ -1541,6 +1724,11 @@ def main():
          f"{tracer_split_report()}")
 
     state = load_state(args.state)
+    if not args.legacy_parity:
+        state = fix_projection_parity(state, args.los)
+        _say("[casa-obs] projection parity: x <-> z swapped so the image is the view "
+             "from -y (west = +x, north = +z); --legacy-parity for the old images "
+             "(reflected about the NW-SE diagonal)")
     print(f"[casa-obs] {args.state}: {state['num_cells']}^3, box {state['box_pc']} pc, "
           f"age {state['age_yr']:.0f} yr, "
           f"scalars {sorted(k for k in state['fields'] if k.startswith('C_') or k in ('shocked_fraction', 'time_since_shock', 'density_time'))}")
@@ -1550,7 +1738,15 @@ def main():
         return
 
     syn = bin_events_to_grid(evtfile)
+    # the exposure of the file that was actually binned, not the CLI default:
+    # with --events pointing at a list made with another --exposure every rate
+    # and band ratio below would otherwise be silently mis-scaled
+    _, _, _, file_exp = read_events(evtfile)
     syn_exp = args.exposure * 1e3
+    if np.isfinite(file_exp) and abs(file_exp - syn_exp) > 0.01 * syn_exp:
+        print(f"[casa-obs] NOTE: event file exposure {file_exp / 1e3:.1f} ks differs "
+              f"from --exposure {args.exposure:.1f} ks; using the file's")
+        syn_exp = file_exp
     np.savez_compressed(f"{args.out}_synimg.npz", counts=syn, exposure=syn_exp)
     print(f"[casa-obs] synthetic image: {syn.sum():.4g} counts in {args.exposure:.0f} ks "
           f"= {syn.sum() / syn_exp:.1f} counts/s (0.5-7 keV)")

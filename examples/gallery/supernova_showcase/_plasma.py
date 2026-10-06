@@ -455,7 +455,7 @@ def shock_electron_temperature(T, f_e, *, model="ghavamian", kT_e_shock_keV=0.3,
 
 
 def electron_ion_temperatures(T, rho_code, time_since_shock_code, X,
-                              kT_e_shock_keV=0.3, n_substeps=16,
+                              kT_e_shock_keV=0.3, n_substeps=48,
                               te_model="ghavamian", beta_shock=0.05):
     """Split the single-fluid temperature into ``(T_e, T_i)``.
 
@@ -518,13 +518,32 @@ def electron_ion_temperatures(T, rho_code, time_since_shock_code, X,
 
     dt_total = np.asarray(time_since_shock_code, dtype=np.float64) * CODE_TIME
     shocked = dt_total > 0.0
-    dt = dt_total / n_substeps
-    for _ in range(n_substeps):
-        # the temperature DIFFERENCE decays on t_eq * n_i/(n_e + n_i); both
-        # temperatures therefore approach the (energy-conserving) mean on it
-        tau = equipartition_time(T_e, T_i, rho_code, X) * (1.0 - f_e)
-        frac = np.where(shocked, -np.expm1(-np.clip(dt / tau, 0.0, 50.0)), 0.0)
-        T_mean = f_e * T_e + (1.0 - f_e) * T_i
+    # THE RELAXATION IS STIFF AT THE START. t_eq ~ T_e^{3/2}, so just behind
+    # the shock -- electrons cold, ions hot -- the rate is at its highest and
+    # it falls as the electrons heat. Equal substeps with tau frozen at the
+    # start of each (what this did until 2026-09-23) take the FIRST substep at
+    # the shortest tau of the whole history: frac -> 1 and the electrons jump
+    # to equipartition in one step. With the 'minimal' start that gave
+    # T_e/T = 0.96 (hotter than the 0.3 keV Ghavamian start, which a
+    # one-variable relaxation cannot do), and every model was biased hot.
+    # Now: substeps geometric in time (the first ~1e-6 of the interval, where
+    # tau is short), each a predictor-corrector with tau at the midpoint state.
+    n = max(int(n_substeps), 1)
+    edges = np.concatenate([[0.0], np.geomspace(1e-6, 1.0, n)])
+    T_mean = f_e * T_e + (1.0 - f_e) * T_i       # conserved: the relaxation target
+
+    def relax(Te, Ti, h):
+        tau = equipartition_time(Te, Ti, rho_code, X) * (1.0 - f_e)
+        return np.where(shocked, -np.expm1(-np.clip(h / tau, 0.0, 50.0)), 0.0)
+
+    for a, b in zip(edges[:-1], edges[1:]):
+        h = (b - a) * dt_total
+        # predictor to the midpoint, corrector with tau there
+        fr = relax(T_e, T_i, 0.5 * h)
+        Te_m = T_e + fr * (T_mean - T_e)
+        Ti_m = T_i + fr * (T_mean - T_i)
+        tau_m = equipartition_time(Te_m, Ti_m, rho_code, X) * (1.0 - f_e)
+        frac = np.where(shocked, -np.expm1(-np.clip(h / tau_m, 0.0, 50.0)), 0.0)
         T_e = T_e + frac * (T_mean - T_e)
         T_i = T_i + frac * (T_mean - T_i)
 
@@ -663,10 +682,15 @@ def load_diagnostic_state(path):
     # infinitesimal amount of the record into every cell, so a > 0 test would
     # call the whole box shocked (exactly the trap the solver's own latch had to
     # be rewritten to avoid).
-    fields["shocked_fraction"] = (
-        np.asarray(d["shocked_fraction"], dtype=np.float64)
-        if "shocked_fraction" in d
-        else (fields["time_since_shock"] > 0).astype(np.float64))
+    if "shocked_fraction" in d:
+        fields["shocked_fraction"] = np.asarray(d["shocked_fraction"], dtype=np.float64)
+    else:
+        # pre-latch states only. This IS the > 0 trap the comment above warns
+        # about, so say so loudly rather than silently calling the box shocked.
+        print(f"[plasma] WARNING: {path} predates the shocked_fraction latch; "
+              "falling back to time_since_shock > 0, which over-counts shocked "
+              "material wherever advection has leaked the record.")
+        fields["shocked_fraction"] = (fields["time_since_shock"] > 0).astype(np.float64)
 
     # C_He matters as much as the others: it is a quarter of the ejecta mass, and
     # leaving it out would put that mass into hydrogen and halve the local mu.
@@ -685,6 +709,14 @@ def load_diagnostic_state(path):
         bad.append(f"max density {float(fields['rho'].max()):.3e}")
     if not np.all(np.isfinite(fields["press"])) or float(fields["press"].min()) < 0:
         bad.append("non-finite or negative pressure")
+    # the ionization age is the fourth check the docstring promises and the one
+    # that catches the "0.000 Msun, T_e/T = 79.9" failure: a blown run leaves
+    # density_time non-finite or negative, or astronomically large
+    dt_ = fields["density_time"]
+    if not np.all(np.isfinite(dt_)):
+        bad.append(f"{int(np.sum(~np.isfinite(dt_)))} non-finite density_time cells")
+    elif float(dt_.min()) < 0 or float(dt_.max()) > 1e12:
+        bad.append(f"density_time range [{float(dt_.min()):.3e}, {float(dt_.max()):.3e}]")
     if "C_ej" in fields:
         dx = float(d["box"]) / int(d["num_cells"])
         m_ej = float(np.sum(fields["C_ej"] * fields["rho"])) * dx ** 3
@@ -876,6 +908,23 @@ def _assert_physics():
           f"T_e/T_i relaxation, per-species ion temperatures; the reverse-shock "
           f"Fe-Si ion temperature difference at 1800 km/s is {dT_keV:.0f} keV "
           f"against XRISM's 150-300)")
+
+    # 3. the relaxation is a one-variable autonomous ODE at fixed T, so a COLDER
+    #    post-shock start can never end HOTTER, and the substepping must be
+    #    converged. The equal-substep scheme broke both (minimal start ended at
+    #    T_e/T = 0.96 against 0.36 for ghavamian; fixed 2026-09-23).
+    X = {"H": 0.7, "He": 0.28, "O": 0.02}
+    mom = composition_moments(X)
+    rho_code = 30.0 * mom["mu_e"] * M_P / CODE_DENSITY
+    T = np.array([3e7, 3e8, 3e9])
+    for age_yr in (10.0, 100.0, 300.0):
+        dt = age_yr * 3.155693e7 / CODE_TIME
+        Te_min, _ = electron_ion_temperatures(T, rho_code, dt, X, te_model="minimal")
+        Te_gha, _ = electron_ion_temperatures(T, rho_code, dt, X, te_model="ghavamian")
+        Te_ref, _ = electron_ion_temperatures(T, rho_code, dt, X, te_model="ghavamian",
+                                              n_substeps=1024)
+        assert np.all(Te_min <= Te_gha * (1 + 1e-3)), (age_yr, Te_min, Te_gha)
+        assert np.all(np.abs(Te_gha / Te_ref - 1) < 0.01), (age_yr, Te_gha / Te_ref)
 
 
 if __name__ == "__main__":

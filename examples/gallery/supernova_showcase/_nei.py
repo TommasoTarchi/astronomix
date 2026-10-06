@@ -136,16 +136,43 @@ def build_table(path=TABLE_PATH, *, elements=ELEMENTS, kt=KT_GRID, net=NET_GRID)
         print(f"[nei] {el:2s} (Z = {Z:2d}) tabulated")
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, kt=kt, net=net,
+                        elements=np.array(sorted(elements)),
                         **{f"f_{el}": v for el, v in out.items()})
     print(f"[nei] wrote {path}")
     return out
 
 
+def _table_is_current(d):
+    """Does a cached table match the grids and element set the code now uses?
+
+    The cache used to be keyed on nothing but the file existing, so changing
+    ``KT_GRID``, ``NET_GRID`` or ``ELEMENTS`` in the code silently kept serving
+    the old table (a new element then failed later with a KeyError).
+    """
+    have = {k[2:] for k in d.files if k.startswith("f_")}
+    if have != set(ELEMENTS):
+        return False, f"elements {sorted(have)} != {sorted(ELEMENTS)}"
+    kt, net = np.asarray(d["kt"]), np.asarray(d["net"])
+    if kt.shape != KT_GRID.shape or not np.allclose(kt, KT_GRID):
+        return False, f"kT grid {kt.shape} differs from KT_GRID {KT_GRID.shape}"
+    if net.shape != NET_GRID.shape or not np.allclose(net, NET_GRID):
+        return False, f"n_e t grid {net.shape} differs from NET_GRID {NET_GRID.shape}"
+    return True, ""
+
+
 def load_table(path=TABLE_PATH):
-    """Read the cached table, building it if it is not there yet."""
-    if not Path(path).exists():
+    """Read the cached table, (re)building it if missing or out of date."""
+    path = Path(path)
+    if path.exists():
+        d = np.load(path)
+        ok, why = _table_is_current(d)
+        if not ok:
+            print(f"[nei] cached table at {path} is stale ({why}) -- rebuilding")
+            d.close()
+            build_table(path)
+    else:
         print(f"[nei] no table at {path} -- building it (needs pyatomdb)")
-        build_table(Path(path))
+        build_table(path)
     d = np.load(path)
     return (np.asarray(d["kt"]), np.asarray(d["net"]),
             {k[2:]: np.asarray(d[k]) for k in d.files if k.startswith("f_")})
