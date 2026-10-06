@@ -12,14 +12,16 @@ as surrogate / solver-in-the-loop training.
 ## Features
 
 - [x] 1D, 2D and 3D hydrodynamics and magnetohydrodynamics simulations scaling to multiple GPUs and nodes
-- [x] a 5th order finite difference constrained transport WENO MHD scheme following [HOW-MHD by Seo & Ryu 2023](https://arxiv.org/abs/2304.04360) as well as the provably divergence free and provably positivity preserving
-finite volume approach of [Pang and Wu (2024)](https://arxiv.org/abs/2410.05173) (the WENO scheme is also available standalone for hydrodynamics)
+- [x] a 5th order finite difference constrained transport WENO MHD scheme following [HOW-MHD by Seo & Ryu 2023](https://arxiv.org/abs/2304.04360) (the WENO scheme is also available standalone for hydrodynamics), with an admissible characteristic face state and an optional positivity-preserving reconstruction (Zhang-Shu scaling of the split fluxes, with the paired admissibility of Wu (2018, SIAM J. Numer. Anal.) for ideal MHD) that keeps density and pressure positive for `C_cfl <= 0.75` without floors
+- [x] the provably divergence free and provably positivity preserving finite volume approach of [Pang and Wu (2024)](https://arxiv.org/abs/2410.05173)
+- [x] a re-implementation of [AthenaPK](https://github.com/parthenon-hpc-lab/athenapk)'s default second-order scheme (VL2 predictor-corrector, PLM, HLLD / HLLE / HLLC, GLM divergence cleaning, first-order flux correction), agreeing with AthenaPK to round-off ([validation](examples/scripts/validation/athenapk_vl2))
 - [x] isothermal hydrodynamics and magnetohydrodynamics are also supported (currently only in the finite difference scheme)
 - [x] for finite volume simulations the basic Lax-Friedrichs, HLL and HLLC Riemann solvers as well as the HLLC-LM ([Fleischmann et al., 2020](https://www.sciencedirect.com/science/article/pii/S0021999120305362)) and HYBRID-HLLC & AM-HLLC ([Hu et al., 2025](https://www.sciencedirect.com/science/article/pii/S1007570425005891)) (sequels to HLLC-LM) variants
+- [x] Pallas (Triton) GPU kernels for the finite difference and the VL2 finite volume schemes, multi-GPU via `shard_map` halo exchange
 - [x] novel semi-discretely energy conserving self-gravity scheme
 - [x] spherically symmetric simulations such that mass and energy are conserved based on the scheme of [Crittenden and Balachandar (2018)](https://doi.org/10.1007/s00193-017-0784-y)
-- [x] backwards and forwards differentiable with adaptive timestepping
-- [x] turbulent driving, simple stellar wind, simple radiative cooling modules
+- [x] backwards and forwards differentiable with adaptive timestepping, including rematerialisation options for memory-lean reverse mode
+- [x] physics modules: turbulent driving (white-in-time and Ornstein-Uhlenbeck, AthenaK / AthenaPK driving spectra), radiative cooling with an implicit solver, thermal conduction, viscosity and resistivity, cosmic rays with a shock finder, passive scalars (e.g. composition tracers), dual energy, stellar winds
 - [x] easily extensible, all code is open source
 
 ## Contents
@@ -117,29 +119,35 @@ the notebooks below and we have also prepared a more advanced use-case
 
 ## Examples for Getting Started
 
-Every example is available both as a runnable script (`examples/scripts/…`) and
-as an equivalent notebook (`examples/notebooks/…`).
+Runnable scripts live under `examples/scripts/`, notebooks under
+`examples/notebooks/`.
 
 - forward simulations
-  - [1D Sod shock tube](examples/notebooks/forward/hydro/shock_tube.ipynb)
-  - [2D Kelvin-Helmholtz instability](examples/notebooks/forward/hydro/khi.ipynb)
-  - [3D MHD jet](examples/notebooks/forward/mhd/jet.ipynb)
-  - [3D driven MHD turbulence](examples/notebooks/forward/mhd/turbulence.ipynb)
-  - [3D self-gravitating collapse](examples/notebooks/forward/self_gravity/collapse.ipynb)
+  - [1D Sod shock tube](examples/scripts/forward/hydro/shock_tube.py), [a minimal notebook](examples/notebooks/hydro/simple_example.ipynb)
+  - [2D Kelvin-Helmholtz instability](examples/scripts/forward/hydro/khi.py) ([notebook](examples/notebooks/hydro/kelvin_helmholtz.ipynb))
+  - [2D Orszag-Tang vortex](examples/scripts/forward/mhd/orszag_tang.py) ([notebook](examples/notebooks/mhd/orszag_tang_vortex.ipynb))
+  - [3D MHD jet](examples/scripts/forward/mhd/jet.py) ([notebook](examples/notebooks/mhd/jet.ipynb))
+  - [3D driven MHD turbulence and the small-scale dynamo](examples/scripts/forward/mhd/turbulence) (astronomix against AthenaPK)
+  - [3D self-gravitating collapse](examples/scripts/forward/self_gravity/collapse.py) ([notebook](examples/notebooks/gravity/evrards_collapse.ipynb))
 - differentiability
-  - [Field-level inference](examples/notebooks/differentiability/field_level_inference.ipynb)
-  - [KHI eigenmode initialization](examples/notebooks/differentiability/eigen_initialization.ipynb)
-  - [Solver-in-the-loop correction network](examples/notebooks/differentiability/solver_in_the_loop.ipynb)
+  - [Field-level inference](examples/scripts/differentiability/field_level_inference) ([notebook](examples/notebooks/differentiability/field_level_inference.ipynb))
+  - [KHI eigenmode initialization](examples/scripts/differentiability/eigen_initialization.py)
+  - [Solver-in-the-loop correction network](examples/scripts/differentiability/solver_in_the_loop.py)
 - output options
-  - [On-the-fly movie via callback](examples/notebooks/output_options/callback.ipynb)
-  - [Orbax checkpointing and restart](examples/notebooks/output_options/orbax_checkpointing.ipynb)
-  - [In-memory snapshot diagnostics](examples/notebooks/output_options/return_snapshots.ipynb)
+  - [On-the-fly movie via callback](examples/scripts/output_options/callback.py)
+  - [Orbax checkpointing and restart](examples/scripts/output_options/orbax_checkpointing.py)
+  - [In-memory snapshot diagnostics](examples/scripts/output_options/return_snapshots.py)
 - multi-GPU
-  - [Sharded multi-GPU run](examples/notebooks/multi_gpu/multi_gpu.ipynb)
-  - [Multi-node run](examples/notebooks/multi_gpu/multi_node.ipynb)
+  - [Sharded multi-GPU run](examples/scripts/multi_gpu/multi_gpu.py)
+  - [Multi-node run](examples/scripts/multi_gpu/multi_node.py)
+- validation
+  - [AthenaPK's VL2 scheme in astronomix](examples/scripts/validation/athenapk_vl2)
+  - [Positivity-preserving WENO](examples/scripts/validation/weno_stability)
 
 More involved, physics-module showcase scripts — turbulent radiative mixing
-layer, stellar wind, cosmic rays, cooling and more — live in
+layer, stellar wind, thermal instability, cooling and the calibrated
+Cassiopeia A supernova remnant reconstruction against Chandra data
+([`supernova_showcase`](examples/gallery/supernova_showcase)) — live in
 [`examples/gallery/`](examples/gallery). The faithful methods-paper figure
 generators live under [`examples/scripts/`](examples/scripts); regenerate every
 paper figure with `pytest pytests/test_reproduce_paper.py --reproduce-paper`.
