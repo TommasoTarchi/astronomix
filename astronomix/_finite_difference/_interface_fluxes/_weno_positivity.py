@@ -51,6 +51,9 @@ lies below it and the chord's root is admissible: one closed-form step.
 import jax
 import jax.numpy as jnp
 
+# numerics
+import numpy as np
+
 # astronomix constants
 from astronomix.option_classes.simulation_config import IDEAL_GAS, ISOTHERMAL
 
@@ -96,9 +99,50 @@ def stencil_maximum(cell_field):
 # -----------------------------------------------------------------------------
 
 
+@jax.custom_jvp
+def _floored_ratio(numerator, denominator):
+    """
+    Return ``numerator / max(denominator, 1e-30)``.
+
+    The forward value is exactly the guarded division it replaces; only the
+    derivative differs (see ``_floored_ratio_jvp``).
+    """
+    return numerator / jnp.maximum(denominator, 1e-30)
+
+
+@_floored_ratio.defjvp
+def _floored_ratio_jvp(primals, tangents):
+    """
+    Derivative of the guarded division that stays finite in single precision.
+
+    JAX differentiates ``x / y`` through ``-x y**-2``. For the 1e-30 guard (in
+    fact for any ``y`` below ~5e-20) ``y**-2`` overflows float32 to infinity,
+    and the tangent multiplying it is exactly zero wherever ``jnp.maximum``
+    picks the guard or a later ``where`` / ``clip`` discards the lane, so the
+    product is ``0 * inf = NaN``, which reverse mode then spreads. The
+    derivative is therefore only formed where ``y**-2`` is finite; elsewhere
+    it is the guard's own derivative, zero.
+    """
+    numerator, denominator = primals
+    numerator_tangent, denominator_tangent = tangents
+    ratio = numerator / jnp.maximum(denominator, 1e-30)
+    smallest_safe_denominator = 2.0 * float(
+        np.sqrt(1.0 / np.finfo(jnp.result_type(denominator)).max)
+    )
+    differentiable = denominator > smallest_safe_denominator
+    inverse_denominator = 1.0 / jnp.where(differentiable, denominator, 1.0)
+    ratio_tangent = jnp.where(
+        differentiable,
+        (numerator_tangent - jnp.where(differentiable, ratio, 0.0) * denominator_tangent)
+        * inverse_denominator,
+        0.0,
+    )
+    return ratio, ratio_tangent
+
+
 def _gas_pressure(state, gamma, config: SimulationConfig, registered_variables: RegisteredVariables):
     """Gas pressure of a conserved-state-like vector (no floors)."""
-    density = jnp.maximum(state[registered_variables.density_index], 1e-30)
+    density = state[registered_variables.density_index]
     energy = state[registered_variables.energy_index]
 
     if config.dimensionality == 1 and not config.mhd:
@@ -110,7 +154,7 @@ def _gas_pressure(state, gamma, config: SimulationConfig, registered_variables: 
         if config.dimensionality == 3 or config.mhd:
             momentum_squared = momentum_squared + state[registered_variables.momentum_index.z] ** 2
 
-    internal_energy = energy - 0.5 * momentum_squared / density
+    internal_energy = energy - _floored_ratio(0.5 * momentum_squared, density)
     if config.mhd:
         internal_energy = internal_energy - 0.5 * (
             state[registered_variables.magnetic_index.x] ** 2
@@ -150,7 +194,7 @@ def _admissible_fraction(
     density_step = step[density_index]
     fraction = jnp.where(
         density_step < 0.0,
-        (base_density - density_floor) / jnp.maximum(-density_step, 1e-30),
+        _floored_ratio(base_density - density_floor, -density_step),
         1.0,
     )
     fraction = jnp.clip(jnp.where(base_density > 0.0, fraction, 0.0), 0.0, 1.0)
@@ -163,7 +207,7 @@ def _admissible_fraction(
     pressure_floor = jnp.minimum(params.minimum_pressure, 0.5 * jnp.maximum(base_pressure, 0.0))
     base_margin = base_pressure - pressure_floor
     end_margin = _gas_pressure(base + fraction[None] * step, gamma, config, registered_variables) - pressure_floor
-    chord_root = fraction * base_margin / jnp.maximum(base_margin - end_margin, 1e-30)
+    chord_root = _floored_ratio(fraction * base_margin, base_margin - end_margin)
     fraction = jnp.where(end_margin >= 0.0, fraction, chord_root)
     return jnp.where(base_margin > 0.0, fraction, 0.0)
 
