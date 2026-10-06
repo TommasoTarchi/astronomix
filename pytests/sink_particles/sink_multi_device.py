@@ -9,9 +9,11 @@ reproduces an uninterrupted run.
 The number of simulated devices can only be set before JAX starts, so each
 check runs this file as a script in a fresh process, with
 ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` and
-``JAX_PLATFORMS=cpu``. The checks use the native JAX backend, since the Pallas
-kernels do not run on CPU devices. The pytest process itself does not use JAX.
-A check can also be run by hand::
+``JAX_PLATFORMS=cpu``. The checks use the native JAX backend: the Pallas
+kernels do not run on CPU devices, and the default ``OPTIMAL_BACKEND`` would
+still pick Pallas on a machine with a GPU, since it decides from
+``nvidia-smi``, not from the devices JAX runs on. The pytest process itself
+does not use JAX. A check can also be run by hand::
 
     python pytests/sink_particles/sink_multi_device.py same_result
 """

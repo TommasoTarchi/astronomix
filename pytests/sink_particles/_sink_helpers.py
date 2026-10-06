@@ -50,7 +50,12 @@ SETTINGS = SinkFormationSettings(
 )
 
 
-def _setup(settings=SETTINGS, mhd=False, backend=OPTIMAL_BACKEND, **sink_particle_options):
+def _setup(
+    settings=SETTINGS,
+    mhd=False,
+    backend=OPTIMAL_BACKEND,
+    **sink_particle_options,
+):
     """Set up the Gaussian overdensity with sink particles on and the given
     sink options.
 
