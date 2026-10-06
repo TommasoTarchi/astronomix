@@ -361,11 +361,13 @@ class GravityConfig(NamedTuple):
     #: tenuous receiver can be driven to negative pressure; the low-order
     #: q = F phi_downwind charges the whole climb to the donor (the cell the
     #: mass leaves). This option blends them face by face,
-    #: q = q_low + psi (q_high - q_low), with the largest psi in [0, 1] that
-    #: keeps every cell's internal-energy loss rate within half its internal
-    #: energy per wave-crossing time (Zalesak limiting with RATE budgets, so
-    #: psi does not depend on dt). Exactly conservative; high order wherever
-    #: psi = 1.
+    #: q = q_low + psi (q_high - q_low), with psi in [0, 1] chosen by a
+    #: one-sided Zalesak limiter so that every cell's internal-energy loss
+    #: rate stays within half its internal energy per wave-crossing time (rate
+    #: budgets, so psi does not depend on dt; the per-cell scaling is
+    #: sufficient, not maximal, and the bound is not guaranteed where the
+    #: low-order coupling alone exceeds it). Exactly conservative; high order
+    #: wherever psi = 1.
     work_flux_correction: bool = False
 
     #: Master gravity switch. Set automatically in ``finalize_config`` to

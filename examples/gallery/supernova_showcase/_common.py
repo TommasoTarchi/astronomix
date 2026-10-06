@@ -495,7 +495,7 @@ def ism_ti_cooling_setup(code_units, hrate_cgs=5.0e-26, mu_athena=0.618,
     # ``explicit=True`` replicates AthenaK exactly: a single forward-Euler
     # source evaluation per stage, with the time step limited to the local
     # thermal time min(T/|dT/dt|) (see the estimator). Far cheaper than the
-    # implicit fixed point (~33 curve evaluations per call) and, because the
+    # implicit (safeguarded Newton) update and, because the
     # net rate vanishes at the two-phase equilibrium, essentially free in dt
     # for this problem.
     config = CoolingConfig(
