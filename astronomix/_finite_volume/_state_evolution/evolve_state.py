@@ -28,6 +28,7 @@ from astronomix.option_classes.simulation_config import (
     STATE_TYPE,
     UNSPLIT,
     VAN_ALBADA_PP,
+    VL2,
 )
 
 # astronomix containers
@@ -51,6 +52,9 @@ from astronomix._finite_volume._state_evolution.reconstruction import (
 from astronomix._finite_volume._state_evolution._pallas_evolve import (
     _evolve_gas_state_unsplit_pallas,
     _fv_pallas_evolve_supported,
+)
+from astronomix._finite_volume._state_evolution._van_leer_integrator import (
+    _evolve_state_vl2,
 )
 from astronomix._geometry.boundaries import _boundary_handler
 from astronomix._fluid_equations._equations import (
@@ -573,6 +577,18 @@ def _evolve_state_fv(
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
 ) -> STATE_TYPE:
+    # The AthenaPK-equivalent VL2 scheme (hydro and GLM-MHD) is self-contained.
+    if config.time_integrator == VL2:
+        return _evolve_state_vl2(
+            primitive_state,
+            dt,
+            gamma,
+            config,
+            params,
+            helper_data,
+            registered_variables,
+        )
+
     if config.mhd:
         if config.dimensionality > 1:
 

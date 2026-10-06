@@ -21,9 +21,11 @@ import jax.numpy as jnp
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     DYNAMIC_VISCOSITY,
+    GHOST_CELLS,
     KINEMATIC_VISCOSITY,
     STATE_TYPE,
     UNSPLIT,
+    VL2,
 )
 
 # astronomix containers
@@ -36,6 +38,11 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 from astronomix._modules._stellar_wind.stellar_wind import _wind_injection
 from astronomix._fluid_equations._fluxes import _euler_flux
 from astronomix._fluid_equations._equations import speed_of_sound
+from astronomix._finite_volume._riemann_solver._athena_riemann_solvers import (
+    adiabatic_sound_speed,
+    fast_magnetosonic_speed,
+)
+from astronomix.time_stepping._utils import _unpad
 from astronomix._modules._cosmic_rays.cr_fluid_equations import (
     gas_pressure_from_primitives_with_crs,
     speed_of_sound_crs,
@@ -107,6 +114,64 @@ def get_wave_speeds(
 
 # @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
+def _maximum_signal_speed_vl2(
+    primitive_state: STATE_TYPE,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+) -> Float[Array, ""]:
+    """
+    The largest hyperbolic signal speed ``max over cells and axes of
+    |v_d| + c_d`` of the VL2 scheme, with ``c_d`` the fast magnetosonic speed
+    along axis ``d`` (MHD) or the sound speed (hydrodynamics).
+
+    It sets both the CFL time step and, as in AthenaPK, the GLM divergence
+    cleaning speed ``c_h``. Ghost cells are excluded.
+
+    Args:
+        primitive_state: The primitive state (padded when ghost cells are used).
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The maximum signal speed.
+    """
+    if config.boundary_handling == GHOST_CELLS:
+        primitive_state = _unpad(primitive_state, config)
+
+    density = primitive_state[registered_variables.density_index]
+    pressure = primitive_state[registered_variables.pressure_index]
+
+    if config.dimensionality == 1 and not config.mhd:
+        velocity_indices = (registered_variables.velocity_index,)
+    else:
+        velocity_indices = tuple(registered_variables.velocity_index)[: config.dimensionality]
+
+    maximum_speed = None
+    for axis in range(config.dimensionality):
+        if config.mhd:
+            # the fast speed along the axis: the axis' own field component is
+            # the normal one, the other two are transverse
+            magnetic_indices = tuple(registered_variables.magnetic_index)
+            signal_speed = fast_magnetosonic_speed(
+                params.gamma,
+                density,
+                pressure,
+                primitive_state[magnetic_indices[axis]],
+                primitive_state[magnetic_indices[(axis + 1) % 3]],
+                primitive_state[magnetic_indices[(axis + 2) % 3]],
+            )
+        else:
+            signal_speed = adiabatic_sound_speed(params.gamma, density, pressure)
+        axis_maximum = jnp.max(jnp.abs(primitive_state[velocity_indices[axis]]) + signal_speed)
+        maximum_speed = axis_maximum if maximum_speed is None else jnp.maximum(maximum_speed, axis_maximum)
+
+    return maximum_speed
+
+
+# @jaxtyped(typechecker=typechecker)
+@partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _cfl_time_step(
     primitive_state: STATE_TYPE,
     config: SimulationConfig,
@@ -130,6 +195,13 @@ def _cfl_time_step(
     grid_spacing = config.grid_spacing
     dt_max = params.dt_max
     gamma = params.gamma
+
+    if config.time_integrator == VL2:
+        maximum_speed = _maximum_signal_speed_vl2(primitive_state, config, params, registered_variables)
+        dt = C_CFL * grid_spacing / maximum_speed
+        if config.use_max_adaptive_timestep:
+            dt = jnp.minimum(dt, dt_max)
+        return dt
 
     if config.split == UNSPLIT:
         rho = primitive_state[registered_variables.density_index]

@@ -79,6 +79,9 @@ DOUBLE_MINMOD = 2
 SUPERBEE = 3
 VAN_ALBADA = 4
 VAN_ALBADA_PP = 5
+#: The harmonic-mean (van Leer) slope of AthenaPK's / Athena++'s piecewise
+#: linear reconstruction (``plm_simple.hpp``). Only used by the VL2 scheme.
+VAN_LEER = 6
 
 # splitting modes
 UNSPLIT = 0
@@ -91,6 +94,10 @@ HLLC_LM = 2
 LAX_FRIEDRICHS = 3
 HYBRID_HLLC = 4
 AM_HLLC = 5
+#: The HLLD solver of Miyoshi & Kusano (2005) for ideal MHD, in AthenaPK's
+#: GLM form. Only used by the VL2 scheme (which also maps HLL, HLLC and
+#: LAX_FRIEDRICHS onto AthenaPK's HLLE, HLLC and LLF solvers).
+HLLD = 6
 
 # time integrators
 # currently only for finite volume
@@ -99,6 +106,13 @@ MUSCL = 1
 # currently only for finite difference
 RK4_SSP = 2
 RK4_LSRK = 3
+#: The second-order van Leer predictor-corrector of AthenaPK / Athena++
+#: (Stone & Gardiner 2009): a donor-cell half step followed by a full step
+#: with the configured reconstruction. Finite volume only; selecting it
+#: switches the finite-volume solver to the AthenaPK-equivalent scheme, which
+#: for MHD carries the cell-centred field together with the GLM cleaning
+#: scalar psi (Dedner et al. 2002).
+VL2 = 4
 
 # boundary conditions
 OPEN_BOUNDARY = 0
@@ -526,6 +540,18 @@ class SimulationConfig(NamedTuple):
 
     #: Integrator used for the magnetic part in the FV MHD scheme.
     fv_magnetic_integrator: int = IMPLICIT_MIDPOINT
+
+    #: VL2 scheme only: use the extended (non-conservative) Dedner source terms
+    #: (AthenaPK ``glmmhd_source = dedner_extended``) instead of the plain
+    #: parabolic damping of psi (``dedner_plain``, AthenaPK's default).
+    glm_extended_source: bool = False
+
+    #: VL2 scheme only: AthenaPK's first-order flux correction. After each
+    #: stage, every cell whose update would produce a non-positive density or
+    #: pressure has all its face fluxes replaced by first-order local
+    #: Lax-Friedrichs fluxes (repeated up to four times, exactly as
+    #: AthenaPK's ``first_order_flux_correct``).
+    first_order_flux_correction: bool = False
 
     #: Density/pressure positivity-enforcement configuration (see PositivityConfig).
     positivity_config: PositivityConfig = PositivityConfig()
@@ -1005,6 +1031,43 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         print("Setting MINMOD limiter for gravity.")
         config = config._replace(limiter=MINMOD)
 
+    # The AthenaPK-equivalent VL2 finite-volume scheme. Its piecewise-linear
+    # stencil needs two ghost cells; with periodic boundaries on every axis the
+    # wrap-around is done by rolling the arrays instead (as in the FD solver).
+    if config.solver_mode == FINITE_VOLUME and config.time_integrator == VL2:
+        if config.split != UNSPLIT:
+            print("Setting unsplit mode for the VL2 scheme.")
+            config = config._replace(split=UNSPLIT)
+        if config.limiter != VAN_LEER and not config.first_order_fallback:
+            print("Setting the VAN_LEER (AthenaPK PLM) limiter for the VL2 scheme.")
+            config = config._replace(limiter=VAN_LEER)
+        if config.mhd and config.riemann_solver not in (HLLD, HLL, LAX_FRIEDRICHS):
+            print("Setting the HLLD Riemann solver for VL2 MHD.")
+            config = config._replace(riemann_solver=HLLD)
+        if not config.mhd and config.riemann_solver not in (HLLC, HLL, LAX_FRIEDRICHS):
+            print("Setting the HLLC Riemann solver for VL2 hydrodynamics.")
+            config = config._replace(riemann_solver=HLLC)
+        if config.riemann_solver == LAX_FRIEDRICHS and not config.first_order_fallback:
+            raise ValueError(
+                "As in AthenaPK, the LAX_FRIEDRICHS solver of the VL2 scheme is "
+                "only available with donor-cell reconstruction "
+                "(first_order_fallback=True)."
+            )
+        periodic_1d = BoundarySettings1D(
+            left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
+        )
+        if config.dimensionality == 1:
+            fully_periodic = config.boundary_settings == periodic_1d
+        else:
+            fully_periodic = config.boundary_settings is not None and all(
+                axis_settings == periodic_1d
+                for axis_settings in tuple(config.boundary_settings)[: config.dimensionality]
+            )
+        if fully_periodic:
+            config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
+        else:
+            config = config._replace(boundary_handling=GHOST_CELLS, num_ghost_cells=2)
+
     # Finite-difference-specific checks.
     if config.solver_mode == FINITE_DIFFERENCE:
 
@@ -1124,6 +1187,8 @@ def riemann_solver_to_string(riemann_solver: int) -> str:
         return "Hybrid HLLC"
     elif riemann_solver == AM_HLLC:
         return "AM HLLC"
+    elif riemann_solver == HLLD:
+        return "HLLD"
 
 
 def limiter_to_string(limiter: int) -> str:
@@ -1140,6 +1205,8 @@ def limiter_to_string(limiter: int) -> str:
         return "Van Albada"
     elif limiter == VAN_ALBADA_PP:
         return "Van Albada PP"
+    elif limiter == VAN_LEER:
+        return "Van Leer"
 
 
 def solver_mode_to_string(solver_mode: int) -> str:

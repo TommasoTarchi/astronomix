@@ -725,6 +725,52 @@ rounding; ``jax.grad`` w.r.t. state and ``g`` matches native to
 series identical between 1 GPU and 2 GPUs (x-axis decomposition);
 a dedicated dual strong-scaling sweep has not been run.
 
+### 4.7 FV VL2 scheme (AthenaPK's VL2 + PLM + HLLD + GLM) — DONE
+
+`_finite_volume/_state_evolution/_van_leer_pallas.py`. One fused kernel per
+VL2 stage (`vl2_predictor_dc`, `vl2_corrector_plm`): for a block of cells it
+loads the stage's primitive stencil along each axis (±1 cell for donor cell,
+±2 for PLM), reconstructs, solves the Riemann problems on all `2*dim` faces of
+the cell, forms the divergence, applies the Dedner GLM source and converts to
+primitives. `U^n` is recomputed in-kernel from `W^n` (pointwise read), and the
+corrector aliases `W^n`'s buffer to its output, so a step is one reduction plus
+two launches holding two state-sized buffers (288 MiB temporary at 4.2 M cells
+dp vs 3.8 GiB native).
+
+Design notes worth keeping:
+
+- **Shared elementwise physics.** The kernel calls the same functions as the
+  native path (`_athena_riemann_solvers.py`, the `_*_components_*` helpers in
+  `_van_leer_integrator.py`), with state values passed as Python lists of
+  tiles. Native and Pallas are bit-identical for MHD on an A100 and ≤1 ulp for
+  hydro. Typed select arms: a `jnp.where` between two bare literals enters
+  Triton as the default float type — build signs etc. from a typed operand
+  (`jnp.ones_like(x)`).
+- **Faces are evaluated twice** (once per adjacent cell): Pallas-Triton does
+  not lower `slice`/`roll` on register tiles (verified 2026-10-06), so
+  neighbouring cells cannot share a face. Measured cost: 9.30 → 5.42 ms/step
+  at N=128 dp on A100 if every face were solved once. A flux-array design
+  avoids it at the price of three state-sized buffers and 2–3× DRAM traffic.
+- **The kernel is FP64-compute bound** (~70 % of A100 FP64 peak, card at its
+  power cap; 254–255 registers, ≤64 B spills, 12.5 % occupancy). Block shape
+  barely matters among 128-cell blocks on 4 warps; default (2, 2, 32).
+- **Ghost-cell layout** without block-aligned interiors: the grid covers only
+  the interior, outputs are whole-array specs written with explicit indices,
+  and the ghost cells are refilled by the boundary handler afterwards.
+- **First-order flux correction**: the kernel optionally reports a positivity
+  failure code per cell and accepts a correction mask (faces bordering a
+  masked cell use donor-cell LLF fluxes); up to four `lax.cond`-guarded
+  re-evaluations reproduce AthenaPK's attempts in order-independent form.
+- **AD**: `diffable_pallas_call_n` with *all traced values as primals*
+  (including `params` — closing over traced values inside a `custom_jvp`
+  raises "No constant handler for DynamicJaxprTracer" under `jax.grad`).
+  Pallas and native gradients agree to 1e-15.
+
+Performance and validation against AthenaPK:
+`examples/scripts/validation/athenapk_vl2/README.md` (A100: 2.0–10× faster
+than AthenaPK per step from 33.6 M down to 8 k cells, 3.1× time to solution
+at N=128 with identical L1 errors).
+
 ---
 
 ## 4.4 The x64 / Triton fix (was a real bug, now resolved)
@@ -843,6 +889,7 @@ happens.  The ``pallasify`` skill must enforce this — see its
 | `astronomix/_finite_difference/_magnetic_update/_constrained_transport_pallas.py` | Optional Pallas CT (3 bounded-halo kernels). Gated by `config.pallas_ct` (default False — see §4.5 for the compile/runtime tradeoff). |
 | `astronomix/option_classes/simulation_config.py` | `backend`, `pallas_block_shape`, `pallas_use_triton`, `pallas_interpret`, `pallas_num_warps`, `pallas_ct`, `donate_state`, `time_integrator` knobs. |
 | `tests/pallas/sedov3D.py` | The canonical hydro Pallas benchmark — produces the figure + memory/runtime printout. |
+| `astronomix/_finite_volume/_state_evolution/_van_leer_pallas.py` | FV VL2 stage kernels (AthenaPK's scheme; §4.7). Native counterpart and dispatch: `_van_leer_integrator.py`. |
 | `pytests/mhd/alfven_wave3D.py` | MHD convergence test (3D CP Alfvén wave, N=8..128, both FV and FD).  Acceptance gate for MHD Pallas changes — L1 error must match the NATIVE backend to machine precision. |
 
 ---

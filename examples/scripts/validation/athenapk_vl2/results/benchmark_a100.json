@@ -1,0 +1,470 @@
+[
+ {
+  "code": "astronomix pallas",
+  "precision": "double",
+  "resolution": 16,
+  "cells": 8192,
+  "milliseconds_per_step": 0.08238168060779572,
+  "all_milliseconds_per_step": [
+   0.14381936192512512,
+   0.08238168060779572,
+   0.08239355683326721,
+   0.08243446052074432,
+   0.08239054307341576
+  ],
+  "zone_cycles_per_second": 99439583.40690608,
+  "temporary_memory_mib": 0.5644760131835938,
+  "compile_and_first_run_seconds": 35.10090878047049,
+  "gpu_status": [
+   "1410 MHz, 56.63 W, 0x0000000000000000",
+   "1410 MHz, 58.58 W, 0x0000000000000000",
+   "1410 MHz, 115.45 W, 0x0000000000000000",
+   "1410 MHz, 86.87 W, 0x0000000000000000",
+   "1410 MHz, 59.72 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "double",
+  "resolution": 16,
+  "cells": 8192,
+  "milliseconds_per_step": 0.12176881730556488,
+  "all_milliseconds_per_step": [
+   0.12404526770114899,
+   0.1220107339322567,
+   0.12176881730556488,
+   0.12185149639844894,
+   0.12187761068344116
+  ],
+  "zone_cycles_per_second": 67275023.12388496,
+  "temporary_memory_mib": 9.082099914550781,
+  "compile_and_first_run_seconds": 8.5966810695827,
+  "gpu_status": [
+   "1410 MHz, 56.63 W, 0x0000000000000000",
+   "1410 MHz, 58.58 W, 0x0000000000000000",
+   "1410 MHz, 115.45 W, 0x0000000000000000",
+   "1410 MHz, 86.87 W, 0x0000000000000000",
+   "1410 MHz, 59.72 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 16,
+  "cells": 8192,
+  "milliseconds_per_step": 0.040780432522296906,
+  "all_milliseconds_per_step": [
+   0.0418449267745018,
+   0.041208911687135696,
+   0.040846213698387146,
+   0.040780432522296906,
+   0.04114258661866188
+  ],
+  "zone_cycles_per_second": 200880655.09165412,
+  "temporary_memory_mib": 0.28322601318359375,
+  "compile_and_first_run_seconds": 30.007905337959528,
+  "gpu_status": [
+   "1410 MHz, 56.63 W, 0x0000000000000000",
+   "1410 MHz, 58.58 W, 0x0000000000000000",
+   "1410 MHz, 115.45 W, 0x0000000000000000",
+   "1410 MHz, 86.87 W, 0x0000000000000000",
+   "1410 MHz, 59.72 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "single",
+  "resolution": 16,
+  "cells": 8192,
+  "milliseconds_per_step": 0.09266824647784233,
+  "all_milliseconds_per_step": [
+   0.09323126450181007,
+   0.09280826896429062,
+   0.09322380647063255,
+   0.09266824647784233,
+   0.09287422895431519
+  ],
+  "zone_cycles_per_second": 88401370.60280696,
+  "temporary_memory_mib": 4.1590728759765625,
+  "compile_and_first_run_seconds": 9.769477935507894,
+  "gpu_status": [
+   "1410 MHz, 56.63 W, 0x0000000000000000",
+   "1410 MHz, 58.58 W, 0x0000000000000000",
+   "1410 MHz, 115.45 W, 0x0000000000000000",
+   "1410 MHz, 86.87 W, 0x0000000000000000",
+   "1410 MHz, 59.72 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "double",
+  "resolution": 16,
+  "cells": 8192,
+  "milliseconds_per_step": 0.8233165829145729,
+  "all_milliseconds_per_step": [
+   0.8233165829145729,
+   1.4003418803418803,
+   1.1804034582132563
+  ],
+  "zone_cycles_per_second": 9950000.0,
+  "gpu_status": [
+   "1200 MHz, 46.81 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "double",
+  "resolution": 32,
+  "cells": 65536,
+  "milliseconds_per_step": 0.17607096582651138,
+  "all_milliseconds_per_step": [
+   0.17702854052186012,
+   0.1784733384847641,
+   0.1761632263660431,
+   0.17607096582651138,
+   0.3219081610441208
+  ],
+  "zone_cycles_per_second": 372213554.3038641,
+  "temporary_memory_mib": 4.501976013183594,
+  "compile_and_first_run_seconds": 34.524143351241946,
+  "gpu_status": [
+   "1410 MHz, 56.45 W, 0x0000000000000000",
+   "1410 MHz, 137.19 W, 0x0000000000000000",
+   "1410 MHz, 66.60 W, 0x0000000000000000",
+   "765 MHz, 37.77 W, 0x0000000000000000",
+   "1410 MHz, 200.86 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "double",
+  "resolution": 32,
+  "cells": 65536,
+  "milliseconds_per_step": 0.7480268962681293,
+  "all_milliseconds_per_step": [
+   0.75137535110116,
+   0.7482997365295887,
+   0.7480268962681293,
+   0.7483232952654362,
+   0.7697931081056595
+  ],
+  "zone_cycles_per_second": 87611822.95309967,
+  "temporary_memory_mib": 51.44187927246094,
+  "compile_and_first_run_seconds": 11.534492194652557,
+  "gpu_status": [
+   "1410 MHz, 56.45 W, 0x0000000000000000",
+   "1410 MHz, 137.19 W, 0x0000000000000000",
+   "1410 MHz, 66.60 W, 0x0000000000000000",
+   "765 MHz, 37.77 W, 0x0000000000000000",
+   "1410 MHz, 200.86 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 32,
+  "cells": 65536,
+  "milliseconds_per_step": 0.07276562973856926,
+  "all_milliseconds_per_step": [
+   0.07437539845705032,
+   0.07339973002672195,
+   0.0730057880282402,
+   0.07276562973856926,
+   0.07285735383629799
+  ],
+  "zone_cycles_per_second": 900644991.8107805,
+  "temporary_memory_mib": 2.2519760131835938,
+  "compile_and_first_run_seconds": 32.42536203749478,
+  "gpu_status": [
+   "1410 MHz, 56.45 W, 0x0000000000000000",
+   "1410 MHz, 137.19 W, 0x0000000000000000",
+   "1410 MHz, 66.60 W, 0x0000000000000000",
+   "765 MHz, 37.77 W, 0x0000000000000000",
+   "1410 MHz, 200.86 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "single",
+  "resolution": 32,
+  "cells": 65536,
+  "milliseconds_per_step": 0.34175536409020424,
+  "all_milliseconds_per_step": [
+   0.341882586479187,
+   0.34175536409020424,
+   0.3418762795627117,
+   0.34200726076960564,
+   0.34206778183579445
+  ],
+  "zone_cycles_per_second": 191762900.85296854,
+  "temporary_memory_mib": 28.75389862060547,
+  "compile_and_first_run_seconds": 9.987496318295598,
+  "gpu_status": [
+   "1410 MHz, 56.45 W, 0x0000000000000000",
+   "1410 MHz, 137.19 W, 0x0000000000000000",
+   "1410 MHz, 66.60 W, 0x0000000000000000",
+   "765 MHz, 37.77 W, 0x0000000000000000",
+   "1410 MHz, 200.86 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "double",
+  "resolution": 32,
+  "cells": 65536,
+  "milliseconds_per_step": 1.6507808564231738,
+  "all_milliseconds_per_step": [
+   1.6507808564231738,
+   1.659139240506329,
+   2.1772757475083053
+  ],
+  "zone_cycles_per_second": 39700000.0,
+  "gpu_status": [
+   "1410 MHz, 57.91 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "double",
+  "resolution": 64,
+  "cells": 524288,
+  "milliseconds_per_step": 1.1952960765675495,
+  "all_milliseconds_per_step": [
+   1.1952960765675495,
+   1.7700133453074254,
+   1.7917225431454809,
+   1.716943889072067,
+   1.608317453218134
+  ],
+  "zone_cycles_per_second": 438626052.8065667,
+  "temporary_memory_mib": 36.001976013183594,
+  "compile_and_first_run_seconds": 34.781947791576385,
+  "gpu_status": [
+   "765 MHz, 38.35 W, 0x0000000000000000",
+   "765 MHz, 38.24 W, 0x0000000000000000",
+   "765 MHz, 38.45 W, 0x0000000000000000",
+   "765 MHz, 38.86 W, 0x0000000000000000",
+   "765 MHz, 39.03 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "double",
+  "resolution": 64,
+  "cells": 524288,
+  "milliseconds_per_step": 8.605287086806799,
+  "all_milliseconds_per_step": [
+   8.611079030915311,
+   8.608126503072286,
+   8.605287086806799,
+   8.6085231876687,
+   8.615427062307534
+  ],
+  "zone_cycles_per_second": 60926264.831281744,
+  "temporary_memory_mib": 450.0053253173828,
+  "compile_and_first_run_seconds": 11.332375571131706,
+  "gpu_status": [
+   "765 MHz, 38.35 W, 0x0000000000000000",
+   "765 MHz, 38.24 W, 0x0000000000000000",
+   "765 MHz, 38.45 W, 0x0000000000000000",
+   "765 MHz, 38.86 W, 0x0000000000000000",
+   "765 MHz, 39.03 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 64,
+  "cells": 524288,
+  "milliseconds_per_step": 0.5000835872794452,
+  "all_milliseconds_per_step": [
+   0.5036046238322007,
+   0.5000835872794452,
+   0.5025173194314304,
+   0.5035454701436194,
+   0.5031456288538481
+  ],
+  "zone_cycles_per_second": 1048400734.0697414,
+  "temporary_memory_mib": 18.001976013183594,
+  "compile_and_first_run_seconds": 33.15848986245692,
+  "gpu_status": [
+   "765 MHz, 38.35 W, 0x0000000000000000",
+   "765 MHz, 38.24 W, 0x0000000000000000",
+   "765 MHz, 38.45 W, 0x0000000000000000",
+   "765 MHz, 38.86 W, 0x0000000000000000",
+   "765 MHz, 39.03 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "single",
+  "resolution": 64,
+  "cells": 524288,
+  "milliseconds_per_step": 5.444192964779703,
+  "all_milliseconds_per_step": [
+   5.444432020579514,
+   5.444192964779703,
+   5.446915112827954,
+   5.445562606971515,
+   5.445972761433375
+  ],
+  "zone_cycles_per_second": 96302244.13274723,
+  "temporary_memory_mib": 240.00457763671875,
+  "compile_and_first_run_seconds": 10.41110155545175,
+  "gpu_status": [
+   "765 MHz, 38.35 W, 0x0000000000000000",
+   "765 MHz, 38.24 W, 0x0000000000000000",
+   "765 MHz, 38.45 W, 0x0000000000000000",
+   "765 MHz, 38.86 W, 0x0000000000000000",
+   "765 MHz, 39.03 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "double",
+  "resolution": 64,
+  "cells": 524288,
+  "milliseconds_per_step": 5.831902113459399,
+  "all_milliseconds_per_step": [
+   6.636556962025316,
+   5.831902113459399,
+   6.594817610062893
+  ],
+  "zone_cycles_per_second": 89900000.0,
+  "gpu_status": [
+   "1410 MHz, 65.99 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "double",
+  "resolution": 128,
+  "cells": 4194304,
+  "milliseconds_per_step": 9.254486907435501,
+  "all_milliseconds_per_step": [
+   9.254486907435501,
+   14.313361000107681,
+   14.452379115897676,
+   13.878238346913587,
+   12.084508314728737
+  ],
+  "zone_cycles_per_second": 453218427.12102103,
+  "temporary_memory_mib": 288.0019760131836,
+  "compile_and_first_run_seconds": 39.177810955792665,
+  "gpu_status": [
+   "765 MHz, 38.17 W, 0x0000000000000000",
+   "765 MHz, 38.26 W, 0x0000000000000000",
+   "765 MHz, 38.58 W, 0x0000000000000000",
+   "765 MHz, 38.85 W, 0x0000000000000000",
+   "765 MHz, 39.23 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "double",
+  "resolution": 128,
+  "cells": 4194304,
+  "milliseconds_per_step": 71.25547026162562,
+  "all_milliseconds_per_step": [
+   71.31379875152007,
+   71.25547026162562,
+   71.27580054752205,
+   71.26407066117163,
+   71.26730591382669
+  ],
+  "zone_cycles_per_second": 58862905.326425545,
+  "temporary_memory_mib": 3820.00496673584,
+  "compile_and_first_run_seconds": 11.27352312207222,
+  "gpu_status": [
+   "765 MHz, 38.17 W, 0x0000000000000000",
+   "765 MHz, 38.26 W, 0x0000000000000000",
+   "765 MHz, 38.58 W, 0x0000000000000000",
+   "765 MHz, 38.85 W, 0x0000000000000000",
+   "765 MHz, 39.23 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 128,
+  "cells": 4194304,
+  "milliseconds_per_step": 3.9567157788121183,
+  "all_milliseconds_per_step": [
+   3.987526926009551,
+   3.9567157788121183,
+   3.9895565613456396,
+   4.00370294633119,
+   3.9684030672778254
+  ],
+  "zone_cycles_per_second": 1060046825.3141018,
+  "temporary_memory_mib": 144.0019760131836,
+  "compile_and_first_run_seconds": 32.80613474175334,
+  "gpu_status": [
+   "765 MHz, 38.17 W, 0x0000000000000000",
+   "765 MHz, 38.26 W, 0x0000000000000000",
+   "765 MHz, 38.58 W, 0x0000000000000000",
+   "765 MHz, 38.85 W, 0x0000000000000000",
+   "765 MHz, 39.23 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "astronomix native",
+  "precision": "single",
+  "resolution": 128,
+  "cells": 4194304,
+  "milliseconds_per_step": 37.89644072885098,
+  "all_milliseconds_per_step": [
+   37.90303424972555,
+   37.90898021796475,
+   37.9070781333291,
+   37.89644072885098,
+   37.89907693862915
+  ],
+  "zone_cycles_per_second": 110678045.730211,
+  "temporary_memory_mib": 2280.00528717041,
+  "compile_and_first_run_seconds": 10.581235503777862,
+  "gpu_status": [
+   "765 MHz, 38.17 W, 0x0000000000000000",
+   "765 MHz, 38.26 W, 0x0000000000000000",
+   "765 MHz, 38.58 W, 0x0000000000000000",
+   "765 MHz, 38.85 W, 0x0000000000000000",
+   "765 MHz, 39.23 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "double",
+  "resolution": 128,
+  "cells": 4194304,
+  "milliseconds_per_step": 25.420024242424244,
+  "all_milliseconds_per_step": [
+   25.420024242424244,
+   25.890765432098767,
+   25.731926380368098
+  ],
+  "zone_cycles_per_second": 165000000.0,
+  "gpu_status": [
+   "1410 MHz, 66.79 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA A100-PCIE-40GB"
+ }
+]
