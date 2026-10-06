@@ -4,7 +4,7 @@ For one saved Evrard snapshot, evaluate per cell: the hydrodynamic rate (PP-WENO
 flux divergence of E minus the kinetic part), and the gravitational rates of the
 high-order, low-order (donor) and flux-corrected couplings.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/evrard_rates.py out/evrard_pp_fct_n32_x32_fourth_none.npz 11
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/evrard_rates.py out/evrard_pp_fct_n32_x32_fourth_none.npz 11
 """
 import os
 import sys

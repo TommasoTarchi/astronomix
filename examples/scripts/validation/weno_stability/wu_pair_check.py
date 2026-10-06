@@ -4,7 +4,7 @@ Random admissible state pairs with equal B_n at plasma beta 1e-1, 1e-3, 1e-5:
 how often q + F/alpha is inadmissible at the fast speed, and how often the
 weighted inflow pair (q1 + F1/alpha + q2 - F2/alpha)/2 is (Wu 2018).
 
-    python stability_lab/wu_pair_check.py
+    python examples/scripts/validation/weno_stability/wu_pair_check.py
 """
 import numpy as np
 rng = np.random.default_rng(0)

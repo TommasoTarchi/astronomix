@@ -7,7 +7,7 @@ The theta-scaling then has no admissible base and returns theta = 0: the face
 falls back to first-order Rusanov although the flow is smooth. This measures
 whether that happens on the standard wave (beta = 0.2) and at beta = 0.02.
 
-    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/alfven_pp.py --p0 0.01
+    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/alfven_pp.py --p0 0.01
 """
 import argparse
 import os

@@ -6,7 +6,7 @@ NO stabilisation at all and records min(rho), max|v| and the first NaN through
 a snapshot callback. The last finite state before a blow-up is written to disk
 for forensics.
 
-    PYTHONPATH=. python stability_lab/turb.py --N 64 --tag bare
+    PYTHONPATH=. python examples/scripts/validation/weno_stability/turb.py --N 64 --tag bare
 """
 
 # general
@@ -54,7 +54,7 @@ if args.precision == 64:
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 
 # jax

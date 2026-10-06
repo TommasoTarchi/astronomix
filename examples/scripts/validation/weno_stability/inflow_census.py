@@ -6,7 +6,7 @@ varies along the axis; the sum is what a cell-level (all axes jointly) limiter w
 need, and it can only fail through the central divergence of the cell-centred field
 (Wu 2018), which is where a divergence-consistent source term would be required.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/inflow_census.py STATE.npy|FAILSTEP.npz
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/inflow_census.py STATE.npy|FAILSTEP.npz
 """
 import os
 import sys

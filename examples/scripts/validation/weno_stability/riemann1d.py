@@ -6,7 +6,7 @@ rarefactions), huge pressure and density ratios, and cold high-Mach flow with
 density contrast. Every problem is run with *no* positivity machinery at all,
 so a failure here is a failure of the bare scheme.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/riemann1d.py --variant baseline
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/riemann1d.py --variant baseline
 """
 
 # general
@@ -19,7 +19,7 @@ from typing import NamedTuple
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 
 
@@ -128,9 +128,9 @@ def run_problem(problem, num_cells, precision, variant, cfl):
         )
         l1 = float(np.mean(np.abs(rho - np.asarray(rho_exact))) * problem.box_size)
     tag = os.environ.get("LAB_TAG", variant)
-    os.makedirs("stability_lab/out", exist_ok=True)
+    os.makedirs("examples/scripts/validation/weno_stability/out", exist_ok=True)
     np.savez(
-        f"stability_lab/out/{problem.name}_{tag}_x{precision}_n{num_cells}.npz",
+        f"examples/scripts/validation/weno_stability/out/{problem.name}_{tag}_x{precision}_n{num_cells}.npz",
         x=np.asarray(x), state=final,
     )
     status = "ok" if finite and rho.min() > 0 and pressure.min() > 0 else "FAIL"

@@ -732,15 +732,15 @@ Things that are not hiding:
 ## Reproduce
 
 All scripts take `WENO_VARIANT=baseline|face|pp`. GPU jobs go through
-`stability_lab/run.sh` and `pq`. Large outputs go to
+`examples/scripts/validation/weno_stability/run.sh` and `pq`. Large outputs go to
 `/export/data/lstorcks/weno_stability`.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/riemann1d.py
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/smooth2d.py shear 0.1
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/evrard.py --n 32
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/pallas_equivalence_mhd.py
-    WENO_VARIANT=pp pq sub -t a100 -n 1 --name t128 -- stability_lab/run.sh stability_lab/turb.py --N 128 --backend pallas --tag pp128
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/riemann1d.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/smooth2d.py shear 0.1
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/evrard.py --n 32
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/pallas_equivalence_mhd.py
+    WENO_VARIANT=pp pq sub -t a100 -n 1 --name t128 -- examples/scripts/validation/weno_stability/run.sh examples/scripts/validation/weno_stability/turb.py --N 128 --backend pallas --tag pp128
     python -m pytest pytests/hydrodynamics/positivity_preserving_weno.py pytests/mhd/positivity_preserving_mhd.py
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/alfven_pp.py --p0 0.01
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/mhd_blast.py --n 100
-    python stability_lab/wu_pair_check.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/alfven_pp.py --p0 0.01
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/mhd_blast.py --n 100
+    python examples/scripts/validation/weno_stability/wu_pair_check.py

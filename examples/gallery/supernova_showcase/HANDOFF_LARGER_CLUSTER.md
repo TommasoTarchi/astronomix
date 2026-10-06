@@ -167,7 +167,7 @@ V = validated, P = preliminary, O = open.
    - `test_ad_tangent_safety.py`, `test_entropy_label_sanitize.py`, the migrated `test_fd_reverse_mode.py`;
    - `S/test_casa_4dvar_lbfgs.py` (15) and `S/test_casa_jaxobs.py`;
    - `casa_jet.py test`;
-   - `stability_lab/pp_gradient_check.py`, plus a **new** f32 + dual-energy + passive-scalar + remat variant: VJP = JVP, dot-product test, finite differences. The branch's own check (x64, 12³, 3 steps, no dual energy, no frozen weights) cannot see the f32 NaN.
+   - `examples/scripts/validation/weno_stability/pp_gradient_check.py`, plus a **new** f32 + dual-energy + passive-scalar + remat variant: VJP = JVP, dot-product test, finite differences. The branch's own check (x64, 12³, 3 steps, no dual energy, no frozen weights) cannot see the f32 NaN.
 
 ### 2.3 What the PP change does to the physics (to measure, not assume)
 

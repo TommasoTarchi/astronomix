@@ -17,9 +17,9 @@ unset CUDA_HOME CUDA_ROOT CUDA_PATH
 # default: no preallocation (friendly on shared nodes); big runs should set
 # XLA_PYTHON_CLIENT_PREALLOCATE=true (+ MEM_FRACTION) to avoid fragmentation
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
-# import the working tree (or ASTRO_ROOT override, e.g. a bisect worktree),
-# not the site-packages astronomix wheel
-ASTRO_ROOT="${ASTRO_ROOT:-/export/home/lstorcks/jf1uids}"
+# import the checkout this script lives in (or an ASTRO_ROOT override, e.g. a
+# bisect worktree), not the site-packages astronomix wheel
+ASTRO_ROOT="${ASTRO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 # Fail loudly if that root has no astronomix. A missing path is silently dropped
 # from PYTHONPATH and the STALE site-packages wheel gets imported instead, so an
 # A/B against a worktree would compare the wrong code and still look healthy.

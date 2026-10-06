@@ -15,7 +15,7 @@ axis-summed first-order inflow B_i is admissible. Measured here:
   p / rho^gamma falls below the minimum over their 27-cell neighbourhood
   (the minimum entropy principle, a stronger invariant domain than p > 0).
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/invariant_domain_audit.py STATE.npy
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/invariant_domain_audit.py STATE.npy
 """
 import argparse
 import os

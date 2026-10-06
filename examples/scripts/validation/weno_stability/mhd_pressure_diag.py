@@ -15,7 +15,7 @@ For a saved turb.py snapshot (primitive state + interface B) evaluate, in float6
    in the CT field with E += 0.5 (B_ct^2 - B_weno^2), which holds p fixed, so
    the pressure of this update is the pressure the code carries.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/mhd_pressure_diag.py SNAP.npy
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/mhd_pressure_diag.py SNAP.npy
 """
 import argparse
 import os

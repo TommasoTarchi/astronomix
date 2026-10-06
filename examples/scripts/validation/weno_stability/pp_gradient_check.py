@@ -4,7 +4,7 @@ A rough 3D state (hydro, ideal MHD, isothermal MHD), a few fixed steps, the
 loss sum(rho^2) at the end; checks that jax.grad and jax.jvp are finite and
 agree with a central finite difference along a random direction (x64).
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/pp_gradient_check.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/pp_gradient_check.py
 """
 import os
 

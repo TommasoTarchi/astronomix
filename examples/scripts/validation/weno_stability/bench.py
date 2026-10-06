@@ -1,6 +1,6 @@
 """Wall-clock cost of the WENO variants: one native WENO flux evaluation per axis.
 
-    PYTHONPATH=. python stability_lab/bench.py out/turb/lastgood_bare64_current.npz
+    PYTHONPATH=. python examples/scripts/validation/weno_stability/bench.py out/turb/lastgood_bare64_current.npz
 """
 
 # general

@@ -6,7 +6,7 @@ low-Mach advection speed is the worst case for a single (scalar) splitting
 speed, because the entropy field's own speed |u| is then much smaller than
 |u| + c.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/smooth1d.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/smooth1d.py
 """
 
 # general
@@ -19,7 +19,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 import jax.numpy as jnp
 

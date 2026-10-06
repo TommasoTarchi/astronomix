@@ -1,6 +1,6 @@
 """Restart a turbulence forensic state WITHOUT forcing and watch it for a short time.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/turb_restart.py out/turb/lastgood_bare64_current.npz
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/turb_restart.py out/turb/lastgood_bare64_current.npz
 """
 
 # general
@@ -28,7 +28,7 @@ if args.precision == 64:
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 import jax
 import jax.numpy as jnp

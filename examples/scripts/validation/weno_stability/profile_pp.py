@@ -4,7 +4,7 @@ Each component is jitted on its own, warmed up, then timed as the median of
 ``--reps`` runs with ``block_until_ready``; the compiled executable's peak
 temporary memory is reported next to it. Input: a real turbulence state.
 
-    WENO_VARIANT=pp python stability_lab/profile_pp.py --state /export/data/.../negp_M20_c0375_lastpositive.npy
+    WENO_VARIANT=pp python examples/scripts/validation/weno_stability/profile_pp.py --state /export/data/.../negp_M20_c0375_lastpositive.npy
 """
 import argparse
 import os

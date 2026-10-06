@@ -1,7 +1,7 @@
 """The fused PP-recombination and inflow-reference kernels against the array
 forms (interpret mode, x64, a rough 3D ideal-MHD state).
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/pallas_equivalence_pp_kernels.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/pallas_equivalence_pp_kernels.py
 """
 import os
 

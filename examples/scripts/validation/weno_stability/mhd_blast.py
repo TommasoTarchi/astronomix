@@ -6,7 +6,7 @@ p = 1000 for r < 0.1 and 0.1 outside, gamma = 1.4, [-0.5, 0.5]^2, t = 0.01.
 The ambient plasma beta is 2.5e-4. Without positivity preservation the
 pressure goes negative within a few steps.
 
-    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/mhd_blast.py --n 200 --cfl 0.75
+    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/mhd_blast.py --n 200 --cfl 0.75
 """
 import argparse
 import os

@@ -1,6 +1,6 @@
 """Step the real SSPRK(5,4) + CT from a dumped state and report min p per stage.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/mhd_step_check.py DUMP.npz [steps] [C_cfl]
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/mhd_step_check.py DUMP.npz [steps] [C_cfl]
 """
 import os
 import sys

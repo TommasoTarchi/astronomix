@@ -5,7 +5,7 @@ post_stage, finalize), so the step is exactly one SSP building block of the
 production integrator. The positivity proof covers C_FE <= 1/2 of the code's
 sum-of-axes CFL (C_cfl <= 0.754 for the full SSPRK(5,4) step).
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python stability_lab/mhd_fe_check.py out/blast_pp_n50_lastgood.npz
+    PYTHONPATH=. JAX_PLATFORMS=cpu WENO_VARIANT=pp python examples/scripts/validation/weno_stability/mhd_fe_check.py out/blast_pp_n50_lastgood.npz
 """
 import os
 import sys

@@ -1,6 +1,6 @@
 """Compare turbulence statistics of two runs from their state dumps.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/turb_stats.py pstats_pp128 pstats_recipe128
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/turb_stats.py pstats_pp128 pstats_recipe128
 """
 
 # general

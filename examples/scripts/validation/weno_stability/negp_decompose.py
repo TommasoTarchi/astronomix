@@ -9,7 +9,7 @@ centre cell as
 
 It then reports which of the states is not admissible.
 
-    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/negp_decompose.py FAILSTEP.npz --cfl 0.375 --cfe 0.25
+    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/negp_decompose.py FAILSTEP.npz --cfl 0.375 --cfe 0.25
 """
 import argparse
 import os

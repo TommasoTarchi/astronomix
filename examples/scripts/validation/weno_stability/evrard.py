@@ -4,7 +4,7 @@ The conservative FD gravity coupling NaNs on this problem below 128^3 in both
 precisions (tests/gravity_stability/FINDINGS.md, deleted in f2caa99). Here it is
 run with the bare scheme so any stabilisation must come from the WENO kernel.
 
-    PYTHONPATH=. python stability_lab/evrard.py --n 32 --precision 32
+    PYTHONPATH=. python examples/scripts/validation/weno_stability/evrard.py --n 32 --precision 32
 """
 
 # general
@@ -36,7 +36,7 @@ if args.precision == 64:
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 
 # jax
@@ -152,9 +152,9 @@ print(
     f"wall={elapsed:.0f}s",
     flush=True,
 )
-os.makedirs("stability_lab/out", exist_ok=True)
+os.makedirs("examples/scripts/validation/weno_stability/out", exist_ok=True)
 np.savez(
-    f"stability_lab/out/evrard_{face}{args.tag}_n{args.n}_x{args.precision}_{args.gravity}.npz",
+    f"examples/scripts/validation/weno_stability/out/evrard_{face}{args.tag}_n{args.n}_x{args.precision}_{args.gravity}.npz",
     times=times, total=total, internal=internal,
     kinetic=np.asarray(snapshots.kinetic_energy),
     gravitational=np.asarray(snapshots.gravitational_energy),

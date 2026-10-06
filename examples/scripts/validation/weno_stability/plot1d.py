@@ -1,11 +1,11 @@
 """Plot saved 1D runs against the exact Riemann solution."""
+import os
 import sys
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-sys.path.insert(0, "stability_lab")
-import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 from riemann1d import PROBLEMS
@@ -29,5 +29,5 @@ axes[0].legend(fontsize=7)
 for ax, t in zip(axes, ["rho", "v", "p"]):
     ax.set_title(f"{name}: {t}")
 plt.tight_layout()
-plt.savefig(f"stability_lab/out/{name}.png", dpi=110)
-print("saved", f"stability_lab/out/{name}.png")
+plt.savefig(f"examples/scripts/validation/weno_stability/out/{name}.png", dpi=110)
+print("saved", f"examples/scripts/validation/weno_stability/out/{name}.png")

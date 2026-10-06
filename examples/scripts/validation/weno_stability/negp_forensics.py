@@ -18,8 +18,8 @@ the centre cell:
   update is not zero;
 * the face-local inflow-pair bases per axis, and their axis sum.
 
-    WENO_VARIANT=pp python stability_lab/negp_forensics.py step LASTPOSITIVE.npy OUT.npz
-    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/negp_forensics.py patch OUT.npz
+    WENO_VARIANT=pp python examples/scripts/validation/weno_stability/negp_forensics.py step LASTPOSITIVE.npy OUT.npz
+    WENO_VARIANT=pp PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/negp_forensics.py patch OUT.npz
 """
 import argparse
 import os

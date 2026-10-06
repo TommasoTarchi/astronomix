@@ -4,7 +4,7 @@ Isothermal rarefactions are exponentially deep (rho* = rho exp(-du/2c) for a
 symmetric expansion), so a velocity jump of 20 c produces a physical density of
 ~1e-9 — the regime of the voids in Mach-10 isothermal turbulence.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/riemann1d_iso.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/riemann1d_iso.py
 """
 
 # general
@@ -155,9 +155,9 @@ def run_problem(problem, num_cells, precision, cfl, rho_floor):
     l1_log_rho = float(np.mean(np.abs(np.log10(np.maximum(rho, 1e-300)) - np.log10(rho_exact)))) if finite else np.nan
     l1_u = float(np.mean(np.abs(velocity - u_exact))) if finite else np.nan
     tag = os.environ.get("LAB_TAG", "run")
-    os.makedirs("stability_lab/out", exist_ok=True)
+    os.makedirs("examples/scripts/validation/weno_stability/out", exist_ok=True)
     np.savez(
-        f"stability_lab/out/{problem.name}_{tag}_x{precision}_n{num_cells}.npz",
+        f"examples/scripts/validation/weno_stability/out/{problem.name}_{tag}_x{precision}_n{num_cells}.npz",
         x=np.asarray(x), state=final, rho_exact=rho_exact, u_exact=u_exact,
     )
     status = "ok" if finite and rho.min() > 0 else ("NaN" if not finite else "FAIL")

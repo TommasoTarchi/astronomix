@@ -1,6 +1,6 @@
 """2D smooth-wave accuracy: entropy wave and vortical (shear) wave, advected in x.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/smooth2d.py shear 0.1
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/smooth2d.py shear 0.1
 """
 
 # general
@@ -13,7 +13,7 @@ os.environ.setdefault("JAX_ENABLE_X64", "1")
 import numpy as np
 
 import sys as _sys
-_sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weno_variant import weno_variant_kwargs, weno_variant_name
 import jax.numpy as jnp
 

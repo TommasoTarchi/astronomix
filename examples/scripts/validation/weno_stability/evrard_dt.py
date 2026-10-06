@@ -5,7 +5,7 @@ Mirrors examples/scripts/forward/self_gravity/evrard_timestep_convergence.py
 the conservative coupling conserves energy exactly in space, so its energy
 error is the time integrator's (~dt^4).
 
-    WENO_VARIANT=pp PYTHONPATH=. python stability_lab/evrard_dt.py --limit-work 0
+    WENO_VARIANT=pp PYTHONPATH=. python examples/scripts/validation/weno_stability/evrard_dt.py --limit-work 0
 """
 
 # general

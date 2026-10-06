@@ -3,7 +3,7 @@
 States are rough, high-contrast and supersonic so the admissibility scaling is
 active at many interfaces; the script also reports how many faces had theta < 1.
 
-    PYTHONPATH=. JAX_PLATFORMS=cpu python stability_lab/pallas_equivalence.py
+    PYTHONPATH=. JAX_PLATFORMS=cpu python examples/scripts/validation/weno_stability/pallas_equivalence.py
 """
 
 # general
