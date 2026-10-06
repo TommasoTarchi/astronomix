@@ -31,8 +31,7 @@ have to be added to the conserved energy RHS.
 
 The spectral footprint of this operator (needed when an imposed ``eta`` is to
 be recovered from a spectral energy budget) is the product of the symbols of
-the four operators above and is computed in
-``examples/scripts/forward/mhd/turbulence/make_calibration_model.py``.
+the four operators above.
 """
 
 # general
@@ -53,64 +52,95 @@ from astronomix._spatial_operators._interpolate import (
 )
 from astronomix._stencil_operations._stencil_operations import _stencil_add
 
-XAXIS, YAXIS, ZAXIS = 0, 1, 2
+# Axes of a single field array. Unlike ``simulation_config.XAXIS`` (= 1), which
+# counts the leading variable axis of the state array, these index the spatial
+# axes of one field directly, as in the constrained-transport module.
+XAXIS = 0
+YAXIS = 1
+ZAXIS = 2
 
 
-def _central_first_derivative(field, axis, dx):
+def _central_first_derivative(field, axis, grid_spacing):
     """Sixth-order central first derivative along ``axis``."""
     return _stencil_add(
         field,
         indices=(3, 2, 1, -1, -2, -3),
         factors=(1.0, -9.0, 45.0, -45.0, 9.0, -1.0),
         axis=axis,
-    ) / (60.0 * dx)
+    ) / (60.0 * grid_spacing)
 
 
 @partial(jax.jit, static_argnames=["config"])
-def fd_ohmic_interface_rhs(bx_interface, by_interface, bz_interface, eta,
-                           dt_tilde, grid_spacing, config: SimulationConfig):
-    """Resistive increment of the three interface fields over ``dt_tilde``.
+def fd_ohmic_interface_rhs(
+    bx_interface: jnp.ndarray,
+    by_interface: jnp.ndarray,
+    bz_interface: jnp.ndarray,
+    eta,
+    dt_tilde,
+    grid_spacing: float,
+    config: SimulationConfig,
+):
+    """
+    Resistive increment of the three interface fields over ``dt_tilde``.
 
     Args:
-        bx_interface, by_interface, bz_interface: interface magnetic fields
-            (index ``i`` is the ``i+1/2`` face of the respective axis).
-        eta: constant ohmic diffusivity.
-        dt_tilde: stage-effective time step (the CT RHS convention).
-        grid_spacing: cell size (cubic cells).
-        config: simulation configuration (3D only).
+        bx_interface: The interface magnetic field B_x (index ``i`` is the
+            ``i+1/2`` face along x).
+        by_interface: The interface magnetic field B_y (index ``j`` is the
+            ``j+1/2`` face along y).
+        bz_interface: The interface magnetic field B_z (index ``k`` is the
+            ``k+1/2`` face along z).
+        eta: The constant ohmic diffusivity.
+        dt_tilde: The stage-effective time step (the CT right-hand-side
+            convention).
+        grid_spacing: The cell size (cubic cells).
+        config: The simulation configuration (3D only).
 
     Returns:
         ``(rhs_bx, rhs_by, rhs_bz)`` to be ADDED to the CT right-hand side.
     """
     if config.dimensionality != 3:
         raise NotImplementedError("fd_ohmic_interface_rhs: 3D only")
-    dx = grid_spacing
 
     # Cell-centred field, as the CT path derives it.
-    Bx = interp_face_to_center(bx_interface, XAXIS)
-    By = interp_face_to_center(by_interface, YAXIS)
-    Bz = interp_face_to_center(bz_interface, ZAXIS)
+    magnetic_field_x = interp_face_to_center(bx_interface, XAXIS)
+    magnetic_field_y = interp_face_to_center(by_interface, YAXIS)
+    magnetic_field_z = interp_face_to_center(bz_interface, ZAXIS)
 
     # J = curl B at cell centres.
-    d = _central_first_derivative
-    Jx = d(Bz, YAXIS, dx) - d(By, ZAXIS, dx)
-    Jy = d(Bx, ZAXIS, dx) - d(Bz, XAXIS, dx)
-    Jz = d(By, XAXIS, dx) - d(Bx, YAXIS, dx)
+    current_x = (
+        _central_first_derivative(magnetic_field_z, YAXIS, grid_spacing)
+        - _central_first_derivative(magnetic_field_y, ZAXIS, grid_spacing)
+    )
+    current_y = (
+        _central_first_derivative(magnetic_field_x, ZAXIS, grid_spacing)
+        - _central_first_derivative(magnetic_field_z, XAXIS, grid_spacing)
+    )
+    current_z = (
+        _central_first_derivative(magnetic_field_y, XAXIS, grid_spacing)
+        - _central_first_derivative(magnetic_field_x, YAXIS, grid_spacing)
+    )
 
     # Edge-centred resistive EMF: E_x on x-edges (j+1/2, k+1/2), etc.
-    Ex = eta * interp_center_to_face(interp_center_to_face(Jx, YAXIS), ZAXIS)
-    Ey = eta * interp_center_to_face(interp_center_to_face(Jy, XAXIS), ZAXIS)
-    Ez = eta * interp_center_to_face(interp_center_to_face(Jz, XAXIS), YAXIS)
+    emf_x = eta * interp_center_to_face(interp_center_to_face(current_x, YAXIS), ZAXIS)
+    emf_y = eta * interp_center_to_face(interp_center_to_face(current_y, XAXIS), ZAXIS)
+    emf_z = eta * interp_center_to_face(interp_center_to_face(current_z, XAXIS), YAXIS)
 
     # dB/dt = -curl E, each component landing on its own face:
     #   dB_x/dt at (i+1/2, j, k) = -(d_y E_z - d_z E_y), with E_z on
     #   (i+1/2, j+1/2, k) and E_y on (i+1/2, j, k+1/2), so the int6 derivative
     #   along y (z) maps j+1/2 -> j (k+1/2 -> k) exactly onto the x-face.
-    dtdx = dt_tilde / dx
-    rhs_bx = -dtdx * (finite_difference_int6(Ez, YAXIS)
-                      - finite_difference_int6(Ey, ZAXIS))
-    rhs_by = -dtdx * (finite_difference_int6(Ex, ZAXIS)
-                      - finite_difference_int6(Ez, XAXIS))
-    rhs_bz = -dtdx * (finite_difference_int6(Ey, XAXIS)
-                      - finite_difference_int6(Ex, YAXIS))
+    dt_over_dx = dt_tilde / grid_spacing
+    rhs_bx = -dt_over_dx * (
+        finite_difference_int6(emf_z, YAXIS)
+        - finite_difference_int6(emf_y, ZAXIS)
+    )
+    rhs_by = -dt_over_dx * (
+        finite_difference_int6(emf_x, ZAXIS)
+        - finite_difference_int6(emf_z, XAXIS)
+    )
+    rhs_bz = -dt_over_dx * (
+        finite_difference_int6(emf_y, XAXIS)
+        - finite_difference_int6(emf_x, YAXIS)
+    )
     return rhs_bx, rhs_by, rhs_bz

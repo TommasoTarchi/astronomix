@@ -7,7 +7,10 @@ of each cooling curve and the overall cooling configuration.
 """
 
 # typing
-from typing import NamedTuple, Union
+from typing import (
+    NamedTuple,
+    Union,
+)
 from types import NoneType
 from jaxtyping import PyTree
 
@@ -29,129 +32,180 @@ IMPLICIT_COOLING = 2
 class SimplePowerLawParams(NamedTuple):
     """Parameters of a single power-law cooling curve Lambda(T)."""
 
+    #: Value of Lambda at the reference temperature.
     factor: float = 1.0
+
+    #: Power-law exponent of Lambda(T) = factor * (T / T_ref)^exponent.
     exponent: float = 1.0
+
+    #: Reference temperature T_ref (rescaled units).
     reference_temperature: float = 1e8
 
 
 class PiecewisePowerLawParams(NamedTuple):
-    """Tabulated parameters of a piecewise power-law cooling curve.
+    """
+    Tabulated parameters of a piecewise power-law cooling curve.
 
     The tables hold, per temperature bin, the curve value and slope plus the
     Townsend temporal-evolution coefficients (``Y_table``).
     """
 
+    #: log10 of the (rescaled) bin-edge temperatures T_k, ascending.
     log10_T_table: jnp.ndarray = jnp.array([])
+
+    #: log10 of the (rescaled) cooling rate Lambda_k at the bin edges.
     log10_Lambda_table: jnp.ndarray = jnp.array([])
+
+    #: Power-law slope alpha_k of each bin,
+    #: Lambda(T) = Lambda_k * (T / T_k)^alpha_k for T_k <= T < T_{k+1}.
     alpha_table: jnp.ndarray = jnp.array([])
+
+    #: Townsend (2009) temporal-evolution coefficients Y_k at the bin edges.
     Y_table: jnp.ndarray = jnp.array([])
+
+    #: Reference temperature of the temporal evolution function (the top of
+    #: the table).
     reference_temperature: float = 1e8
 
 
 class CoolingNetConfig(NamedTuple):
     """Static configuration of a neural-network cooling curve."""
 
+    #: The static part of the (equinox) network, i.e. its architecture.
     network_static: Union[PyTree, NoneType] = None
 
 
 class CoolingNetParams(NamedTuple):
     """Trainable parameters of a neural-network cooling curve."""
 
+    #: The trainable part of the (equinox) network, i.e. its weights.
     network_params: Union[PyTree, NoneType] = None
 
 
 class MixingCoolingParams(NamedTuple):
     """Parameters of the simple mixing-layer cooling model (Lancaster 2026)."""
 
-    xi: float = 0.5  # xi = t_sh / t_coolmin
+    #: Ratio of the shear time to the minimum cooling time, t_sh / t_coolmin.
+    xi: float = 0.5
+
+    #: Shear Mach number v_rel / c_s with respect to the hot medium.
     mach_number: float = 0.5
+
+    #: Density contrast chi between the cold and the hot phase (the hot to
+    #: cold temperature ratio).
     density_contrast: float = 10.0
 
 
 # Union of every cooling-curve parameter container; the active variant is
 # selected by the cooling-curve type tag in CoolingCurveConfig.
-COOLING_CURVE_TYPE = Union[SimplePowerLawParams, PiecewisePowerLawParams, CoolingNetParams, MixingCoolingParams]
+COOLING_CURVE_TYPE = Union[
+    SimplePowerLawParams,
+    PiecewisePowerLawParams,
+    CoolingNetParams,
+    MixingCoolingParams,
+]
 
 
 class CoolingCurveConfig(NamedTuple):
     """Static configuration selecting the cooling-curve model."""
 
+    #: The cooling-curve type tag (``SIMPLE_POWER_LAW``,
+    #: ``PIECEWISE_POWER_LAW``, ``NEURAL_NET_COOLING``,
+    #: ``NEURAL_NET_COOLING_WITH_DENSITY`` or ``SIMPLE_MIXING_LAYER_COOLING``).
     cooling_curve_type: int = SIMPLE_POWER_LAW
 
-    #: In case of neural the cooling the network architecture
+    #: The network architecture of a neural-network cooling curve.
     cooling_net_config: CoolingNetConfig = CoolingNetConfig()
 
 
 class CoolingConfig(NamedTuple):
     """Top-level cooling configuration (activation, method and curve)."""
 
+    #: Switch for radiative cooling.
     cooling: bool = False
+
+    #: Time integration of the temperature update, ``EXPLICIT_COOLING``
+    #: (forward Euler) or ``IMPLICIT_COOLING`` (backward Euler, solved by a
+    #: safeguarded Newton iteration).
     cooling_method: int = IMPLICIT_COOLING
+
+    #: The cooling-curve model.
     cooling_curve_config: CoolingCurveConfig = CoolingCurveConfig()
 
 
 class CoolingParams(NamedTuple):
-    """Runtime cooling parameters (composition, temperature floor, curve)."""
+    """
+    Runtime cooling parameters: composition, temperature floor, the
+    cooling-resolution limiter, the floor handling, the per-step cap, the
+    heating and the cooling curve.
+    """
 
-    # NOTE: CURRENTLY ONLY POWER LAW COOLING
+    #: Hydrogen mass fraction X.
     hydrogen_mass_fraction: float = 0.76
+
+    #: Metal mass fraction Z.
     metal_mass_fraction: float = 0.02
 
+    #: Temperature floor of the cooling update (rescaled units); see
+    #: ``clamp_to_floor`` for how it is enforced.
     floor_temperature: float = 1e4
 
-    #: Cooling-resolution limiter (0 = off). Where the cooling length
-    #: ``l_cool = c_s * t_cool`` is unresolved (below ``alpha`` grid cells) the
-    #: cooling rate is suppressed by ``min(1, (l_cool / (alpha*dx))^2)``. An
-    #: unresolved radiative shock otherwise collapses into a cell-scale cold
-    #: dense layer with no pressure support (the ram-pressure crush runaway
-    #: that killed the 512^3 SNR runs); suppressing the un-representable
-    #: cooling keeps such layers at the resolved adiabatic solution, while
-    #: resolved cooling regions are untouched.
+    #: Cooling-resolution limiter: the minimum number of grid cells over which
+    #: the cooling length ``l_cool = c_s * t_cool`` must be resolved (0 = off).
+    #: Where ``l_cool`` falls below this many cells, the cooling rate is
+    #: suppressed by ``min(1, (l_cool / (resolution_limiter_alpha * dx))^2)``.
+    #: An unresolved radiative shock otherwise collapses into a cell-scale cold
+    #: dense layer with no pressure support, which the ram pressure then
+    #: crushes without bound; suppressing the unrepresentable cooling keeps
+    #: such layers at the resolved adiabatic solution, while resolved cooling
+    #: regions are untouched. Applied by both the finite-difference and the
+    #: finite-volume solver (not by the mixing-layer cooling model).
     resolution_limiter_alpha: float = 0.0
 
     #: How the temperature floor is enforced after the cooling update.
     #:
-    #: ``False`` (default, historical): a cell whose update would take it below
-    #: ``floor_temperature`` keeps its ORIGINAL temperature -- the whole update
-    #: is discarded. ``True``: it is clamped ONTO the floor instead (cells that
-    #: START below it are left alone either way).
+    #: ``False`` (default): a cell whose update would take it below
+    #: ``floor_temperature`` keeps its original temperature, i.e. the whole
+    #: update is discarded. ``True``: it is clamped onto the floor instead.
+    #: Cells that start below the floor are left alone either way.
     #:
-    #: Clamping is the more defensible numerics -- reverting makes cooling
-    #: non-monotone in dt, and a cell at 1e5 K that wants to cross the floor
-    #: stays at 1e5 K rather than reaching 1e4 K. It is also what makes the
-    #: EXPLICIT path usable at all: with the revert, a stiff forward step always
-    #: overshoots the floor and is always discarded, so ``EXPLICIT_COOLING``
-    #: silently applies NO cooling (the 256^3 Cas A run reproduced the ADIABATIC
-    #: solution to four significant figures).
+    #: Clamping is the more defensible numerics: reverting makes cooling
+    #: non-monotone in dt, and a cell at 1e5 K that would cross the floor stays
+    #: at 1e5 K rather than reaching 1e4 K. Clamping is also what makes the
+    #: explicit update usable for stiff cooling: with the revert, a stiff
+    #: forward step always overshoots the floor and is discarded, so
+    #: ``EXPLICIT_COOLING`` applies no cooling at all in those cells.
     #:
-    #: It defaults to False anyway, because the revert turns out to be
-    #: LOAD-BEARING for stability: it is a de-facto crush guard that suppresses
-    #: cooling exactly in the unresolved cells that would otherwise run away.
-    #: Switching it on makes the Cas A piston runs abort (with the wide LLF
-    #: blend) or blow up silently (with the per-step cap). Turn it on only
-    #: together with a crush control that has been shown to hold.
+    #: NOTE: The revert stays the default because it suppresses cooling
+    #: exactly in the unresolved cells that would otherwise collapse, which
+    #: stabilises unresolved radiative shocks under ram pressure. Enable
+    #: clamping only together with a crush control (e.g. the
+    #: cooling-resolution limiter or the per-step cap) that keeps such layers
+    #: stable.
     clamp_to_floor: bool = False
 
-    #: Cap on the FRACTIONAL temperature drop applied in one hydro step
+    #: Cap on the fractional temperature drop applied in one hydro step
     #: (0 = off; 0.3 means a cell may lose at most 30% of its temperature per
     #: step). Backward Euler is unconditionally stable for the cooling ODE, but
-    #: the operator SPLITTING is not: a cell taken from its post-shock
+    #: the operator splitting is not: a cell taken from its post-shock
     #: temperature to the floor in a single step loses its pressure support
-    #: before the hydro ever sees an intermediate state, and the neighbours ram
-    #: into it -- the crush runaway that aborts the Cas A piston runs. Capping
-    #: the per-step drop reaches the SAME equilibrium (over several steps
-    #: instead of one) and, unlike a cooling CFL, is purely local: one crushing
-    #: cell does not throttle the global time step.
+    #: before the hydrodynamics ever sees an intermediate state, and the
+    #: neighbours ram into it. Capping the per-step drop reaches the same
+    #: equilibrium (over several steps instead of one) and, unlike a cooling
+    #: CFL condition, is purely local: one crushing cell does not throttle the
+    #: global time step.
     max_cooling_fraction: float = 0.0
 
-    #: Constant volumetric ISM heating (0 = off), as the EFFECTIVE rescaled-
-    #: temperature rate: dT~/dt = (gamma - 1) * heating_rate. Physically this
-    #: represents Gamma per particle (e.g. photoelectric heating,
-    #: de/dt = n * Gamma), whose T~ rate is density-independent; the
-    #: conversion from a cgs Gamma [erg/s] belongs in the setup helper (see
-    #: the showcase ``ism_ti_cooling_setup``). Together with a cooling curve
-    #: that extends below 1e4 K (``athenak_ism_cooling``) this enables the
-    #: classic two-phase thermal-instability equilibrium (Lambda = Gamma).
+    #: Constant volumetric ISM heating (0 = off), as the effective
+    #: rescaled-temperature rate: dT~/dt = (gamma - 1) * heating_rate.
+    #: Physically this represents a heating rate Gamma per particle (e.g.
+    #: photoelectric heating, de/dt = n * Gamma), whose T~ rate is
+    #: density-independent; the conversion from a cgs Gamma [erg/s] belongs in
+    #: the problem setup. Together with a cooling curve that extends below
+    #: 1e4 K (``athenak_ism_cooling``) this enables the classic two-phase
+    #: thermal-instability equilibrium (Lambda = Gamma).
     heating_rate: float = 0.0
 
+    #: The parameters of the cooling curve selected by
+    #: ``CoolingCurveConfig.cooling_curve_type``.
     cooling_curve_params: COOLING_CURVE_TYPE = SimplePowerLawParams()
