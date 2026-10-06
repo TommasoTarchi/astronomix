@@ -9,49 +9,68 @@ from functools import partial
 
 # typing
 from typing import Union
-from jaxtyping import Array, Float, jaxtyped
-from beartype import beartype as typechecker
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax
 import jax.numpy as jnp
 
 # astronomix constants
-from astronomix.option_classes.simulation_config import (
-    FIELD_TYPE,
-    STATE_TYPE,
-)
+from astronomix.option_classes.simulation_config import STATE_TYPE
 
 # astronomix containers
 from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.variable_registry.registered_variables import RegisteredVariables
-from astronomix.option_classes.simulation_params import SimulationParams
 
 # astronomix functions
+from astronomix._fluid_equations._dual_energy_switch import dual_energy_internal_energy
 from astronomix._modules._cosmic_rays.cr_fluid_equations import (
     total_energy_from_primitives_with_crs,
     total_pressure_from_conserved_with_crs,
 )
 
+
+# -------------------------------------------------------------
+# ============== ↓ Recover the primitive state ↓ ==============
+# -------------------------------------------------------------
+
+
 def dual_switched_pressure_hydro(E, rho, u, gamma, internal_energy_density, eta):
-    """Gas pressure with the dual-energy switch (Bryan et al. 1995), hydro.
-
-    The total-energy internal energy ``e_E = E - KE`` is trustworthy only when
-    it is a non-negligible fraction of E; otherwise (high Mach) float
-    cancellation destroys it and the separately-advected internal-energy
-    density ``g`` is used instead. Returns the switched thermal pressure
-    ``(gamma-1) e_int``. This is the coupled-recovery primitive used *inside*
-    the WENO flux + eigenstructure so the scheme never sees the corrupted
-    pressure.
     """
-    e_E = E - 0.5 * rho * u * u
-    E_safe = jnp.maximum(E, 1e-30)
-    reliable = (e_E > eta * E_safe) & (e_E == e_E)
-    e_int = jnp.where(reliable, e_E, internal_energy_density)
-    return (gamma - 1.0) * e_int
+    Gas pressure with the dual-energy switch (Bryan et al. 1995), hydro.
+
+    The internal energy recovered from the total energy, ``e_E = E - KE``, is
+    trustworthy only when it is a non-negligible fraction of ``E``; at high
+    Mach numbers floating-point cancellation destroys it and the separately
+    advected internal energy density ``g`` is used instead (see
+    ``dual_energy_internal_energy``). The recovery is coupled into the WENO
+    flux and eigenstructure, so the scheme never sees the corrupted pressure.
+
+    Args:
+        E: The total energy density.
+        rho: The density.
+        u: The absolute velocity.
+        gamma: The adiabatic index.
+        internal_energy_density: The separately advected internal energy
+            density ``g``.
+        eta: The switch threshold (``config.dual_energy_eta``).
+
+    Returns:
+        The switched thermal pressure ``(gamma - 1) e_int``.
+    """
+    internal_energy_from_total = E - 0.5 * rho * u * u
+    internal_energy = dual_energy_internal_energy(
+        internal_energy_from_total,
+        E,
+        internal_energy_density,
+        eta,
+    )
+    return (gamma - 1.0) * internal_energy
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def primitive_state_from_conserved(
     conserved_state: STATE_TYPE,
@@ -62,14 +81,15 @@ def primitive_state_from_conserved(
 ) -> STATE_TYPE:
     """Convert the conserved state to the primitive state.
 
-    ``internal_energy_density`` (the separately-advected dual-energy ``g``),
-    when given, switches the pressure recovery so the corrupted total-energy
-    value is not used in the catastrophic-cancellation regime (coupled
-    dual-energy).
-
     Args:
         conserved_state: The conserved state.
         gamma: The adiabatic index of the fluid.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None. When given, the pressure recovery is dual-energy switched, so
+            the total-energy value is not used where it suffers catastrophic
+            cancellation.
 
     Returns:
         The primitive state.
@@ -86,7 +106,9 @@ def primitive_state_from_conserved(
         ux = conserved_state[registered_variables.velocity_index.x] / rho
         uy = conserved_state[registered_variables.velocity_index.y] / rho
         # The 1e-20 offset keeps the gradient of sqrt finite at u = 0, where
-        # d/dx sqrt(0) would otherwise be infinite. TODO: find a cleaner way.
+        # d/dx sqrt(0) would otherwise be infinite. TODO: the offset biases |u|
+        # in nearly static gas; a custom JVP with a masked derivative at u = 0
+        # would keep the value exact.
         u = jnp.sqrt(ux**2 + uy**2 + 1e-20)
     elif config.dimensionality == 3:
         ux = conserved_state[registered_variables.velocity_index.x] / rho
@@ -100,7 +122,12 @@ def primitive_state_from_conserved(
         )
     elif internal_energy_density is not None:
         p = dual_switched_pressure_hydro(
-            E, rho, u, gamma, internal_energy_density, config.dual_energy_eta
+            E,
+            rho,
+            u,
+            gamma,
+            internal_energy_density,
+            config.dual_energy_eta,
         )
     else:
         p = pressure_from_energy(E, rho, u, gamma)
@@ -134,11 +161,15 @@ def primitive_state_from_conserved(
 
 
 # -------------------------------------------------------------
+# ============== ↑ Recover the primitive state ↑ ==============
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
 # =============== ↓ Create the conserved state ↓ ==============
 # -------------------------------------------------------------
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def conserved_state_from_primitive(
     primitive_state: STATE_TYPE,
@@ -151,6 +182,8 @@ def conserved_state_from_primitive(
     Args:
         primitive_state: The primitive state.
         gamma: The adiabatic index of the fluid.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
 
     Returns:
         The conserved state.
@@ -194,6 +227,7 @@ def conserved_state_from_primitive(
 
     return conserved_state
 
+
 # -------------------------------------------------------------
 # =============== ↑ Create the conserved state ↑ ==============
 # -------------------------------------------------------------
@@ -204,7 +238,6 @@ def conserved_state_from_primitive(
 # -------------------------------------------------------------
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def get_absolute_velocity(
     primitive_state: STATE_TYPE,
@@ -293,7 +326,6 @@ def pressure_from_energy(E, rho, u, gamma):
     return pressure_from_internal_energy(e, rho, gamma)
 
 
-
 @jax.jit
 def total_energy_from_primitives(rho, u, p, gamma):
     """Calculate the total energy from the primitive variables.
@@ -309,6 +341,7 @@ def total_energy_from_primitives(rho, u, p, gamma):
     """
 
     return p / (gamma - 1) + 0.5 * rho * u**2
+
 
 @jax.jit
 def speed_of_sound(rho, p, gamma):

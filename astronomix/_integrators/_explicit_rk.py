@@ -12,16 +12,24 @@ discretisation-specific work lives there, not here.
 Model contract (all closures operate on the state pytree ``u``):
 
     pre_stage(u) -> u
-        Hooks applied at the start of every stage (positivity flooring,
-        boundary handling, ...).  Defaults to the identity.
+        Hook applied at the start of every stage (e.g. boundary handling).
+        Defaults to the identity.
 
     rhs(u, dt_stage) -> du
         The stage increment ``dt_stage * L(u)``, a pytree matching ``u``.
 
+    post_stage(u) -> u   [ssprk4 only]
+        Hook applied to each new stage state as soon as it is formed, before
+        it is accumulated or used as the base of the next increment (e.g.
+        rebuilding the cell-centered MHD fields from the interface fields).
+        The final SSPRK4 combination keeps the ``_SSPRK4_FINAL_RAW`` share of
+        each stage on the state as formed, so a modifying hook leaves that
+        combination convex. Defaults to the identity.
+
     finalize(u) -> u
-        Hooks applied once after the last stage (e.g. recomputing the
-        cell-centered MHD fields from the interface fields, final
-        positivity).  Defaults to the identity.
+        Hook applied once after the last stage (e.g. recomputing the
+        cell-centered MHD fields from the interface fields).  Defaults to the
+        identity.
 
     lsrk_increment(u, du, a_coef, dt) -> du   [optional, low-storage only]
         Returns the new low-storage register ``a_coef * du + dt * L(u)``.
@@ -60,14 +68,40 @@ def _tree_add(x, y):
 # preserving Runge-Kutta.  Three registers: the initial state ``u0``, the
 # running stage state ``u_curr`` and the accumulating ``u_final``.
 # ---------------------------------------------------------------------------
-_SSPRK4_K0 = (1.0, 0.44437049406734, 0.62010185138540, 0.17807995410773, -2.081261929715610e-02)
-_SSPRK4_KRHS = (0.39175222700392, 0.36841059262959, 0.25189177424738, 0.54497475021237, 0.22600748319395)
-_SSPRK4_KCURR = (0.0, 0.55562950593266, 0.37989814861460, 0.82192004589227, 5.03580947213895e-01)
-_SSPRK4_FINAL = (-2.081261929715610e-02, 0.0, 0.51723167208978, -6.518979800418380e-12, 5.03580947213895e-01)
-# Part of the u4 weight in _SSPRK4_FINAL that stands in for the Shu-Osher
-# term 0.0961 u3 + 0.0637 dt L(u3) (= 0.1169 (u4 - 0.1781 u0 - 0.8219 u3), the
-# source of the -0.0208 u0 weight). It must multiply u4 exactly as formed, so a
-# ``post_stage`` that changes u4 leaves the final combination convex.
+_SSPRK4_K0 = (
+    1.0,
+    0.44437049406734,
+    0.62010185138540,
+    0.17807995410773,
+    -2.081261929715610e-02,
+)
+_SSPRK4_KRHS = (
+    0.39175222700392,
+    0.36841059262959,
+    0.25189177424738,
+    0.54497475021237,
+    0.22600748319395,
+)
+_SSPRK4_KCURR = (
+    0.0,
+    0.55562950593266,
+    0.37989814861460,
+    0.82192004589227,
+    5.03580947213895e-01,
+)
+_SSPRK4_FINAL = (
+    -2.081261929715610e-02,
+    0.0,
+    0.51723167208978,
+    -6.518979800418380e-12,
+    5.03580947213895e-01,
+)
+#: Part of the u4 weight in _SSPRK4_FINAL that stands in for the Shu-Osher
+#: term 0.0961 u3 + 0.0637 dt L(u3) (= 0.1169 (u4 - 0.1781 u0 - 0.8219 u3), the
+#: source of the -0.0208 u0 weight). It must multiply u4 exactly as formed, so a
+#: ``post_stage`` that changes u4 leaves the final combination convex. Unlike
+#: _SSPRK4_FINAL (whose entry 0 weights u0), it is indexed by the loop stage
+#: 0..3 that forms the state.
 _SSPRK4_FINAL_RAW = (0.0, 0.0, 0.0, 0.063692468666290 / 0.544974750228521)
 
 
@@ -78,11 +112,11 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, post_stage=_identity, finalize=_
         u0: Initial state pytree at ``t = t_n``.
         dt: Full time step.
         rhs: ``rhs(u, dt_stage) -> du`` stage increment.
-        pre_stage: per-stage hook, defaults to identity.
-        post_stage: applied to each new stage state as soon as it is formed,
+        pre_stage: Per-stage hook, defaults to the identity.
+        post_stage: Applied to each new stage state as soon as it is formed,
             before it is accumulated or used as the base of the next increment;
-            defaults to identity.
-        finalize: post-integration hook, defaults to identity.
+            defaults to the identity.
+        finalize: Post-integration hook, defaults to the identity.
 
     Returns:
         The state pytree at ``t = t_n + dt``.
@@ -119,7 +153,10 @@ def ssprk4(u0, dt, *, rhs, pre_stage=_identity, post_stage=_identity, finalize=_
             # u_final <- u_final + ff * u_curr (the raw share on u as formed)
             ff_raw = final_raw_s[stage_idx]
             u_final = jax.tree_util.tree_map(
-                lambda f_, c_, r_: f_ + (ff - ff_raw) * c_ + ff_raw * r_, u_final, u_curr, u_formed
+                lambda f_, c_, r_: f_ + (ff - ff_raw) * c_ + ff_raw * r_,
+                u_final,
+                u_curr,
+                u_formed,
             )
 
         return (u_curr, u_final)
@@ -165,6 +202,18 @@ def lsrk4(u0, dt, *, pre_stage=_identity, finalize=_identity, rhs=None, lsrk_inc
     Either ``rhs`` or ``lsrk_increment`` must be supplied.  ``lsrk_increment``
     lets the model fuse the ``a_coef * du`` accumulate into its flux kernel;
     when only ``rhs`` is given the accumulate is done here via ``tree_map``.
+
+    Args:
+        u0: Initial state pytree at ``t = t_n``.
+        dt: Full time step.
+        pre_stage: Per-stage hook, defaults to the identity.
+        finalize: Post-integration hook, defaults to the identity.
+        rhs: ``rhs(u, dt) -> du`` increment, or None.
+        lsrk_increment: ``lsrk_increment(u, du, a_coef, dt) -> du`` fused
+            register update, or None.
+
+    Returns:
+        The state pytree at ``t = t_n + dt``.
     """
     if lsrk_increment is None and rhs is None:
         raise ValueError("lsrk4 requires either 'rhs' or 'lsrk_increment'.")
@@ -202,7 +251,18 @@ def lsrk4(u0, dt, *, pre_stage=_identity, finalize=_identity, rhs=None, lsrk_inc
 # (Heun's method):  u1 = u0 + dt L(u0);  u2 = u1 + dt L(u1);  u = (u0 + u2)/2.
 # ---------------------------------------------------------------------------
 def rk2_ssp(u0, dt, *, rhs, pre_stage=_identity, finalize=_identity):
-    """2-stage 2nd-order SSP RK (Heun)."""
+    """2-stage 2nd-order SSP RK (Heun).
+
+    Args:
+        u0: Initial state pytree at ``t = t_n``.
+        dt: Full time step.
+        rhs: ``rhs(u, dt) -> du`` increment.
+        pre_stage: Per-stage hook, defaults to the identity.
+        finalize: Post-integration hook, defaults to the identity.
+
+    Returns:
+        The state pytree at ``t = t_n + dt``.
+    """
     u = pre_stage(u0)
     u1 = _tree_add(u, rhs(u, dt))
 

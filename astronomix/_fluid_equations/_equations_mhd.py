@@ -11,7 +11,10 @@ from functools import partial
 
 # typing
 from typing import Union
-from jaxtyping import Array, Float
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax
@@ -26,6 +29,9 @@ from astronomix.option_classes.simulation_config import (
 # astronomix containers
 from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.variable_registry.registered_variables import RegisteredVariables
+
+# astronomix functions
+from astronomix._fluid_equations._dual_energy_switch import dual_energy_internal_energy
 
 
 @partial(jax.jit, static_argnames=["registered_variables"])
@@ -63,27 +69,54 @@ def thermal_pressure_from_energy_mhd(E, rho, u_squared, b_squared, gamma):
         u_squared: The squared velocity.
         b_squared: The squared magnetic field.
         gamma: The adiabatic index.
+
     Returns:
         The pressure.
     """
     return (gamma - 1) * (E - 0.5 * rho * u_squared - 0.5 * b_squared)
 
 
-def dual_switched_pressure(E, rho, u_squared, b_squared, gamma, internal_energy_density, eta):
-    """Gas pressure with the dual-energy switch (Bryan et al. 1995).
-
-    The total-energy internal energy ``e_E = E - KE - ME`` is trustworthy only
-    when it is a non-negligible fraction of E; otherwise (high Mach / low beta)
-    float cancellation destroys it and the separately-advected internal-energy
-    density ``g`` is used instead. Returns the switched thermal pressure
-    ``(gamma-1) e_int``. This is the coupled-recovery primitive used *inside* the
-    WENO flux + eigenstructure so the scheme never sees the corrupted pressure.
+def dual_switched_pressure_mhd(
+    E,
+    rho,
+    u_squared,
+    b_squared,
+    gamma,
+    internal_energy_density,
+    eta,
+):
     """
-    e_E = E - 0.5 * (rho * u_squared + b_squared)
-    E_safe = jnp.maximum(E, 1e-30)
-    reliable = (e_E > eta * E_safe) & (e_E == e_E)
-    e_int = jnp.where(reliable, e_E, internal_energy_density)
-    return (gamma - 1.0) * e_int
+    Gas pressure with the dual-energy switch (Bryan et al. 1995), MHD.
+
+    The internal energy recovered from the total energy,
+    ``e_E = E - KE - ME``, is trustworthy only when it is a non-negligible
+    fraction of ``E``; at high Mach numbers or low plasma beta floating-point
+    cancellation destroys it and the separately advected internal energy
+    density ``g`` is used instead (see ``dual_energy_internal_energy``). The
+    recovery is coupled into the WENO flux and eigenstructure, so the scheme
+    never sees the corrupted pressure.
+
+    Args:
+        E: The total energy density.
+        rho: The density.
+        u_squared: The squared velocity.
+        b_squared: The squared magnetic field.
+        gamma: The adiabatic index.
+        internal_energy_density: The separately advected internal energy
+            density ``g``.
+        eta: The switch threshold (``config.dual_energy_eta``).
+
+    Returns:
+        The switched thermal pressure ``(gamma - 1) e_int``.
+    """
+    internal_energy_from_total = E - 0.5 * (rho * u_squared + b_squared)
+    internal_energy = dual_energy_internal_energy(
+        internal_energy_from_total,
+        E,
+        internal_energy_density,
+        eta,
+    )
+    return (gamma - 1.0) * internal_energy
 
 
 @jax.jit
@@ -151,7 +184,7 @@ def conserved_state_from_primitive_mhd(
     return conserved_state
 
 
-@partial(jax.jit, static_argnames=["clamp", "registered_variables", 'config'])
+@partial(jax.jit, static_argnames=["clamp", "registered_variables", "config"])
 def primitive_state_from_conserved_mhd(
     conserved_state: STATE_TYPE,
     rhomin: Union[float, Float[Array, ""]],
@@ -164,14 +197,7 @@ def primitive_state_from_conserved_mhd(
 ) -> STATE_TYPE:
     """Convert the conserved state to the primitive state for ideal-gas MHD.
 
-    ``clamp=False`` for the state that is carried to the next step: the
-    estimate clamps (``clamp_in_estimates``) must never modify the solution.
-
     Currently only the 3D case is supported.
-
-    ``internal_energy_density`` (the separately-advected dual-energy ``g``), when
-    given, switches the pressure recovery so the corrupted total-energy value is
-    not used in the catastrophic-cancellation regime (coupled dual-energy).
 
     Args:
         conserved_state: The conserved MHD state.
@@ -180,6 +206,13 @@ def primitive_state_from_conserved_mhd(
         gamma: The adiabatic index of the fluid.
         config: The simulation configuration.
         registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None. When given, the pressure recovery is dual-energy switched, so
+            the total-energy value is not used where it suffers catastrophic
+            cancellation.
+        clamp: Whether the estimate clamps (``clamp_in_estimates``) may act.
+            Pass False for the state that is carried to the next step: those
+            clamps must never modify the solution.
 
     Returns:
         The primitive MHD state.
@@ -199,9 +232,14 @@ def primitive_state_from_conserved_mhd(
     if internal_energy_density is None:
         p = thermal_pressure_from_energy_mhd(E, rho, u_squared, b_squared, gamma)
     else:
-        p = dual_switched_pressure(
-            E, rho, u_squared, b_squared, gamma,
-            internal_energy_density, config.dual_energy_eta,
+        p = dual_switched_pressure_mhd(
+            E,
+            rho,
+            u_squared,
+            b_squared,
+            gamma,
+            internal_energy_density,
+            config.dual_energy_eta,
         )
 
     # Write the recovered thermal pressure and velocities into the primitive state.
@@ -212,7 +250,7 @@ def primitive_state_from_conserved_mhd(
     primitive_state = primitive_state.at[registered_variables.velocity_index.z].set(uz)
 
     if clamp and config.positivity_config.clamp_in_estimates:
-        # Positivity of density and pressure in primitives that only feed
+        # Keep density and pressure positive in primitives that only feed
         # estimates (time step, wave speeds, source terms).
         primitive_state = primitive_state.at[registered_variables.density_index].set(
             jnp.maximum(
@@ -227,7 +265,8 @@ def primitive_state_from_conserved_mhd(
 
     return primitive_state
 
-@partial(jax.jit, static_argnames=["clamp", "registered_variables", 'config'])
+
+@partial(jax.jit, static_argnames=["clamp", "registered_variables", "config"])
 def primitive_state_from_conserved_isothermal(
     conserved_state: STATE_TYPE,
     minimum_density: Union[float, Float[Array, ""]],
@@ -235,8 +274,21 @@ def primitive_state_from_conserved_isothermal(
     registered_variables: RegisteredVariables,
     clamp: bool = True,
 ) -> STATE_TYPE:
-    """Convert the conserved state to the primitive state for the isothermal
-    case (``clamp=False`` for the carried state, as in the ideal-gas form)."""
+    """Convert the conserved state to the primitive state for the isothermal case.
+
+    Args:
+        conserved_state: The conserved state (hydro or MHD).
+        minimum_density: The density floor (applied when ``clamp_in_estimates``
+            is set).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        clamp: Whether the estimate clamp (``clamp_in_estimates``) may act.
+            Pass False for the state that is carried to the next step, as in
+            ``primitive_state_from_conserved_mhd``.
+
+    Returns:
+        The primitive state.
+    """
 
     rho = conserved_state[registered_variables.density_index]
 
@@ -269,13 +321,23 @@ def primitive_state_from_conserved_isothermal(
     # There is no pressure variable in the isothermal case, so nothing to set there.
     return primitive_state
 
-@partial(jax.jit, static_argnames=["registered_variables", 'config'])
+
+@partial(jax.jit, static_argnames=["registered_variables", "config"])
 def conserved_state_from_primitive_isothermal(
     primitive_state: STATE_TYPE,
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ) -> STATE_TYPE:
-    """Convert the primitive state to the conserved state for the isothermal case."""
+    """Convert the primitive state to the conserved state for the isothermal case.
+
+    Args:
+        primitive_state: The primitive state (hydro or MHD).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The conserved state.
+    """
 
     rho = primitive_state[registered_variables.density_index]
 
@@ -304,6 +366,7 @@ def conserved_state_from_primitive_isothermal(
 
     # There is no pressure variable in the isothermal case, so nothing to set there.
     return primitive_state
+
 
 @partial(jax.jit, static_argnames=["registered_variables"])
 def total_pressure_from_conserved_mhd(

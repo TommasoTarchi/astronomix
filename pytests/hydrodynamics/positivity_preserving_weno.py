@@ -1,44 +1,48 @@
 """
 Positivity-preserving WENO pytest.
 
-Two stress problems where the bare finite-difference scheme fails and the
-``weno_admissible_face_state`` / ``weno_positivity_preserving`` options must
-hold, plus a smooth-flow check that the options do not cost order of accuracy:
+Two stress problems where the finite-difference scheme needs its robustness
+options, plus a smooth-flow check that the options do not cost order of
+accuracy:
 
-* a cold dense slab rammed at Mach ~800 into tenuous gas (the default interface
-  sound speed goes negative there and the run blows up within a few steps);
+* a cold dense slab rammed at Mach ~800 into tenuous gas. With the legacy
+  enthalpy-averaged interface basis (``weno_admissible_face_state=False``) the
+  interface sound speed goes negative there and the run blows up within a few
+  steps; the default admissible face state and the positivity-preserving limiter
+  (``weno_positivity_preserving``) must both hold;
 * a strong double rarefaction close to vacuum (positivity of density and
   pressure);
-* an advected entropy wave (fifth-order convergence with the options on).
+* an advected entropy wave (fifth-order convergence with the limiter on).
 """
 
 # ==== GPU selection ====
-from autocvd import autocvd
-autocvd(num_gpus=1)
+import os
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
-
-# general
-import numpy as np
 
 # jax
 import jax
 import jax.numpy as jnp
 
+# numerics
+import numpy as np
+
 # astronomix constants
-from astronomix.option_classes.simulation_config import (
-    DOUBLE_PRECISION,
+from astronomix import (
     OPEN_BOUNDARY,
     PERIODIC_BOUNDARY,
-    PERIODIC_ROLL,
 )
+from astronomix.option_classes.simulation_config import DOUBLE_PRECISION
 
 # astronomix containers
 from astronomix import (
+    BoundarySettings1D,
     SimulationConfig,
     SimulationParams,
 )
-from astronomix.option_classes.simulation_config import BoundarySettings1D
 
 # astronomix functions
 from astronomix import (
@@ -56,13 +60,28 @@ jax.config.update("jax_enable_x64", True)
 
 
 def _run_riemann(left, right, gamma, t_end, num_cells, **options):
-    """Run a 1D Riemann problem (rho, u, p per side) on [0, 1], diaphragm at 0.5."""
+    """
+    Run a 1D Riemann problem on [0, 1] with the diaphragm at x = 0.5.
+
+    Args:
+        left: The left state as (density, velocity, pressure).
+        right: The right state as (density, velocity, pressure).
+        gamma: The adiabatic index.
+        t_end: The end time.
+        num_cells: The number of cells.
+        **options: Extra SimulationConfig options (the robustness switches).
+
+    Returns:
+        The final primitive state, the registered variables and the exact
+        density at ``t_end``.
+    """
     config = SimulationConfig(
         dimensionality=1,
         num_cells=num_cells,
         numerical_precision=DOUBLE_PRECISION,
         boundary_settings=BoundarySettings1D(
-            left_boundary=OPEN_BOUNDARY, right_boundary=OPEN_BOUNDARY
+            left_boundary=OPEN_BOUNDARY,
+            right_boundary=OPEN_BOUNDARY,
         ),
         **options,
     )
@@ -86,13 +105,26 @@ def _run_riemann(left, right, gamma, t_end, num_cells, **options):
 def test_cold_dense_ram():
     """Mach ~800 cold slab into tenuous gas: finite, positive, near exact."""
     left, right = (100.0, 1.0, 1e-4), (1.0, 0.0, 1e-4)
-    for options in (dict(weno_admissible_face_state=True), dict(weno_positivity_preserving=True)):
-        final, registered_variables, exact = _run_riemann(left, right, 5.0 / 3.0, 0.3, 400, **options)
+    robustness_options = (
+        # The default: admissible face state, no positivity-preserving limiter.
+        dict(weno_admissible_face_state=True, weno_positivity_preserving=False),
+        dict(weno_positivity_preserving=True),
+    )
+    for options in robustness_options:
+        final, registered_variables, exact = _run_riemann(
+            left,
+            right,
+            5.0 / 3.0,
+            0.3,
+            400,
+            **options,
+        )
         density = final[registered_variables.density_index]
         pressure = final[registered_variables.pressure_index]
         assert np.all(np.isfinite(final)), options
         assert density.min() > 0.0 and pressure.min() > 0.0, options
-        # the error is dominated by the smeared density-400 contact
+        # The error is dominated by the smeared density-400 contact, hence the
+        # loose bound.
         assert np.mean(np.abs(density - exact)) < 3.0, options
 
 
@@ -100,7 +132,12 @@ def test_near_vacuum_double_rarefaction():
     """Double rarefaction with u = -+3.5 (vacuum at u = -+3.74): positive."""
     left, right = (1.0, -3.5, 0.4), (1.0, 3.5, 0.4)
     final, registered_variables, exact = _run_riemann(
-        left, right, 1.4, 0.1, 400, weno_positivity_preserving=True
+        left,
+        right,
+        1.4,
+        0.1,
+        400,
+        weno_positivity_preserving=True,
     )
     density = final[registered_variables.density_index]
     pressure = final[registered_variables.pressure_index]
@@ -109,17 +146,18 @@ def test_near_vacuum_double_rarefaction():
 
 
 def test_smooth_fifth_order():
-    """An advected entropy wave stays fifth order with the options on."""
+    """An advected entropy wave stays fifth order with the limiter on."""
     errors = []
     for num_cells in (32, 64):
+        # finalize_config selects the periodic roll (no ghost cells) for the
+        # fully periodic 1D boundaries.
         config = SimulationConfig(
             dimensionality=1,
             num_cells=num_cells,
             numerical_precision=DOUBLE_PRECISION,
-            boundary_handling=PERIODIC_ROLL,
-            num_ghost_cells=0,
             boundary_settings=BoundarySettings1D(
-                left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
+                left_boundary=PERIODIC_BOUNDARY,
+                right_boundary=PERIODIC_BOUNDARY,
             ),
             weno_positivity_preserving=True,
         )
@@ -134,11 +172,15 @@ def test_smooth_fifth_order():
             velocity_x=jnp.ones_like(x),
             gas_pressure=jnp.ones_like(x),
         )
-        # 1D finalize keeps ghost cells; the convergence test needs the roll
-        config = finalize_config(config, state.shape)._replace(
-            boundary_handling=PERIODIC_ROLL, num_ghost_cells=0
-        )
+        config = finalize_config(config, state.shape)
         final = np.asarray(time_integration(state, config, params, registered_variables))
-        errors.append(np.mean(np.abs(final[registered_variables.density_index] - np.asarray(density))))
+        final_density = final[registered_variables.density_index]
+        errors.append(np.mean(np.abs(final_density - np.asarray(density))))
     order = np.log2(errors[0] / errors[1])
     assert order > 4.5, f"observed order {order:.2f}"
+
+
+if __name__ == "__main__":
+    test_cold_dense_ram()
+    test_near_vacuum_double_rarefaction()
+    test_smooth_fifth_order()
