@@ -1,10 +1,14 @@
 """
 Computations of the eigenvalues and eigenvectors for the Euler (hydrodynamics) equations.
 
-Problems for differentiation largely follow from square roots and divisions:
-The derivative of sqrt(x) is 1/(2*sqrt(x)) and of 1/x is -1/x^2, where both expressions
-are problematic for small x, especially when multiplying gradients in the backward pass,
--> exploding gradients.
+The characteristic decomposition is evaluated along x on a state whose axes have been
+permuted so that the sweep direction comes first; the eigenvectors are those of the
+interface state between cell i and cell i + 1.
+
+NOTE: Problems for differentiation largely follow from square roots and divisions:
+the derivative of sqrt(x) is 1/(2*sqrt(x)) and that of 1/x is -1/x^2, both of which
+are problematic for small x, especially when gradients are multiplied in the backward
+pass (exploding gradients).
 """
 
 # general
@@ -22,6 +26,7 @@ from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._fluid_equations._dual_energy_switch import dual_energy_switched_pressure
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
@@ -44,8 +49,28 @@ def _eigenvalue_building_blocks(
     pgmin,
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
-    # unpack the conserved variables
+    """
+    Cell-centred velocity and sound speed entering the hydro eigenvalues.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold; required when
+            ``internal_energy_density`` is given.
+
+    Returns:
+        The normal velocity and the sound speed per cell.
+    """
+    # Unpack the conserved variables.
     density = conserved_state[registered_variables.density_index]
 
     if config.dimensionality == 1:
@@ -65,7 +90,7 @@ def _eigenvalue_building_blocks(
 
     energy = conserved_state[registered_variables.energy_index]
 
-    # compute primitives
+    # Compute the primitive quantities.
     rho = density
     velocity_x = momentum_x / rho
     velocity_y = momentum_y / rho
@@ -73,12 +98,21 @@ def _eigenvalue_building_blocks(
     velocity_squared = (
         velocity_x * velocity_x + velocity_y * velocity_y + velocity_z * velocity_z
     )
-    
+
     gas_pressure = (gamma - 1.0) * (
         energy - 0.5 * rho * velocity_squared
     )
 
-    # redefine the density and pressure, and energy based on floors
+    if internal_energy_density is not None:
+        gas_pressure = dual_energy_switched_pressure(
+            gas_pressure,
+            energy,
+            gamma,
+            internal_energy_density,
+            dual_eta,
+        )
+
+    # Apply the density and pressure floors (and make the energy consistent).
     rho = jnp.where(
         (rho < rhomin) | (gas_pressure < pgmin), jnp.maximum(rho, rhomin), rho
     )
@@ -93,13 +127,14 @@ def _eigenvalue_building_blocks(
         energy,
     )
 
-    # compute derived quantities
+    # Compute the derived quantities.
     sound_speed = diff_safe_sqrt(jnp.maximum(0.0, gamma * jnp.abs(gas_pressure / rho)))
 
     return (
         velocity_x,
         sound_speed,
     )
+
 
 @partial(jax.jit, static_argnames=["registered_variables", "config"])
 def _eigenvector_building_blocks(
@@ -109,15 +144,40 @@ def _eigenvector_building_blocks(
     pgmin,
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
-    # unpack conserved variables
-    rho = conserved_state[registered_variables.density_index]  
+    """
+    Interface quantities entering the hydro eigenvectors.
+
+    The interface state between cell i and cell i + 1 is built from averages
+    of the two cells; with ``config.weno_admissible_face_state`` its sound speed
+    comes from the averaged pressure instead of the averaged enthalpy.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold; required when
+            ``internal_energy_density`` is given.
+
+    Returns:
+        The interface density, velocity components, squared velocity, specific
+        enthalpy, sound speed, squared sound speed and its (zero-safe) inverse,
+        and gamma - 1.
+    """
+    # Unpack the conserved variables.
+    rho = conserved_state[registered_variables.density_index]
 
     if config.dimensionality == 1:
         momentum_x = conserved_state[registered_variables.momentum_index]
     else:
         momentum_x = conserved_state[registered_variables.momentum_index.x]
-
 
     if config.dimensionality == 1:
         momentum_y = 0.0
@@ -128,20 +188,29 @@ def _eigenvector_building_blocks(
     elif config.dimensionality == 3:
         momentum_y = conserved_state[registered_variables.momentum_index.y]
         momentum_z = conserved_state[registered_variables.momentum_index.z]
-        
+
     energy = conserved_state[registered_variables.energy_index]
 
-    # compute primitives
+    # Compute the primitive quantities.
     velocity_x = momentum_x / rho
     velocity_y = momentum_y / rho
     velocity_z = momentum_z / rho
     velocity_sq = (
         velocity_x * velocity_x + velocity_y * velocity_y + velocity_z * velocity_z
     )
-    
+
     gas_pressure = (gamma - 1.0) * (energy - 0.5 * rho * velocity_sq)
 
-    # redefine the density and pressure, and energy based on floors
+    if internal_energy_density is not None:
+        gas_pressure = dual_energy_switched_pressure(
+            gas_pressure,
+            energy,
+            gamma,
+            internal_energy_density,
+            dual_eta,
+        )
+
+    # Apply the density and pressure floors (and make the energy consistent).
     rho = jnp.where(
         (rho < rhomin) | (gas_pressure < pgmin), jnp.maximum(rho, rhomin), rho
     )
@@ -181,17 +250,30 @@ def _eigenvector_building_blocks(
 
     specific_enthalpy_interface = avg_x(specific_enthalpy)
 
-    # interface derived quantities
+    # Derived interface quantities.
     velocity_sq_interface = (
         velocity_x_interface * velocity_x_interface
         + velocity_y_interface * velocity_y_interface
         + velocity_z_interface * velocity_z_interface
     )
 
-    # enthalpy based sound speed at interfaces
+    # Enthalpy-based sound speed at the interfaces.
     sound_speed_sq_interface = (gamma - 1.0) * (
         specific_enthalpy_interface - 0.5 * velocity_sq_interface
     )
+    if config.weno_admissible_face_state:
+        # Build the interface state from averaged primitives so the frozen
+        # characteristic basis is that of a real, hyperbolic state. The
+        # enthalpy average above mixes an unweighted mean of h with a
+        # mass-weighted velocity: at a density jump with a velocity jump of a
+        # few sound speeds its c^2 goes NEGATIVE (and it is not Galilean
+        # invariant), which zeroes the acoustic upwind correction exactly
+        # where it is needed. Averaging p directly is positive, frame
+        # independent and free of the H - v^2/2 cancellation at high Mach.
+        sound_speed_sq_interface = gamma * avg_x(gas_pressure) / rho_interface
+        specific_enthalpy_interface = (
+            sound_speed_sq_interface / (gamma - 1.0) + 0.5 * velocity_sq_interface
+        )
     sound_speed_interface = diff_safe_sqrt(jnp.maximum(0.0, sound_speed_sq_interface))
 
     sound_speed_sq_inverse = jnp.where(
@@ -223,7 +305,29 @@ def _eigen_R_col_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     col: int,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
+    """
+    One right eigenvector (column of R) of the hydro flux Jacobian at the interfaces.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        col: The index of the characteristic mode, ordered by wave speed
+            (u - c, u, [u, u,] u + c).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+
+    Returns:
+        The right eigenvector, shaped like ``conserved_state``.
+    """
     (
         rho_interface,
         velocity_x_interface,
@@ -242,24 +346,24 @@ def _eigen_R_col_hydro(
         pgmin,
         config,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
     )
 
-    # shorter names for registry indices
+    # Shorter names for the registry indices.
     density_index = registered_variables.density_index
-
 
     if config.dimensionality == 1:
         momentum_index_x = registered_variables.momentum_index
     else:
         momentum_index_x = registered_variables.momentum_index.x
-    
+
     if config.dimensionality >= 2:
         momentum_index_y = registered_variables.momentum_index.y
 
     if config.dimensionality == 3:
         momentum_index_z = registered_variables.momentum_index.z
 
-    
     energy_index = registered_variables.energy_index
 
     def col_0():
@@ -272,8 +376,10 @@ def _eigen_R_col_hydro(
             R = R.at[momentum_index_y].set(velocity_y_interface)
         if config.dimensionality == 3:
             R = R.at[momentum_index_z].set(velocity_z_interface)
-        
-        R = R.at[energy_index].set(specific_enthalpy_interface - velocity_x_interface * sound_speed_interface)
+
+        R = R.at[energy_index].set(
+            specific_enthalpy_interface - velocity_x_interface * sound_speed_interface
+        )
         return R
 
     def col_1():
@@ -325,7 +431,9 @@ def _eigen_R_col_hydro(
             R = R.at[momentum_index_y].set(velocity_y_interface)
         if config.dimensionality == 3:
             R = R.at[momentum_index_z].set(velocity_z_interface)
-        R = R.at[energy_index].set(specific_enthalpy_interface + velocity_x_interface * sound_speed_interface)
+        R = R.at[energy_index].set(
+            specific_enthalpy_interface + velocity_x_interface * sound_speed_interface
+        )
         return R
 
     if config.dimensionality == 1:
@@ -347,7 +455,29 @@ def _eigen_L_row_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     row: int,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
+    """
+    One left eigenvector (row of L) of the hydro flux Jacobian at the interfaces.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        row: The index of the characteristic mode, ordered by wave speed
+            (u - c, u, [u, u,] u + c).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+
+    Returns:
+        The left eigenvector, shaped like ``conserved_state``.
+    """
     (
         rho_interface,
         velocity_x_interface,
@@ -366,9 +496,11 @@ def _eigen_L_row_hydro(
         pgmin,
         config,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
     )
 
-    # shorter names for registry indices
+    # Shorter names for the registry indices.
     density_index = registered_variables.density_index
 
     if config.dimensionality == 1:
@@ -385,8 +517,13 @@ def _eigen_L_row_hydro(
     def row_0():
         # Row 1 (Left Acoustic / u - c)
         L = jnp.zeros_like(conserved_state)
-        L = L.at[density_index].set(0.5 * gamma_minus_one * velocity_sq_interface + velocity_x_interface * sound_speed_interface)
-        L = L.at[momentum_index_x].set(-(gamma_minus_one * velocity_x_interface + sound_speed_interface))
+        L = L.at[density_index].set(
+            0.5 * gamma_minus_one * velocity_sq_interface
+            + velocity_x_interface * sound_speed_interface
+        )
+        L = L.at[momentum_index_x].set(
+            -(gamma_minus_one * velocity_x_interface + sound_speed_interface)
+        )
         if config.dimensionality >= 2:
             L = L.at[momentum_index_y].set(-gamma_minus_one * velocity_y_interface)
         if config.dimensionality == 3:
@@ -398,7 +535,9 @@ def _eigen_L_row_hydro(
     def row_1():
         # Row 2 (Entropy / u)
         L = jnp.zeros_like(conserved_state)
-        L = L.at[density_index].set(sound_speed_sq_interface - 0.5 * gamma_minus_one * velocity_sq_interface)
+        L = L.at[density_index].set(
+            sound_speed_sq_interface - 0.5 * gamma_minus_one * velocity_sq_interface
+        )
         L = L.at[momentum_index_x].set(gamma_minus_one * velocity_x_interface)
         if config.dimensionality >= 2:
             L = L.at[momentum_index_y].set(gamma_minus_one * velocity_y_interface)
@@ -435,8 +574,13 @@ def _eigen_L_row_hydro(
     def row_4():
         # Row 5 (Right Acoustic / u + c)
         L = jnp.zeros_like(conserved_state)
-        L = L.at[density_index].set(0.5 * gamma_minus_one * velocity_sq_interface - velocity_x_interface * sound_speed_interface)
-        L = L.at[momentum_index_x].set(-(gamma_minus_one * velocity_x_interface - sound_speed_interface))
+        L = L.at[density_index].set(
+            0.5 * gamma_minus_one * velocity_sq_interface
+            - velocity_x_interface * sound_speed_interface
+        )
+        L = L.at[momentum_index_x].set(
+            -(gamma_minus_one * velocity_x_interface - sound_speed_interface)
+        )
         if config.dimensionality >= 2:
             L = L.at[momentum_index_y].set(-gamma_minus_one * velocity_y_interface)
         if config.dimensionality == 3:
@@ -464,6 +608,23 @@ def _eigen_all_lambdas_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
+    """
+    All hydro eigenvalues per cell, stacked along a leading mode axis.
+
+    Used by the CFL time-step estimate, which works on the plain total-energy
+    pressure recovery.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The eigenvalues (u - c, u, [u, u,] u + c) per cell.
+    """
     (
         velocity_x,
         sound_speed,
@@ -485,7 +646,7 @@ def _eigen_all_lambdas_hydro(
             ],
             axis=0,
         )
-    
+
     if config.dimensionality == 2:
         return jnp.stack(
             [
@@ -496,7 +657,7 @@ def _eigen_all_lambdas_hydro(
             ],
             axis=0,
         )
-    
+
     if config.dimensionality == 3:
         return jnp.stack(
             [
@@ -518,7 +679,29 @@ def _eigen_lambdas_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     mode: int,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
+    """
+    One hydro eigenvalue per cell.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        mode: The index of the characteristic mode, ordered by wave speed
+            (u - c, u, [u, u,] u + c).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+
+    Returns:
+        The eigenvalue of the mode per cell.
+    """
     (
         velocity_x,
         sound_speed,
@@ -529,6 +712,8 @@ def _eigen_lambdas_hydro(
         pgmin,
         config,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
     )
 
     def mode_0():
@@ -551,6 +736,4 @@ def _eigen_lambdas_hydro(
     if config.dimensionality == 2:
         return jax.lax.switch(mode, [mode_0, mode_1, mode_2, mode_4])
     if config.dimensionality == 3:
-        return jax.lax.switch(
-            mode, [mode_0, mode_1, mode_2, mode_3, mode_4]
-        )
+        return jax.lax.switch(mode, [mode_0, mode_1, mode_2, mode_3, mode_4])

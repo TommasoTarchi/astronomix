@@ -25,7 +25,6 @@ from astronomix.option_classes.simulation_config import (
     FINITE_VOLUME,
     IDEAL_GAS,
     POSITIVITY_HARD_FLOOR,
-    POSITIVITY_REDISTRIBUTE,
     STATE_TYPE,
 )
 
@@ -45,7 +44,6 @@ from astronomix._modules._stellar_wind.stellar_wind import _wind_injection
 from astronomix._modules._turbulent_forcing._turbulent_forcing import (
     _apply_forcing,
     _apply_ou_forcing,
-    _vacuum_protection,
 )
 from astronomix._modules._viscosity._viscosity import fv_viscosity_update
 from astronomix.shock_finder.shock_finder import shock_criteria
@@ -99,7 +97,8 @@ def _iteration_level_updates(
             registered_variables,
         )
 
-    # Cosmic-ray injection at the strongest shock.
+    # Cosmic-ray injection at the selected shock (strongest or outermost, see
+    # ``CosmicRayConfig.shock_selection``).
     if config.cosmic_ray_config.diffusive_shock_acceleration:
         shock_present = shock_criteria(
             primitive_state,
@@ -135,7 +134,8 @@ def _iteration_level_updates(
 
     # Cooling.
     # In the finite-difference case this is instead handled as a source term
-    # inside the hydro integrator.
+    # inside the hydro integrator. The grid spacing enables the
+    # cooling-resolution limiter, as on the finite-difference path.
     if config.cooling_config.cooling and config.solver_mode == FINITE_VOLUME:
         primitive_state = update_pressure_by_cooling(
             primitive_state,
@@ -143,6 +143,7 @@ def _iteration_level_updates(
             config.cooling_config,
             params,
             dt,
+            grid_spacing=config.grid_spacing,
         )
 
     # Neural-network body force.
@@ -216,12 +217,12 @@ def _iteration_level_updates(
             helper_data,
         )
 
-    # Per-step positivity on the primitive state.
-    #   - HARD_FLOOR clamps density (and pressure, for an ideal gas) to its
-    #     configured minimum.
-    #   - REDISTRIBUTE applies the conservative ``prot`` neighbour
-    #     redistribution, but is skipped when turbulent forcing already runs
-    #     ``prot`` each step (via vacuum_protection) to avoid a redundant pass.
+    # Per-step state floor. The finite-difference scheme stays positive through
+    # the positivity-preserving WENO, so this floor mainly serves the
+    # finite-volume solver and, with ``per_step_specific_floor``, acts as the
+    # temperature floor of radiatively cooled runs. HARD_FLOOR clamps the
+    # density (and, for an ideal gas, the pressure) pointwise; it is not
+    # conservative.
     if config.positivity_config.per_step_mode == POSITIVITY_HARD_FLOOR:
         primitive_state = primitive_state.at[registered_variables.density_index].set(
             jnp.maximum(
@@ -230,24 +231,22 @@ def _iteration_level_updates(
             )
         )
         if config.equation_of_state == IDEAL_GAS:
+            pressure_floor = params.minimum_pressure
+            if config.positivity_config.per_step_specific_floor:
+                # With the density-scaled temperature floor
+                # p >= rho * minimum_specific_pressure, radiatively cooled
+                # dense layers keep isothermal pressure support instead of
+                # falling onto the comparatively negligible constant floor.
+                pressure_floor = jnp.maximum(
+                    pressure_floor,
+                    primitive_state[registered_variables.density_index]
+                    * params.minimum_specific_pressure,
+                )
             primitive_state = primitive_state.at[registered_variables.pressure_index].set(
                 jnp.maximum(
                     primitive_state[registered_variables.pressure_index],
-                    params.minimum_pressure,
+                    pressure_floor,
                 )
-            )
-    elif config.positivity_config.per_step_mode == POSITIVITY_REDISTRIBUTE:
-        forcing_already_runs_protection = (
-            config.turbulent_forcing_config.turbulent_forcing
-            and config.turbulent_forcing_config.vacuum_protection
-        )
-        if not forcing_already_runs_protection:
-            primitive_state = _vacuum_protection(
-                primitive_state,
-                params.minimum_density,
-                params.positivity_max_velocity,
-                config,
-                registered_variables,
             )
 
     return key, forcing, primitive_state

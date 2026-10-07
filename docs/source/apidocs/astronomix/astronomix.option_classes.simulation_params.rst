@@ -148,13 +148,6 @@ API
 
       .. autodoc2-docstring:: astronomix.option_classes.simulation_params.SimulationParams.minimum_pressure
 
-   .. py:attribute:: positivity_max_velocity
-      :canonical: astronomix.option_classes.simulation_params.SimulationParams.positivity_max_velocity
-      :type: float
-      :value: 50.0
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_params.SimulationParams.positivity_max_velocity
-
    .. py:attribute:: dt_max
       :canonical: astronomix.option_classes.simulation_params.SimulationParams.dt_max
       :type: float

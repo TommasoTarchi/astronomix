@@ -50,13 +50,25 @@ def _eigenvalue_building_blocks(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
+    """
+    Cell-centred velocity and sound speed entering the isothermal eigenvalues.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        sound_speed: The isothermal sound speed.
+        rhomin: The density floor.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The normal velocity per cell and the sound speed.
+    """
     density = conserved_state[registered_variables.density_index]
 
     if config.dimensionality == 1:
         momentum_x = conserved_state[registered_variables.momentum_index]
     else:
         momentum_x = conserved_state[registered_variables.momentum_index.x]
-
 
     rho = jnp.maximum(density, rhomin)
     velocity_x = momentum_x / rho
@@ -72,24 +84,39 @@ def _eigenvector_building_blocks(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
-    rho = conserved_state[registered_variables.density_index]
-    momentum_x = conserved_state[registered_variables.momentum_index.x]
+    """
+    Interface quantities entering the isothermal eigenvectors.
 
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        sound_speed: The isothermal sound speed.
+        rhomin: The density floor.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The interface velocity components, the sound speed, its square and
+        the (zero-safe) inverse of the square.
+    """
+    rho = conserved_state[registered_variables.density_index]
+
+    # In 1D the registry stores the single momentum index as a plain int.
     if config.dimensionality == 1:
+        momentum_x = conserved_state[registered_variables.momentum_index]
         momentum_y = 0.0
         momentum_z = 0.0
     elif config.dimensionality == 2:
+        momentum_x = conserved_state[registered_variables.momentum_index.x]
         momentum_y = conserved_state[registered_variables.momentum_index.y]
         momentum_z = 0.0
     elif config.dimensionality == 3:
+        momentum_x = conserved_state[registered_variables.momentum_index.x]
         momentum_y = conserved_state[registered_variables.momentum_index.y]
         momentum_z = conserved_state[registered_variables.momentum_index.z]
 
     rho = jnp.maximum(rho, rhomin)
-    velocity_x = momentum_x / rho
-    velocity_y = momentum_y / rho
-    velocity_z = momentum_z / rho
 
+    # Periodic average from cell centres to interfaces.
     def avg_x(arr):
         return 0.5 * (arr + _shift(arr, shift=-1, axis=0))
 
@@ -132,6 +159,21 @@ def _eigen_R_col_hydro_iso(
     registered_variables: RegisteredVariables,
     col: int,
 ):
+    """
+    One right eigenvector (column of R) of the isothermal flux Jacobian.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        sound_speed: The isothermal sound speed.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        col: The index of the characteristic mode, ordered by wave speed
+            (u - cs, [u, u,] u + cs).
+
+    Returns:
+        The right eigenvector, shaped like ``conserved_state``.
+    """
     (
         velocity_x_interface,
         velocity_y_interface,
@@ -140,7 +182,11 @@ def _eigen_R_col_hydro_iso(
         cs2,
         cs2_inverse,
     ) = _eigenvector_building_blocks(
-        conserved_state, sound_speed, rhomin, config, registered_variables,
+        conserved_state,
+        sound_speed,
+        rhomin,
+        config,
+        registered_variables,
     )
 
     density_index = registered_variables.density_index
@@ -156,7 +202,7 @@ def _eigen_R_col_hydro_iso(
         momentum_index_z = registered_variables.momentum_index.z
 
     def col_acoustic_minus():
-        # u - cs
+        # Acoustic mode u - cs.
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(1.0)
         R = R.at[momentum_index_x].set(velocity_x_interface - cs)
@@ -167,7 +213,7 @@ def _eigen_R_col_hydro_iso(
         return R
 
     def col_shear_y():
-        # shear y
+        # Shear mode along y.
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(0.0)
         R = R.at[momentum_index_x].set(0.0)
@@ -178,7 +224,7 @@ def _eigen_R_col_hydro_iso(
         return R
 
     def col_shear_z():
-        # shear z
+        # Shear mode along z.
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(0.0)
         R = R.at[momentum_index_x].set(0.0)
@@ -189,7 +235,7 @@ def _eigen_R_col_hydro_iso(
         return R
 
     def col_acoustic_plus():
-        # u + cs
+        # Acoustic mode u + cs.
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(1.0)
         R = R.at[momentum_index_x].set(velocity_x_interface + cs)
@@ -204,7 +250,10 @@ def _eigen_R_col_hydro_iso(
     elif config.dimensionality == 2:
         R = jax.lax.switch(col, [col_acoustic_minus, col_shear_y, col_acoustic_plus])
     elif config.dimensionality == 3:
-        R = jax.lax.switch(col, [col_acoustic_minus, col_shear_y, col_shear_z, col_acoustic_plus])
+        R = jax.lax.switch(
+            col,
+            [col_acoustic_minus, col_shear_y, col_shear_z, col_acoustic_plus],
+        )
 
     return R
 
@@ -218,6 +267,21 @@ def _eigen_L_row_hydro_iso(
     registered_variables: RegisteredVariables,
     row: int,
 ):
+    """
+    One left eigenvector (row of L) of the isothermal flux Jacobian.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        sound_speed: The isothermal sound speed.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        row: The index of the characteristic mode, ordered by wave speed
+            (u - cs, [u, u,] u + cs).
+
+    Returns:
+        The left eigenvector, shaped like ``conserved_state``.
+    """
     (
         velocity_x_interface,
         velocity_y_interface,
@@ -226,7 +290,11 @@ def _eigen_L_row_hydro_iso(
         cs2,
         cs2_inverse,
     ) = _eigenvector_building_blocks(
-        conserved_state, sound_speed, rhomin, config, registered_variables,
+        conserved_state,
+        sound_speed,
+        rhomin,
+        config,
+        registered_variables,
     )
 
     density_index = registered_variables.density_index
@@ -242,7 +310,7 @@ def _eigen_L_row_hydro_iso(
         momentum_index_z = registered_variables.momentum_index.z
 
     def row_acoustic_minus():
-        # u - cs
+        # Acoustic mode u - cs.
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(cs2 + velocity_x_interface * cs)
         L = L.at[momentum_index_x].set(-cs)
@@ -254,7 +322,7 @@ def _eigen_L_row_hydro_iso(
         return L
 
     def row_shear_y():
-        # shear y
+        # Shear mode along y.
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(-velocity_y_interface)
         L = L.at[momentum_index_x].set(0.0)
@@ -265,7 +333,7 @@ def _eigen_L_row_hydro_iso(
         return L
 
     def row_shear_z():
-        # shear z
+        # Shear mode along z.
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(-velocity_z_interface)
         L = L.at[momentum_index_x].set(0.0)
@@ -276,7 +344,7 @@ def _eigen_L_row_hydro_iso(
         return L
 
     def row_acoustic_plus():
-        # u + cs
+        # Acoustic mode u + cs.
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(cs2 - velocity_x_interface * cs)
         L = L.at[momentum_index_x].set(cs)
@@ -292,7 +360,10 @@ def _eigen_L_row_hydro_iso(
     elif config.dimensionality == 2:
         L = jax.lax.switch(row, [row_acoustic_minus, row_shear_y, row_acoustic_plus])
     elif config.dimensionality == 3:
-        L = jax.lax.switch(row, [row_acoustic_minus, row_shear_y, row_shear_z, row_acoustic_plus])
+        L = jax.lax.switch(
+            row,
+            [row_acoustic_minus, row_shear_y, row_shear_z, row_acoustic_plus],
+        )
 
     return L
 
@@ -305,8 +376,25 @@ def _eigen_all_lambdas_hydro_iso(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
 ):
+    """
+    All isothermal eigenvalues per cell, stacked along a leading mode axis.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        sound_speed: The isothermal sound speed.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The eigenvalues (u - cs, [u, u,] u + cs) per cell.
+    """
     (velocity_x, cs) = _eigenvalue_building_blocks(
-        conserved_state, sound_speed, rhomin, config, registered_variables,
+        conserved_state,
+        sound_speed,
+        rhomin,
+        config,
+        registered_variables,
     )
 
     if config.dimensionality == 1:
@@ -325,8 +413,27 @@ def _eigen_lambdas_hydro_iso(
     registered_variables: RegisteredVariables,
     mode: int,
 ):
+    """
+    One isothermal eigenvalue per cell.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        sound_speed: The isothermal sound speed.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        mode: The index of the characteristic mode, ordered by wave speed
+            (u - cs, [u, u,] u + cs).
+
+    Returns:
+        The eigenvalue of the mode per cell.
+    """
     (velocity_x, cs) = _eigenvalue_building_blocks(
-        conserved_state, sound_speed, rhomin, config, registered_variables,
+        conserved_state,
+        sound_speed,
+        rhomin,
+        config,
+        registered_variables,
     )
 
     def mode_minus():

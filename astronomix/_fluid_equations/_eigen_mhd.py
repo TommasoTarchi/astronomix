@@ -2,12 +2,14 @@
 Computations of the eigenvalues and eigenvectors for the MHD equations.
 
 The eigenstructure was extracted from the HOW-MHD Fortran code, with altered
-variable names for clarity and altered numerical safeguards.
+variable names for clarity and altered numerical safeguards. As in the hydro
+case it is evaluated along x on a state whose axes have been permuted so that
+the sweep direction comes first.
 
 NOTE: Problems for differentiation largely follow from square roots and divisions:
-The derivative of sqrt(x) is 1/(2*sqrt(x)) and of 1/x is -1/x^2, where both expressions
-are problematic for small x, especially when multiplying gradients in the backward pass,
--> exploding gradients.
+the derivative of sqrt(x) is 1/(2*sqrt(x)) and that of 1/x is -1/x^2, both of which
+are problematic for small x, especially when gradients are multiplied in the backward
+pass (exploding gradients).
 """
 
 # general
@@ -21,10 +23,10 @@ import jax
 import jax.numpy as jnp
 
 # astronomix containers
-from astronomix.option_classes.simulation_config import SimulationConfig
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._fluid_equations._dual_energy_switch import dual_energy_switched_pressure
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
@@ -36,11 +38,10 @@ def diff_safe_sqrt(x):
     The floor is tighter under x64 than under x32 to match the available precision.
     """
     if jax.config.jax_enable_x64:
-        eps = 1e-30
+        epsilon = 1e-30
     else:
-        eps = 1e-20
+        epsilon = 1e-20
 
-    epsilon = eps
     x_safe = jnp.maximum(x, epsilon)
     return jnp.sqrt(x_safe)
 
@@ -52,8 +53,28 @@ def _eigenvalue_building_blocks(
     rhomin,
     pgmin,
     registered_variables: RegisteredVariables,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
-    # unpack the conserved variables
+    """
+    Cell-centred velocity and wave speeds entering the MHD eigenvalues.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+
+    Returns:
+        The normal velocity and the fast magnetosonic, Alfven and slow
+        magnetosonic speeds per cell.
+    """
+    # Unpack the conserved variables.
     density = conserved_state[registered_variables.density_index]
     momentum_x = conserved_state[registered_variables.momentum_index.x]
     momentum_y = conserved_state[registered_variables.momentum_index.y]
@@ -63,7 +84,7 @@ def _eigenvalue_building_blocks(
     magnetic_z = conserved_state[registered_variables.magnetic_index.z]
     energy = conserved_state[registered_variables.energy_index]
 
-    # compute primitives
+    # Compute the primitive quantities.
     rho = density
     velocity_x = momentum_x / rho
     velocity_y = momentum_y / rho
@@ -78,7 +99,16 @@ def _eigenvalue_building_blocks(
         energy - 0.5 * (rho * velocity_squared + magnetic_field_squared)
     )
 
-    # redefine the density and pressure, and energy based on floors
+    if internal_energy_density is not None:
+        gas_pressure = dual_energy_switched_pressure(
+            gas_pressure,
+            energy,
+            gamma,
+            internal_energy_density,
+            dual_eta,
+        )
+
+    # Apply the density and pressure floors (and make the energy consistent).
     rho = jnp.where(
         (rho < rhomin) | (gas_pressure < pgmin), jnp.maximum(rho, rhomin), rho
     )
@@ -94,7 +124,7 @@ def _eigenvalue_building_blocks(
         energy,
     )
 
-    # compute derived quantities
+    # Compute the derived quantities.
     sound_speed_sq = jnp.maximum(0.0, gamma * jnp.abs(gas_pressure / rho))
     magnetosonic_discriminant_root = diff_safe_sqrt(
         jnp.maximum(
@@ -134,15 +164,44 @@ def _eigenvalue_building_blocks(
         slow_magnetosonic_velocity,
     )
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigenvector_building_blocks(
     conserved_state,
     gamma,
     rhomin,
     pgmin,
     registered_variables: RegisteredVariables,
+    internal_energy_density=None,
+    dual_eta=None,
+    admissible_face_state: bool = True,
 ):
+    """
+    Interface quantities entering the MHD eigenvectors.
 
+    The interface state between cell i and cell i + 1 is built from averages
+    of the two cells.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+        admissible_face_state: Build the interface sound speed from the
+            averaged pressure (``config.weno_admissible_face_state``) instead of
+            the averaged enthalpy.
+
+    Returns:
+        The interface density and its square root, velocity and magnetic field
+        components, normalised tangential field and sign factors, the sound,
+        fast, Alfven and slow speeds, the fast/slow mode weightings and the
+        gamma combinations gam0, gam1, gam2 of the HOW-MHD eigenvectors.
+    """
     if jax.config.jax_enable_x64:
         eps = 1e-30
     else:
@@ -170,7 +229,16 @@ def _eigenvector_building_blocks(
     )
     gas_pressure = (gamma - 1.0) * (energy - 0.5 * (rho * velocity_sq + magnetic_sq))
 
-    # redefine the density and pressure, and energy based on floors
+    if internal_energy_density is not None:
+        gas_pressure = dual_energy_switched_pressure(
+            gas_pressure,
+            energy,
+            gamma,
+            internal_energy_density,
+            dual_eta,
+        )
+
+    # Apply the density and pressure floors (and make the energy consistent).
     rho = jnp.where(
         (rho < rhomin) | (gas_pressure < pgmin), jnp.maximum(rho, rhomin), rho
     )
@@ -205,7 +273,7 @@ def _eigenvector_building_blocks(
     magnetic_z_interface = avg_x(magnetic_z)
     specific_enthalpy_interface = avg_x(specific_enthalpy)
 
-    # interface derived quantities
+    # Derived interface quantities.
     velocity_sq_interface = (
         velocity_x_interface * velocity_x_interface
         + velocity_y_interface * velocity_y_interface
@@ -221,14 +289,23 @@ def _eigenvector_building_blocks(
         magnetic_x_interface * magnetic_x_interface
     ) / rho_interface
 
-    # enthalpy based sound speed at interfaces
+    # Enthalpy-based sound speed at the interfaces.
     sound_speed_sq_interface = (gamma - 1.0) * (
         specific_enthalpy_interface
         - 0.5 * (velocity_sq_interface + b_sq_over_rho_interface)
     )
+    if admissible_face_state:
+        # Build the interface state from averaged primitives so that the frozen
+        # characteristic basis is that of a real, hyperbolic state; see
+        # _eigen_hydro._eigenvector_building_blocks for why the enthalpy
+        # average fails at strong density and velocity jumps.
+        sound_speed_sq_interface = gamma * avg_x(gas_pressure) / rho_interface
+        specific_enthalpy_interface = sound_speed_sq_interface / (gamma - 1.0) + 0.5 * (
+            velocity_sq_interface + b_sq_over_rho_interface
+        )
     sound_speed_interface = diff_safe_sqrt(jnp.maximum(0.0, sound_speed_sq_interface))
 
-    # calculate the characteristic velocities at the interfaces
+    # Calculate the characteristic velocities at the interfaces.
     magnetosonic_discriminant_interface = (
         b_sq_over_rho_interface + sound_speed_sq_interface
     ) ** 2 - 4.0 * bx_sq_over_rho_interface * sound_speed_sq_interface
@@ -262,7 +339,7 @@ def _eigenvector_building_blocks(
         )
     )
 
-    # retrieve tangential magnetic field components
+    # Retrieve the tangential magnetic field components.
     b_tangential_sq = (
         magnetic_y_interface * magnetic_y_interface
         + magnetic_z_interface * magnetic_z_interface
@@ -286,7 +363,7 @@ def _eigenvector_building_blocks(
 
     # fast_mode_weighting = sqrt( c_s^2 − λ_slow^2 ) / sqrt( λ_fast^2 − λ_slow^2 )
     # slow_mode_weighting = sqrt( λ_fast^2 − c_s^2 ) / sqrt( λ_fast^2 − λ_slow^2 )
-    # these are designed such that fast_mode_weighting^2 + slow_mode_weighting^2 = 1
+    # These are designed such that fast_mode_weighting^2 + slow_mode_weighting^2 = 1.
     denom = (
         fast_magnetosonic_velocity_interface * fast_magnetosonic_velocity_interface
         - slow_magnetosonic_velocity_interface * slow_magnetosonic_velocity_interface
@@ -368,7 +445,7 @@ def _eigenvector_building_blocks(
     )
 
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigen_R_col(
     conserved_state,
     rhomin: Union[float, jnp.ndarray],
@@ -376,7 +453,32 @@ def _eigen_R_col(
     gamma: Union[float, jnp.ndarray],
     registered_variables: RegisteredVariables,
     col: int,
+    internal_energy_density=None,
+    dual_eta=None,
+    admissible_face_state: bool = True,
 ):
+    """
+    One right eigenvector (column of R) of the MHD flux Jacobian at the interfaces.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        registered_variables: The registered variables.
+        col: The index of the characteristic mode, ordered by wave speed
+            (fast -, Alfven -, slow -, entropy, slow +, Alfven +, fast +).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+        admissible_face_state: Build the interface sound speed from the
+            averaged pressure (``config.weno_admissible_face_state``) instead of
+            the averaged enthalpy.
+
+    Returns:
+        The right eigenvector, shaped like ``conserved_state``.
+    """
     (
         rho_interface,
         sqrt_rho,
@@ -409,9 +511,12 @@ def _eigen_R_col(
         rhomin,
         pgmin,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
+        admissible_face_state,
     )
 
-    # shorter names for registry indices
+    # Shorter names for the registry indices.
     density_index = registered_variables.density_index
     momentum_index_x = registered_variables.momentum_index.x
     momentum_index_y = registered_variables.momentum_index.y
@@ -483,6 +588,7 @@ def _eigen_R_col(
         return R
 
     def col_2():
+        # Column 3 (slow -)
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(slow_mode_weighting)
         R = R.at[momentum_index_x].set(
@@ -529,6 +635,7 @@ def _eigen_R_col(
         return R
 
     def col_3():
+        # Column 4 (entropy)
         R = jnp.zeros_like(conserved_state)
         R = R.at[density_index].set(1.0)
         R = R.at[momentum_index_x].set(velocity_x_interface)
@@ -653,7 +760,7 @@ def _eigen_R_col(
     return R
 
 
-@partial(jax.jit, static_argnames=["registered_variables"])
+@partial(jax.jit, static_argnames=["registered_variables", "admissible_face_state"])
 def _eigen_L_row(
     conserved_state,
     rhomin: Union[float, jnp.ndarray],
@@ -661,7 +768,32 @@ def _eigen_L_row(
     gamma: Union[float, jnp.ndarray],
     registered_variables: RegisteredVariables,
     row: int,
+    internal_energy_density=None,
+    dual_eta=None,
+    admissible_face_state: bool = True,
 ):
+    """
+    One left eigenvector (row of L) of the MHD flux Jacobian at the interfaces.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        registered_variables: The registered variables.
+        row: The index of the characteristic mode, ordered by wave speed
+            (fast -, Alfven -, slow -, entropy, slow +, Alfven +, fast +).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+        admissible_face_state: Build the interface sound speed from the
+            averaged pressure (``config.weno_admissible_face_state``) instead of
+            the averaged enthalpy.
+
+    Returns:
+        The left eigenvector, shaped like ``conserved_state``.
+    """
     (
         rho_interface,
         sqrt_rho,
@@ -694,9 +826,12 @@ def _eigen_L_row(
         rhomin,
         pgmin,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
+        admissible_face_state,
     )
 
-    # shorter names for registry indices
+    # Shorter names for the registry indices.
     density_index = registered_variables.density_index
     momentum_index_x = registered_variables.momentum_index.x
     momentum_index_y = registered_variables.momentum_index.y
@@ -706,6 +841,7 @@ def _eigen_L_row(
     energy_index = registered_variables.energy_index
 
     def row_0():
+        # Row 1 (fast -)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             fast_mode_weighting
@@ -753,6 +889,7 @@ def _eigen_L_row(
         return L
 
     def row_1():
+        # Row 2 (alfven -)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             bt_normalized_z * velocity_y_interface
@@ -768,6 +905,7 @@ def _eigen_L_row(
         return L
 
     def row_2():
+        # Row 3 (slow -)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             slow_mode_weighting
@@ -815,6 +953,7 @@ def _eigen_L_row(
         return L
 
     def row_3():
+        # Row 4 (entropy)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             -sound_speed_sq_interface / gam0 - 0.5 * velocity_sq_interface
@@ -829,6 +968,7 @@ def _eigen_L_row(
         return L
 
     def row_4():
+        # Row 5 (slow +)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             slow_mode_weighting
@@ -876,6 +1016,7 @@ def _eigen_L_row(
         return L
 
     def row_5():
+        # Row 6 (alfven +)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             bt_normalized_z * velocity_y_interface
@@ -891,6 +1032,7 @@ def _eigen_L_row(
         return L
 
     def row_6():
+        # Row 7 (fast +)
         L = jnp.zeros_like(conserved_state)
         L = L.at[density_index].set(
             fast_mode_weighting
@@ -950,6 +1092,22 @@ def _eigen_all_lambdas(
     gamma: Union[float, jnp.ndarray],
     registered_variables: RegisteredVariables,
 ):
+    """
+    All MHD eigenvalues per cell, stacked along a leading mode axis.
+
+    Used by the CFL time-step estimate, which works on the plain total-energy
+    pressure recovery.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        registered_variables: The registered variables.
+
+    Returns:
+        The eigenvalues (fast -, Alfven -, slow -, entropy, slow +, Alfven +, fast +) per cell.
+    """
     (
         velocity_x,
         fast_magnetosonic_velocity,
@@ -984,7 +1142,28 @@ def _eigen_lambdas(
     gamma: Union[float, jnp.ndarray],
     registered_variables: RegisteredVariables,
     mode: int,
+    internal_energy_density=None,
+    dual_eta=None,
 ):
+    """
+    One MHD eigenvalue per cell.
+
+    Args:
+        conserved_state: The conserved state, sweep direction first.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        gamma: The adiabatic index.
+        registered_variables: The registered variables.
+        mode: The index of the characteristic mode, ordered by wave speed
+            (fast -, Alfven -, slow -, entropy, slow +, Alfven +, fast +).
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None for the plain total-energy pressure recovery.
+        dual_eta: The dual-energy switch threshold (``config.dual_energy_eta``);
+            required when ``internal_energy_density`` is given.
+
+    Returns:
+        The eigenvalue of the mode per cell.
+    """
     (
         velocity_x,
         fast_magnetosonic_velocity,
@@ -996,6 +1175,8 @@ def _eigen_lambdas(
         rhomin,
         pgmin,
         registered_variables,
+        internal_energy_density,
+        dual_eta,
     )
 
     def mode_0():
@@ -1020,5 +1201,6 @@ def _eigen_lambdas(
         return velocity_x + fast_magnetosonic_velocity
 
     return jax.lax.switch(
-        mode, [mode_0, mode_1, mode_2, mode_3, mode_4, mode_5, mode_6]
+        mode,
+        [mode_0, mode_1, mode_2, mode_3, mode_4, mode_5, mode_6],
     )

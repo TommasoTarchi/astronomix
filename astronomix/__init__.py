@@ -15,13 +15,16 @@ from astronomix.option_classes.simulation_config import (
     OPTIMAL_BACKEND,
     FINITE_VOLUME,
     FINITE_DIFFERENCE,
+    VL2,
     FORWARDS,
     BACKWARDS,
     MINMOD,
     OSHER,
+    VAN_LEER,
     HLL,
     HLLC,
     HLLC_LM,
+    HLLD,
     OPEN_BOUNDARY,
     REFLECTIVE_BOUNDARY,
     PERIODIC_BOUNDARY,
@@ -56,10 +59,14 @@ from astronomix.data_classes.simulation_helper_data import get_helper_data
 from astronomix.variable_registry.registered_variables import get_registered_variables
 from astronomix.option_classes.simulation_config import finalize_config
 from astronomix.data_classes.simulation_state_struct import finalize_state
-from astronomix.initial_condition_generation.construct_primitive_state import construct_primitive_state
+from astronomix.initial_condition_generation.construct_primitive_state import (
+    construct_primitive_state,
+)
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     initialize_interface_fields,
 )
 from astronomix.time_stepping.time_integration import time_integration
 from astronomix.setup_helpers import restart_from_latest_checkpoint
-from astronomix.initial_condition_generation.magnetic_field_from_vector_potential import setup_magnetic_fields_from_vector_potential
+from astronomix.initial_condition_generation.magnetic_field_from_vector_potential import (
+    setup_magnetic_fields_from_vector_potential,
+)

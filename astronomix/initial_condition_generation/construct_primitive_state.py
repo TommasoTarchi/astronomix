@@ -2,10 +2,11 @@
 Assemble the primitive state array from individual primitive fields.
 
 Given the per-variable fields (density, velocities, magnetic field components,
-pressures, ...) this stacks them into the single state array used throughout
-the solver, placing each field at the index dictated by ``registered_variables``
-for the active configuration (dimensionality, MHD, solver mode, equation of
-state, cosmic rays).
+pressures, passive scalars, ...) this stacks them into the single state array
+used throughout the solver, placing each field at the index dictated by
+``registered_variables`` for the active configuration (dimensionality, MHD,
+solver mode, equation of state, cosmic rays, dual energy, passive scalars and
+the shock history).
 """
 
 # general
@@ -14,8 +15,6 @@ from functools import partial
 # typing
 from typing import Union
 from types import NoneType
-from jaxtyping import jaxtyped
-from beartype import beartype as typechecker
 
 # jax
 import jax
@@ -28,18 +27,25 @@ from astronomix.option_classes.simulation_config import (
     IDEAL_GAS,
     STATE_TYPE,
 )
+from astronomix.variable_registry.registered_variables import (
+    ENTROPY_INITIAL_SLOT,
+    NUM_SHOCK_HISTORY_SCALARS,
+)
 
 # astronomix containers
-from astronomix.option_classes.simulation_config import SimulationConfig
+from astronomix.option_classes.simulation_config import (
+    SimulationConfig,
+    StaticIntVector,
+)
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     initialize_interface_fields,
 )
+from astronomix._fluid_equations._passive_scalars import specific_entropy
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["registered_variables", "config", "sharding"])
 def _assemble_primitive_state(
     config: SimulationConfig,
@@ -56,6 +62,8 @@ def _assemble_primitive_state(
     interface_magnetic_field_z: Union[FIELD_TYPE, NoneType] = None,
     gas_pressure: Union[FIELD_TYPE, NoneType] = None,
     cosmic_ray_pressure: Union[FIELD_TYPE, NoneType] = None,
+    passive_scalars: Union[STATE_TYPE, NoneType] = None,
+    gamma: Union[float, NoneType] = None,
     sharding=None,
 ) -> STATE_TYPE:
     """Stack the primitive variables into the state array.
@@ -81,6 +89,12 @@ def _assemble_primitive_state(
             (interface) magnetic field, used by the finite-difference solver.
         gas_pressure: The thermal pressure of the fluid.
         cosmic_ray_pressure: The cosmic ray pressure of the fluid.
+        passive_scalars: The user-defined passive scalars, stacked along a
+            leading axis with shape ``(config.num_passive_scalars,) + grid``.
+            The library-managed shock-history scalars are NOT included here.
+        gamma: The adiabatic index. Required only when
+            ``config.track_shock_history`` is set, to seed the parcels' initial
+            specific entropy.
         sharding: An optional sharding to apply to the allocated state array.
 
     Returns:
@@ -97,9 +111,14 @@ def _assemble_primitive_state(
 
     state = state.at[registered_variables.density_index].set(density)
 
-    # The velocity index is a scalar in 1D and a per-axis vector otherwise.
+    # The velocity index is a scalar in 1D and a per-axis vector otherwise —
+    # except for the layouts that always carry all three components (the FD
+    # and the VL2 MHD schemes), where it is a vector in 1D too.
     if config.dimensionality == 1:
-        state = state.at[registered_variables.velocity_index].set(velocity_x)
+        if isinstance(registered_variables.velocity_index, StaticIntVector):
+            state = state.at[registered_variables.velocity_index.x].set(velocity_x)
+        else:
+            state = state.at[registered_variables.velocity_index].set(velocity_x)
     elif config.dimensionality == 2:
         state = state.at[registered_variables.velocity_index.x].set(velocity_x)
         state = state.at[registered_variables.velocity_index.y].set(velocity_y)
@@ -108,8 +127,11 @@ def _assemble_primitive_state(
         state = state.at[registered_variables.velocity_index.y].set(velocity_y)
         state = state.at[registered_variables.velocity_index.z].set(velocity_z)
 
+    # The VL2 GLM-MHD layout carries the divergence-cleaning scalar psi, which
+    # simply starts at zero, and stores all three velocity and field components
+    # in any dimensionality.
     if config.mhd:
-        if config.dimensionality >= 2:
+        if config.dimensionality >= 2 or registered_variables.magnetic_psi_active:
             if magnetic_field_x is not None:
                 state = state.at[registered_variables.magnetic_index.x].set(
                     magnetic_field_x
@@ -123,14 +145,17 @@ def _assemble_primitive_state(
                     magnetic_field_z
                 )
 
-        if config.solver_mode == FINITE_DIFFERENCE:
-            # The finite-difference MHD state always carries all three velocity
-            # components; any not supplied stay zero by default.
+        if config.solver_mode == FINITE_DIFFERENCE or registered_variables.magnetic_psi_active:
+            # The finite-difference and VL2 MHD states always carry all three
+            # velocity components; any not supplied stay zero by default.
             if velocity_y is not None:
                 state = state.at[registered_variables.velocity_index.y].set(velocity_y)
             if velocity_z is not None:
                 state = state.at[registered_variables.velocity_index.z].set(velocity_z)
 
+        # Only the finite-difference layout stores face-centred fields; the
+        # cell-centred VL2 layout ignores any that a shared setup passes.
+        if config.solver_mode == FINITE_DIFFERENCE:
             if interface_magnetic_field_x is not None:
                 state = state.at[
                     registered_variables.interface_magnetic_field_index.x
@@ -164,6 +189,49 @@ def _assemble_primitive_state(
             cosmic_ray_pressure ** (1 / gamma_cr)
         )
 
+    if registered_variables.passive_scalars_active:
+        num_user_scalars = registered_variables.num_passive_scalars
+        if registered_variables.shock_history_active:
+            num_user_scalars -= NUM_SHOCK_HISTORY_SCALARS
+        if passive_scalars is None:
+            if num_user_scalars > 0:
+                raise ValueError(
+                    f"config.num_passive_scalars = {num_user_scalars} but no "
+                    "`passive_scalars` were supplied to construct_primitive_state"
+                )
+        else:
+            passive_scalars = jnp.asarray(passive_scalars)
+            if passive_scalars.shape[0] != num_user_scalars:
+                raise ValueError(
+                    f"expected {num_user_scalars} passive scalars (config."
+                    f"num_passive_scalars), got {passive_scalars.shape[0]}"
+                )
+            user_scalars_start = registered_variables.passive_scalar_index
+            state = state.at[user_scalars_start:user_scalars_start + num_user_scalars].set(
+                passive_scalars
+            )
+
+        # The shock-history block is library-managed: the shocked fraction and
+        # the two accumulators start empty, but ``entropy_initial`` is the
+        # parcel's t = 0 specific entropy and must be seeded from the assembled
+        # state. It is seeded HERE, once, and never again: unlike the
+        # dual-energy ``g`` (a function of the current state, so safely
+        # re-derived at every restart) it is a genuine history variable, and a
+        # checkpointed value has to survive untouched.
+        if registered_variables.shock_history_active:
+            if gamma is None:
+                raise ValueError(
+                    "config.track_shock_history requires `gamma` to be passed to "
+                    "construct_primitive_state, to seed the parcels' initial "
+                    "specific entropy log(p / rho^gamma)"
+                )
+            entropy_label_index = (
+                registered_variables.shock_history_index + ENTROPY_INITIAL_SLOT
+            )
+            state = state.at[entropy_label_index].set(
+                specific_entropy(state, gamma, registered_variables)
+            )
+
     return state
 
 
@@ -182,6 +250,8 @@ def construct_primitive_state(
     interface_magnetic_field_z: Union[FIELD_TYPE, NoneType] = None,
     gas_pressure: Union[FIELD_TYPE, NoneType] = None,
     cosmic_ray_pressure: Union[FIELD_TYPE, NoneType] = None,
+    passive_scalars: Union[STATE_TYPE, NoneType] = None,
+    gamma: Union[float, NoneType] = None,
     sharding=None,
 ) -> STATE_TYPE:
     """Stack the primitive variables into the state array, checking for NaNs.
@@ -256,6 +326,8 @@ def construct_primitive_state(
         interface_magnetic_field_z=interface_magnetic_field_z,
         gas_pressure=gas_pressure,
         cosmic_ray_pressure=cosmic_ray_pressure,
+        passive_scalars=passive_scalars,
+        gamma=gamma,
         sharding=sharding,
     )
 

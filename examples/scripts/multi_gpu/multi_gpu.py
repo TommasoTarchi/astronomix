@@ -55,6 +55,7 @@ autocvd(num_gpus=NUM_GPUS)
 import jax
 import jax.numpy as jnp
 from jax.sharding import (
+    AxisType,
     PartitionSpec as P,
     NamedSharding,
 )
@@ -135,8 +136,14 @@ params = SimulationParams(
     turbulent_forcing_params = TurbulentForcingParams(energy_injection_rate = 1.65),
 )
 
-# domain-decompose along the x axis across the GPUs
-mesh = jax.make_mesh((1, NUM_GPUS, 1, 1), (VARAXIS, XAXIS, YAXIS, ZAXIS))
+# domain-decompose along the x axis across the GPUs; the mesh axes must be
+# Auto (newer jax defaults to Explicit), since the helper data is placed with
+# with_sharding_constraint
+mesh = jax.make_mesh(
+    (1, NUM_GPUS, 1, 1),
+    (VARAXIS, XAXIS, YAXIS, ZAXIS),
+    axis_types=(AxisType.Auto,) * 4,
+)
 sharding = NamedSharding(mesh, P(VARAXIS, XAXIS, YAXIS, ZAXIS))
 
 

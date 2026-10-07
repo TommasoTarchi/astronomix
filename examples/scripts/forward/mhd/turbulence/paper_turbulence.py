@@ -44,16 +44,12 @@ from astronomix import PERIODIC_BOUNDARY
 from astronomix.option_classes.simulation_config import (
     IDEAL_GAS,
     ISOTHERMAL,
-    POSITIVITY_NONE,
-    POSITIVITY_HARD_FLOOR,
-    POSITIVITY_REDISTRIBUTE,
 )
 
 # astronomix containers
 from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
-    PositivityConfig,
     SimulationConfig,
     SnapshotSettings,
     SimulationParams,
@@ -78,10 +74,6 @@ from astronomix.analysis_helpers.energy_spectrum import (
 )
 
 
-# per-RK-substage / per-step positivity-mode lookup
-_POS = {"none": POSITIVITY_NONE,
-        "floor": POSITIVITY_HARD_FLOOR, "redist": POSITIVITY_REDISTRIBUTE}
-
 # script-relative data directory (shared with make_fig14.py / make_fig15.py)
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -102,27 +94,9 @@ def main():
     p.add_argument("--kf", type=float, default=3.0 * np.pi, help="OU peak wavenumber (= 0.75 k_exp)")
     p.add_argument("--nsnap", type=int, default=60)
     p.add_argument("--cfl", type=float, default=1.5)
-    p.add_argument("--protect", type=int, default=-1, help="vacuum protection (prot): -1 auto, 0 off, 1 on")
-    p.add_argument("--hardfloor", type=int, default=-1,
-                   help="enforce_positivity (per-RK-substage + floor): -1 auto (on for supersonic), 0 off, 1 on")
-    p.add_argument("--stage_mode", choices=list(_POS), default="floor",
-                   help="per-RK-substage positivity mode (forced off when protect=0)")
-    p.add_argument("--step_mode", choices=list(_POS), default="floor",
-                   help="per-step positivity mode (forced off when protect=0)")
-    p.add_argument("--rhomin", type=float, default=0.02, help="density floor / protection threshold")
-    p.add_argument("--vmax", type=float, default=50.0, help="vacuum-protection velocity ceiling")
-    p.add_argument("--vmaxcap", type=float, default=float("inf"),
-                   help="per-stage positivity velocity cap (REDISTRIBUTE only); inf = off")
-    p.add_argument("--vacuum_rest", type=int, default=-1,
-                   help="zero momentum (v=0) in floored cells so deep voids stay stable: "
-                        "-1 auto (on for supersonic), 0 off, 1 on")
-    p.add_argument("--blend", type=int, default=0,
-                   help="deep-void first-order LLF flux blending (FOFC robustness "
-                        "fix-up): 0 off, 1 on. Blends WENO->Rusanov near the density "
-                        "floor to kill the high-Mach deep-void WENO overshoot.")
-    p.add_argument("--blend_factor", type=float, default=8.0,
-                   help="density (in units of rhomin) at which the LLF blend weight "
-                        "reaches zero (larger = more dissipative / more robust).")
+    p.add_argument("--rhomin", type=float, default=1e-10,
+                   help="minimum_density: the floor of the positivity-preserving WENO scalings "
+                        "(the old recipe's 0.02 would limit genuine voids)")
     p.add_argument("--diag", type=int, default=0,
                    help="diagnostic mode: per-snapshot scalar diagnostics (min rho, max|v|, "
                         "max|B|, max b^2/rho, NaN flag) via snapshot callback + progress bar, "
@@ -155,22 +129,6 @@ def main():
         P_thermal = a ** 2 * rho0                  # isothermal gas pressure c_s^2 rho
     B0 = float(np.sqrt(2.0 * P_thermal / args.beta))
 
-    # vacuum protection = HOW-MHD `prot` conservative neighbour redistribution
-    # (on for supersonic by default). Hard floor (enforce_positivity) is OFF by
-    # default to match the paper, which never hard-floors the evolved state.
-    vacuum = (args.mturb >= 2.0) if args.protect < 0 else bool(args.protect)
-    # per-RK-substage enforce_positivity: the CFL lever. With prot (vacuum) now
-    # wired into the OU path, prot + per-substage positivity is stable at the
-    # paper's CFL=1.5 and floor=0.02 for M_turb~10 (no hard tuning needed).
-    protect = (args.mturb >= 2.0) if args.hardfloor < 0 else bool(args.hardfloor)
-    # vacuum-rest: zero momentum in floored near-vacuum cells (v=0 instead of the
-    # mom/rho_floor spike). Validated as THE stabiliser for deep voids: at high
-    # resolution (>=512^3) hypersonic low-beta turbulence resolves voids deep
-    # enough that the floored-but-moving cells blow up; resting them fixes it,
-    # whereas capping the recovered velocity (positivity_max_velocity) does NOT.
-    # Auto-on for supersonic, like prot/hardfloor. (Cheap-test isolated at 128^3.)
-    vacuum_rest = (args.mturb >= 2.0) if args.vacuum_rest < 0 else bool(args.vacuum_rest)
-
     config = SimulationConfig(
         equation_of_state=IDEAL_GAS if adiabatic else ISOTHERMAL,
         memory_analysis=False,
@@ -185,16 +143,11 @@ def main():
             BoundarySettings1D(left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY),
         ),
         turbulent_forcing_config=TurbulentForcingConfig(
-            turbulent_forcing=True, ou_forcing=True, vacuum_protection=vacuum,
+            turbulent_forcing=True, ou_forcing=True,
         ),
-        positivity_config=PositivityConfig(
-            default_positivity_protection=protect,
-            per_stage_mode=_POS[args.stage_mode],
-            per_step_mode=_POS[args.step_mode],
-            vacuum_rest=vacuum_rest,
-            deepvoid_blend=bool(args.blend),
-            deepvoid_blend_factor=args.blend_factor,
-        ),
+        # positivity-preserving WENO: keeps the deep voids of the supersonic
+        # runs positive without floors, vacuum handling or flux blending
+        weno_positivity_preserving=True,
         return_snapshots=True,
         num_snapshots=args.nsnap,
         snapshot_settings=SnapshotSettings(return_states=True),
@@ -210,9 +163,7 @@ def main():
         t_end=args.tcross * t_cross,
         turbulent_forcing_params=TurbulentForcingParams(
             forcing_amplitude=args.F0, correlation_time=args.tau, forcing_wavenumber=args.kf,
-            protection_density_threshold=args.rhomin, protection_max_velocity=args.vmax,
         ),
-        positivity_max_velocity=args.vmaxcap,
         minimum_density=args.rhomin,
         minimum_pressure=1e-6,
     )
@@ -239,8 +190,7 @@ def main():
 
     print(f"[{args.tag}] eos={args.eos} M_turb_aim={args.mturb} beta={args.beta:g} "
           f"a={a:.3f} P0={P0} B0={B0:.4g} F0={args.F0} kf={args.kf:.3f} "
-          f"cfl={args.cfl} rhomin={args.rhomin} prot={vacuum} hardfloor={protect} "
-          f"vacuum_rest={vacuum_rest}")
+          f"cfl={args.cfl} rhomin={args.rhomin}")
 
     if args.diag:
         # Diagnostic mode: per-snapshot scalar diagnostics via the snapshot
@@ -367,7 +317,7 @@ def main():
     out = os.path.join(args.outdir, f"paper_{args.tag}.npz")
     np.savez(
         out, tag=args.tag, eos=args.eos, mturb_aim=args.mturb, beta=args.beta, gamma=args.gamma,
-        N=args.N, a=a, B0=B0, F0=args.F0, kf=args.kf, tcross=args.tcross, protect=protect,
+        N=args.N, a=a, B0=B0, F0=args.F0, kf=args.kf, tcross=args.tcross,
         time_points=time_points, t_over_tc=t_over_tc,
         Ms_t=Ms_t, vrms_t=vrms_t, drho_t=drho_t, EK_t=EK_t, EB_t=EB_t,
         k=kvec, spec_rho=spec_rho, spec_EK=spec_EK, spec_EB=spec_EB,

@@ -1,0 +1,1 @@
+- BUG found+fixed: v2 Doppler M1 is signed; sync_columns log-linear (and log-kT) clamp -> -inf*0 = NaN (INTEGRATION 2e recipe as written gives NaN). Fix: tables carry M1'=M1+0.1 keV*M0 >0, subtract after N_H mix (casa_xfit.doppler_moments_v2); CPU: finite, log vs linear kT 0.6 km/s (cpu32/dop_test.log)

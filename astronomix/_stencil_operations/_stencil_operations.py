@@ -8,22 +8,35 @@ Allows for code "closer to the math".
 from functools import partial
 
 # typing
-from typing import Tuple, Union
-from beartype import beartype as typechecker
-from jaxtyping import Array, Float, jaxtyped
+from typing import (
+    Tuple,
+    Union,
+)
+from jaxtyping import (
+    Array,
+    Float,
+)
 
 # jax
 import jax
 import jax.numpy as jnp
 
-# @jaxtyped(typechecker=typechecker)
-@partial(jax.jit, static_argnames=["shift", "axis"])
+# astronomix functions
+from astronomix._pallas_helpers import sharded_roll
+
+
 def custom_roll(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     """Periodic roll of ``input_array`` by ``shift`` along ``axis``.
 
     Equivalent to ``jnp.roll`` but expressed via two static slices and a
     concatenate, which keeps ``shift`` / ``axis`` compile-time constants so the
     stencil helpers built on top of it fuse cleanly.
+
+    Inside a multi-device ``pallas_mesh_context`` (a sharded
+    ``time_integration``), a roll along the split axis is a shard_map halo
+    exchange of ``|shift|`` planes (``sharded_roll``) instead of GSPMD's
+    all-to-all reshard of the whole block. The result is bitwise identical to
+    the single-device roll.
 
     Args:
         input_array: The array to roll.
@@ -33,11 +46,20 @@ def custom_roll(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     Returns:
         The rolled array.
     """
-    i = (-shift) % input_array.shape[axis]
+    rolled = sharded_roll(input_array, shift, axis)
+    if rolled is not None:
+        return rolled
+    return _custom_roll_local(input_array, shift, axis)
+
+
+@partial(jax.jit, static_argnames=["shift", "axis"])
+def _custom_roll_local(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
+    """The single-device roll (two static slices + a concatenate)."""
+    split_index = (-shift) % input_array.shape[axis]
     return jax.lax.concatenate(
         [
-            jax.lax.slice_in_dim(input_array, i, input_array.shape[axis], axis=axis),
-            jax.lax.slice_in_dim(input_array, 0, i, axis=axis),
+            jax.lax.slice_in_dim(input_array, split_index, input_array.shape[axis], axis=axis),
+            jax.lax.slice_in_dim(input_array, 0, split_index, axis=axis),
         ],
         dimension=axis,
     )
@@ -52,7 +74,7 @@ def _shift(input_array: jnp.ndarray, shift: int, axis: int) -> jnp.ndarray:
     """
     return custom_roll(input_array, shift, axis)
 
-# @jaxtyped(typechecker=typechecker)
+
 @partial(jax.jit, static_argnames=["indices", "axis"])
 def _stencil_add(
     input_array: jnp.ndarray,

@@ -7,15 +7,17 @@ are tracked through ``n_cr = P_cr ** (1 / gamma_cr)`` (an advected scalar), so
 the cosmic-ray pressure is recovered as ``P_cr = n_cr ** gamma_cr``. The total
 pressure stored in ``pressure_index`` is the sum of the gas and cosmic-ray
 pressures.
+
+NOTE: The conversions that involve the velocity read a single velocity
+component, so they only support 1D setups; generalising them to 2D / 3D needs
+the full kinetic energy.
 """
 
 # general
 from functools import partial
 
 # typing
-from typing import Union
-from jaxtyping import Array, Float, jaxtyped
-from beartype import beartype as typechecker
+from jaxtyping import Array, Float
 
 # jax
 import jax
@@ -24,9 +26,6 @@ import jax.numpy as jnp
 # astronomix containers
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
-# NOTE: these routines currently only support 1D setups; generalising them to
-# 2D / 3D is still outstanding.
-
 # WARNING: the adiabatic indices are fixed here rather than read from
 # ``SimulationParams``. They should eventually be sourced from the simulation
 # parameters so a run can override them consistently.
@@ -34,26 +33,79 @@ gamma_gas = 5 / 3
 gamma_cr = 4 / 3
 
 
-# @jaxtyped(typechecker=typechecker)
+# -------------------------------------------------------------
+# ============ ↓ AD- and round-off-safe conversions ↓ ==========
+# -------------------------------------------------------------
+
+
+def cosmic_ray_pressure_from_n(n_cr, adiabatic_index_cr=gamma_cr):
+    """
+    ``P_cr = n_cr ** gamma_cr`` with ``n_cr`` clipped at zero.
+
+    A reconstruction or Riemann-solver undershoot can leave ``n_cr`` a hair
+    below zero next to a CR front, and a non-integer power of a negative
+    number is NaN. The clip only affects cells that would otherwise be NaN.
+    The derivative ``gamma_cr * n ** (gamma_cr - 1)`` is finite (zero) at
+    ``n = 0``, so this is AD-safe as it stands.
+
+    Args:
+        n_cr: The advected cosmic-ray scalar ``P_cr ** (1 / gamma_cr)``.
+        adiabatic_index_cr: The adiabatic index of the cosmic-ray fluid.
+
+    Returns:
+        The cosmic-ray pressure.
+    """
+    return jnp.maximum(n_cr, 0.0) ** adiabatic_index_cr
+
+
+def cosmic_ray_n_from_pressure(p_cr, adiabatic_index_cr=gamma_cr):
+    """
+    ``n_cr = P_cr ** (1 / gamma_cr)``, AD-safe at ``P_cr = 0``.
+
+    The naive power has an infinite derivative at zero, which turns every
+    CR-free cell into a NaN tangent (inf * 0) under ``jax.jvp`` / ``jax.grad``,
+    and CR-free regions are common (e.g. any initial condition without CRs).
+    The double-``where`` evaluates the power only on strictly positive
+    pressures and returns ``n = 0`` with a zero derivative elsewhere; the
+    forward value is unchanged for every ``P_cr >= 0``.
+
+    Args:
+        p_cr: The cosmic-ray pressure.
+        adiabatic_index_cr: The adiabatic index of the cosmic-ray fluid.
+
+    Returns:
+        The advected cosmic-ray scalar ``n_cr``.
+    """
+    positive = p_cr > 0.0
+    p_safe = jnp.where(positive, p_cr, 1.0)
+    return jnp.where(positive, p_safe ** (1.0 / adiabatic_index_cr), 0.0)
+
+
+# -------------------------------------------------------------
+# ============ ↑ AD- and round-off-safe conversions ↑ ==========
+# -------------------------------------------------------------
+
+
 @partial(jax.jit, static_argnames=["registered_variables"])
 def total_energy_from_primitives_with_crs(
     primitive_state: Float[Array, "num_vars num_cells"],
     registered_variables: RegisteredVariables,
 ) -> Float[Array, "num_cells"]:
     """
-    Calculates the total energy density from primitive variables in a system with cosmic rays.
+    Calculate the total energy density from the primitive variables of a
+    fluid with cosmic rays.
 
     Args:
-        primitive_state: Array of primitive variables
-        registered_variables: Object containing indices for accessing different physical quantities
+        primitive_state: The primitive state array.
+        registered_variables: The registered variables.
 
     Returns:
-        Total energy density array
+        The total (gas kinetic + gas thermal + cosmic-ray) energy density.
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # Cosmic-ray energy density from its (relativistic) equation of state.
@@ -66,65 +118,63 @@ def total_energy_from_primitives_with_crs(
     )
 
     # Gas energy density: internal (thermal) plus kinetic.
-    rho_gas = primitive_state[registered_variables.density_index]
+    density = primitive_state[registered_variables.density_index]
     velocity = primitive_state[registered_variables.velocity_index]
-    gas_energy = gas_pressure / (gamma_gas - 1) + 0.5 * rho_gas * velocity**2
+    gas_energy = gas_pressure / (gamma_gas - 1) + 0.5 * density * velocity**2
 
     # Total energy density is the sum of the two components.
-    E_tot = gas_energy + cosmic_ray_energy
+    total_energy = gas_energy + cosmic_ray_energy
 
-    return E_tot
+    return total_energy
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["registered_variables"])
 def gas_pressure_from_primitives_with_crs(
     primitive_state: Float[Array, "num_vars num_cells"],
     registered_variables: RegisteredVariables,
 ) -> Float[Array, "num_cells"]:
     """
-    Calculates the gas pressure from the primitive state when cosmic rays
-    are considered in the simulation.
+    Calculate the gas pressure from the primitive state of a fluid with
+    cosmic rays.
 
     Args:
-        primitive_state: Array of primitive variables
-        registered_variables: Object containing indices for accessing different physical quantities
+        primitive_state: The primitive state array.
+        registered_variables: The registered variables.
 
     Returns:
-        gas pressure
+        The gas pressure.
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # The stored pressure is the total, so subtract the cosmic-ray part.
     return primitive_state[registered_variables.pressure_index] - cosmic_ray_pressure
 
 
-# NOTE: this still needs to be generalised to 2D and 3D.
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["registered_variables"])
 def total_pressure_from_conserved_with_crs(
     conserved_state: Float[Array, "num_vars num_cells"],
     registered_variables: RegisteredVariables,
 ) -> Float[Array, "num_cells"]:
     """
-    Calculates the total pressure from the conserved state when cosmic rays
-    are considered in the simulation.
+    Calculate the total pressure from the conserved state of a fluid with
+    cosmic rays.
 
     Args:
-        primitive_state: Array of primitive variables
-        registered_variables: Object containing indices for accessing different physical quantities
+        conserved_state: The conserved state array (the energy slot holds the
+            total energy density).
+        registered_variables: The registered variables.
 
     Returns:
-        total pressure
+        The total (gas + cosmic-ray) pressure.
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        conserved_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        conserved_state[registered_variables.cosmic_ray_n_index]
     )
 
     # Cosmic-ray energy density from its equation of state.
@@ -137,9 +187,9 @@ def total_pressure_from_conserved_with_crs(
     )
 
     # Back out the gas pressure from the gas energy by removing the kinetic part.
-    rho_gas = conserved_state[registered_variables.density_index]
-    velocity = conserved_state[registered_variables.velocity_index] / rho_gas
-    gas_pressure = (gas_energy - 0.5 * rho_gas * velocity**2) * (gamma_gas - 1)
+    density = conserved_state[registered_variables.density_index]
+    velocity = conserved_state[registered_variables.velocity_index] / density
+    gas_pressure = (gas_energy - 0.5 * density * velocity**2) * (gamma_gas - 1)
 
     # The total pressure is the sum of both pressure components.
     total_pressure = cosmic_ray_pressure + gas_pressure
@@ -147,28 +197,26 @@ def total_pressure_from_conserved_with_crs(
     return total_pressure
 
 
-# @jaxtyped(typechecker=typechecker)
 @partial(jax.jit, static_argnames=["registered_variables"])
 def speed_of_sound_crs(
     primitive_state: Float[Array, "num_vars num_cells"],
     registered_variables: RegisteredVariables,
 ) -> Float[Array, "num_cells"]:
     """
-    Calculates the speed of sound from the primitive state
-    when cosmic rays are considered in the simulation, where
-    c_s = sqrt((gamma_gas * P_gas + gamma_cr * P_CR) / rho)
+    Calculate the sound speed of a fluid with cosmic rays,
+    ``c_s = sqrt((gamma_gas * P_gas + gamma_cr * P_cr) / rho)``.
 
     Args:
-        primitive_state: Array of primitive variables
-        registered_variables: Object containing indices for accessing different physical quantities
+        primitive_state: The primitive state array.
+        registered_variables: The registered variables.
 
     Returns:
-        sound speed
+        The effective sound speed of the composite fluid.
     """
 
     # Recover the cosmic-ray pressure from the advected scalar n_cr.
-    cosmic_ray_pressure = (
-        primitive_state[registered_variables.cosmic_ray_n_index] ** gamma_cr
+    cosmic_ray_pressure = cosmic_ray_pressure_from_n(
+        primitive_state[registered_variables.cosmic_ray_n_index]
     )
 
     # The stored pressure is the total, so subtract the cosmic-ray part.

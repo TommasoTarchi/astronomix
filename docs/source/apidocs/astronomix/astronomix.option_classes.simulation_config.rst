@@ -89,12 +89,6 @@ Data
    * - :py:obj:`POSITIVITY_HARD_FLOOR <astronomix.option_classes.simulation_config.POSITIVITY_HARD_FLOOR>`
      - .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_HARD_FLOOR
           :summary:
-   * - :py:obj:`POSITIVITY_REDISTRIBUTE <astronomix.option_classes.simulation_config.POSITIVITY_REDISTRIBUTE>`
-     - .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_REDISTRIBUTE
-          :summary:
-   * - :py:obj:`POSITIVITY_CONSERVATIVE <astronomix.option_classes.simulation_config.POSITIVITY_CONSERVATIVE>`
-     - .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_CONSERVATIVE
-          :summary:
    * - :py:obj:`FINITE_VOLUME <astronomix.option_classes.simulation_config.FINITE_VOLUME>`
      - .. autodoc2-docstring:: astronomix.option_classes.simulation_config.FINITE_VOLUME
           :summary:
@@ -299,18 +293,6 @@ API
    :value: 1
 
    .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_HARD_FLOOR
-
-.. py:data:: POSITIVITY_REDISTRIBUTE
-   :canonical: astronomix.option_classes.simulation_config.POSITIVITY_REDISTRIBUTE
-   :value: 2
-
-   .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_REDISTRIBUTE
-
-.. py:data:: POSITIVITY_CONSERVATIVE
-   :canonical: astronomix.option_classes.simulation_config.POSITIVITY_CONSERVATIVE
-   :value: 3
-
-   .. autodoc2-docstring:: astronomix.option_classes.simulation_config.POSITIVITY_CONSERVATIVE
 
 .. py:data:: FINITE_VOLUME
    :canonical: astronomix.option_classes.simulation_config.FINITE_VOLUME
@@ -918,6 +900,13 @@ API
 
       .. autodoc2-docstring:: astronomix.option_classes.simulation_config.GravityConfig.poisson_manual_open_boundaries
 
+   .. py:attribute:: work_flux_correction
+      :canonical: astronomix.option_classes.simulation_config.GravityConfig.work_flux_correction
+      :type: bool
+      :value: False
+
+      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.GravityConfig.work_flux_correction
+
    .. py:attribute:: gravity
       :canonical: astronomix.option_classes.simulation_config.GravityConfig.gravity
       :type: bool
@@ -932,26 +921,19 @@ API
 
    .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig
 
-   .. py:attribute:: default_positivity_protection
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.default_positivity_protection
-      :type: bool
-      :value: False
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.default_positivity_protection
-
-   .. py:attribute:: per_stage_mode
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.per_stage_mode
-      :type: int
-      :value: None
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.per_stage_mode
-
    .. py:attribute:: per_step_mode
       :canonical: astronomix.option_classes.simulation_config.PositivityConfig.per_step_mode
       :type: int
       :value: None
 
       .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.per_step_mode
+
+   .. py:attribute:: per_step_specific_floor
+      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.per_step_specific_floor
+      :type: bool
+      :value: False
+
+      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.per_step_specific_floor
 
    .. py:attribute:: clamp_in_estimates
       :canonical: astronomix.option_classes.simulation_config.PositivityConfig.clamp_in_estimates
@@ -960,61 +942,19 @@ API
 
       .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.clamp_in_estimates
 
-   .. py:attribute:: vacuum_rest
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.vacuum_rest
+   .. py:attribute:: coldcrush_blend
+      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.coldcrush_blend
       :type: bool
       :value: False
 
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.vacuum_rest
+      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.coldcrush_blend
 
-   .. py:attribute:: nan_safe
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.nan_safe
-      :type: bool
-      :value: False
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.nan_safe
-
-   .. py:attribute:: cons_coeff
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.cons_coeff
-      :type: float
-      :value: 0.15
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.cons_coeff
-
-   .. py:attribute:: cons_passes
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.cons_passes
-      :type: int
-      :value: 16
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.cons_passes
-
-   .. py:attribute:: cons_activate
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.cons_activate
-      :type: float
-      :value: 1.0
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.cons_activate
-
-   .. py:attribute:: deepvoid_blend
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.deepvoid_blend
-      :type: bool
-      :value: False
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.deepvoid_blend
-
-   .. py:attribute:: deepvoid_blend_factor
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.deepvoid_blend_factor
+   .. py:attribute:: coldcrush_blend_factor
+      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.coldcrush_blend_factor
       :type: float
       :value: 8.0
 
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.deepvoid_blend_factor
-
-   .. py:attribute:: preserving_flux
-      :canonical: astronomix.option_classes.simulation_config.PositivityConfig.preserving_flux
-      :type: bool
-      :value: False
-
-      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.preserving_flux
+      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.PositivityConfig.coldcrush_blend_factor
 
 .. py:class:: SimulationConfig
    :canonical: astronomix.option_classes.simulation_config.SimulationConfig
@@ -1386,6 +1326,13 @@ API
       :value: False
 
       .. autodoc2-docstring:: astronomix.option_classes.simulation_config.SimulationConfig.first_order_fallback
+
+   .. py:attribute:: weno_positivity_preserving
+      :canonical: astronomix.option_classes.simulation_config.SimulationConfig.weno_positivity_preserving
+      :type: bool
+      :value: False
+
+      .. autodoc2-docstring:: astronomix.option_classes.simulation_config.SimulationConfig.weno_positivity_preserving
 
    .. py:attribute:: turbulent_forcing_config
       :canonical: astronomix.option_classes.simulation_config.SimulationConfig.turbulent_forcing_config

@@ -1,0 +1,162 @@
+[
+ {
+  "label": "AthenaPK (double)",
+  "resolution": 8,
+  "l1_error": 0.038760254275,
+  "cycles": 99,
+  "seconds": 0.09386666666666667,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (double)",
+  "resolution": 8,
+  "l1_error": 0.038760254790455466,
+  "cycles": 99,
+  "seconds": 0.026903919875621796,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (single)",
+  "resolution": 8,
+  "l1_error": 0.03876021332439433,
+  "cycles": 99,
+  "seconds": 0.022141002118587494,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix native (double)",
+  "resolution": 8,
+  "l1_error": 0.03876025479045547,
+  "cycles": 99,
+  "seconds": 0.030761683359742165,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "AthenaPK (double)",
+  "resolution": 16,
+  "l1_error": 0.019077188575,
+  "cycles": 205,
+  "seconds": 0.26698887122416537,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (double)",
+  "resolution": 16,
+  "l1_error": 0.019077187820081762,
+  "cycles": 205,
+  "seconds": 0.050922514870762825,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (single)",
+  "resolution": 16,
+  "l1_error": 0.019077231395952323,
+  "cycles": 205,
+  "seconds": 0.0393564198166132,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix native (double)",
+  "resolution": 16,
+  "l1_error": 0.01907718782008168,
+  "cycles": 205,
+  "seconds": 0.06667538359761238,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "AthenaPK (double)",
+  "resolution": 32,
+  "l1_error": 0.0039569815500000004,
+  "cycles": 415,
+  "seconds": 0.8317259938837921,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (double)",
+  "resolution": 32,
+  "l1_error": 0.003956981490756349,
+  "cycles": 415,
+  "seconds": 0.12952537275850773,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (single)",
+  "resolution": 32,
+  "l1_error": 0.0039568015629063424,
+  "cycles": 415,
+  "seconds": 0.09541894868016243,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix native (double)",
+  "resolution": 32,
+  "l1_error": 0.003956981490756397,
+  "cycles": 415,
+  "seconds": 0.32941579073667526,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "AthenaPK (double)",
+  "resolution": 64,
+  "l1_error": 0.001095599325,
+  "cycles": 834,
+  "seconds": 7.007310769230769,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (double)",
+  "resolution": 64,
+  "l1_error": 0.0010955994291131064,
+  "cycles": 834,
+  "seconds": 1.0419192146509886,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (single)",
+  "resolution": 64,
+  "l1_error": 0.0010955358971149881,
+  "cycles": 834,
+  "seconds": 0.4732485804706812,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix native (double)",
+  "resolution": 64,
+  "l1_error": 0.0010955994291130308,
+  "cycles": 834,
+  "seconds": 7.268195778131485,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "AthenaPK (double)",
+  "resolution": 128,
+  "l1_error": 0.00031063156249999994,
+  "cycles": 1670,
+  "seconds": 48.98243132867133,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (double)",
+  "resolution": 128,
+  "l1_error": 0.00031063156072724135,
+  "cycles": 1670,
+  "seconds": 15.765885397791862,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix Pallas (single)",
+  "resolution": 128,
+  "l1_error": 0.0003103134020354121,
+  "cycles": 1670,
+  "seconds": 6.6797777358442545,
+  "device": "NVIDIA A100-PCIE-40GB"
+ },
+ {
+  "label": "astronomix native (double)",
+  "resolution": 128,
+  "l1_error": 0.00031063156072727485,
+  "cycles": 1670,
+  "seconds": 119.6573906969279,
+  "device": "NVIDIA A100-PCIE-40GB"
+ }
+]

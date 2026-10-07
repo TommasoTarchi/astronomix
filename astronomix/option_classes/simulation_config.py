@@ -32,38 +32,32 @@ from astronomix._modules._neural_net_force._neural_net_force_options import (
 )
 from astronomix._modules._sink_particles._sink_particle_options import SinkParticleConfig
 from astronomix._modules._stellar_wind.stellar_wind_options import WindConfig
-from astronomix._modules._turbulent_forcing._turbulent_forcing_options import TurbulentForcingConfig
+from astronomix._modules._turbulent_forcing._turbulent_forcing_options import (
+    TurbulentForcingConfig,
+)
 
-# ===================== constant definition =====================
+# -------------------------------------------------------------
+# ================= ↓ Constant definitions ↓ ==================
+# -------------------------------------------------------------
 
 # backends (very limited support currently)
 NATIVE_JAX = 0
 PALLAS = 1
 #: OPTIMAL_BACKEND is not a backend of its own: it is a request to pick the
-#: fastest available one at ``finalize_config`` time.  It resolves to PALLAS on
-#: GPUs new enough to run the Triton kernels (compute capability >= 8.0) and
-#: falls back to NATIVE_JAX everywhere else (older GPUs, CPU, no ``nvidia-smi``).
+#: fastest available one at ``finalize_config`` time.  It resolves to PALLAS
+#: when JAX's default backend is a GPU new enough to run the Triton kernels
+#: (compute capability >= 8.0, read from ``jax.devices()``) and falls back to
+#: NATIVE_JAX everywhere else (older GPUs, CPU -- including ``JAX_PLATFORMS=cpu``
+#: on a GPU node).
 OPTIMAL_BACKEND = 2
 
-# positivity-enforcement modes (used by ``PositivityConfig.per_stage_mode`` /
-# ``per_step_mode``).  HARD_FLOOR clamps density (and, for ideal
-# gas, pressure) pointwise — cheap, non-conservative, matches the *adiabatic*
-# HOW-MHD ``prot.f``.  REDISTRIBUTE neighbour-averages density+momentum (and
-# energy) over the valid 3x3x3 neighbourhood of sub-threshold cells — much
-# gentler at strong shocks than a hard floor (no sharp floored cell), matches
-# the *isothermal* HOW-MHD ``prot.f`` (not strictly mass-conserving: like
-# ``prot.f`` it copies neighbour values without debiting the donors).
+# Per-step state floor (``PositivityConfig.per_step_mode``). Positivity of the
+# finite-difference scheme itself comes from ``weno_positivity_preserving``; the
+# floor remains for the finite-volume solver and as the temperature floor of
+# radiatively cooled runs (``per_step_specific_floor``). HARD_FLOOR clamps
+# density (and, for an ideal gas, pressure) pointwise; it is not conservative.
 POSITIVITY_NONE = 0
 POSITIVITY_HARD_FLOOR = 1
-POSITIVITY_REDISTRIBUTE = 2
-#: CONSERVATIVE: enforce internal-energy positivity by an antisymmetric
-#: face-flux diffusion that pulls internal energy into (near-)negative-pressure
-#: cells from their hotter neighbours (exact total-energy conservation), plus a
-#: density floor / vacuum-rest for voids and a minimal residual pressure floor
-#: as the unconditional guarantee. The smooth, conservative cousin of HARD_FLOOR:
-#: it keeps the energy-conserving self-gravity scheme stable on violent collapse
-#: without the 100%+ energy injection a bare floor causes.
-POSITIVITY_CONSERVATIVE = 3
 
 # solver modes
 FINITE_VOLUME = 0
@@ -73,6 +67,36 @@ FINITE_DIFFERENCE = 1
 FORWARDS = 0
 BACKWARDS = 1
 
+# Passive-scalar sub-cycling loop (``SimulationConfig.passive_scalar_substep_loop``).
+#   SUBSTEPS_AUTO     - DYNAMIC under FORWARDS, MASKED under BACKWARDS (default)
+#   SUBSTEPS_DYNAMIC  - a traced trip count (lowers to a while loop): exactly the
+#                       flow-derived number of sub-steps runs; forward-mode AD
+#                       only (reverse mode cannot differentiate a while loop)
+#   SUBSTEPS_MASKED   - a static loop over ``max_passive_scalar_substeps`` in
+#                       which sub-steps beyond the flow-derived count are masked
+#                       out (``lax.cond``): reverse-mode differentiable, same
+#                       primal
+SUBSTEPS_AUTO = 0
+SUBSTEPS_DYNAMIC = 1
+SUBSTEPS_MASKED = 2
+
+# Rematerialisation in reverse mode (``SimulationConfig.ad_remat``). Unlike the
+# integer enumerations, the modes are strings, so ``ad_remat="stage"`` works
+# without importing the constants.
+#   "none"  - store every residual of the step (fastest backward, most memory)
+#   "stage" - ``jax.checkpoint`` around every Runge-Kutta-stage RHS (hydro WENO
+#             fluxes + blends + divergence + sources, and the passive-scalar
+#             advection RHS): the backward keeps only the stage inputs and
+#             recomputes each stage's internals (about one extra forward)
+#   "axis"  - "stage" plus nested checkpoints: each axis' flux + blend +
+#             divergence inside the hydro RHS (non-fused flux path), and in the
+#             passive-scalar RHS each axis and each scalar separately, so the
+#             backward holds one axis' (one scalar's) internals at a time
+AD_REMAT_NONE = "none"
+AD_REMAT_STAGE = "stage"
+AD_REMAT_AXIS = "axis"
+AD_REMAT_MODES = (AD_REMAT_NONE, AD_REMAT_STAGE, AD_REMAT_AXIS)
+
 # limiter types
 MINMOD = 0
 OSHER = 1
@@ -80,6 +104,14 @@ DOUBLE_MINMOD = 2
 SUPERBEE = 3
 VAN_ALBADA = 4
 VAN_ALBADA_PP = 5
+#: The harmonic-mean (van Leer) slope of AthenaPK's / Athena++'s piecewise
+#: linear reconstruction. This is the slope of the VL2 scheme, which always
+#: uses it and does not read ``limiter`` (its choice between piecewise-linear
+#: and donor-cell reconstruction is ``first_order_fallback``); ``finalize_config``
+#: sets ``limiter = VAN_LEER`` for VL2 only so that the configuration reports
+#: the reconstruction in use. The classic finite-volume scheme does not
+#: implement it.
+VAN_LEER = 6
 
 # splitting modes
 UNSPLIT = 0
@@ -92,6 +124,11 @@ HLLC_LM = 2
 LAX_FRIEDRICHS = 3
 HYBRID_HLLC = 4
 AM_HLLC = 5
+#: The HLLD solver of Miyoshi & Kusano (2005) for ideal MHD, in AthenaPK's
+#: GLM form. Only implemented in the VL2 scheme (which also maps HLL, HLLC and
+#: LAX_FRIEDRICHS onto AthenaPK's HLLE, HLLC and LLF solvers); ``finalize_config``
+#: rejects it for the other finite-volume time integrators.
+HLLD = 6
 
 # time integrators
 # currently only for finite volume
@@ -100,6 +137,18 @@ MUSCL = 1
 # currently only for finite difference
 RK4_SSP = 2
 RK4_LSRK = 3
+# finite volume only
+#: The second-order van Leer predictor-corrector of AthenaPK / Athena++
+#: (Stone & Gardiner 2009): a donor-cell half step followed by a full step
+#: with van Leer-limited piecewise-linear reconstruction (donor cell in both
+#: steps with ``first_order_fallback``). Selecting it switches the
+#: finite-volume solver to the AthenaPK-equivalent scheme, which for MHD
+#: carries the cell-centred field together with the GLM cleaning scalar psi
+#: (Dedner et al. 2002). The scheme is Cartesian and has no self-gravity,
+#: external-potential, stellar-wind-tracer or cosmic-ray terms;
+#: ``finalize_config`` rejects those combinations (spherical geometry, as for
+#: every spherical configuration, is switched to MUSCL instead).
+VL2 = 4
 
 # boundary conditions
 OPEN_BOUNDARY = 0
@@ -159,9 +208,14 @@ ISOTHERMAL = 1
 ON_DEVICE = 0
 TO_DISK = 1
 
-# ============================================================
+# -------------------------------------------------------------
+# ================= ↑ Constant definitions ↑ ==================
+# -------------------------------------------------------------
 
-# ===================== type definitions =====================
+# -------------------------------------------------------------
+# =================== ↓ Type definitions ↓ ====================
+# -------------------------------------------------------------
+
 
 class StaticIntVector(NamedTuple):
     """A static (compile-time) per-axis integer triple (e.g. cells per axis)."""
@@ -188,6 +242,7 @@ class StaticFloatVector(NamedTuple):
             z=self.z / other.z,
         )
 
+
 STATE_TYPE = Union[
     Float[Array, "num_vars num_cells_x"],
     Float[Array, "num_vars num_cells_x num_cells_y"],
@@ -205,6 +260,11 @@ FIELD_TYPE = Union[
     Float[Array, "num_cells_x num_cells_y"],
     Float[Array, "num_cells_x num_cells_y num_cells_z"],
 ]
+
+# -------------------------------------------------------------
+# =================== ↑ Type definitions ↑ ====================
+# -------------------------------------------------------------
+
 
 class SnapshotSettings(NamedTuple):
     """Settings for the snapshot output of the simulation."""
@@ -293,6 +353,24 @@ class GravityConfig(NamedTuple):
     #: Manual open boundary conditions in the Poisson solver.
     poisson_manual_open_boundaries: bool = False
 
+    #: Flux-corrected gravitational work (finite difference,
+    #: SECOND/FOURTH_ORDER_CONSERVATIVE). Every conservative energy coupling
+    #: is a choice of the potential-energy flux q at each face,
+    #: S_E,i = -(1/dx) sum [(q - F phi_i)_{i+1/2} - (q - F phi_i)_{i-1/2}],
+    #: and conserves total energy for ANY q. The scheme's high-order q charges
+    #: half the climb of mass crossing a face to each side, so a cold or
+    #: tenuous receiver can be driven to negative pressure; the low-order
+    #: q = F phi_downwind charges the whole climb to the donor (the cell the
+    #: mass leaves). This option blends them face by face,
+    #: q = q_low + psi (q_high - q_low), with psi in [0, 1] chosen by a
+    #: one-sided Zalesak limiter so that every cell's internal-energy loss
+    #: rate stays within half its internal energy per wave-crossing time (rate
+    #: budgets, so psi does not depend on dt; the per-cell scaling is
+    #: sufficient, not maximal, and the bound is not guaranteed where the
+    #: low-order coupling alone exceeds it). Exactly conservative; high order
+    #: wherever psi = 1.
+    work_flux_correction: bool = False
+
     #: Master gravity switch. Set automatically in ``finalize_config`` to
     #: ``self_gravity or external_potential``; gates the gravity source-term
     #: machinery so an external potential works without self-gravity. Not set
@@ -302,64 +380,60 @@ class GravityConfig(NamedTuple):
 
 class PositivityConfig(NamedTuple):
     """
-    Density/pressure positivity-enforcement configuration.
+    State floors and estimate clamps.
+
+    The finite-difference scheme keeps density and pressure positive through
+    ``SimulationConfig.weno_positivity_preserving`` (every stage a convex
+    combination of admissible states). What is left here is not a positivity
+    patch: the per-step floor serves the finite-volume solver and the
+    temperature floor of radiatively cooled runs, the clamps keep wave-speed
+    and time-step estimates finite, and the cold-crush blend damps the
+    runaway compression of radiatively cooled shells.
     """
 
-    #: Casual on/off switch for the per-stage / per-step STATE floors. Default
-    #: False (no flooring). When True, finalize_config sets per_stage_mode and
-    #: per_step_mode to HARD_FLOOR unless explicitly overridden. Does NOT affect
-    #: the read-only ``clamp_in_estimates`` (always respected).
-    default_positivity_protection: bool = False
-
-    #: Positivity enforcement applied inside every SSPRK/LSRK stage (on the
-    #: conserved state — the CFL lever for strong shocks). One of
-    #: ``POSITIVITY_{NONE,HARD_FLOOR,REDISTRIBUTE,CONSERVATIVE}``. Default NONE;
-    #: set to HARD_FLOOR by finalize when ``default_positivity_protection``.
-    per_stage_mode: int = POSITIVITY_NONE
-
-    #: Positivity enforcement applied once per step before the evolve (on the
-    #: primitive state). With turbulent forcing + ``vacuum_protection`` the
-    #: conservative ``prot`` redistribution already runs once per step, so a
-    #: per-step REDISTRIBUTE here is redundant and is auto-skipped.
+    #: State floor applied once per step before the evolve (on the primitive
+    #: state): ``POSITIVITY_NONE`` or ``POSITIVITY_HARD_FLOOR``. With
+    #: ``time_integrator=VL2`` the hard floor also switches on AthenaPK's
+    #: density / pressure floors inside every stage's primitive recovery.
     per_step_mode: int = POSITIVITY_NONE
 
+    #: Upgrade the per-step HARD_FLOOR pressure clamp to the density-scaled
+    #: temperature floor ``p >= max(minimum_pressure,
+    #: rho * params.minimum_specific_pressure)`` (Athena-style temperature
+    #: floor). Meant for radiatively cooled runs: a radiatively cooled shock
+    #: layer compresses to the isothermal jump, and without isothermal pressure
+    #: support (p ∝ rho) the constant floor leaves it effectively pressureless,
+    #: so it is crushed by the ram pressure without bound. With cooling active
+    #: the floor's energy input is radiated away (the isothermal balance).
+    #: No-op when ``params.minimum_specific_pressure == 0``.
+    per_step_specific_floor: bool = False
+
     #: Read-only density/pressure clamp in the flux / eigenvalue / timestep
-    #: estimates (NaN-safety; does NOT modify the evolved state). This is the
-    #: role the old ``enforce_positivity`` bool played in those estimators.
-    #: DECOUPLED from ``default_positivity_protection`` and ON by default --
-    #: cheap insurance that never touches the conserved solution.
+    #: estimates. It never modifies the evolved state (the step-end primitive
+    #: recovery is unclamped).
     clamp_in_estimates: bool = True
 
-    #: Vacuum-rest velocity recovery: zero the momentum in below-floor (vacuum)
-    #: cells so the recovered velocity is 0 rather than ``momentum/rho_floored``
-    #: (which spikes and drives high-Mach blow-up); lets ``minimum_density`` be
-    #: lowered by orders of magnitude without instability.
-    vacuum_rest: bool = False
+    #: Cold-crush first-order flux blending (the FD counterpart of Athena's
+    #: first-order flux correction for radiatively cooled gas): blend the WENO
+    #: interface flux toward LLF at interfaces with a COLD side under
+    #: COMPRESSION. The weight is a temperature ramp on the COLDER adjacent
+    #: cell's recovered ``p/rho`` (1 at the effective temperature floor
+    #: ``params.minimum_specific_pressure``, 0 at ``coldcrush_blend_factor``
+    #: times it) times a compressive-velocity gate, so freely expanding cold
+    #: gas and a static ambient medium never activate it. It catches both
+    #: cold-cold isothermal collapse and the crushing of a cold dense clump by
+    #: hot surroundings; the trade is locally first-order shock fronts into
+    #: cold gas (classic flux-correction behaviour). Radiatively cooled cells
+    #: crushed by ram pressure otherwise collapse without bound once the grid
+    #: resolves the cooling layer: the local first-order diffusion saturates
+    #: the collapse the way coarse-grid numerical diffusion does at lower
+    #: resolution. Inert unless ``params.minimum_specific_pressure > 0``.
+    coldcrush_blend: bool = False
 
-    #: NaN/inf backstop: reset non-finite conserved entries to zero before the
-    #: density/pressure floors so they become a valid floored state.
-    nan_safe: bool = False
-
-    #: POSITIVITY_CONSERVATIVE-mode parameters (conservative internal-energy
-    #: redistribution): per-axis diffusion coefficient (stability needs
-    #: < 1/(2*dim)), number of Jacobi passes, and the activation margin in units
-    #: of the internal-energy floor (keep ~1 -- genuine near-violations only).
-    cons_coeff: float = 0.15
-    cons_passes: int = 16
-    cons_activate: float = 1.0
-
-    #: Deep-void first-order flux blending (FOFC-style): blend the WENO interface
-    #: flux toward LLF in cells near the density floor; the weight ramps from 1
-    #: at the floor to 0 at ``deepvoid_blend_factor * minimum_density``.
-    deepvoid_blend: bool = False
-    deepvoid_blend_factor: float = 8.0
-
-    #: Positivity-preserving (Hu-Adams-Shu / Zalesak FCT) flux limiter: blend the
-    #: WENO flux toward LLF by the largest weight keeping the LF-updated density
-    #: AND pressure above their floors. Shares the unified flux-blending
-    #: infrastructure with ``deepvoid_blend`` (different activation path; both may
-    #: be on, the stronger blend wins). Forces the non-fused WENO+divergence path.
-    preserving_flux: bool = False
+    #: Upper end of the temperature ramp of ``coldcrush_blend``, in units of
+    #: ``params.minimum_specific_pressure``: interfaces whose colder side has
+    #: ``p/rho`` above this multiple of the floor are not blended.
+    coldcrush_blend_factor: float = 8.0
 
 
 class BackendConfig(NamedTuple):
@@ -385,17 +459,17 @@ class BackendConfig(NamedTuple):
     pallas_num_warps: int = 4
     #: Toggle for the Pallas constrained-transport helpers
     #: (``update_cell_center_fields``, ``constrained_transport_rhs``).
-    #: Disabled by default: the staged Pallas-CT pipeline gives a clear
-    #: memory win at small grids (~65% temp at N=16 on alfven_wave3D)
-    #: but only marginal savings at production scale (~2% temp at N=64)
-    #: while adding ~25s of one-time compile cost.  Flip to True if the
-    #: small-N memory profile matters; the rest of the Pallas backend
-    #: stays on regardless.
+    #: Disabled by default: the staged Pallas-CT pipeline saves a large share
+    #: of the temporary memory on small grids, but only a few percent on
+    #: production-size grids, while adding a noticeable one-time compile cost.
+    #: Flip to True if the small-grid memory profile matters; the rest of the
+    #: Pallas backend stays on regardless.
     pallas_ct: bool = False
     #: Replace the IEEE ``sqrt`` in the MHD WENO kernel with the refined
     #: approximate ``rsqrt`` path (``x * jax.lax.rsqrt(x)`` -> ``rsqrt.approx.f64``,
-    #: still ~1 ULP).  On A100 this cut the dp WENO kernel ~1.6x and the full
-    #: dp step ~1.77x (spill loads halved) with Alfvén L1 convergence bit-identical.
+    #: still ~1 ULP). On GPUs where the double-precision ``sqrt`` dominates the
+    #: kernel this markedly speeds up the double-precision step (fewer register
+    #: spills) without changing the convergence behaviour.
     #: NOTE: the *forward* kernel is switched but the hand-written Pallas
     #: *adjoints* still use IEEE ``sqrt``; with this on, reverse-mode AD is
     #: therefore ~1 ULP inconsistent with the forward (``finalize_config`` warns).
@@ -478,23 +552,204 @@ class SimulationConfig(NamedTuple):
     #: Integrator used for the magnetic part in the FV MHD scheme.
     fv_magnetic_integrator: int = IMPLICIT_MIDPOINT
 
-    #: Density/pressure positivity-enforcement configuration (see PositivityConfig).
+    #: VL2 scheme only: add the non-conservative Dedner et al. (2002) sources,
+    #: ``-(div B) B`` in the momentum and ``-B . grad(psi)`` in the energy
+    #: equation, to the parabolic damping of psi (AthenaPK
+    #: ``glmmhd_source = dedner_extended``). The default is the plain damping
+    #: only (AthenaPK's default ``dedner_plain``).
+    glm_extended_source: bool = False
+
+    #: VL2 scheme only: AthenaPK's first-order flux correction. After each
+    #: stage, every cell whose update would produce a non-positive density or
+    #: pressure has all its face fluxes replaced by first-order local
+    #: Lax-Friedrichs fluxes (repeated up to four times, exactly as
+    #: AthenaPK's ``first_order_flux_correct``).
+    first_order_flux_correction: bool = False
+
+    #: State floors, estimate clamps and the cold-crush flux blend (see
+    #: PositivityConfig). Positivity of the finite-difference scheme itself
+    #: comes from ``weno_positivity_preserving``.
     positivity_config: PositivityConfig = PositivityConfig()
+
+    #: Dual-energy formalism (Bryan et al. 1995 switch) for adiabatic FD
+    #: hydro and MHD. When True a separately-advected internal-energy density
+    #: ``g`` is carried through the time loop and used in the WENO pressure
+    #: recovery wherever ``e_E/E < dual_energy_eta``, so high-Mach / low-beta
+    #: float32 cancellation of ``e_int = E - KE - ME`` does not corrupt the
+    #: pressure.
+    dual_energy: bool = False
+
+    #: Switch threshold for the dual-energy formalism: the fraction of total
+    #: energy below which the total-energy internal energy is deemed
+    #: cancellation-unreliable and the advected ``g`` is used instead.
+    dual_energy_eta: float = 1e-3
+
+    #: Number of user-defined passive scalars: per-parcel labels advected with
+    #: the flow (``dC/dt + v.grad C = 0``) that do not act back on it —
+    #: composition mass fractions, an ejecta/circumstellar discriminator, and so
+    #: on. Finite-difference solver only; they are carried as the last variables
+    #: of the state and advected operator-split (WENO5 + SSP-RK3) in
+    #: ``_passive_scalars.py``.
+    num_passive_scalars: int = 0
+
+    #: Physical bounds for the user's passive scalars, one ``(lo, hi)`` pair per
+    #: scalar (``None`` for an unbounded one). Declaring them is strongly
+    #: recommended for anything that is a mass fraction: the recovered label is
+    #: a ratio ``s / rho~``, and in the near-vacuum interior of a blast wave the
+    #: denominator can collapse and the ratio run away (for example to values
+    #: far outside [0, 1] where radiative cooling and a fast piston compress the
+    #: same cells).
+    #:
+    #: Note this is NOT the same as clipping a scalar to its own current range,
+    #: which is destructive: that clips smooth extrema every step and degrades
+    #: the convergence order. A *physical* bound never activates on smooth data
+    #: that respects it, so it is free.
+    passive_scalar_bounds: Tuple[Optional[Tuple[float, float]], ...] = ()
+
+    #: CFL number for the passive-scalar sub-steps. The scalar advection is
+    #: operator-split, so it does not inherit the hydro timestep's safety: the
+    #: hydro CFL is set by ``|u| + c``, while what constrains this is ``|u|`` and
+    #: — the binding one — positivity of the companion density under
+    #: ``h |div v| <= 0.5``. The number of sub-steps is derived from the flow at
+    #: every step, so a benign step takes exactly one and costs nothing.
+    passive_scalar_cfl: float = 0.4
+
+    #: Cap on the derived sub-step count, so a single pathological cell cannot
+    #: stall a run. Hitting the cap means the scalars are being integrated
+    #: outside their stability limit in some cells; the physical bounds in
+    #: ``passive_scalar_bounds`` are the backstop for that.
+    max_passive_scalar_substeps: int = 8
+
+    #: How the sub-cycling loop is built (``SUBSTEPS_AUTO`` / ``_DYNAMIC`` /
+    #: ``_MASKED``, see the constants). The flow-derived count is a traced
+    #: integer, and a loop with a traced trip count is a while loop, which
+    #: reverse-mode AD cannot differentiate. The MASKED loop runs to the static
+    #: cap ``max_passive_scalar_substeps`` and skips (``lax.cond``) the sub-steps
+    #: beyond the flow-derived count, so its primal is the same computation. The
+    #: default AUTO keeps the dynamic loop under ``differentiation_mode ==
+    #: FORWARDS`` (forward results unchanged, bit for bit) and switches to the
+    #: masked one under BACKWARDS. In the masked loop every sub-step (the first
+    #: included) is one iteration of a scan whose body is ``jax.checkpoint``-ed
+    #: (its RHS too, whatever ``ad_remat`` says), so the backward stores one
+    #: scalar-stack copy per iteration and recomputes the rest: reverse-mode
+    #: memory grows only mildly with the cap, compute by one extra advection
+    #: evaluation. A cap of 1 is a straight-line single sub-step (no loop).
+    #: Lower ``max_passive_scalar_substeps`` in reverse-mode runs whose flow
+    #: never needs more than one or two sub-steps.
+    passive_scalar_substep_loop: int = SUBSTEPS_AUTO
+
+    #: Track when each parcel was shocked, adding three further library-managed
+    #: scalars (``entropy_initial``, ``time_since_shock``, ``density_time``)
+    #: after the user's. ``density_time`` is the ionization age up to a unit
+    #: conversion, and ``time_since_shock`` drives electron/ion temperature
+    #: relaxation — the Dwarkadas, Dewey & Bauer (2010) proxy that makes
+    #: non-equilibrium-ionization spectral synthesis possible without an
+    #: ionization network.
+    track_shock_history: bool = False
+
+    #: Entropy rise (in nats, above the parcel's own ``t = 0`` value) that counts
+    #: as having been shocked. Because the Rankine-Hugoniot jump fixes the
+    #: entropy rise as a function of Mach number alone, this threshold is
+    #: equivalent to a minimum shock strength; for ``gamma = 5/3``:
+    #:
+    #: ===========  ==========
+    #: Mach number  rise [nats]
+    #: ===========  ==========
+    #: 2            0.18
+    #: 3            0.57
+    #: **3.3**      **0.69**
+    #: 5            1.31
+    #: 10           2.57
+    #: 100          7.12
+    #: ===========  ==========
+    #:
+    #: The default ``log(2)`` therefore flags everything above Mach ~3.3 —
+    #: comfortably below a supernova remnant's Mach ~100 forward and reverse
+    #: shocks, while ignoring the weak compressions and sound waves that carry
+    #: no ionization. Lower it if weak shocks matter for the problem at hand.
+    shock_entropy_jump: float = 0.6931471805599453
+
+    #: Give the shock-history latch a derivative (straight-through estimator).
+    #: The primal is UNCHANGED: a parcel is still flagged by the boolean test
+    #: ``entropy rise > shock_entropy_jump AND div v < 0``. With the switch off
+    #: that boolean has zero derivative, so d(shocked_fraction, time_since_shock,
+    #: density_time)/d(state) only transports the existing history, and an
+    #: adjoint cannot see that moving a shock changes which parcels are freshly
+    #: shocked. With it on, the tangent (and cotangent) of the latch is taken
+    #: through the smooth surrogate
+    #:
+    #:     soft = sigmoid((ds - shock_entropy_jump) / ad_shock_latch_entropy_width)
+    #:          * sigmoid(-div_v / (ad_shock_latch_compression_width * c_s))
+    #:
+    #: (the same two criteria; ``div_v`` is the undivided central difference
+    #: the latch uses and ``c_s`` the local sound speed, held constant), merged
+    #: with the carried fraction as a probabilistic OR:
+    #: ``d sf = (1 - latch) d sf_old + (1 - sf_old) d soft``. Away from the
+    #: threshold soft saturates and the derivative reduces to transport -- but
+    #: only if the entropy sigmoid is narrow enough: quiescent, never-shocked
+    #: gas (entropy rise 0, div_v = 0) sits at the steepest point of the
+    #: compression sigmoid, so its leak is set by sigmoid(-jump / width) alone,
+    #: and it ACCUMULATES step after step in the carried fraction. With width
+    #: 0.25 about 22 % of the at-threshold response leaks into every ambient
+    #: cell per step; with width 0.1 (the default) about 0.4 %. This is a
+    #: surrogate gradient, not the derivative of the primal (which is zero
+    #: almost everywhere); check it with a finite-difference Taylor test at the
+    #: amplitudes the optimiser uses.
+    ad_smooth_shock_latch: bool = False
+
+    #: Width in nats of the entropy-rise sigmoid of the smooth latch. Keep it
+    #: well below ``shock_entropy_jump`` (see the leak above).
+    ad_shock_latch_entropy_width: float = 0.1
+
+    #: Width of the compression sigmoid of the smooth latch, in units of the
+    #: local sound speed (``div_v`` is an undivided difference, i.e. a velocity).
+    ad_shock_latch_compression_width: float = 0.05
 
     #: Self-gravity / external-potential configuration (see GravityConfig).
     gravity_config: GravityConfig = GravityConfig()
 
-    #: Explicit diffusion term 
-    #: (currently only for finite difference mode)
+    #: Explicit viscous diffusion term with the coefficient
+    #: ``params.viscosity`` (see ``viscosity_type``), in both the
+    #: finite-difference and the finite-volume solver.
     diffusion: bool = False
 
     #: Viscosity type - either kinematic or dynamic viscosity.
     viscosity_type: int = DYNAMIC_VISCOSITY
 
+    #: Switch for explicit ohmic resistivity in the induction equation. The
+    #: switch pairs with the coefficient of the same name,
+    #: ``params.resistivity`` (eta). It is applied to the interface fields as
+    #: the curl of an edge EMF; 3D finite-difference CT MHD with the isothermal
+    #: EOS only, since no ohmic heating term is added to the energy equation.
+    resistivity: bool = False
+
     #: Explicit thermal conduction term div(kappa grad T) in the energy
-    #: equation (constant conductivity params.thermal_conductivity,
-    #: explicit integration). Currently only for finite difference mode.
+    #: equation (constant conductivity ``params.thermal_conductivity``, or
+    #: ``kappa = rho alpha`` with ``conduction_density_weighted``; explicit
+    #: integration). Currently only for finite difference mode.
     thermal_conduction: bool = False
+
+    #: Interpret ``params.thermal_conductivity`` as the Athena-style
+    #: DIFFUSIVITY ``alpha`` instead of a constant conductivity, i.e. use
+    #: ``kappa = rho * alpha`` so the heat flux is ``-rho alpha grad T``
+    #: (conservative face-flux form). This keeps the TEMPERATURE diffusivity
+    #: ``chi = (gamma - 1) alpha`` density-INDEPENDENT — the convention used
+    #: for thermal-instability / Field-length studies (AthenaK
+    #: ``<hydro> alpha_iso``), where the constant-kappa form would instead
+    #: suppress conduction exactly inside the cold dense clumps.
+    conduction_density_weighted: bool = False
+
+    #: Formal order of the conduction discretisation: 2 (default) or 4; any
+    #: other value is rejected by ``finalize_config``. In a FINITE-DIFFERENCE
+    #: scheme the state IS the pointwise value, so evaluating ``T = p/rho``
+    #: (and ``kappa = rho*alpha``) pointwise is already exact -- the order is
+    #: set purely by the derivative stencils. Order 4 uses the 4th-order central
+    #: first derivative for the pointwise heat flux and the 4th-order
+    #: conservative face interpolation
+    #: ``(-F_{i-1} + 7F_i + 7F_{i+1} - F_{i+2})/12`` for its divergence (the
+    #: same linear flux the WENO kernel uses), so it is consistent with the
+    #: 5th-order hydro rather than reducing it to 2nd order.
+    conduction_order: int = 2
 
     #: The size of the simulation box.
     box_size: Union[float, StaticFloatVector] = 1.0
@@ -508,12 +763,12 @@ class SimulationConfig(NamedTuple):
     #: reconstruction at the interfaces.
     reconstruction_order: int = 1
 
-    #: The limiter for the reconstruction.
-    #: Only affects finite volume mode.
+    #: The limiter for the reconstruction of the classic finite-volume
+    #: scheme. The VL2 scheme does not read it (see ``VAN_LEER``).
     limiter: int = MINMOD
 
-    #: The Riemann solver used
-    #: Only for finite volume mode.
+    #: The Riemann solver used. Only for finite volume mode; ``HLLD`` is only
+    #: available with the VL2 time integrator.
     riemann_solver: int = HLL
 
     #: Dimensional splitting / unsplit mode.
@@ -522,7 +777,9 @@ class SimulationConfig(NamedTuple):
     #: with self-gravity.
     split: int = UNSPLIT
 
-    #: Time integration method.
+    #: Time integration method: RK2_SSP, MUSCL or VL2 for the finite-volume
+    #: solver, RK4_SSP or RK4_LSRK for the finite-difference solver (which
+    #: falls back to RK4_SSP for any other value).
     time_integrator: int = RK2_SSP
 
     # Explanation of the ghost cells
@@ -576,6 +833,38 @@ class SimulationConfig(NamedTuple):
     #: time stepping.
     num_checkpoints: int = 100
 
+    #: Rematerialisation for reverse-mode AD: ``"none"`` (default), ``"stage"``
+    #: or ``"axis"`` (see ``AD_REMAT_*``). Changes only what the backward pass
+    #: stores versus recomputes; the primal is the same computation, and under
+    #: forward-only evaluation or forward-mode AD ``jax.checkpoint`` is inlined
+    #: (no cost). For a finite-difference WENO step, "stage" roughly halves and
+    #: "axis" roughly quarters the temporary memory of the backward pass, at
+    #: the cost of about one ("stage") or two ("axis") extra forward
+    #: evaluations of the rematerialised pieces.
+    ad_remat: str = AD_REMAT_NONE
+
+    #: ``ad_remat == "axis"`` only: split each axis' flux + blend + divergence
+    #: into this many slabs along a PERPENDICULAR axis (z for the x / y fluxes,
+    #: y for the z flux; never the first spatial axis, the one a multi-GPU run
+    #: splits), a ``lax.map`` with one ``jax.checkpoint`` per slab. The
+    #: backward then holds one slab's WENO / blend internals at a time. Exact
+    #: (every piece is a stencil along the flux axis only); 1 = off; a count
+    #: that does not divide the slab axis falls back to 1.
+    ad_remat_chunks: int = 1
+
+    #: Reverse-mode memory of the passive-scalar block (``ad_remat != "none"``
+    #: only; default False = unchanged). With many scalars, the backward of the
+    #: scalar advection dominates the memory of a reverse-mode gradient: the
+    #: masked sub-step scan's stack of ``max_passive_scalar_substeps``
+    #: scalar-stack copies and the tie-preserving clips' mask residuals of the
+    #: ratio recovery and of the shock history. With True: the sub-steps run in
+    #: an equinox checkpointed while loop over the flow-derived count (two
+    #: scalar-stack checkpoints instead of the cap's), and the ratio recovery /
+    #: bounds and the shock-history update are ``jax.checkpoint``-ed (their
+    #: masks are recomputed, not stored). Same arithmetic in the primal;
+    #: derivatives equal up to rounding (a different XLA program).
+    ad_scalar_lean: bool = False
+
     #: Return intermediate snapshots of the time evolution
     #: instead of only the final fluid state.
     return_snapshots: bool = False
@@ -611,9 +900,85 @@ class SimulationConfig(NamedTuple):
     #: Fallback to the first order Godunov scheme.
     first_order_fallback: bool = False
 
+    #: WENO nonlinear weights: ``False`` = classic Jiang-Shu
+    #: ``alpha_k = c_k/(eps+IS_k)^2``, ``True`` = WENO-Z (Borges et al. 2008)
+    #: ``alpha_k = c_k (1 + tau_5/(eps+IS_k))``. WENO-Z is scale invariant (the
+    #: nonlinearity is a ratio of smoothness indicators, not a comparison
+    #: against an absolute epsilon) and keeps the optimal linear weights at
+    #: smooth extrema, where JS drops order and damps small-amplitude features.
+    #: Implemented in the native and the Pallas forward kernels; the
+    #: hand-written Pallas adjoints use the Jiang-Shu weights, so reverse-mode
+    #: gradients with the Pallas backend are inconsistent with the forward pass
+    #: (``finalize_config`` prints a note).
+    weno_z: bool = False
+
+    #: Absolute floor in the WENO smoothness denominators (JS and Z).
+    weno_epsilon: float = 1e-7
+
+    #: Evaluate the characteristic basis of the WENO projection at an
+    #: ADMISSIBLE interface state: the interface sound speed comes from the
+    #: averaged pressure, c^2 = gamma <p> / <rho>, and the enthalpy is rebuilt
+    #: from it. ``False`` uses c^2 = (gamma - 1)(<h> - v^2/2) from an
+    #: UNWEIGHTED enthalpy mean and a MASS-WEIGHTED velocity; that combination
+    #: is not the state of any gas, is not Galilean invariant, and at a density
+    #: jump (ratio >~ 10) carrying a velocity jump of a few sound speeds its
+    #: c^2 is negative -- the clamp then zeroes the acoustic upwind correction
+    #: exactly at the strongest jumps, so a cold dense slab driven at high Mach
+    #: number into tenuous gas blows up within a few steps. Smooth-flow results
+    #: of the two bases agree to the WENO dissipation level (the basis moves by
+    #: O(dx^2)). Ideal gas only (the isothermal basis has a fixed sound speed).
+    #: Native and Pallas.
+    weno_admissible_face_state: bool = True
+
+    #: Positivity-preserving WENO (Zhang & Shu 2012, J. Comput. Phys. 231,
+    #: 2245), inside the reconstruction. With alpha the splitting speed of an
+    #: interface, each split flux is f^+- = +-(alpha/2) w^+- with
+    #: w^+- = q +- F/alpha - sum_s (1 - alpha_s/alpha) R_s L_s q. Every field
+    #: that carries mass is split with the common alpha (the stencil's spectral
+    #: radius), which makes the frozen-basis splitting monotone for every
+    #: stencil cell; mass-free fields (hydro shear, isothermal-MHD Alfven) keep
+    #: their own speed alpha_s. Each WENO face value is then pulled toward its
+    #: upwind split state by the largest theta in [0, 1] keeping it, and its
+    #: mirror about q +- F/alpha, admissible (positive density; positive
+    #: pressure for an ideal gas; closed form, as pressure is concave). theta = 1
+    #: in smooth flow. For ideal MHD a single q +- F/alpha is often NOT
+    #: admissible at the fast speed when beta is low (Wu 2018, SIAM J. Numer.
+    #: Anal. 56, 2124), so theta acts on the weighted parts of each cell's
+    #: update instead: its own two mirror states per axis (the cell's flux
+    #: cancels; base q_i) and its inflow states of ALL axes jointly (base: the
+    #: axis-summed first-order inflow, in which the neighbours' magnetic-tension
+    #: terms cancel up to the discrete div B; per axis they do not). The SSPRK stages then
+    #: rebuild the cell-centred B from the faces, pressure held, so each
+    #: increment starts from the state it was evaluated at. Each forward-Euler
+    #: stage is positivity preserving for C_cfl <= 1/2 (sum-of-speeds CFL),
+    #: i.e. 0.75 with SSPRK4 (ideal MHD: up to the rare inadmissible inflow
+    #: base, where theta = 0). Implies ``weno_admissible_face_state``. Native
+    #: and Pallas (not the fused WENO+divergence kernel, which is then skipped).
+    weno_positivity_preserving: bool = False
+
+    #: If > 0, ADD a relative contribution ``weno_epsilon_relative * (amx*|q|)^2``
+    #: to the WENO epsilon, where ``q`` is the local characteristic variable and
+    #: ``amx`` the family's dissipation coefficient — i.e. compare the
+    #: smoothness indicators against the local DATA SCALE instead of an
+    #: absolute constant. With ``weno_epsilon`` alone the weights are fully
+    #: nonlinear whenever the variables are O(10) or larger, regardless of how
+    #: smooth the solution is. NATIVE backend only (``finalize_config`` rejects
+    #: it with the Pallas backend).
+    weno_epsilon_relative: float = 0.0
+
+    #: Differentiate through the WENO reconstruction with its nonlinear
+    #: weights, characteristic eigenvectors and Lax-Friedrichs splitting speed
+    #: FROZEN (``stop_gradient``): the tangent / adjoint is then that of the
+    #: linear scheme the primal step actually used, the usual linearisation for
+    #: WENO adjoints. The primal is unchanged. Needed for forward-mode
+    #: derivatives through long runs with cold, near-uniform gas: there
+    #: IS_k << weno_epsilon, d alpha / d IS ~ 2 / epsilon^3 ~ 1e21, and the
+    #: float32 tangent overflows long before the end of such a run.
+    weno_ad_frozen_weights: bool = False
+
     # physical modules
 
-    #: Turbulent forcing configuration.
+    #: Turbulent forcing configuration (see TurbulentForcingConfig).
     turbulent_forcing_config: TurbulentForcingConfig = TurbulentForcingConfig()
 
     #: The configuration for the stellar wind module.
@@ -640,18 +1005,57 @@ class SimulationConfig(NamedTuple):
     sink_particle_config: SinkParticleConfig = SinkParticleConfig()
 
 
+def _parse_compute_capability(compute_capability):
+    """
+    Parse a compute capability such as ``"8.0"`` into the tuple ``(8, 0)``.
+    Anything that is not of the form ``major.minor`` gives ``None``.
+    """
+    try:
+        major, minor = str(compute_capability).strip().split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, TypeError):
+        return None
+
+
 def gpu_compute_capability_at_least_80() -> bool:
-    """Return whether every visible NVIDIA GPU has compute capability >= 8.0.
+    """Return whether JAX runs on GPUs that all have compute capability >= 8.0.
 
     Compute capability 8.0 (Ampere) is the floor for the Triton kernels the
     Pallas backend compiles to, so this is the predicate that decides whether
-    OPTIMAL_BACKEND resolves to PALLAS. Any failure to query the GPUs — no
-    ``nvidia-smi`` on the PATH (e.g. a CPU-only host) or the call erroring out —
-    is treated as "not capable" so the safe NATIVE_JAX fallback is chosen.
+    OPTIMAL_BACKEND resolves to PALLAS.
+
+    The question is asked of JAX, not of the machine: what matters is the
+    platform the kernels will be compiled for. ``JAX_PLATFORMS=cpu`` on a GPU
+    node therefore answers False (the kernels would run on XLA:CPU, where
+    Pallas only has an interpreter), which ``nvidia-smi`` could not tell.
+    The capability is read from ``jax.devices()``; ``nvidia-smi`` is only a
+    fallback for GPU devices that do not expose it. Any failure is treated as
+    "not capable" so the safe NATIVE_JAX fallback is chosen.
 
     Returns:
-        True if all visible NVIDIA GPUs report compute capability >= 8.0,
-        False otherwise (including when no GPU could be queried).
+        True if JAX's default backend is a GPU backend and every one of its
+        devices reports compute capability >= 8.0, False otherwise.
+    """
+    try:
+        devices = jax.devices()
+    except RuntimeError:
+        return False
+    if not devices or any(device.platform != "gpu" for device in devices):
+        return False
+    capabilities = [
+        _parse_compute_capability(getattr(device, "compute_capability", None))
+        for device in devices
+    ]
+    if all(capability is not None for capability in capabilities):
+        return all(capability >= (8, 0) for capability in capabilities)
+    return _nvidia_smi_compute_capability_at_least_80()
+
+
+def _nvidia_smi_compute_capability_at_least_80() -> bool:
+    """
+    Fallback of :func:`gpu_compute_capability_at_least_80`: ask ``nvidia-smi``
+    whether every visible NVIDIA GPU has compute capability >= 8.0 (False if
+    it cannot be queried).
     """
     try:
         output = subprocess.check_output(
@@ -679,7 +1083,10 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     cross-field consistency: the positivity-protection defaults, the number
     of cells per axis, the grid spacing, the geometry- and solver-specific
     overrides, the master gravity switch, the boundary defaults, and the
-    disk-snapshot and sink-particle requirements.
+    disk-snapshot and sink particle requirements. Combinations the solvers
+    do not implement (e.g. cosmic rays with the finite-difference solver,
+    self-gravity or non-Cartesian geometry with VL2, HLLD outside VL2) raise
+    a ``ValueError``.
 
     Args:
         config: The user-supplied simulation configuration.
@@ -690,17 +1097,90 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         The finalized simulation configuration.
     """
 
+    # The positivity-preserving reconstruction evaluates its characteristic
+    # basis at the admissible interface state, so it switches that on too.
+    if config.weno_positivity_preserving and not config.weno_admissible_face_state:
+        config = config._replace(weno_admissible_face_state=True)
+
     # Resolve the OPTIMAL_BACKEND request into a concrete backend before any
-    # downstream code inspects ``config.backend_config.backend``. PALLAS needs an Ampere-class
-    # (compute capability >= 8.0) GPU for its Triton kernels; anywhere else we
-    # fall back to the portable NATIVE_JAX backend.
+    # downstream code inspects ``config.backend_config.backend``. PALLAS needs
+    # an Ampere-class (compute capability >= 8.0) GPU for its Triton kernels;
+    # anywhere else we fall back to the portable NATIVE_JAX backend.
     if config.backend_config.backend == OPTIMAL_BACKEND:
         if gpu_compute_capability_at_least_80():
             print("OPTIMAL_BACKEND: using the PALLAS backend (GPU compute capability >= 8.0).")
-            config = config._replace(backend_config=config.backend_config._replace(backend=PALLAS))
+            config = config._replace(
+                backend_config=config.backend_config._replace(backend=PALLAS)
+            )
         else:
-            print("OPTIMAL_BACKEND: using the NATIVE_JAX backend (no compute capability >= 8.0 GPU found).")
-            config = config._replace(backend_config=config.backend_config._replace(backend=NATIVE_JAX))
+            print(
+                "OPTIMAL_BACKEND: using the NATIVE_JAX backend (JAX is not running on a "
+                "compute capability >= 8.0 GPU)."
+            )
+            config = config._replace(
+                backend_config=config.backend_config._replace(backend=NATIVE_JAX)
+            )
+
+    # Cosmic rays exist only in the finite-volume solver. Under the
+    # finite-difference solver the registry does not add the CR variable, so
+    # the CR code paths that still run (DSA injection, energy totals) index
+    # variable -1 -- the pressure in 1D, the last passive scalar when scalars
+    # are carried -- and the run silently returns a CR-free (and corrupted)
+    # solution. Refuse instead.
+    if config.cosmic_ray_config.cosmic_rays and config.solver_mode == FINITE_DIFFERENCE:
+        raise ValueError(
+            "cosmic_ray_config.cosmic_rays is not implemented for the "
+            "finite-difference solver (the default solver_mode): the CR "
+            "configuration would be silently ignored and the CR modules would "
+            "write into variable -1. Use solver_mode=FINITE_VOLUME for cosmic "
+            "rays."
+        )
+
+    # Reverse-mode / AD options.
+    if config.ad_remat not in AD_REMAT_MODES:
+        raise ValueError(
+            f"ad_remat must be one of {AD_REMAT_MODES}, got {config.ad_remat!r}."
+        )
+    if int(config.ad_remat_chunks) < 1:
+        raise ValueError(f"ad_remat_chunks must be >= 1, got {config.ad_remat_chunks!r}.")
+    if config.passive_scalar_substep_loop not in (SUBSTEPS_AUTO, SUBSTEPS_DYNAMIC, SUBSTEPS_MASKED):
+        raise ValueError(
+            "passive_scalar_substep_loop must be SUBSTEPS_AUTO, SUBSTEPS_DYNAMIC "
+            f"or SUBSTEPS_MASKED, got {config.passive_scalar_substep_loop!r}."
+        )
+    if int(config.max_passive_scalar_substeps) < 1:
+        raise ValueError("max_passive_scalar_substeps must be >= 1.")
+    if (config.passive_scalar_substep_loop == SUBSTEPS_DYNAMIC
+            and config.differentiation_mode == BACKWARDS
+            and (config.num_passive_scalars > 0 or config.track_shock_history)):
+        print(
+            "NOTE: passive_scalar_substep_loop = SUBSTEPS_DYNAMIC uses a traced "
+            "trip count (a while loop); reverse-mode AD through the passive "
+            "scalars will fail. Use SUBSTEPS_AUTO or SUBSTEPS_MASKED."
+        )
+    if config.ad_smooth_shock_latch and not config.track_shock_history:
+        print("NOTE: ad_smooth_shock_latch has no effect without track_shock_history.")
+
+    # The conduction source only distinguishes order 4 from everything else,
+    # so any other value would silently run the second-order discretisation.
+    if config.conduction_order not in (2, 4):
+        raise ValueError(f"conduction_order must be 2 or 4, got {config.conduction_order!r}.")
+
+    # weno_z is implemented in the FORWARD Pallas kernels; their hand-written
+    # adjoints use the Jiang-Shu weights, so reverse-mode gradients would not
+    # match the forward pass. weno_epsilon_relative is native-only.
+    if config.weno_epsilon_relative > 0.0 and config.backend_config.backend == PALLAS:
+        raise ValueError(
+            "weno_epsilon_relative is implemented for the NATIVE_JAX backend "
+            "only; pass BackendConfig(backend=NATIVE_JAX)."
+        )
+    if config.weno_z and config.backend_config.backend == PALLAS:
+        print(
+            "NOTE: weno_z runs the Pallas FORWARD kernels; the hand-written "
+            "Pallas adjoints use Jiang-Shu weights, so reverse-mode gradients "
+            "would be inconsistent with the forward pass. Forward-only runs "
+            "(evolution, convergence, timing) are unaffected."
+        )
 
     # Approximate-rsqrt fast path: the forward MHD WENO kernel is switched to the
     # refined approximate rsqrt, but the hand-written Pallas adjoints still use
@@ -715,28 +1195,10 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             "forward. Fine for forward-only runs; turn off for exact AD."
         )
 
-    # ``default_positivity_protection`` is a casual on/off switch for the STATE
-    # floors only: the default ``False`` is a clean slate (no per-stage /
-    # per-step flooring). When set, turn the floors on (HARD_FLOOR) unless the
-    # user explicitly chose a mode. The read-only clamps (clamp_in_estimates)
-    # are decoupled and left untouched (default on), as are the feature toggles
-    # (deepvoid_blend, preserving_flux, conservative redistribution,
-    # vacuum_rest, nan_safe).
-    positivity_config = config.positivity_config
-    if positivity_config.default_positivity_protection:
-        config = config._replace(positivity_config=positivity_config._replace(
-            per_stage_mode=(POSITIVITY_HARD_FLOOR
-                            if positivity_config.per_stage_mode == POSITIVITY_NONE
-                            else positivity_config.per_stage_mode),
-            per_step_mode=(POSITIVITY_HARD_FLOOR
-                           if positivity_config.per_step_mode == POSITIVITY_NONE
-                           else positivity_config.per_step_mode),
-        ))
-
     if jax.config.jax_enable_x64:
-        config._replace(numerical_precision=DOUBLE_PRECISION)
+        config = config._replace(numerical_precision=DOUBLE_PRECISION)
     else:
-        config._replace(numerical_precision=SINGLE_PRECISION)
+        config = config._replace(numerical_precision=SINGLE_PRECISION)
 
     # set the number of cells
     if config.dimensionality == 1:
@@ -775,7 +1237,10 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             )
     elif config.dimensionality == 3:
         config = config._replace(grid_spacing=grid_spacing_vec.x)
-        if not (math.isclose(grid_spacing_vec.x, grid_spacing_vec.y) and math.isclose(grid_spacing_vec.x, grid_spacing_vec.z)):
+        if not (
+            math.isclose(grid_spacing_vec.x, grid_spacing_vec.y)
+            and math.isclose(grid_spacing_vec.x, grid_spacing_vec.z)
+        ):
             raise ValueError(
                 "For now, we assume the grid spacing is the same in all dimensions. "
                 f"Got grid spacing {grid_spacing_vec}."
@@ -783,7 +1248,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
 
     if config.geometry == SPHERICAL:
         print(
-            "For spherical geometry, only HLL is currently supported. Also, only the unsplit mode has been tested."
+            "For spherical geometry, only HLL is currently supported. Also, only the "
+            "unsplit mode has been tested."
         )
         # SPHERICAL is intrinsically 1D in this code; pick the x component
         # so grid_spacing stays a scalar (otherwise CFL divisions blow up
@@ -820,8 +1286,90 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         print("Setting MINMOD limiter for gravity.")
         config = config._replace(limiter=MINMOD)
 
+    # The AthenaPK-equivalent VL2 finite-volume scheme. Its piecewise-linear
+    # stencil needs two ghost cells; with periodic boundaries on every axis the
+    # wrap-around is done by rolling the arrays instead (as in the FD solver).
+    if config.solver_mode == FINITE_VOLUME and config.time_integrator == VL2:
+
+        # The VL2 update replaces the whole finite-volume step: it has no
+        # gravity source, no geometric source terms and only fluxes for the
+        # gas and field variables, so these combinations would be silently
+        # ignored (gravity, geometry) or fail on the extra state variables.
+        # Spherical geometry was already switched to MUSCL above.
+        if config.gravity_config.gravity:
+            raise ValueError(
+                "The VL2 scheme has no gravity source: self-gravity and an "
+                "external potential require another finite-volume time "
+                "integrator (e.g. RK2_SSP or MUSCL)."
+            )
+        if config.geometry != CARTESIAN:
+            raise ValueError("The VL2 scheme is implemented for Cartesian geometry only.")
+        if config.wind_config.trace_wind_density or config.cosmic_ray_config.cosmic_rays:
+            raise ValueError(
+                "The VL2 scheme does not evolve the stellar-wind tracer "
+                "(wind_config.trace_wind_density) or the cosmic-ray variable "
+                "(cosmic_ray_config.cosmic_rays)."
+            )
+
+        if config.split != UNSPLIT:
+            print("Setting unsplit mode for the VL2 scheme.")
+            config = config._replace(split=UNSPLIT)
+        # The VL2 scheme does not read ``limiter``: its corrector always uses
+        # the van Leer slope, or donor cell with ``first_order_fallback``.
+        # Setting VAN_LEER only makes the configuration report the
+        # reconstruction actually in use.
+        if config.limiter != VAN_LEER and not config.first_order_fallback:
+            print("Setting the VAN_LEER (AthenaPK PLM) limiter for the VL2 scheme.")
+            config = config._replace(limiter=VAN_LEER)
+        if config.mhd and config.riemann_solver not in (HLLD, HLL, LAX_FRIEDRICHS):
+            print("Setting the HLLD Riemann solver for VL2 MHD.")
+            config = config._replace(riemann_solver=HLLD)
+        if not config.mhd and config.riemann_solver not in (HLLC, HLL, LAX_FRIEDRICHS):
+            print("Setting the HLLC Riemann solver for VL2 hydrodynamics.")
+            config = config._replace(riemann_solver=HLLC)
+        if config.riemann_solver == LAX_FRIEDRICHS and not config.first_order_fallback:
+            raise ValueError(
+                "As in AthenaPK, the LAX_FRIEDRICHS solver of the VL2 scheme is "
+                "only available with donor-cell reconstruction "
+                "(first_order_fallback=True)."
+            )
+        periodic_1d = BoundarySettings1D(
+            left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
+        )
+        if config.dimensionality == 1:
+            fully_periodic = config.boundary_settings == periodic_1d
+        else:
+            fully_periodic = config.boundary_settings is not None and all(
+                axis_settings == periodic_1d
+                for axis_settings in tuple(config.boundary_settings)[: config.dimensionality]
+            )
+        if fully_periodic:
+            config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
+        else:
+            config = config._replace(boundary_handling=GHOST_CELLS, num_ghost_cells=2)
+
+    # HLLD is implemented only inside the VL2 scheme; the classic
+    # finite-volume Riemann-solver dispatch does not know it.
+    elif config.solver_mode == FINITE_VOLUME and config.riemann_solver == HLLD:
+        raise ValueError(
+            "The HLLD Riemann solver is only available with the VL2 time "
+            "integrator (time_integrator=VL2)."
+        )
+
     # Finite-difference-specific checks.
     if config.solver_mode == FINITE_DIFFERENCE:
+
+        # The WENO5 stencil reaches three cells beyond each interface, so the
+        # default ghost-cell count (reconstruction_order + 1 = 2) is too few:
+        # 1D runs then read wrapped / stale values at the edges, and smooth
+        # periodic problems converged at first order. Same rule as 2D/3D.
+        if config.dimensionality == 1:
+            if config.boundary_settings == BoundarySettings1D(
+                left_boundary=PERIODIC_BOUNDARY, right_boundary=PERIODIC_BOUNDARY
+            ):
+                config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
+            elif config.boundary_handling == GHOST_CELLS:
+                config = config._replace(num_ghost_cells=max(config.num_ghost_cells, 4))
 
         if config.dimensionality == 3 and config.boundary_settings == BoundarySettings(
             BoundarySettings1D(
@@ -837,7 +1385,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             # Fully periodic boundaries are enforced more cheaply by rolling the
             # arrays (PERIODIC_ROLL) than by maintaining explicit ghost cells.
             print(
-                "For 3D simulations with periodic boundaries, setting boundary handling to " \
+                "For 3D simulations with periodic boundaries, setting boundary handling to "
                 "PERIODIC_ROLL and num_ghost_cells to 0 for better performance."
             )
             config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
@@ -856,7 +1404,7 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             # Fully periodic boundaries are enforced more cheaply by rolling the
             # arrays (PERIODIC_ROLL) than by maintaining explicit ghost cells.
             print(
-                "For 2D simulations with periodic boundaries, setting boundary handling to " \
+                "For 2D simulations with periodic boundaries, setting boundary handling to "
                 "PERIODIC_ROLL and num_ghost_cells to 0 for better performance."
             )
             config = config._replace(boundary_handling=PERIODIC_ROLL, num_ghost_cells=0)
@@ -877,8 +1425,19 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
         if config.boundary_handling == PERIODIC_ROLL:
             config = config._replace(num_ghost_cells=0)
 
-        if config.boundary_handling == GHOST_CELLS and (config.diffusion or config.thermal_conduction):
+        if config.boundary_handling == GHOST_CELLS and (
+            config.diffusion or config.thermal_conduction or config.resistivity
+        ):
             config = config._replace(num_ghost_cells=max(config.num_ghost_cells, 6))
+
+        if config.resistivity:
+            if not config.mhd or config.dimensionality != 3:
+                raise ValueError("resistivity requires 3D finite-difference MHD")
+            if config.equation_of_state != ISOTHERMAL:
+                raise ValueError(
+                    "resistivity is implemented for the ISOTHERMAL EOS only: the "
+                    "ohmic heating eta J^2 is not added to the energy equation"
+                )
 
     # Pick sensible default boundary conditions when the user left them unset.
     if config.boundary_settings is None:
@@ -894,7 +1453,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 config = config._replace(boundary_settings=BoundarySettings())
         elif config.geometry == SPHERICAL and config.dimensionality == 1:
             print(
-                "Automatically setting reflective left and open right boundary for spherical geometry."
+                "Automatically setting reflective left and open right boundary for "
+                "spherical geometry."
             )
             config = config._replace(
                 boundary_settings=BoundarySettings1D(
@@ -952,6 +1512,8 @@ def riemann_solver_to_string(riemann_solver: int) -> str:
         return "Hybrid HLLC"
     elif riemann_solver == AM_HLLC:
         return "AM HLLC"
+    elif riemann_solver == HLLD:
+        return "HLLD"
 
 
 def limiter_to_string(limiter: int) -> str:
@@ -968,6 +1530,8 @@ def limiter_to_string(limiter: int) -> str:
         return "Van Albada"
     elif limiter == VAN_ALBADA_PP:
         return "Van Albada PP"
+    elif limiter == VAN_LEER:
+        return "Van Leer"
 
 
 def solver_mode_to_string(solver_mode: int) -> str:
@@ -981,6 +1545,9 @@ def solver_mode_to_string(solver_mode: int) -> str:
 def config_to_string(config: SimulationConfig) -> str:
     """Return a compact one-line description of the solver configuration."""
     if config.solver_mode == FINITE_VOLUME:
-        return f"FV, {riemann_solver_to_string(config.riemann_solver)}, {limiter_to_string(config.limiter)}, {config.num_cells.x} cells"
+        return (
+            f"FV, {riemann_solver_to_string(config.riemann_solver)}, "
+            f"{limiter_to_string(config.limiter)}, {config.num_cells.x} cells"
+        )
     elif config.solver_mode == FINITE_DIFFERENCE:
         return f"FD, {config.num_cells.x} cells"

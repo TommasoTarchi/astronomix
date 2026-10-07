@@ -346,6 +346,35 @@ The full design rationale (why this is needed, how the alternative
 threading-mesh-through-every-function design was rejected) is in the
 ``pallasify`` skill, §4b'.
 
+**Per-input halos, kept output halos, and the split-axis predicate.**
+``_pallas_call_sharded`` takes two optional arguments that cut the
+communication of a sharded step:
+
+- ``input_halos=((hx, hy, hz), ...)``, one tuple per state input: every
+  input is still padded to the same block-rounded shape, but only the
+  requested cells are exchanged; the rest of the padding is filled with
+  local edge copies. The contract is the kernel's read pattern: declare
+  ``0`` for an input the kernel reads only at the cell itself (an
+  accumulator, the flux slices of the CT modified-flux stage) and the
+  stencil reach otherwise. A stale declaration silently produces wrong
+  values at shard seams only, so re-check it whenever a kernel's read
+  pattern changes, and test with the multi-device equivalence check.
+- ``output_halo``: keep part of the padding on the state outputs (one
+  per-axis tuple for all outputs, or one per output), so a following
+  local stencil can reuse cells this kernel already computed instead of
+  exchanging them again. The multi-GPU fast path of ``_lsrk4_with_ct``
+  keeps one x cell of the x-WENO flux so the x divergence needs no
+  second exchange.
+
+Code that relies on such an exchange must be gated on
+``_pallas_mesh_splits_axis(state, spatial_axis)`` (the active mesh
+really splits that axis), never on ``jax.device_count()``, which says
+nothing about how the state is sharded (an unsharded run on a multi-GPU
+node would otherwise take the sharded path and crash). Kernels called
+outside ``diffable_pallas_call`` break ``jax.jvp`` / ``jax.grad``; wrap
+the whole step with ``diffable_pallas_call_n`` and a native branch that
+computes the same thing (see ``compute_lqs`` in ``_ssprk.py``).
+
 ### 2.4 Backend-aware dispatch
 
 The wrapper for each direction stays small and JIT-able:
@@ -397,9 +426,10 @@ two full-state buffers (`q`, `dq`) instead of SSPRK4's three (`q0`,
 `astronomix/_finite_difference/_time_integrators/_ssprk.py`.
 
 Empirical CFL on WENO5+LSRK4: `C_cfl ≈ 1.4` (vs SSPRK4's 1.5).  LSRK4
-has **no SSP property**, so very strong shocks may want
-`enforce_positivity=True` and a slightly looser `minimum_density` /
-`minimum_pressure` floor.
+has **no SSP property**, so the positivity guarantee of
+`weno_positivity_preserving=True` (a convex combination of forward-Euler
+stages, i.e. SSPRK4 with `C_cfl <= 0.75`) does not carry over; very strong
+shocks should prefer SSPRK4.
 
 ---
 
@@ -656,9 +686,15 @@ pointwise Pallas kernel with `input_output_aliases={0: 0}` so the
 floored conserved state is written back into the input buffer
 in-place. Supports 1/2/3D, IDEAL_GAS and ISOTHERMAL, with or without
 MHD. Files:
-`astronomix/_finite_difference/_fluid_equations/_enforce_positivity.py`
+`astronomix/_fluid_equations/_enforce_positivity.py`
 (dispatch + native fallback) and `_enforce_positivity_pallas.py`
-(kernel).
+(kernel). **Since removed** together with the per-stage floors: FD
+positivity now comes from `weno_positivity_preserving`, and the remaining
+per-step floor (`PositivityConfig.per_step_mode`) is a native
+`jnp.maximum` in `astronomix/_modules/_iteration_level_updates.py`. The
+kernel is still the reference skeleton for pointwise leaf ops; recover it
+from the parent of the commit that deleted it
+(`git log --diff-filter=D -- astronomix/_fluid_equations/_enforce_positivity_pallas.py`).
 
 **MHD CFL fast path.** `_cfl_time_step_fd` used to materialise the full
 seven-mode characteristic eigenvalue array for every cell at every
@@ -702,6 +738,88 @@ inter-node effect are recorded in the weak-scaling campaign notes
 (``examples/scripts/scaling/weak_scaling_gh200_section.tex``).  On a
 GH200 the toggle also cuts sharded MHD temp memory from 52 GB to 36 GB
 per device at 2.7e8 cells/GPU.
+
+### 4.6 FD dual-energy (Bryan+95 ``g``) — DONE (hydro + MHD)
+
+`config.dual_energy` threads the separately-advected internal-energy
+density ``g`` into the WENO flux + eigenstructure so the pressure
+recovery never sees the float32 cancellation-corrupted ``E − KE``
+(the cold-ejecta / high-Mach regime). The Pallas kernels carry ``g``
+natively — no fallback to the native backend:
+
+- ``_weno_flux_hydro_pallas`` / ``_weno_flux_mhd_pallas`` accept
+  ``internal_energy_density``; the field enters as a ``(1, *spatial)``
+  extra state input, **rides the same shard_map halo exchange as the
+  conserved state** (``extra_state_inputs`` in ``_weno5_shard_wrap``),
+  and is gathered at all six stencil offsets.
+- Inside the kernel the Bryan+95 switch mirrors
+  ``dual_switched_pressure_hydro`` exactly:
+  ``reliable = (e_E > eta·max(E, 1e-30)) & (e_E == e_E)``,
+  ``p = (γ−1)·where(reliable, e_E, g)`` — applied in the physical
+  flux, the per-cell floors, and the interface eigenstructure.
+  ``eta`` and the ``1e-30`` floor are typed scalars (x64/Triton dtype
+  hygiene, §4.4).
+- The dispatcher (``_weno_flux_axis_dispatch``) wraps the dual path in
+  ``diffable_pallas_call_n`` with primals ``(state, params, g)``, so
+  both AD modes work and ``grad`` w.r.t. ``g`` is non-zero.
+- The advection of ``g`` itself (upwind ``div(gv) − p·div v``,
+  ``_fluid_equations/_dual_energy.py``) stays native JAX — pointwise +
+  radius-1 stencil, not worth a kernel (§ "Decide first").
+
+Validated on GPU (2026-07-25, ``tests/dual_energy/pallas_dual_validate.py``,
+N=32 blast-like switch-active state, x32): dual PALLAS vs NATIVE rel
+max diff 5.5e-05 (hydro) / 1.5e-05 (MHD) — the same order as the
+non-dual control diffs (2.3e-05 / 1.3e-05), i.e. single-precision
+rounding; ``jax.grad`` w.r.t. state and ``g`` matches native to
+≤3.5e-05. Multi-GPU: the N=256 dual production run gives an energy
+series identical between 1 GPU and 2 GPUs (x-axis decomposition);
+a dedicated dual strong-scaling sweep has not been run.
+
+### 4.7 FV VL2 scheme (AthenaPK's VL2 + PLM + HLLD + GLM) — DONE
+
+`_finite_volume/_state_evolution/_van_leer_pallas.py`. One fused kernel per
+VL2 stage (`vl2_predictor_dc`, `vl2_corrector_plm`): for a block of cells it
+loads the stage's primitive stencil along each axis (±1 cell for donor cell,
+±2 for PLM), reconstructs, solves the Riemann problems on all `2*dim` faces of
+the cell, forms the divergence, applies the Dedner GLM source and converts to
+primitives. `U^n` is recomputed in-kernel from `W^n` (pointwise read), and the
+corrector aliases `W^n`'s buffer to its output, so a step is one reduction plus
+two launches holding two state-sized buffers (288 MiB temporary at 4.2 M cells
+dp vs 3.8 GiB native).
+
+Design notes worth keeping:
+
+- **Shared elementwise physics.** The kernel calls the same functions as the
+  native path (`_athena_riemann_solvers.py`, the `_*_components_*` helpers in
+  `_van_leer_integrator.py`), with state values passed as Python lists of
+  tiles. Native and Pallas are bit-identical for MHD on an A100 and ≤1 ulp for
+  hydro. Typed select arms: a `jnp.where` between two bare literals enters
+  Triton as the default float type — build signs etc. from a typed operand
+  (`jnp.ones_like(x)`).
+- **Faces are evaluated twice** (once per adjacent cell): Pallas-Triton does
+  not lower `slice`/`roll` on register tiles (verified 2026-10-06), so
+  neighbouring cells cannot share a face. Measured cost: 9.30 → 5.42 ms/step
+  at N=128 dp on A100 if every face were solved once. A flux-array design
+  avoids it at the price of three state-sized buffers and 2–3× DRAM traffic.
+- **The kernel is FP64-compute bound** (~70 % of A100 FP64 peak, card at its
+  power cap; 254–255 registers, ≤64 B spills, 12.5 % occupancy). Block shape
+  barely matters among 128-cell blocks on 4 warps; default (2, 2, 32).
+- **Ghost-cell layout** without block-aligned interiors: the grid covers only
+  the interior, outputs are whole-array specs written with explicit indices,
+  and the ghost cells are refilled by the boundary handler afterwards.
+- **First-order flux correction**: the kernel optionally reports a positivity
+  failure code per cell and accepts a correction mask (faces bordering a
+  masked cell use donor-cell LLF fluxes); up to four `lax.cond`-guarded
+  re-evaluations reproduce AthenaPK's attempts in order-independent form.
+- **AD**: `diffable_pallas_call_n` with *all traced values as primals*
+  (including `params` — closing over traced values inside a `custom_jvp`
+  raises "No constant handler for DynamicJaxprTracer" under `jax.grad`).
+  Pallas and native gradients agree to 1e-15.
+
+Performance and validation against AthenaPK:
+`examples/scripts/validation/athenapk_vl2/README.md` (A100: 2.0–10× faster
+than AthenaPK per step from 33.6 M down to 8 k cells, 3.1× time to solution
+at N=128 with identical L1 errors).
 
 ---
 
@@ -817,10 +935,11 @@ happens.  The ``pallasify`` skill must enforce this — see its
 | `astronomix/_finite_difference/_time_integrators/_ssprk.py` | SSPRK4 (native), LSRK4 (Pallas-friendly 2N-storage), per-axis Pallas divergence kernel with `scale_in` + `input_output_aliases`, shared `_hydro_step_rhs`. |
 | `astronomix/_finite_difference/_state_evolution/_evolve_state.py` | Top-level FD dispatch; picks SSPRK4 vs LSRK4 based on `config.time_integrator`. |
 | `astronomix/_finite_difference/_timestep_estimation/_timestep_estimator.py` | Backend-aware CFL estimator; Pallas mode skips the full-state characteristic eigenvalue arrays. Hydro path reads primitive `|v| + c`; MHD path uses `_cfl_time_step_fd_mhd_fast` for the per-cell fast-magnetosonic speed. |
-| `astronomix/_finite_difference/_fluid_equations/_enforce_positivity.py` + `_enforce_positivity_pallas.py` | Pointwise floor on ρ and p; Pallas kernel writes back in-place via `input_output_aliases={0:0}`. |
+| `astronomix/_finite_difference/_interface_fluxes/_weno_positivity_pallas.py` | Positivity-preserving WENO (`weno_positivity_preserving`) Pallas kernels. (The pointwise `_enforce_positivity_pallas.py` floor kernel was removed; see §4.5.) |
 | `astronomix/_finite_difference/_magnetic_update/_constrained_transport_pallas.py` | Optional Pallas CT (3 bounded-halo kernels). Gated by `config.pallas_ct` (default False — see §4.5 for the compile/runtime tradeoff). |
 | `astronomix/option_classes/simulation_config.py` | `backend`, `pallas_block_shape`, `pallas_use_triton`, `pallas_interpret`, `pallas_num_warps`, `pallas_ct`, `donate_state`, `time_integrator` knobs. |
 | `tests/pallas/sedov3D.py` | The canonical hydro Pallas benchmark — produces the figure + memory/runtime printout. |
+| `astronomix/_finite_volume/_state_evolution/_van_leer_pallas.py` | FV VL2 stage kernels (AthenaPK's scheme; §4.7). Native counterpart and dispatch: `_van_leer_integrator.py`. |
 | `pytests/mhd/alfven_wave3D.py` | MHD convergence test (3D CP Alfvén wave, N=8..128, both FV and FD).  Acceptance gate for MHD Pallas changes — L1 error must match the NATIVE backend to machine precision. |
 
 ---

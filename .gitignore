@@ -203,6 +203,8 @@ cython_debug/
 /docs/site/*
 .mypy_cache
 
+.claude/worktrees/
+
 .venv
 /poetry.toml
 # generated example/test outputs: simulation caches + figures
@@ -225,3 +227,15 @@ examples/scripts/differentiability/field_level_inference/*.png
 
 # core dumps from crashed jobs
 core.*
+
+# supernova showcase: simulation states, run logs and rendered figures are
+# outputs, not source (states live in /export/data/lstorcks/supernova_showcase)
+examples/gallery/supernova_showcase/*.npz
+examples/gallery/supernova_showcase/*.log
+examples/gallery/supernova_showcase/figures/
+
+# same, for the thermal-instability / AthenaK cross-code study next door
+examples/gallery/thermal_instability/*.npz
+examples/gallery/thermal_instability/*.log
+examples/gallery/thermal_instability/figures/
+*.swp

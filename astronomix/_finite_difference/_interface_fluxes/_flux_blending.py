@@ -1,344 +1,607 @@
-"""Unified WENO interface-flux blending toward first-order Lax-Friedrichs.
-
-Both robustness fix-ups in the FD WENO scheme are the SAME operation — blend the
-high-order interface flux toward a first-order local Lax-Friedrichs (Rusanov)
-flux,
+"""Cold-crush blending of the WENO interface flux toward first-order Lax-Friedrichs.
 
     F_hat_{i+1/2} = (1 - w_{i+1/2}) F_WENO_{i+1/2} + w_{i+1/2} F_LLF_{i+1/2},
 
-with a per-interface LLF weight ``w in [0, 1]``.  They differ ONLY in how that
-weight is chosen — the *activation path*:
-
-  * deep-void path (``config.positivity_config.deepvoid_blend``): ``w`` ramps from 1 at
-    the density floor to 0 at ``blend_factor * minimum_density``.  Cures the
-    high-Mach characteristic overshoot in the immediate neighbourhood of a deep
-    void (see ``_deepvoid_blend_weight``).
-
-  * positivity-preserving path (``config.positivity_config.preserving_flux``): ``w`` is
-    the SMALLEST LLF fraction (largest WENO fraction) for which the LF-updated
-    cell keeps both density and pressure above their floors — a Hu-Adams-Shu
-    (2013) / Zalesak-FCT limiter (see ``_ppflux_blend_weight``).  Cures the
-    WENO over-depletion / negative-pressure overshoot that crashes a violent
-    self-gravity collapse.
-
-Both paths share the single LLF flux ``_local_lax_friedrichs_flux`` (hydro and
-isothermal/ideal MHD).  When both are enabled the unified blend takes the
-stronger (max) weight, so the flux is as robust as either path demands.  This is
-a native-JAX post-process on the assembled interface-flux array, applied before
-the divergence; it does not touch the Pallas WENO kernel.  It is CT-safe for MHD
-(CT rebuilds single-valued edge EMFs from whatever face fluxes it is given, so
-div(B)=0 is preserved; blending toward LLF merely adds a localised magnetic
-diffusivity at the trouble cell, and the normal-B flux is overwritten by CT).
+with an LLF weight ``w in [0, 1]`` from a temperature ramp on the colder
+adjacent cell under compression (``PositivityConfig.coldcrush_blend``; see
+``_coldcrush_blend_weight``). It damps the runaway compression of radiatively
+cooled, ram-pressure-crushed gas once the grid resolves the cooling layer --
+a dissipation of unresolved physics, not a positivity fix (positivity is
+``weno_positivity_preserving``). Native-JAX post-process on the assembled
+interface flux, applied before the divergence. CT-safe for MHD (CT rebuilds
+single-valued edge EMFs from whatever face fluxes it is given).
 """
 
 # jax
+import jax
 import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import IDEAL_GAS
 
 # astronomix functions
+from astronomix._fluid_equations._dual_energy_switch import dual_energy_internal_energy
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
-# ---------------------------------------------------------------------------
-# Shared first-order Lax-Friedrichs interface flux (hydro & MHD, iso & ideal)
-# ---------------------------------------------------------------------------
-
-def _local_lax_friedrichs_flux(conserved_state, axis, params, config,
-                               registered_variables):
-    """First-order local Lax-Friedrichs (Rusanov) interface flux along ``axis``.
-
-    ``F_LLF[..., i]`` is the flux at interface ``i+1/2`` (cells ``i`` and ``i+1``),
-    matching the WENO convention so the blended array feeds the existing
-    ``-dt/dx (F_{i+1/2} - F_{i-1/2})`` divergence unchanged. Returns the full
-    interface-flux array.
+def _momentum_indices(config, registered_variables):
     """
-    ndim = config.dimensionality
-    di = registered_variables.density_index
-    rhomin = params.minimum_density
-    is_ideal = (config.equation_of_state == IDEAL_GAS)
+    The registry indices of the momentum components carried by the state.
+
+    Hydrodynamics carries one momentum component per spatial dimension.
+    Finite-difference MHD always carries all three (also in 1D and 2D): the
+    induction equation needs the out-of-plane velocity, and its kinetic energy
+    and fluxes belong to the face states like those of the in-plane ones.
+
+    Args:
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The list of momentum indices in x, y, z order (three entries for MHD,
+        ``config.dimensionality`` entries for hydrodynamics).
+    """
+    if config.dimensionality == 1 and not config.mhd:
+        return [registered_variables.velocity_index]
+    momentum_indices = [
+        registered_variables.velocity_index.x,
+        registered_variables.velocity_index.y,
+        registered_variables.velocity_index.z,
+    ]
+    if config.mhd:
+        return momentum_indices
+    return momentum_indices[:config.dimensionality]
+
+
+# -------------------------------------------------------------
+# ===== ↓ Shared first-order Lax-Friedrichs interface flux ↓ ===
+# -------------------------------------------------------------
+
+
+def _local_lax_friedrichs_flux(
+    conserved_state,
+    axis,
+    params,
+    config,
+    registered_variables,
+    internal_energy_density=None,
+):
+    """
+    First-order local Lax-Friedrichs (Rusanov) interface flux along ``axis``.
+
+    Covers hydro and MHD, ideal-gas and isothermal. ``F_LLF[..., i]`` is the
+    flux at interface ``i+1/2`` (cells ``i`` and ``i+1``), matching the WENO
+    convention so the blended array feeds the existing
+    ``-dt/dx (F_{i+1/2} - F_{i-1/2})`` divergence unchanged.
+
+    The dual-energy switch matters here: without it the raw ``E - KE``
+    recovery is destroyed by float32 cancellation in cold, kinetic-energy
+    dominated cells, and a blend that activates there would inject fluxes
+    built from a corrupted pressure.
+
+    Args:
+        conserved_state: The conserved state.
+        axis: The spatial axis of the interfaces.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None. When given, the pressure recovery is switched exactly like
+            in the WENO path.
+
+    Returns:
+        The full interface-flux array.
+    """
+    density_index = registered_variables.density_index
+    minimum_density = params.minimum_density
+    is_ideal_gas = (config.equation_of_state == IDEAL_GAS)
     is_mhd = bool(config.mhd)
 
-    if ndim == 1:
-        mom_all = [registered_variables.velocity_index]
-    else:
-        mom_all = [
-            registered_variables.velocity_index.x,
-            registered_variables.velocity_index.y,
-            registered_variables.velocity_index.z,
-        ][:ndim]
-    md = mom_all[axis]
-    mom_others = [m for i, m in enumerate(mom_all) if i != axis]
+    momentum_indices = _momentum_indices(config, registered_variables)
+    normal_momentum_index = momentum_indices[axis]
+    transverse_momentum_indices = [
+        index for component, index in enumerate(momentum_indices) if component != axis
+    ]
 
     if is_mhd:
-        B_all = [
+        magnetic_indices = [
             registered_variables.magnetic_index.x,
             registered_variables.magnetic_index.y,
             registered_variables.magnetic_index.z,
         ]
-        Bd = B_all[axis]
-        B_others = [B_all[i] for i in range(3) if i != axis]
+        normal_magnetic_index = magnetic_indices[axis]
+        transverse_magnetic_indices = [
+            magnetic_indices[component] for component in range(3) if component != axis
+        ]
 
-    def R(a):
-        return _shift(a, -1, axis=axis)
+    def right_neighbour(field):
+        return _shift(field, -1, axis=axis)
 
-    def R_state(a):
-        return _shift(a, -1, axis=axis + 1)
+    def right_neighbour_state(state):
+        return _shift(state, -1, axis=axis + 1)
 
-    rhoL = jnp.maximum(conserved_state[di], rhomin)
-    rhoR = jnp.maximum(R(conserved_state[di]), rhomin)
-    mdL = conserved_state[md]
-    mdR = R(conserved_state[md])
-    vdL = mdL / rhoL
-    vdR = mdR / rhoR
+    # -------------------------------------------------------------
+    # ============== ↓ Left and right face states ↓ ===============
+    # -------------------------------------------------------------
 
-    veL = [conserved_state[m] / rhoL for m in mom_others]
-    veR = [R(conserved_state[m]) / rhoR for m in mom_others]
+    density_left = jnp.maximum(conserved_state[density_index], minimum_density)
+    density_right = jnp.maximum(right_neighbour(conserved_state[density_index]), minimum_density)
+    normal_momentum_left = conserved_state[normal_momentum_index]
+    normal_momentum_right = right_neighbour(conserved_state[normal_momentum_index])
+    normal_velocity_left = normal_momentum_left / density_left
+    normal_velocity_right = normal_momentum_right / density_right
+
+    transverse_velocities_left = [
+        conserved_state[index] / density_left for index in transverse_momentum_indices
+    ]
+    transverse_velocities_right = [
+        right_neighbour(conserved_state[index]) / density_right
+        for index in transverse_momentum_indices
+    ]
 
     if is_mhd:
-        BdL = conserved_state[Bd]
-        BdR = R(conserved_state[Bd])
-        BeL = [conserved_state[b] for b in B_others]
-        BeR = [R(conserved_state[b]) for b in B_others]
-        b2L = BdL * BdL
-        b2R = BdR * BdR
-        for bl, br in zip(BeL, BeR):
-            b2L = b2L + bl * bl
-            b2R = b2R + br * br
+        normal_field_left = conserved_state[normal_magnetic_index]
+        normal_field_right = right_neighbour(conserved_state[normal_magnetic_index])
+        transverse_fields_left = [
+            conserved_state[index] for index in transverse_magnetic_indices
+        ]
+        transverse_fields_right = [
+            right_neighbour(conserved_state[index]) for index in transverse_magnetic_indices
+        ]
+        field_squared_left = normal_field_left * normal_field_left
+        field_squared_right = normal_field_right * normal_field_right
+        for field_left, field_right in zip(transverse_fields_left, transverse_fields_right):
+            field_squared_left = field_squared_left + field_left * field_left
+            field_squared_right = field_squared_right + field_right * field_right
 
-    if is_ideal:
+    if is_ideal_gas:
         gamma = params.gamma
-        EL = conserved_state[registered_variables.energy_index]
-        ER = R(EL)
-        keL = 0.5 * (mdL * mdL) / rhoL
-        keR = 0.5 * (mdR * mdR) / rhoR
-        for ve in veL:
-            keL = keL + 0.5 * rhoL * ve * ve
-        for ve in veR:
-            keR = keR + 0.5 * rhoR * ve * ve
+        energy_left = conserved_state[registered_variables.energy_index]
+        energy_right = right_neighbour(energy_left)
+        kinetic_energy_left = 0.5 * (normal_momentum_left * normal_momentum_left) / density_left
+        kinetic_energy_right = (
+            0.5 * (normal_momentum_right * normal_momentum_right) / density_right
+        )
+        for velocity in transverse_velocities_left:
+            kinetic_energy_left = kinetic_energy_left + 0.5 * density_left * velocity * velocity
+        for velocity in transverse_velocities_right:
+            kinetic_energy_right = (
+                kinetic_energy_right + 0.5 * density_right * velocity * velocity
+            )
+        internal_energy_left = energy_left - kinetic_energy_left
+        internal_energy_right = energy_right - kinetic_energy_right
         if is_mhd:
-            pL = jnp.maximum((gamma - 1.0) * (EL - keL - 0.5 * b2L), params.minimum_pressure)
-            pR = jnp.maximum((gamma - 1.0) * (ER - keR - 0.5 * b2R), params.minimum_pressure)
+            internal_energy_left = internal_energy_left - 0.5 * field_squared_left
+            internal_energy_right = internal_energy_right - 0.5 * field_squared_right
+        if internal_energy_density is not None:
+            # The Bryan et al. (1995) dual-energy switch, as in the WENO-side
+            # pressure recovery.
+            internal_energy_left = dual_energy_internal_energy(
+                internal_energy_left,
+                energy_left,
+                internal_energy_density,
+                config.dual_energy_eta,
+            )
+            internal_energy_right = dual_energy_internal_energy(
+                internal_energy_right,
+                energy_right,
+                _shift(internal_energy_density, -1, axis=axis),
+                config.dual_energy_eta,
+            )
+        pressure_left = jnp.maximum((gamma - 1.0) * internal_energy_left, params.minimum_pressure)
+        pressure_right = jnp.maximum(
+            (gamma - 1.0) * internal_energy_right,
+            params.minimum_pressure,
+        )
+        sound_speed_squared_left = gamma * pressure_left / density_left
+        sound_speed_squared_right = gamma * pressure_right / density_right
+    else:
+        sound_speed = params.isothermal_sound_speed
+        sound_speed_squared_left = sound_speed * sound_speed
+        sound_speed_squared_right = sound_speed * sound_speed
+        pressure_left = sound_speed_squared_left * density_left
+        pressure_right = sound_speed_squared_right * density_right
+
+    # -------------------------------------------------------------
+    # ============== ↑ Left and right face states ↑ ===============
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ================== ↓ Splitting speed ↓ ======================
+    # -------------------------------------------------------------
+
+    if is_mhd:
+        def fast_magnetosonic_speed(field_squared, density, normal_field, sound_speed_squared):
+            field_squared_over_rho = field_squared / density
+            normal_field_squared_over_rho = (normal_field * normal_field) / density
+            discriminant = jnp.maximum(
+                (field_squared_over_rho + sound_speed_squared) ** 2
+                - 4.0 * normal_field_squared_over_rho * sound_speed_squared,
+                0.0,
+            )
+            return jnp.sqrt(
+                jnp.maximum(
+                    0.5 * (
+                        field_squared_over_rho
+                        + sound_speed_squared
+                        + jnp.sqrt(discriminant)
+                    ),
+                    0.0,
+                )
+            )
+        wave_speed_left = fast_magnetosonic_speed(
+            field_squared_left,
+            density_left,
+            normal_field_left,
+            sound_speed_squared_left,
+        )
+        wave_speed_right = fast_magnetosonic_speed(
+            field_squared_right,
+            density_right,
+            normal_field_right,
+            sound_speed_squared_right,
+        )
+    else:
+        wave_speed_left = jnp.sqrt(sound_speed_squared_left)
+        wave_speed_right = jnp.sqrt(sound_speed_squared_right)
+
+    splitting_speed = jnp.maximum(
+        jnp.abs(normal_velocity_left) + wave_speed_left,
+        jnp.abs(normal_velocity_right) + wave_speed_right,
+    )
+    if config.weno_ad_frozen_weights:
+        # Frozen like the WENO splitting speed: d c / d p ~ 1 / c blows up in
+        # cold gas.
+        splitting_speed = jax.lax.stop_gradient(splitting_speed)
+
+    # -------------------------------------------------------------
+    # ================== ↑ Splitting speed ↑ ======================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ============ ↓ Physical fluxes of both face states ↓ ========
+    # -------------------------------------------------------------
+
+    conserved_state_right = right_neighbour_state(conserved_state)
+    flux_left = jnp.zeros_like(conserved_state)
+    flux_right = jnp.zeros_like(conserved_state)
+
+    flux_left = flux_left.at[density_index].set(normal_momentum_left)
+    flux_right = flux_right.at[density_index].set(normal_momentum_right)
+
+    normal_momentum_flux_left = normal_momentum_left * normal_velocity_left + pressure_left
+    normal_momentum_flux_right = normal_momentum_right * normal_velocity_right + pressure_right
+    if is_mhd:
+        normal_momentum_flux_left = (
+            normal_momentum_flux_left + 0.5 * field_squared_left
+            - normal_field_left * normal_field_left
+        )
+        normal_momentum_flux_right = (
+            normal_momentum_flux_right + 0.5 * field_squared_right
+            - normal_field_right * normal_field_right
+        )
+    flux_left = flux_left.at[normal_momentum_index].set(normal_momentum_flux_left)
+    flux_right = flux_right.at[normal_momentum_index].set(normal_momentum_flux_right)
+
+    for component, index in enumerate(transverse_momentum_indices):
+        transverse_momentum_flux_left = (
+            normal_momentum_left * transverse_velocities_left[component]
+        )
+        transverse_momentum_flux_right = (
+            normal_momentum_right * transverse_velocities_right[component]
+        )
+        if is_mhd:
+            transverse_momentum_flux_left = (
+                transverse_momentum_flux_left
+                - normal_field_left * transverse_fields_left[component]
+            )
+            transverse_momentum_flux_right = (
+                transverse_momentum_flux_right
+                - normal_field_right * transverse_fields_right[component]
+            )
+        flux_left = flux_left.at[index].set(transverse_momentum_flux_left)
+        flux_right = flux_right.at[index].set(transverse_momentum_flux_right)
+
+    if is_mhd:
+        flux_left = flux_left.at[normal_magnetic_index].set(jnp.zeros_like(normal_field_left))
+        flux_right = flux_right.at[normal_magnetic_index].set(jnp.zeros_like(normal_field_right))
+        for component, index in enumerate(transverse_magnetic_indices):
+            flux_left = flux_left.at[index].set(
+                transverse_fields_left[component] * normal_velocity_left
+                - normal_field_left * transverse_velocities_left[component]
+            )
+            flux_right = flux_right.at[index].set(
+                transverse_fields_right[component] * normal_velocity_right
+                - normal_field_right * transverse_velocities_right[component]
+            )
+
+    if is_ideal_gas:
+        energy_index = registered_variables.energy_index
+        if is_mhd:
+            velocity_dot_field_left = normal_velocity_left * normal_field_left
+            velocity_dot_field_right = normal_velocity_right * normal_field_right
+            for component in range(len(transverse_momentum_indices)):
+                velocity_dot_field_left = (
+                    velocity_dot_field_left
+                    + transverse_velocities_left[component] * transverse_fields_left[component]
+                )
+                velocity_dot_field_right = (
+                    velocity_dot_field_right
+                    + transverse_velocities_right[component] * transverse_fields_right[component]
+                )
+            flux_left = flux_left.at[energy_index].set(
+                (energy_left + pressure_left + 0.5 * field_squared_left) * normal_velocity_left
+                - normal_field_left * velocity_dot_field_left
+            )
+            flux_right = flux_right.at[energy_index].set(
+                (energy_right + pressure_right + 0.5 * field_squared_right) * normal_velocity_right
+                - normal_field_right * velocity_dot_field_right
+            )
         else:
-            pL = jnp.maximum((gamma - 1.0) * (EL - keL), params.minimum_pressure)
-            pR = jnp.maximum((gamma - 1.0) * (ER - keR), params.minimum_pressure)
-        cs2L = gamma * pL / rhoL
-        cs2R = gamma * pR / rhoR
-    else:
-        cs = params.isothermal_sound_speed
-        cs2L = cs * cs
-        cs2R = cs * cs
-        pL = cs2L * rhoL
-        pR = cs2R * rhoR
+            flux_left = flux_left.at[energy_index].set(
+                (energy_left + pressure_left) * normal_velocity_left
+            )
+            flux_right = flux_right.at[energy_index].set(
+                (energy_right + pressure_right) * normal_velocity_right
+            )
 
-    if is_mhd:
-        def cfast(b2, rho, Bn, cs2):
-            b2_over_rho = b2 / rho
-            bn2_over_rho = (Bn * Bn) / rho
-            disc = jnp.maximum((b2_over_rho + cs2) ** 2 - 4.0 * bn2_over_rho * cs2, 0.0)
-            return jnp.sqrt(jnp.maximum(0.5 * (b2_over_rho + cs2 + jnp.sqrt(disc)), 0.0))
-        cL = cfast(b2L, rhoL, BdL, cs2L)
-        cR = cfast(b2R, rhoR, BdR, cs2R)
-    else:
-        cL = jnp.sqrt(cs2L)
-        cR = jnp.sqrt(cs2R)
+    # -------------------------------------------------------------
+    # ============ ↑ Physical fluxes of both face states ↑ ========
+    # -------------------------------------------------------------
 
-    alpha = jnp.maximum(jnp.abs(vdL) + cL, jnp.abs(vdR) + cR)
-
-    qR = R_state(conserved_state)
-    FL = jnp.zeros_like(conserved_state)
-    FR = jnp.zeros_like(conserved_state)
-
-    FL = FL.at[di].set(mdL)
-    FR = FR.at[di].set(mdR)
-
-    fmdL = mdL * vdL + pL
-    fmdR = mdR * vdR + pR
-    if is_mhd:
-        fmdL = fmdL + 0.5 * b2L - BdL * BdL
-        fmdR = fmdR + 0.5 * b2R - BdR * BdR
-    FL = FL.at[md].set(fmdL)
-    FR = FR.at[md].set(fmdR)
-
-    for k, m in enumerate(mom_others):
-        feL = mdL * veL[k]
-        feR = mdR * veR[k]
-        if is_mhd:
-            feL = feL - BdL * BeL[k]
-            feR = feR - BdR * BeR[k]
-        FL = FL.at[m].set(feL)
-        FR = FR.at[m].set(feR)
-
-    if is_mhd:
-        FL = FL.at[Bd].set(jnp.zeros_like(BdL))
-        FR = FR.at[Bd].set(jnp.zeros_like(BdR))
-        for k, b in enumerate(B_others):
-            FL = FL.at[b].set(BeL[k] * vdL - BdL * veL[k])
-            FR = FR.at[b].set(BeR[k] * vdR - BdR * veR[k])
-
-    if is_ideal:
-        ei = registered_variables.energy_index
-        if is_mhd:
-            vdotBL = vdL * BdL
-            vdotBR = vdR * BdR
-            for k in range(len(mom_others)):
-                vdotBL = vdotBL + veL[k] * BeL[k]
-                vdotBR = vdotBR + veR[k] * BeR[k]
-            FL = FL.at[ei].set((EL + pL + 0.5 * b2L) * vdL - BdL * vdotBL)
-            FR = FR.at[ei].set((ER + pR + 0.5 * b2R) * vdR - BdR * vdotBR)
-        else:
-            FL = FL.at[ei].set((EL + pL) * vdL)
-            FR = FR.at[ei].set((ER + pR) * vdR)
-
-    return 0.5 * (FL + FR) - 0.5 * alpha * (qR - conserved_state)
+    return (
+        0.5 * (flux_left + flux_right)
+        - 0.5 * splitting_speed * (conserved_state_right - conserved_state)
+    )
 
 
-# ---------------------------------------------------------------------------
-# Activation path 1: deep-void density ramp
-# ---------------------------------------------------------------------------
-
-def _deepvoid_blend_weight(conserved_state, axis, params, config,
-                           registered_variables):
-    """LLF weight that ramps from 1 at ``minimum_density`` to 0 at
-    ``positivity_deepvoid_blend_factor * minimum_density`` (per interface, using
-    the smaller of the two adjacent densities)."""
-    di = registered_variables.density_index
-    rhomin = params.minimum_density
-    rhoL = jnp.maximum(conserved_state[di], rhomin)
-    rhoR = jnp.maximum(_shift(conserved_state[di], -1, axis=axis), rhomin)
-    rho_face = jnp.minimum(rhoL, rhoR)
-    blend_thr = config.positivity_config.deepvoid_blend_factor * rhomin
-    return jnp.clip((blend_thr - rho_face) / (blend_thr - rhomin), 0.0, 1.0)
+# -------------------------------------------------------------
+# ===== ↑ Shared first-order Lax-Friedrichs interface flux ↑ ===
+# -------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Activation path 2: Hu-Adams-Shu / Zalesak positivity-preserving limiter
-# ---------------------------------------------------------------------------
-
-def _momentum_components(config, registered_variables):
-    """Return the conserved-state momentum component indices for this run,
-    truncated to the active dimensionality."""
-    if config.dimensionality == 1:
-        return [registered_variables.velocity_index]
-    return [registered_variables.velocity_index.x,
-            registered_variables.velocity_index.y,
-            registered_variables.velocity_index.z][:config.dimensionality]
+# -------------------------------------------------------------
+# ========== ↓ Activation: cold-crush temperature ramp ↓ =======
+# -------------------------------------------------------------
 
 
-def _internal_energy_residual(U, config, registered_variables, e_floor):
-    """q = rho*(E - e_floor) - 0.5|m|^2 (- 0.5*rho*|B|^2)  >= 0  <=>  p >= pgmin.
-    Affine-in-t evaluation of the pressure constraint along the LF->WENO segment
-    (quadratic for hydro, cubic for MHD — handled by direct evaluation)."""
-    rho = U[registered_variables.density_index]
-    m2 = sum(U[m] ** 2 for m in _momentum_components(config, registered_variables))
-    res = rho * (U[registered_variables.energy_index] - e_floor) - 0.5 * m2
-    if config.mhd:
-        b2 = (U[registered_variables.magnetic_index.x] ** 2
-              + U[registered_variables.magnetic_index.y] ** 2
-              + U[registered_variables.magnetic_index.z] ** 2)
-        res = res - 0.5 * rho * b2
-    return res
-
-
-def _ppflux_blend_weight(dF_weno, F_llf, conserved_state, axis, dtdx, params,
-                         config, registered_variables):
-    """LLF weight w = 1 - theta_keep, where theta_keep in [0,1] is the largest
-    fraction of the antidiffusive flux ``A = F_WENO - F_LLF`` that keeps the
-    LF-updated density (Zalesak) AND pressure (HAS) above their floors."""
-    fa = axis
-    va = axis + 1
-    rhomin = params.minimum_density
-    pgmin = params.minimum_pressure
-    gamma = params.gamma
-    di = registered_variables.density_index
-    U = conserved_state
-
-    A = dF_weno - F_llf
-
-    # density limiter (Zalesak lower bound)
-    A_rho = A[di]
-    F_LF_rho = F_llf[di]
-    rho_LF_new = U[di] - dtdx * (F_LF_rho - _shift(F_LF_rho, 1, axis=fa))
-    P_minus = dtdx * (jnp.maximum(0.0, A_rho)
-                      + jnp.maximum(0.0, -_shift(A_rho, 1, axis=fa)))
-    Q_minus = jnp.maximum(rho_LF_new - rhomin, 0.0)
-    R_minus = jnp.where(P_minus > 1e-30, jnp.minimum(1.0, Q_minus / P_minus), 1.0)
-    theta_rho = jnp.where(A_rho >= 0.0, R_minus, _shift(R_minus, -1, axis=fa))
-
-    # pressure limiter (ideal gas only; isothermal pressure is always positive)
-    if config.equation_of_state == IDEAL_GAS:
-        A1 = theta_rho[None, ...] * A
-        U_LF = U - dtdx * (F_llf - _shift(F_llf, 1, axis=va))
-        dU = -dtdx * (A1 - _shift(A1, 1, axis=va))
-        e_floor = pgmin / (gamma - 1.0)
-        c = _internal_energy_residual(U_LF, config, registered_variables, e_floor)
-        q1 = _internal_energy_residual(U_LF + dU, config, registered_variables, e_floor)
-        lo = jnp.zeros_like(c)
-        hi = jnp.ones_like(c)
-        for _ in range(30):  # bisect the per-cell admissible fraction
-            mid = 0.5 * (lo + hi)
-            qmid = _internal_energy_residual(
-                U_LF + mid[None, ...] * dU, config, registered_variables, e_floor)
-            ok = qmid >= 0.0
-            lo = jnp.where(ok, mid, lo)
-            hi = jnp.where(ok, hi, mid)
-        t_cell = jnp.where(q1 >= 0.0, 1.0, lo)
-        t_cell = jnp.where(c >= 0.0, t_cell, 0.0)
-        theta_p = jnp.minimum(t_cell, _shift(t_cell, -1, axis=fa))
-    else:
-        theta_p = jnp.ones_like(theta_rho)
-
-    theta_keep = theta_rho * theta_p
-    return 1.0 - theta_keep
-
-
-# ---------------------------------------------------------------------------
-# Unified entry point
-# ---------------------------------------------------------------------------
-
-def _blend_interface_flux(dF_weno, conserved_state, axis, dtdx, params, config,
-                          registered_variables):
-    """Blend the WENO interface flux toward LLF along ``axis``, combining the
-    enabled activation paths (deep-void density ramp and/or FCT positivity).
-
-    The shared LLF flux is computed once; the LLF weight is the max over the
-    active paths (robust as either demands).  ``dtdx`` is the stage CFL factor
-    ``dt_tilde / grid_spacing`` (used by the positivity path).  Returns
-    ``dF_weno`` unchanged if neither path is enabled.
+def _face_min_specific_pressure(
+    conserved_state,
+    axis,
+    params,
+    config,
+    registered_variables,
+    internal_energy_density=None,
+):
     """
-    use_deepvoid = config.positivity_config.deepvoid_blend
-    use_ppflux = config.positivity_config.preserving_flux
-    if not (use_deepvoid or use_ppflux):
+    The smaller specific pressure ``min(p_L/rho_L, p_R/rho_R)`` per interface.
+
+    The pressures are recovered with the dual-energy switch when ``g`` is
+    given: the raw recovery is destroyed by cancellation in exactly the cold
+    cells the cold-crush gate has to classify.
+
+    Args:
+        conserved_state: The conserved state.
+        axis: The spatial axis of the interfaces.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None.
+
+    Returns:
+        The interface minimum of ``p/rho``, the floored left and right
+        densities, and the momentum indices (for the convergence gate).
+    """
+    density_index = registered_variables.density_index
+    gamma = params.gamma
+    minimum_density = params.minimum_density
+
+    def right_neighbour(field):
+        return _shift(field, -1, axis=axis)
+
+    density_left = jnp.maximum(conserved_state[density_index], minimum_density)
+    density_right = jnp.maximum(right_neighbour(conserved_state[density_index]), minimum_density)
+
+    momentum_indices = _momentum_indices(config, registered_variables)
+    kinetic_energy_left = (
+        sum(conserved_state[index] ** 2 for index in momentum_indices) * 0.5 / density_left
+    )
+    kinetic_energy_right = (
+        sum(right_neighbour(conserved_state[index]) ** 2 for index in momentum_indices)
+        * 0.5 / density_right
+    )
+
+    energy_index = registered_variables.energy_index
+    energy_left = conserved_state[energy_index]
+    energy_right = right_neighbour(energy_left)
+    internal_energy_left = energy_left - kinetic_energy_left
+    internal_energy_right = energy_right - kinetic_energy_right
+    if config.mhd:
+        field_squared_left = sum(
+            conserved_state[index] ** 2 for index in (
+                registered_variables.magnetic_index.x,
+                registered_variables.magnetic_index.y,
+                registered_variables.magnetic_index.z,
+            )
+        )
+        internal_energy_left = internal_energy_left - 0.5 * field_squared_left
+        internal_energy_right = (
+            internal_energy_right - 0.5 * _shift(field_squared_left, -1, axis=axis)
+        )
+
+    if internal_energy_density is not None:
+        internal_energy_left = dual_energy_internal_energy(
+            internal_energy_left,
+            energy_left,
+            internal_energy_density,
+            config.dual_energy_eta,
+        )
+        internal_energy_right = dual_energy_internal_energy(
+            internal_energy_right,
+            energy_right,
+            _shift(internal_energy_density, -1, axis=axis),
+            config.dual_energy_eta,
+        )
+
+    pressure_left = jnp.maximum((gamma - 1.0) * internal_energy_left, params.minimum_pressure)
+    pressure_right = jnp.maximum((gamma - 1.0) * internal_energy_right, params.minimum_pressure)
+    face_min_specific_pressure = jnp.minimum(
+        pressure_left / density_left,
+        pressure_right / density_right,
+    )
+    return face_min_specific_pressure, density_left, density_right, momentum_indices
+
+
+def _coldcrush_blend_weight(
+    conserved_state,
+    axis,
+    params,
+    config,
+    registered_variables,
+    internal_energy_density=None,
+):
+    """
+    LLF weight for radiatively crushed cells: interfaces that are both
+    SUB-floor cold and CONVERGING.
+
+    Two gates, both per interface:
+
+    * temperature ramp — on the COLDER of the two adjacent cells' recovered
+      ``p/rho``, ramping from 1 at (or below) the effective temperature
+      floor ``minimum_specific_pressure`` down to 0 at
+      ``coldcrush_blend_factor`` times it. Any interface with a cold side
+      under compression gets the diffusive flux: cold-cold isothermal
+      collapse AND the boundary faces of a cold dense clump being crushed
+      by hot surroundings (a gate on the hotter side would leave exactly
+      those faces unprotected). The price is that shock fronts advancing
+      into cold ambient gas are handled at first order locally — the
+      classic first-order flux-correction trade.
+    * convergence gate — the normal velocity must be compressive across the
+      interface (``v_L > v_R``), ramped over the floor sound speed. Freely
+      expanding cold gas is divergent and never activates, so seeded density
+      structure in it is not diffused away; static cold gas has no
+      convergence and is untouched.
+
+    Args:
+        conserved_state: The conserved state.
+        axis: The spatial axis of the interfaces.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None.
+
+    Returns:
+        The blend weight in [0, 1] per interface.
+    """
+    gamma = params.gamma
+    # The specific pressure p/rho at the floor temperature.
+    floor_specific_pressure = params.minimum_specific_pressure
+
+    def right_neighbour(field):
+        return _shift(field, -1, axis=axis)
+
+    face_min_specific_pressure, density_left, density_right, momentum_indices = (
+        _face_min_specific_pressure(
+            conserved_state,
+            axis,
+            params,
+            config,
+            registered_variables,
+            internal_energy_density=internal_energy_density,
+        )
+    )
+
+    # Temperature ramp on the colder side: 1 at (or below) the floor
+    # temperature, 0 at factor * floor, so any compressed cold side qualifies.
+    ramp_top_specific_pressure = (
+        config.positivity_config.coldcrush_blend_factor * floor_specific_pressure
+    )
+    temperature_weight = jnp.clip(
+        (ramp_top_specific_pressure - face_min_specific_pressure)
+        / jnp.maximum(ramp_top_specific_pressure - floor_specific_pressure, 1e-30),
+        0.0,
+        1.0,
+    )
+
+    # Convergence gate: a compressive normal velocity, ramped over the floor
+    # sound speed so that it switches on smoothly.
+    normal_momentum_index = momentum_indices[axis]
+    normal_velocity_left = conserved_state[normal_momentum_index] / density_left
+    normal_velocity_right = right_neighbour(conserved_state[normal_momentum_index]) / density_right
+    floor_sound_speed = jnp.sqrt(gamma * jnp.maximum(floor_specific_pressure, 1e-30))
+    convergence_weight = jnp.clip(
+        (normal_velocity_left - normal_velocity_right) / floor_sound_speed,
+        0.0,
+        1.0,
+    )
+
+    return temperature_weight * convergence_weight
+
+
+# -------------------------------------------------------------
+# ========== ↑ Activation: cold-crush temperature ramp ↑ =======
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ======================= ↓ Entry point ↓ =====================
+# -------------------------------------------------------------
+
+
+def _blend_interface_flux(
+    dF_weno,
+    conserved_state,
+    axis,
+    params,
+    config,
+    registered_variables,
+    internal_energy_density=None,
+):
+    """
+    Blend the WENO interface flux toward LLF along ``axis`` at cold interfaces
+    under compression (``coldcrush_blend``; ideal gas only).
+
+    Args:
+        dF_weno: The WENO interface flux along ``axis``.
+        conserved_state: The conserved state.
+        axis: The spatial axis of the interfaces.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        internal_energy_density: The separately advected dual-energy ``g``, or
+            None.
+
+    Returns:
+        The blended interface flux, or ``dF_weno`` unchanged when the blend is
+        off.
+    """
+    if not (config.positivity_config.coldcrush_blend and config.equation_of_state == IDEAL_GAS):
         return dF_weno
+    lax_friedrichs_flux = _local_lax_friedrichs_flux(
+        conserved_state,
+        axis,
+        params,
+        config,
+        registered_variables,
+        internal_energy_density=internal_energy_density,
+    )
+    blend_weight = _coldcrush_blend_weight(
+        conserved_state,
+        axis,
+        params,
+        config,
+        registered_variables,
+        internal_energy_density=internal_energy_density,
+    )
+    # The blend weight is a switching function (limiter activation): its
+    # derivative carries no physical sensitivity, so the limiter is frozen at
+    # its current activation for differentiation. The primal is untouched.
+    blend_weight = jax.lax.stop_gradient(blend_weight)[None, ...]
+    return dF_weno * (1.0 - blend_weight) + lax_friedrichs_flux * blend_weight
 
-    F_llf = _local_lax_friedrichs_flux(
-        conserved_state, axis, params, config, registered_variables)
 
-    w = None
-    if use_deepvoid:
-        w = _deepvoid_blend_weight(
-            conserved_state, axis, params, config, registered_variables)
-    if use_ppflux:
-        w_pp = _ppflux_blend_weight(
-            dF_weno, F_llf, conserved_state, axis, dtdx, params, config,
-            registered_variables)
-        w = w_pp if w is None else jnp.maximum(w, w_pp)
-
-    w = w[None, ...]
-    return dF_weno * (1.0 - w) + F_llf * w
-
-
-# Back-compat alias: the deep-void-only entry point (density ramp only). Kept so
-# any external callers of the old name keep working; new code uses
-# _blend_interface_flux with the activation paths selected via config.
-def _deepvoid_llf_blend(dF_weno, conserved_state, axis, params, config,
-                        registered_variables):
-    """Deep-void-only LLF blend (density ramp). Back-compat entry point; new
-    code uses ``_blend_interface_flux`` with the activation paths selected via
-    config."""
-    F_llf = _local_lax_friedrichs_flux(
-        conserved_state, axis, params, config, registered_variables)
-    w = _deepvoid_blend_weight(
-        conserved_state, axis, params, config, registered_variables)[None, ...]
-    return dF_weno * (1.0 - w) + F_llf * w
+# -------------------------------------------------------------
+# ======================= ↑ Entry point ↑ =====================
+# -------------------------------------------------------------
