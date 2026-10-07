@@ -46,7 +46,6 @@ from astronomix import (
     BoundarySettings,
     BoundarySettings1D,
     GravityConfig,
-    PositivityConfig,
     SimulationConfig,
     SimulationParams,
     SinkParticleConfig,
@@ -104,7 +103,6 @@ def _run_collapse(num_cells, t_end, backend):
     """
     config = SimulationConfig(
         solver_mode=FINITE_DIFFERENCE,
-        positivity_config=PositivityConfig(default_positivity_protection=False),
         backend_config=BackendConfig(backend=backend),
         runtime_debugging=False,
         progress_bar=False,
