@@ -297,6 +297,16 @@ def time_integration(
             lambda leaf: jax.device_put(jnp.asarray(leaf), replicated),
             params,
         )
+        # Sink particles passed in are small jit inputs too: copy them to
+        # every device in the same way, which is also the layout they keep
+        # during the run.
+        if config.state_struct and primitive_state.sink_particles is not None:
+            primitive_state = primitive_state._replace(
+                sink_particles=jax.tree.map(
+                    lambda leaf: jax.device_put(jnp.asarray(leaf), replicated),
+                    primitive_state.sink_particles,
+                )
+            )
 
     # Disk-checkpointing mode is driven on the host: it runs JIT'd segments
     # between snapshot times and streams each segment's loop carry to disk via
@@ -1121,6 +1131,10 @@ def _time_integration_to_disk(
             # otherwise sensitive to the layout XLA happens to pick).
             if sharding is not None:
                 primitive_state = jax.device_put(primitive_state, sharding)
+                # The sink particles, small, are copied to every device, the
+                # layout they are also restored with from a checkpoint.
+                if sink_particles is not None:
+                    sink_particles = jax.device_put(sink_particles, replicated)
 
             segment_params = params._replace(t_start=times[i], t_end=times[i + 1])
             # Keep every params leaf on a concrete (replicated) sharding so pjit
