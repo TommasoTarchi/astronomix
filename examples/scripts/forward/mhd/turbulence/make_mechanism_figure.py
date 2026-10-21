@@ -12,6 +12,10 @@ the resolvedness check flags, where the Kolmogorov scale implied by the measured
 ``nu`` lies beyond Nyquist and ``Re`` is partly an extrapolation.
 
     python make_mechanism_figure.py
+    python make_mechanism_figure.py --data data/fd_fv   # astronomix FD and FV
+
+The publication figure restricted to astronomix's FD and FV schemes is
+``make_fd_fv_reynolds_figure.py``.
 """
 
 # general

@@ -1,12 +1,16 @@
 """Advected self-gravitating slab: L1 density-error convergence.
 
-Figure: ``figures/slab_error_convergence.svg``.
+Figure: ``figures/slab_error_convergence.{svg,pdf,png}``.
 
 Advects a self-gravitating slab in equilibrium for one period and measures the
 L1 density error vs resolution for the three finite-difference self-gravity
-source-term schemes. The convergence order of the corrected flux-based source
-scheme is reported from a direct power-law fit and the x-axis is labelled
-directly with the cell counts.
+couplings. The scheme is the finite-difference baseline for smooth flow
+(WENO-Z weights, admissible face state, Pallas backend, float64).
+The second-order finite-volume scheme (VL2, PLM, HLLC, native backend,
+C_cfl = 0.3) runs with Athena++'s coupling and Poisson kernel (discrete
+Laplacian). The convergence order of the corrected flux-based coupling is
+reported from a direct power-law fit and the x-axis is labelled directly with
+the cell counts.
 
 Run from the repo root:
 
@@ -14,12 +18,17 @@ Run from the repo root:
 
 Pass ``--rerun`` to re-run the simulations; otherwise the cached results in
 ``data/slab_convergence.npz`` are used.
+``--rerun --schemes 3`` reruns only the finite-volume scheme and keeps the
+cached errors of the others.
 """
 
 # ==== GPU selection ====
-from autocvd import autocvd
+import os
 
-autocvd(num_gpus=1)
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
@@ -66,20 +75,23 @@ from astronomix.plotting_helpers.power_law_indicators import add_power_law_indic
 
 # figure helpers
 from _common import (
+    CORRECTED_SCHEME,
     DATA_DIR,
-    FIG_DIR,
-    FIT_SCHEME_VERSION,
-    SCHEMES,
-    SCHEME_LABELS,
+    FINITE_VOLUME_SCHEME,
+    SMOOTH_TEST_SCHEMES,
     apply_paper_style,
     fit_power_law,
+    gravity_options,
     integer_log_ticks,
+    save_figure,
+    smooth_test_courant_number,
+    solver_options,
 )
 
 RESOLUTIONS = [16, 32, 64, 96, 128, 192, 256]
 NUM_PERIODS = 1
 DATA_FILE = DATA_DIR / "slab_convergence.npz"
-FIG_FILE = FIG_DIR / "slab_error_convergence.svg"
+FIGURE_STEM = "slab_error_convergence"
 
 # Slab parameters (see tests/self_gravity_tests/advection.py).
 G = 1 / (4 * jnp.pi)
@@ -118,7 +130,7 @@ def initial_slab(x):
     return rho, (vx, vy, vz), P, w
 
 
-def slab_l1_error(num_cells, self_gravity_version):
+def slab_l1_error(num_cells, scheme):
     """L1 density error after ``NUM_PERIODS`` advection periods.
 
     Advects the equilibrium slab for a whole number of periods and compares the
@@ -126,7 +138,8 @@ def slab_l1_error(num_cells, self_gravity_version):
 
     Args:
         num_cells: The resolution ``N`` (isotropic cubic grid).
-        self_gravity_version: The self-gravity source-term scheme to use.
+        scheme: The self-gravity scheme (coupling, solver and whether
+            positivity-preserving WENO is on).
 
     Returns:
         The mean absolute (L1) density error at the final time.
@@ -134,9 +147,10 @@ def slab_l1_error(num_cells, self_gravity_version):
     box_size = float(2 * jnp.pi * jnp.max(1 / K_VEC))
 
     config = SimulationConfig(
+        **solver_options(scheme),
         gravity_config=GravityConfig(
             self_gravity=True,
-            self_gravity_version=self_gravity_version,
+            **gravity_options(scheme),
         ),
         boundary_handling=PERIODIC_ROLL,
         num_ghost_cells=0,
@@ -161,7 +175,7 @@ def slab_l1_error(num_cells, self_gravity_version):
     period = 2 * jnp.pi / w
 
     params = SimulationParams(
-        C_cfl=1.5,
+        C_cfl=smooth_test_courant_number(scheme),
         t_end=NUM_PERIODS * period,
         gamma=GAMMA,
         gravitational_constant=G,
@@ -185,34 +199,48 @@ def slab_l1_error(num_cells, self_gravity_version):
     return float(jax.block_until_ready(error))
 
 
-def run_and_cache():
-    """Measure the L1 density error over the resolution sweep and cache it."""
-    errors = {version: [] for version in SCHEME_LABELS}
+def run_and_cache(schemes):
+    """
+    Measure the L1 density error over the resolution sweep and cache it.
+
+    Schemes that are not run keep their cached errors, so a single scheme can
+    be added or rerun without repeating the others.
+
+    Args:
+        schemes: The schemes to run.
+    """
+    errors = {scheme.key: [] for scheme in schemes}
     for num_cells in RESOLUTIONS:
-        for scheme in SCHEMES:
-            error = slab_l1_error(num_cells, scheme.self_gravity_version)
-            errors[scheme.self_gravity_version].append(error)
+        for scheme in schemes:
+            error = slab_l1_error(num_cells, scheme)
+            errors[scheme.key].append(error)
             print(
-                f"  N={num_cells:4d}  {scheme.label:32s}  L1 = {error:.6e}", flush=True
+                f"  N={num_cells:4d}  {scheme.label:44s}  L1 = {error:.6e}", flush=True
             )
 
     save_kwargs = {"resolutions": np.array(RESOLUTIONS)}
-    for version, version_errors in errors.items():
-        save_kwargs[f"errors_{version}"] = np.array(version_errors)
-    jnp.savez(DATA_FILE, **save_kwargs)
+    if DATA_FILE.exists():
+        cached = np.load(DATA_FILE)
+        for key in cached.files:
+            if key != "resolutions" and np.array_equal(cached["resolutions"], RESOLUTIONS):
+                save_kwargs[key] = cached[key]
+    for key, scheme_errors in errors.items():
+        save_kwargs[f"errors_{key}"] = np.array(scheme_errors)
+    np.savez(DATA_FILE, **save_kwargs)
     print(f"Saved -> {DATA_FILE}")
 
 
 def plot():
-    """Draw the L1 error convergence figure with fit and reference slopes."""
+    """Draw the L1 error convergence figure with the fits of the corrected
+    coupling and the finite-volume scheme, and reference slopes."""
     data = np.load(DATA_FILE)
     resolutions = data["resolutions"]
 
     apply_paper_style()
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(10.5, 5))
 
-    for scheme in SCHEMES:
-        errs = data[f"errors_{scheme.self_gravity_version}"]
+    for scheme in SMOOTH_TEST_SCHEMES:
+        errs = data[f"errors_{scheme.key}"]
         ax.plot(
             resolutions,
             errs,
@@ -223,18 +251,23 @@ def plot():
             label=scheme.label,
         )
 
-    fit_errs = data[f"errors_{FIT_SCHEME_VERSION}"]
-    p, A, n_fit, _ = fit_power_law(resolutions, fit_errs)
-    n_line = np.array([n_fit.min(), n_fit.max()])
-    ax.plot(
-        n_line,
-        A * n_line**p,
-        color="k",
-        linestyle="-",
-        linewidth=1.2,
-        zorder=5,
-        label=rf"fit: $\propto N^{{{p:.2f}}}$ ({SCHEME_LABELS[FIT_SCHEME_VERSION]})",
-    )
+    # Direct power-law fits of the corrected flux-based coupling and of the
+    # finite-volume scheme.
+    for fit_scheme, fit_color in ((CORRECTED_SCHEME, "k"), (FINITE_VOLUME_SCHEME, "0.45")):
+        scheme_order, prefactor, n_fit, _ = fit_power_law(
+            resolutions,
+            data[f"errors_{fit_scheme.key}"],
+        )
+        n_line = np.array([n_fit.min(), n_fit.max()])
+        ax.plot(
+            n_line,
+            prefactor * n_line**scheme_order,
+            color=fit_color,
+            linestyle="-",
+            linewidth=1.2,
+            zorder=5,
+            label=rf"fit: $\propto N^{{{scheme_order:.2f}}}$ ({fit_scheme.label})",
+        )
 
     # Reference power-law slopes (the indicators from the original advection
     # test), placed in the lower-left as a visual guide alongside the direct fit.
@@ -253,10 +286,15 @@ def plot():
     ax.set_xlabel("number of cells per dimension $N$")
     ax.set_ylabel("L1 density error")
     ax.set_title("Advected slab: L1 density error convergence")
-    ax.legend()
+    # The curves and fits leave no free corner, so the legend sits
+    # beside the axes.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize="small")
     fig.tight_layout()
-    fig.savefig(FIG_FILE)
-    print(f"Saved -> {FIG_FILE}   (corrected flux-based source order p = {p:.3f})")
+    corrected_order, _, _, _ = fit_power_law(resolutions, data[f"errors_{CORRECTED_SCHEME.key}"])
+    print(f"Saved -> {save_figure(fig, FIGURE_STEM)}   (flux-based corrected order p = {corrected_order:.3f})")
+    for scheme in SMOOTH_TEST_SCHEMES:
+        scheme_order, _, _, _ = fit_power_law(resolutions, data[f"errors_{scheme.key}"])
+        print(f"  {scheme.label}: fitted order {scheme_order:.2f}")
 
 
 def main():
@@ -265,10 +303,20 @@ def main():
     parser.add_argument(
         "--rerun", action="store_true", help="re-run simulations (otherwise use cache)"
     )
+    parser.add_argument(
+        "--schemes",
+        nargs="+",
+        default=None,
+        help="with --rerun, run only the schemes with these cache keys (e.g. 3 for "
+        "the finite-volume scheme) and keep the cached errors of the others",
+    )
     args = parser.parse_args()
 
+    schemes = SMOOTH_TEST_SCHEMES
+    if args.schemes is not None:
+        schemes = [scheme for scheme in SMOOTH_TEST_SCHEMES if scheme.key in args.schemes]
     if args.rerun or not DATA_FILE.exists():
-        run_and_cache()
+        run_and_cache(schemes)
     else:
         print(f"Using cached results in {DATA_FILE} (pass --rerun to recompute).")
     plot()

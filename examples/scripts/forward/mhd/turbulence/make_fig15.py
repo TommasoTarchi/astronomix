@@ -1,101 +1,248 @@
 """
-HOW-MHD (Seo & Ryu 2023) Fig. 15 reproduction -- plain matplotlib style.
-This is the paper `turbulence_spectra` figure.
-
-Time-averaged power spectra of the isothermal-MHD turbulence runs, 2x3 grid:
+The paper's ``turbulence_spectra`` figure (the analogue of HOW-MHD, Seo & Ryu
+2023, Fig. 15): time-averaged power spectra of the driven isothermal-MHD
+turbulence runs of ``paper_turbulence.py``, in a 2x3 grid
 
   rows    : ISM (M_turb ~ 10) / ICM (M_turb ~ 0.5)
   columns : density P_rho, kinetic E_K, magnetic E_B
 
-Each panel overlays every resolution present in the script-relative data/ dir
-(paper: 256^3 and 512^3; a cheaper resolution such as 128^3 is picked up
-automatically) so the convergence of the inertial range is visible. Spectra are
-averaged over the saturated window (last third of the snapshots). A k^-5/3 guide
+Each panel overlays every resolution present in the script-relative data/
+directory (paper: 256^3 and 512^3). The spectra are averaged over the
+stationary window, the last third of the snapshots (only snapshots before a
+non-finite one, should a run have failed). The paper version smooths the
+time-averaged shell spectra by averaging the occupied shells within
+logarithmic wavenumber bins, which removes the scatter of the sparsely
+populated low-k shells and the shell-to-shell noise at high k. A k^-5/3 guide
 is drawn in each panel.
+
+Writes figures/turbulence_spectra_smooth.{svg,pdf,png} (the paper figure) and
+figures/turbulence_spectra.{svg,png} (the unsmoothed shells). ``--suffix S``
+reads the runs tagged ``<case>_N<N>S`` instead (e.g. ``_uct0.03``, the runs with
+the upwind EMF dissipation).
 """
+
+# general
+import sys
 from pathlib import Path
+
+# numerics
 import numpy as np
+
+# plotting
 import matplotlib.pyplot as plt
 
-# script-relative dirs (data/ shared with paper_turbulence.py)
+
+#: Script-relative directories (data/ is shared with paper_turbulence.py).
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA = SCRIPT_DIR / "data"
-FIG = SCRIPT_DIR / "figures"
-FIG.mkdir(exist_ok=True)
+DATA_DIR = SCRIPT_DIR / "data"
 
-# resolutions to look for, low to high (paper runs: 256 and 512; 128 = cheap default)
-RESOLUTIONS = ("128", "256", "512")
+#: Suffix of the run tags to draw (``--suffix``; empty: the plain runs).
+RUN_SUFFIX = sys.argv[sys.argv.index("--suffix") + 1] if "--suffix" in sys.argv else ""
+FIGURE_DIR = SCRIPT_DIR / "figures"
+
+#: Resolutions looked for, low to high (paper: 256 and 512).
+RESOLUTIONS = (128, 256, 512)
+
+#: The two cases (rows).
+CASES = ("ISM", "ICM")
+
+#: The spectra (columns): npz key, axis label, panel title.
+COLUMNS = (
+    ("spec_rho", r"$P_\rho(k)$", "density spectrum"),
+    ("spec_EK", r"$E_K(k)$", "kinetic spectrum"),
+    ("spec_EB", r"$E_B(k)$", "magnetic spectrum"),
+)
+
+#: Line colour per resolution.
+COLORS = {128: "tab:green", 256: "tab:blue", 512: "tab:red"}
+
+#: Box fundamental wavenumber (box size 1): the x-axis is k / k_0.
+FUNDAMENTAL_WAVENUMBER = 2.0 * np.pi
+
+#: The plotted wavenumber range in k / k_0: from just below the box scale to
+#: ~85 % of the Nyquist mode, which drops the grid-noise tail.
+LOWEST_MODE = 0.8
+HIGHEST_MODE_PER_CELL = 0.42
+
+#: Logarithmic bins per decade of the smoothed spectra.
+BINS_PER_DECADE = 12
+
+#: The stationary window: the last third of the snapshots.
+STATIONARY_FRACTION = 1.0 / 3.0
 
 
-def load(tag):
-    f = DATA / f"paper_{tag}.npz"
-    return dict(np.load(f, allow_pickle=True)) if f.exists() else None
+def load_run(case, resolution):
+    """The reduced data of one run, or ``None`` if its npz is absent."""
+    path = DATA_DIR / f"paper_{case}_N{resolution}{RUN_SUFFIX}.npz"
+    return dict(np.load(path, allow_pickle=True)) if path.exists() else None
 
 
-def series(case):
-    """All resolutions present for a case, low to high."""
-    out = []
-    for res in RESOLUTIONS:
-        d = load(f"{case}_N{res}")
-        if d is not None:
-            out.append((int(d["N"]), d))
-    return out
+def runs_of_case(case):
+    """All resolutions present for a case, low to high, as (N, data) pairs."""
+    runs = []
+    for resolution in RESOLUTIONS:
+        run = load_run(case, resolution)
+        if run is not None:
+            runs.append((int(run["N"]), run))
+    return runs
 
 
-def saturated_spectrum(d, key):
-    """Average a spectrum over the saturated window (last third of snapshots)."""
-    sp = np.asarray(d[key], dtype=np.float64)
-    n = sp.shape[0]
-    take = sp[max(1, n - max(1, n // 3)):]
-    return np.nanmean(take, axis=0)
+def stationary_spectrum(run, key):
+    """
+    Average one spectrum over the stationary window: the last third of the
+    snapshots, among those before the first non-finite one.
+
+    Args:
+        run: The reduced data of a run.
+        key: The spectrum's npz key.
+
+    Returns:
+        The time-averaged shell spectrum.
+    """
+    spectra = np.asarray(run[key], dtype=np.float64)
+    first_bad = int(run["first_bad"])
+    usable = spectra[:first_bad] if first_bad >= 0 else spectra
+    window = max(1, int(round(STATIONARY_FRACTION * (len(usable) - 1))))
+    return np.nanmean(usable[-window:], axis=0)
 
 
-cases = ["ISM", "ICM"]
-cols = [
-    ("spec_rho", r"$P_\rho(k)$"),
-    ("spec_EK", r"$E_K(k)$"),
-    ("spec_EB", r"$E_B(k)$"),
-]
-colors = {128: "tab:green", 256: "tab:blue", 448: "tab:orange", 512: "tab:red"}
-K0 = 2.0 * np.pi  # box fundamental wavenumber (box_size = 1) -> x-axis is k/k_0
+def plotted_shells(run, spectrum):
+    """
+    The shells inside the plotted range that hold modes.
 
-fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.0))
-for i, case in enumerate(cases):
-    runs = series(case)
-    for j, (key, ylab) in enumerate(cols):
-        ax = axes[i, j]
-        ymax = -np.inf
-        for N, d in runs:
-            k = np.asarray(d["k"], dtype=np.float64)
-            sp = saturated_spectrum(d, key)
-            x = k / K0
-            # keep box scale .. ~85% of Nyquist (drop sub-fundamental + grid-noise tail)
-            m = (sp > 0) & np.isfinite(sp) & (x >= 0.8) & (x <= 0.42 * N)
-            ax.loglog(x[m], sp[m], lw=1.4, color=colors.get(N, None), label=f"$N={N}^3$")
-            ymax = max(ymax, np.nanmax(sp[m]))
-        # k^-5/3 guide anchored in the inertial range, lifted above the data
-        if np.isfinite(ymax):
-            xg = np.array([2.0, 20.0])
-            yg = 1.6 * ymax * (xg / xg[0]) ** (-5.0 / 3.0)
-            ax.plot(xg, yg, "k--", lw=1.0)
-            ax.text(xg[0] * 1.6, yg[0], r"$k^{-5/3}$", fontsize=9, va="bottom")
-            ax.set_ylim(ymax / 3e4, ymax * 4)  # ~4.5 decades, clips the noise floor
-        ax.set_xlim(0.8, None)
-        ax.set_xlabel(r"$k/k_0$")
-        ax.set_ylabel(ylab)
-        if i == 0:
-            ax.set_title(["density", "kinetic", "magnetic"][j] + " spectrum")
-        ax.text(0.04, 0.06, f"{case}", transform=ax.transAxes, fontsize=11,
-                fontweight="bold", va="bottom")
-        ax.legend(fontsize=8, frameon=False, loc="upper right")
-        ax.grid(True, which="both", alpha=0.15)
+    Args:
+        run: The reduced data of a run.
+        spectrum: A shell spectrum of that run.
 
-fig.tight_layout()
-out = FIG / "turbulence_spectra"
-fig.savefig(str(out) + ".png", dpi=200)
-fig.savefig(str(out) + ".svg")
-print("wrote", str(out) + ".png/.svg")
-for case in cases:
-    for N, d in series(case):
-        print(f"{case} N={N}^3: M_turb(last)={float(d['Ms_t'][-1]):.2f}, "
-              f"snaps={d['spec_EK'].shape[0]}")
+    Returns:
+        ``(modes, values)``: the shell wavenumbers in units of k_0 and their
+        spectrum values.
+    """
+    modes = np.asarray(run["k"], dtype=np.float64) / FUNDAMENTAL_WAVENUMBER
+    resolution = int(run["N"])
+    # The physical-wavenumber shells (width dk = 1) are narrower than the
+    # spacing of the integer modes at low k, so many of them are empty.
+    occupied = (
+        (spectrum > 0.0)
+        & np.isfinite(spectrum)
+        & (modes >= LOWEST_MODE)
+        & (modes <= HIGHEST_MODE_PER_CELL * resolution)
+    )
+    return modes[occupied], spectrum[occupied]
+
+
+def log_binned(modes, values):
+    """
+    Smooth a shell spectrum by averaging the occupied shells within
+    logarithmic bins (``BINS_PER_DECADE`` per decade, edges at powers of
+    10^(1/BINS_PER_DECADE)); empty bins are skipped.
+
+    Args:
+        modes: The occupied shells' wavenumbers (units of k_0).
+        values: Their spectrum values.
+
+    Returns:
+        ``(bin_centres, bin_means)``, the centres geometric.
+    """
+    bin_numbers = np.floor(BINS_PER_DECADE * np.log10(modes)).astype(int)
+    bin_centres = []
+    bin_means = []
+    for bin_number in np.unique(bin_numbers):
+        in_bin = bin_numbers == bin_number
+        bin_centres.append(10.0 ** ((bin_number + 0.5) / BINS_PER_DECADE))
+        bin_means.append(np.mean(values[in_bin]))
+    return np.asarray(bin_centres), np.asarray(bin_means)
+
+
+def plot_spectra(smooth):
+    """
+    Draw the 2x3 spectra figure.
+
+    Args:
+        smooth: Log-bin the spectra (the paper figure) or plot every shell.
+
+    Returns:
+        The matplotlib figure.
+    """
+    figure, axes = plt.subplots(2, 3, figsize=(13.5, 8.0))
+    for row, case in enumerate(CASES):
+        runs = runs_of_case(case)
+        for column, (key, label, title) in enumerate(COLUMNS):
+            axis = axes[row, column]
+            largest_value = -np.inf
+            for resolution, run in runs:
+                modes, values = plotted_shells(run, stationary_spectrum(run, key))
+                if smooth:
+                    modes, values = log_binned(modes, values)
+                axis.loglog(
+                    modes,
+                    values,
+                    lw=1.6 if smooth else 1.4,
+                    color=COLORS.get(resolution),
+                    label=f"$N={resolution}^3$",
+                )
+                largest_value = max(largest_value, np.nanmax(values))
+            # k^-5/3 guide anchored in the inertial range, lifted above the data.
+            if np.isfinite(largest_value):
+                guide_modes = np.array([2.0, 20.0])
+                guide_values = 1.6 * largest_value * (guide_modes / guide_modes[0]) ** (-5.0 / 3.0)
+                axis.plot(guide_modes, guide_values, "k--", lw=1.0)
+                axis.text(
+                    guide_modes[0] * 1.6,
+                    guide_values[0],
+                    r"$k^{-5/3}$",
+                    fontsize=9,
+                    va="bottom",
+                )
+                # About five decades: clips the noise floor.
+                axis.set_ylim(largest_value / 3e4, largest_value * 4)
+            axis.set_xlim(LOWEST_MODE, None)
+            axis.set_xlabel(r"$k/k_0$")
+            axis.set_ylabel(label)
+            if row == 0:
+                axis.set_title(title)
+            axis.text(
+                0.04,
+                0.06,
+                case,
+                transform=axis.transAxes,
+                fontsize=11,
+                fontweight="bold",
+                va="bottom",
+            )
+            axis.legend(fontsize=8, frameon=False, loc="upper right")
+            axis.grid(True, which="both", alpha=0.15)
+    figure.tight_layout()
+    return figure
+
+
+def main():
+    """Write the smoothed (paper) and the unsmoothed spectra figures."""
+    FIGURE_DIR.mkdir(exist_ok=True)
+
+    figure = plot_spectra(smooth=True)
+    smooth_path = FIGURE_DIR / "turbulence_spectra_smooth"
+    for suffix in (".svg", ".pdf"):
+        figure.savefig(str(smooth_path) + suffix)
+    figure.savefig(str(smooth_path) + ".png", dpi=200)
+    plt.close(figure)
+    print("wrote", str(smooth_path) + ".svg/.pdf/.png")
+
+    figure = plot_spectra(smooth=False)
+    raw_path = FIGURE_DIR / "turbulence_spectra"
+    figure.savefig(str(raw_path) + ".svg")
+    figure.savefig(str(raw_path) + ".png", dpi=200)
+    plt.close(figure)
+    print("wrote", str(raw_path) + ".svg/.png")
+
+    for case in CASES:
+        for resolution, run in runs_of_case(case):
+            sound_speed = float(run["sound_t"][-1]) if "sound_t" in run else float(run["a"])
+            mass_weighted = np.sqrt(2.0 * float(run["EK_t"][-1])) / sound_speed
+            print(f"{case} N={resolution}^3: M_turb(last) mass-weighted={mass_weighted:.2f} "
+                  f"volume-weighted={float(run['Ms_t'][-1]):.2f}, "
+                  f"snapshots={run['spec_EK'].shape[0]}, first_bad={int(run['first_bad'])}")
+
+
+if __name__ == "__main__":
+    main()

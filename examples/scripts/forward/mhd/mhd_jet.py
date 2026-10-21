@@ -2,20 +2,42 @@
 
 A magnetic tower launched from a magnetized central region in an initially
 uniform medium (vector-potential initial condition), evolved with the
-finite-difference (WENO + constrained-transport) solver.  This is the
-FD-only version of the jet test.
+finite-difference scheme (WENO-Z weights, positivity-preserving WENO,
+constrained transport) at C_cfl = 0.75 with SSPRK4, the combination for which
+positivity preservation is provable.
 
-The figure is a density slice through the jet axis at t = 5.0.  The full 3D
-density field is cached under ``data/`` so the figure can be re-sliced /
-re-styled without re-running the (expensive) 256^3 simulation.
+The figure is a density slice through the jet axis at t = 5.0. Only that
+slice is cached under ``data/``, so the figure can be re-styled without
+re-running the (expensive) simulation.
 
-    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/mhd_jet.py [--res N] [--gpus M] [--rerun]
+The box is periodic. Nothing reaches its faces before t = 5: the bow shock,
+the fastest signal, stays well inside, and the initial field decays as
+exp(-r^2), so open boundaries would give the same solution.
 
-The run is domain-decomposed across ``--gpus M`` devices (x-axis split); the
-paper's high-resolution figure is ``--res 1024 --gpus 4``.
+    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/mhd_jet.py [--res N] [--gpus M] [--block bx,by,bz] [--lsrk4] [--rerun]
+
+The run is domain-decomposed along x across ``--gpus M`` devices of one
+process, or, when launched by ``srun`` with one task per GPU, across all GPUs
+of all tasks (``pytests/runners/mhd_jet.sh``). The positivity-preserving MHD
+fluxes need about 100 GB of temporary memory per 2.7e8 cells (fp32, SSPRK4),
+so 768^3 is the largest grid on the four GPUs of one node and 1024^3 needs at
+least two nodes:
+
+    sbatch --nodes=1 --ntasks-per-node=1 pytests/runners/mhd_jet.sh --res 768 --gpus 4 --rerun
+    sbatch --nodes=4 --time=12:00:00 pytests/runners/mhd_jet.sh --res 1024 --rerun
+
+``--lsrk4`` selects the 2N-storage LSRK4 integrator, one full-state buffer
+fewer than SSPRK4; it is not strong stability preserving, so positivity
+preservation is then no longer provable.
+
+``--ct-upwind`` adds the upwind dissipation of the CT edge EMFs at its default
+strength (the setup of the supersonic turbulence); the run is cached and drawn
+under ``mhd_jet_fd_<N>_uct`` and compared with the plain run of the same
+resolution when that is cached.
 """
 
 # general
+import os
 import sys
 
 
@@ -40,11 +62,26 @@ def _block_shape_from_argv():
     return None
 
 
-# ==== GPU selection ====
-from autocvd import autocvd
-NUM_GPUS = _num_gpus_from_argv()
+# Under srun with several tasks every task drives one GPU, and JAX's
+# distributed runtime must be initialised before anything (astronomix
+# included) creates the backend. Every task sees all GPUs of its node
+# (``--gpu-bind=none``) and picks its own by its local rank.
+MULTI_PROCESS = int(os.environ.get("SLURM_NTASKS", "1")) > 1
 BLOCK_SHAPE = _block_shape_from_argv()
-autocvd(num_gpus=NUM_GPUS)
+
+# ==== GPU selection ====
+if MULTI_PROCESS:
+    import jax
+    visible_devices = [
+        device for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if device
+    ]
+    local_device_ids = [int(os.environ["SLURM_LOCALID"])] if len(visible_devices) > 1 else [0]
+    jax.distributed.initialize(local_device_ids=local_device_ids)
+    NUM_GPUS = jax.device_count()
+else:
+    from autocvd import autocvd
+    NUM_GPUS = _num_gpus_from_argv()
+    autocvd(num_gpus=NUM_GPUS)
 # ruff: noqa: E402
 # =======================
 
@@ -58,10 +95,14 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 # jax
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 from jax.sharding import AxisType, PartitionSpec as P, NamedSharding
 
 # astronomix constants
-from astronomix import PERIODIC_BOUNDARY
+from astronomix import (
+    PALLAS,
+    PERIODIC_BOUNDARY,
+)
 from astronomix.option_classes.simulation_config import (
     RK4_LSRK,
     RK4_SSP,
@@ -75,6 +116,7 @@ from astronomix.option_classes.simulation_config import (
 from astronomix import (
     SimulationConfig,
     SimulationParams,
+    SnapshotSettings,
     BoundarySettings,
     BoundarySettings1D,
     BackendConfig,
@@ -94,16 +136,23 @@ from astronomix import (
 from _common import DATA_DIR
 from _common import FIG_DIR
 from _common import rerun_requested
-from _common import mhd_registered_variables
 
 
 GAMMA = 5.0 / 3.0
 BOX_SIZE = 24.0
 T_END = 5.0
-C_CFL = 0.8
 RHO_0 = 1.0
 P_0 = 1.0
 A0 = 20.0
+
+# The CFL number up to which positivity-preserving WENO is provable with
+# SSPRK4.
+C_CFL = 0.75
+
+# Opt into the low-storage, non-SSP LSRK4 integrator.
+USE_LSRK4 = "--lsrk4" in sys.argv
+CT_UPWIND = "--ct-upwind" in sys.argv
+RUN_SUFFIX = "_uct" if CT_UPWIND else ""
 
 
 def _resolution_from_argv():
@@ -113,87 +162,114 @@ def _resolution_from_argv():
     return 256
 
 
-def cache_path(num_cells):
+def cache_path(num_cells, suffix=RUN_SUFFIX):
     """Return the cache path for the FD jet run at ``num_cells``^3."""
-    return DATA_DIR / f"mhd_jet_fd_{num_cells}.npz"
+    return DATA_DIR / f"mhd_jet_fd_{num_cells}{suffix}.npz"
 
 
-def simulate(num_cells):
-    """Run the finite-difference MHD jet simulation at ``num_cells``^3.
-
-    Sets up the magnetic-tower initial condition from a vector potential in an
-    initially uniform medium, evolves it to ``T_END`` with the finite-difference
-    (WENO + constrained-transport) solver on the Pallas backend, and returns the
-    final density field.
+def make_config(num_cells, boundary_type=PERIODIC_BOUNDARY):
+    """Build the jet configuration at ``num_cells``^3.
 
     Args:
         num_cells: The per-dimension resolution of the cubic grid.
+        boundary_type: The boundary condition on every face.
 
     Returns:
-        The final density field as a numpy array of shape
-        ``(num_cells, num_cells, num_cells)``.
+        The (not yet finalized) simulation configuration.
     """
-
-    # -------------------------------------------------------------
-    # ============ ↓ Grid and solver configuration ↓ =============
-    # -------------------------------------------------------------
-
-    grid_spacing = BOX_SIZE / num_cells
-    center = BOX_SIZE / 2.0
-
-    config = SimulationConfig(
-        # FD/WENO runs ~10x faster through the Pallas (Triton) backend;
-        # bit-compatible with native JAX.
-        grid_spacing=grid_spacing,
+    axis_boundaries = BoundarySettings1D(boundary_type, boundary_type)
+    return SimulationConfig(
         mhd=True,
+        weno_z=True,
+        weno_positivity_preserving=True,
+        ct_upwind_dissipation=CT_UPWIND,
         progress_bar=True,
         dimensionality=3,
         box_size=BOX_SIZE,
         num_cells=num_cells,
+        grid_spacing=BOX_SIZE / num_cells,
         boundary_settings=BoundarySettings(
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            axis_boundaries,
+            axis_boundaries,
+            axis_boundaries,
         ),
-        # Memory savers are enabled only for the multi-GPU (high-resolution)
-        # path so the single-GPU run reproduces the paper's 256^3 figure
-        # byte-for-byte (default SSPRK4, no buffer donation).  For NUM_GPUS > 1
-        # we donate the state buffer (numerically neutral) and switch to the
-        # 2N-storage low-memory RK4 (one fewer full-state buffer than SSPRK4)
-        # to fit the 1024^3 run across the devices; see multi_gpu.py.
+        # Donating the state buffer to the integration is numerically neutral
+        # and saves one state-sized buffer; it is used for the multi-GPU
+        # (high-resolution) runs, where memory is tight.
         donate_state=(NUM_GPUS > 1),
-        time_integrator=(RK4_LSRK if NUM_GPUS > 1 else RK4_SSP),
+        time_integrator=(RK4_LSRK if USE_LSRK4 else RK4_SSP),
         # Optional smaller Pallas block shape (``--block bx,by,bz``): a
         # numerics-preserving lever to shave peak device memory (smaller halo
         # padding + tile temporaries). ``None`` keeps the astronomix default.
         backend_config=BackendConfig(
+            backend=PALLAS,
             pallas_block_shape=BLOCK_SHAPE,
         ),
+        # Return the final state together with the step count, the runtime
+        # and the compiled memory footprint.
+        return_snapshots=True,
+        num_snapshots=2,
+        print_elapsed_time=True,
+        memory_analysis=True,
+        snapshot_settings=SnapshotSettings(return_final_state=True),
     )
-    rv = get_registered_variables(config)
 
-    # Domain-decompose along the x axis across the GPUs. With NUM_GPUS == 1 this
-    # is a trivial single-device mesh, so the single- and multi-GPU paths share
-    # exactly the same code (and the same numerics).
-    # Auto mesh axes: newer jax defaults to Explicit, which the helper data's
-    # with_sharding_constraint does not accept.
+
+def gather_to_host(array):
+    """Return the whole of a (possibly multi-process) sharded array as numpy.
+
+    Args:
+        array: A jax array, sharded over the devices of one or several
+            processes.
+
+    Returns:
+        The full array as a numpy array, on every process.
+    """
+    return np.asarray(multihost_utils.process_allgather(array, tiled=True))
+
+
+def make_sharding(num_gpus):
+    """Return the sharding that splits the x axis across ``num_gpus`` devices.
+
+    With one GPU this is a trivial single-device mesh, so the single- and
+    multi-GPU paths share exactly the same code. The mesh axes are Auto
+    because newer JAX defaults to Explicit, which the helper data's
+    ``with_sharding_constraint`` does not accept.
+
+    Args:
+        num_gpus: The number of devices.
+
+    Returns:
+        The NamedSharding of the ``(variable, x, y, z)`` state.
+    """
     mesh = jax.make_mesh(
-        (1, NUM_GPUS, 1, 1),
+        (1, num_gpus, 1, 1),
         (VARAXIS, XAXIS, YAXIS, ZAXIS),
         axis_types=(AxisType.Auto,) * 4,
     )
-    sharding = NamedSharding(mesh, P(VARAXIS, XAXIS, YAXIS, ZAXIS))
+    return NamedSharding(mesh, P(VARAXIS, XAXIS, YAXIS, ZAXIS))
 
-    # -------------------------------------------------------------
-    # ============ ↑ Grid and solver configuration ↑ =============
-    # -------------------------------------------------------------
 
-    # -------------------------------------------------------------
-    # =============== ↓ Initial magnetic tower ↓ =================
-    # -------------------------------------------------------------
+def build_initial_state(config, registered_variables, sharding, num_cells):
+    """Build the sharded initial state of the jet on the devices.
 
-    # The magnetic field is seeded from a vector potential so that the
-    # constrained-transport solver starts from a divergence-free field.
+    The magnetic field is seeded from a vector potential so that the
+    constrained-transport solver starts from a divergence-free field. The
+    construction runs under a jit with ``out_shardings``, so XLA partitions it
+    and every device only computes and stores its own shard of each field; no
+    single device holds the full state, which is what makes the 1024^3 run fit.
+
+    Args:
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        sharding: The sharding of the state.
+        num_cells: The per-dimension resolution of the cubic grid.
+
+    Returns:
+        The initial primitive state, sharded over the devices.
+    """
+    center = BOX_SIZE / 2.0
+
     def jet_vector_potential(X, Y, Z):
         r = jnp.sqrt((X - center) ** 2 + (Y - center) ** 2 + (Z - center) ** 2)
         A_x = -jnp.exp(-r**2) * (Y - center)
@@ -201,24 +277,7 @@ def simulate(num_cells):
         A_z = 0.5 * A0 * jnp.exp(-r**2)
         return A_x, A_y, A_z
 
-    # -------------------------------------------------------------
-    # =============== ↑ Initial magnetic tower ↑ =================
-    # -------------------------------------------------------------
-
-    # -------------------------------------------------------------
-    # ============ ↓ Uniform background and evolve ↓ =============
-    # -------------------------------------------------------------
-
-    def build_initial_state():
-        """Assemble the sharded initial primitive state on the devices.
-
-        The vector-potential magnetic field and the uniform background fields
-        are built inside this closure so that, under the ``out_shardings`` jit
-        below, XLA partitions the whole construction and every device only ever
-        computes and stores *its own shard* of each field (strategy 3 in
-        ``examples/scripts/multi_gpu/multi_gpu.py``). No single device holds the
-        full state, which is what makes the 1024^3 run fit.
-        """
+    def build():
         B_x, B_y, B_z, bxb, byb, bzb = setup_magnetic_fields_from_vector_potential(
             config=config,
             vector_potential_func=jet_vector_potential,
@@ -231,7 +290,7 @@ def simulate(num_cells):
 
         return construct_primitive_state(
             config=config,
-            registered_variables=rv,
+            registered_variables=registered_variables,
             density=rho,
             velocity_x=zeros,
             velocity_y=zeros,
@@ -246,74 +305,106 @@ def simulate(num_cells):
             sharding=sharding,
         )
 
-    # Build the state directly on the individual GPUs — XLA partitions the whole
-    # construction, so no single device ever holds the full state.
-    initial_state = jax.jit(build_initial_state, out_shardings=sharding)()
+    return jax.jit(build, out_shardings=sharding)()
 
-    if NUM_GPUS > 1:
-        # Confirm the domain decomposition (x-axis split across the devices).
-        jax.debug.visualize_array_sharding(
-            initial_state[rv.density_index, :, :, num_cells // 2]
-        )
+
+def simulate(num_cells):
+    """Run the finite-difference MHD jet simulation at ``num_cells``^3.
+
+    Args:
+        num_cells: The per-dimension resolution of the cubic grid.
+
+    Returns:
+        A dict with the density slice through the jet axis (the x-z plane at
+        mid-y), the extrema of the final state, the number of steps, the
+        runtime and the compiled temporary memory per device.
+    """
+    config = make_config(num_cells)
+    registered_variables = get_registered_variables(config)
+    sharding = make_sharding(NUM_GPUS)
+
+    initial_state = build_initial_state(config, registered_variables, sharding, num_cells)
 
     params = SimulationParams(
         C_cfl=C_CFL,
         dt_max=0.1,
         t_end=T_END,
         gamma=GAMMA,
-        minimum_density=1e-4 * RHO_0,
-        minimum_pressure=1e-4 * P_0,
     )
 
     config = finalize_config(config, initial_state.shape)
-    final_state = time_integration(
-        initial_state, config, params, rv, sharding=sharding
+    result = time_integration(
+        initial_state,
+        config,
+        params,
+        registered_variables,
+        sharding=sharding,
     )
+    final_state = result.final_state
 
-    density = np.asarray(final_state[rv.density_index])
-    return density
-
-    # -------------------------------------------------------------
-    # ============ ↑ Uniform background and evolve ↑ =============
-    # -------------------------------------------------------------
+    density = final_state[registered_variables.density_index]
+    pressure = final_state[registered_variables.pressure_index]
+    summary = dict(
+        density_slice=gather_to_host(density[:, num_cells // 2, :]),
+        minimum_density=float(jnp.min(density)),
+        minimum_pressure=float(jnp.min(pressure)),
+        all_finite=bool(jnp.all(jnp.isfinite(final_state))),
+        num_iterations=int(result.num_iterations),
+        runtime=float(result.runtime),
+        temporary_memory_bytes=int(result.temporary_memory_bytes),
+    )
+    print(
+        f"  {summary['num_iterations']} steps in {summary['runtime']:.1f} s, "
+        f"temporary memory {summary['temporary_memory_bytes'] / 1024**3:.1f} GiB per device, "
+        f"min density {summary['minimum_density']:.3e}, "
+        f"min pressure {summary['minimum_pressure']:.3e}, "
+        f"finite: {summary['all_finite']}"
+    )
+    return summary
 
 
 def get_run(num_cells, rerun):
-    """Return the FD jet density field, from cache or by (re-)running.
+    """Return the jet-axis density slice, from cache or by (re-)running.
 
     Args:
         num_cells: The per-dimension resolution of the run.
         rerun: When True, ignore any cache and re-run the simulation.
 
     Returns:
-        The final density field as a numpy array.
+        The density slice through the jet axis as a numpy array.
     """
     path = cache_path(num_cells)
     if path.exists() and not rerun:
-        return np.load(path)["density"]
-    print(f"running FD MHD jet at {num_cells}^3 ...")
-    density = simulate(num_cells)
-    np.savez(path, density=density)
-    print(f"  cached -> {path}")
-    return density
+        return np.load(path)["density_slice"]
+    print(f"running FD MHD jet at {num_cells}^3 on {NUM_GPUS} GPU(s) ...")
+    summary = simulate(num_cells)
+    # Every process holds the gathered slice; one writes the cache.
+    if jax.process_index() == 0:
+        np.savez(path, **summary)
+        print(f"  cached -> {path}")
+    return summary["density_slice"]
 
 
 def plot(num_cells, rerun):
     """Render the jet-axis density slice figure.
 
-    Loads (or regenerates) the cached density field, slices it through the jet
-    axis (the x-z plane at mid-y) and saves the figure as both ``.png`` and
-    ``.pdf`` (``mhd_jet_fd_{num_cells}``).
+    Loads (or regenerates) the cached density slice through the jet axis (the
+    x-z plane at mid-y) and saves the figure as ``.png``, ``.pdf`` and
+    ``.svg`` (``mhd_jet_fd_{num_cells}``).
 
     Args:
         num_cells: The per-dimension resolution of the run to plot.
         rerun: When True, force the underlying simulation to be re-run.
     """
-    density = get_run(num_cells, rerun)
-    y_index = num_cells // 2
-
-    # Slice through the jet axis: the x-z plane at mid-y.
-    density_slice = density[:, y_index, :].T
+    density_slice = get_run(num_cells, rerun).T
+    plain_path = cache_path(num_cells, suffix="")
+    if CT_UPWIND and plain_path.exists():
+        plain_slice = np.load(plain_path)["density_slice"].T
+        print(
+            f"with vs without the upwind EMF dissipation at {num_cells}^3: mean |density difference| "
+            f"{np.mean(np.abs(density_slice - plain_slice)):.3e} (mean density {np.mean(plain_slice):.3e}, "
+            f"max |difference| {np.max(np.abs(density_slice - plain_slice)):.3e})"
+        )
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
     image = ax.imshow(
@@ -334,7 +425,7 @@ def plot(num_cells, rerun):
     # imshow embedded (rasterized) inside the PDF/SVG vector outputs, which
     # otherwise defaults to the figure's ~100 dpi.
     dpi = 600
-    out = FIG_DIR / f"mhd_jet_fd_{num_cells}.png"
+    out = FIG_DIR / f"mhd_jet_fd_{num_cells}{RUN_SUFFIX}.png"
     fig.savefig(out, dpi=dpi)
     # Vector outputs cropped tight to the drawn content (panel + colorbar).
     for suffix in (".pdf", ".svg"):
@@ -345,4 +436,8 @@ def plot(num_cells, rerun):
 
 if __name__ == "__main__":
     num_cells = _resolution_from_argv()
-    plot(num_cells, rerun_requested())
+    if MULTI_PROCESS and jax.process_index() != 0:
+        # The other tasks only take part in the simulation.
+        get_run(num_cells, rerun_requested())
+    else:
+        plot(num_cells, rerun_requested())

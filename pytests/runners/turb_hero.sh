@@ -18,7 +18,7 @@
 #         --export=ALL,N=2048,TCROSS=5,NSEG=100,CKPT=/e/scratch/astronomix/turb2048,TAG=icm2048 \
 #         pytests/runners/turb_hero.sh
 
-source /e/home/jusers/storcks1/jupiter/astronomix/pytests/runners/_env.sh
+source "${ASTRONOMIX_REPO:-/e/home/jusers/storcks1/jupiter/astronomix}/pytests/runners/_env.sh"
 
 N="${N:-256}"
 MTURB="${MTURB:-0.5}"

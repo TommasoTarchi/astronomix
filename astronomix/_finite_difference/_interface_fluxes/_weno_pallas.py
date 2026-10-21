@@ -23,8 +23,12 @@ All kernels support the admissible face state of the characteristic basis,
 the positivity-preserving flux splitting (``weno_positivity_preserving``)
 where the native kernels do, and the hydro and ideal-MHD kernels the
 dual-energy pressure switch. Their AD tangents are the native kernels
-(``diffable_pallas_call`` in ``_weno.py``). The shared block-shape,
-compiler-parameter and multi-GPU helpers live in ``astronomix._pallas_helpers``.
+(``diffable_pallas_call`` in ``_weno.py``); in reverse mode with
+``BackendConfig.pallas_adjoint`` the hydro and ideal-MHD fluxes are instead
+differentiated by Pallas adjoint kernels (``_weno_flux_hydro_pallas_vjp``,
+``_weno_flux_mhd_pallas_vjp``), which run ``jax.vjp`` of the forward kernels'
+window functions per interface. The shared block-shape, compiler-parameter
+and multi-GPU helpers live in ``astronomix._pallas_helpers``.
 """
 
 # typing
@@ -61,8 +65,105 @@ from astronomix._finite_difference._interface_fluxes._weno_positivity import (
 )
 from astronomix._finite_difference._interface_fluxes._weno_weights import (
     _weno_omega_weights,
+    _weno_omega_weights_ad,
     _weno_omega_weights_z,
 )
+
+
+# -------------------------------------------------------------
+# ============ ↓ Arithmetic helpers of the kernels ↓ ==========
+# -------------------------------------------------------------
+
+
+def _weno_omega_weights_z_kernel(IS0, IS1, IS2, epsilon, tiny):
+    """
+    The WENO-Z weights of the Pallas kernels: ``_weno_omega_weights_z`` with
+    its five quotients cleared to a single reciprocal in double precision.
+
+    Multiplying the numerators and the denominator of
+    ``omega_k = alpha_k / max(alpha_0 + alpha_1 + alpha_2, tiny)``,
+    ``alpha_k = c_k (t_k + tau_5) / t_k`` (``t_k = epsilon + IS_k``,
+    ``(c_0, c_1, c_2) = (1, 6, 3)``), by ``t_0 t_1 t_2 > 0`` gives
+    ``omega_k = a_k / max(a_0 + a_1 + a_2, tiny t_0 t_1 t_2)`` with
+    ``a_0 = (t_0 + tau_5) t_1 t_2``, ``a_1 = 6 (t_1 + tau_5) t_0 t_2`` and
+    ``a_2 = 3 (t_2 + tau_5) t_0 t_1``: the same function, including the
+    ``tiny`` clamp, up to rounding. A double-precision division expands to a
+    long instruction sequence on the GPU and the weights are evaluated twice
+    per characteristic field and interface, so this removes most divisions
+    of the double-precision kernels (about a quarter of their run time).
+    Single precision keeps the quotient form: its divisions are cheap
+    approximations, and the cubic products would overflow for smoothness
+    indicators beyond ~1e12.
+
+    Args and Returns are those of ``_weno_omega_weights_z``.
+    """
+    if IS0.dtype != jnp.float64:
+        return _weno_omega_weights_z(IS0, IS1, IS2, epsilon, tiny)
+    t0 = epsilon + IS0
+    t1 = epsilon + IS1
+    t2 = epsilon + IS2
+    tau = jnp.abs(IS0 - IS2)
+    t1_t2 = t1 * t2
+    a0 = (t0 + tau) * t1_t2
+    a1 = 6.0 * (t1 + tau) * (t0 * t2)
+    a2 = 3.0 * (t2 + tau) * (t0 * t1)
+    inverse_sum = 1.0 / jnp.maximum(a0 + a1 + a2, tiny * (t0 * t1_t2))
+    return a0 * inverse_sum, a2 * inverse_sum
+
+
+def _add_scaled_column(accumulator, column, amplitude):
+    """
+    ``accumulator + column * amplitude`` per component, skipping the
+    components whose column entry is the literal ``0.0`` (the structural
+    zeros of the eigenvectors): their product would only reproduce the
+    accumulator, at the cost of instructions and live registers.
+
+    Args:
+        accumulator: The list of accumulated components.
+        column: The eigenvector components (tiles or Python floats).
+        amplitude: The characteristic amplitude (a tile).
+
+    Returns:
+        The updated list of components.
+    """
+    return [
+        value if isinstance(entry, float) and entry == 0.0 else value + entry * amplitude
+        for value, entry in zip(accumulator, column)
+    ]
+
+
+def _stencil_differences(stencil, num_components):
+    """
+    The differences ``v[k + 1] - v[k]`` of neighbouring cells of a six-cell
+    stencil of component tuples.
+
+    The WENO reconstruction uses the projected characteristic values only
+    through such differences, and the projection is linear, so the kernels
+    project the five differences instead of the six values: two fewer
+    projections per characteristic field, fewer live registers, and no
+    cancellation between large projected values.
+
+    Args:
+        stencil: The six component tuples (offsets -2 .. +3).
+        num_components: The number of components.
+
+    Returns:
+        The five difference tuples.
+    """
+    return [
+        tuple(stencil[k + 1][slot] - stencil[k][slot] for slot in range(num_components))
+        for k in range(5)
+    ]
+
+
+def _as_tile(value, like):
+    """A component as a tile: a literal ``0.0`` becomes a zero tile shaped as ``like``."""
+    return jnp.zeros_like(like) if isinstance(value, float) else value
+
+
+# -------------------------------------------------------------
+# ============ ↑ Arithmetic helpers of the kernels ↑ ==========
+# -------------------------------------------------------------
 
 
 # -------------------------------------------------------------
@@ -524,6 +625,384 @@ def _weno_flux_hydro_pallas(
     )
 
 
+def _weno_hydro_flux_from_window(
+    q_stencil,
+    g_stencil,
+    gamma,
+    rhomin,
+    pgmin,
+    dual_eta,
+    *,
+    ncomp,
+    num_modes,
+    epsilon,
+    omega_weights,
+    admissible_face_state,
+    positivity_preserving,
+    own_speed_modes,
+    frozen=False,
+):
+    """
+    The ideal-gas hydro WENO interface flux at i + 1/2 from its six-cell window.
+
+    The arithmetic of the hydro Pallas kernel for one interface, shared by the
+    forward kernel and the adjoint kernel (``jax.vjp`` of this function), so the
+    Pallas backward is the exact transpose of the Pallas forward by construction.
+    Every operation is elementwise on the block of interfaces the kernel works on.
+
+    Args:
+        q_stencil: The six local conserved tuples of cells i - 2 ... i + 3, each
+            ``(rho, m_n, [m_t1, [m_t2]], E)``.
+        g_stencil: The six dual-energy ``g`` values of the same cells, or six
+            Nones without dual energy.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        dual_eta: The dual-energy switch threshold (unused without dual energy).
+        ncomp: The number of local components (3, 4 or 5).
+        num_modes: The number of characteristic fields (``ncomp``).
+        epsilon: The WENO epsilon.
+        omega_weights: The weight function ``(IS0, IS1, IS2, epsilon, tiny) ->
+            (omega_0, omega_2)``.
+        admissible_face_state: Whether the face sound speed comes from the
+            averaged pressure.
+        positivity_preserving: Whether the split fluxes are recombined with the
+            admissibility scalings.
+        own_speed_modes: The characteristic fields that keep their own
+            splitting speed under positivity preservation.
+        frozen: Freeze the nonlinear weights, the eigensystem, the splitting
+            speeds and the admissibility scaling for differentiation
+            (``weno_ad_frozen_weights``); the value is unchanged.
+
+    Returns:
+        The interface flux as a list of the ``ncomp`` local components.
+    """
+    gm1 = gamma - 1.0
+    tiny = 1e-14
+    if dual_eta is not None:
+        # typed tiny floor for the reliability test (x64/Triton dtype hygiene)
+        e_floor = (gamma - gamma) + 1e-30
+    if frozen:
+        unfrozen_omega_weights = omega_weights
+
+        def omega_weights(*args):
+            return tuple(jax.lax.stop_gradient(w) for w in unfrozen_omega_weights(*args))
+
+    def primitive_from_q(q, g=None):
+        rho = q[0]
+        mn = q[1]
+        if ncomp == 3:
+            mt1 = 0.0
+            mt2 = 0.0
+            energy = q[2]
+        elif ncomp == 4:
+            mt1 = q[2]
+            mt2 = 0.0
+            energy = q[3]
+        else:
+            mt1 = q[2]
+            mt2 = q[3]
+            energy = q[4]
+
+        inv_rho = 1.0 / rho
+        vn = mn * inv_rho
+        vt1 = mt1 * inv_rho
+        vt2 = mt2 * inv_rho
+        v2 = vn * vn + vt1 * vt1 + vt2 * vt2
+        e_E = energy - 0.5 * rho * v2
+        if g is None:
+            pressure = gm1 * e_E
+        else:
+            # Dual-energy switch (Bryan+95): use the advected g where the
+            # total-energy internal energy is cancellation-unreliable.
+            reliable = (e_E > dual_eta * jnp.maximum(energy, e_floor)) & (e_E == e_E)
+            pressure = gm1 * jnp.where(reliable, e_E, g)
+        return rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure
+
+    def floored_cell(q, g=None):
+        rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure = primitive_from_q(q, g)
+        troubled = (rho < rhomin) | (pressure < pgmin)
+        rho_f = jnp.where(troubled, jnp.maximum(rho, rhomin), rho)
+        pressure_f = jnp.where(troubled, jnp.maximum(pressure, pgmin), pressure)
+        energy_f = jnp.where(troubled, pressure_f / gm1 + 0.5 * rho_f * v2, energy)
+        specific_enthalpy = (energy_f + pressure_f) / rho_f
+        sound_speed = jnp.sqrt(jnp.maximum(gamma * jnp.abs(pressure_f / rho_f), 1e-12))
+        return rho_f, mn, mt1, mt2, energy_f, vn, vt1, vt2, v2, pressure_f, specific_enthalpy, sound_speed
+
+    def flux_from_q(q, g=None):
+        rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure = primitive_from_q(q, g)
+        if ncomp == 3:
+            return (mn, mn * vn + pressure, (energy + pressure) * vn)
+        if ncomp == 4:
+            return (mn, mn * vn + pressure, mt1 * vn, (energy + pressure) * vn)
+        return (mn, mn * vn + pressure, mt1 * vn, mt2 * vn, (energy + pressure) * vn)
+
+    f_stencil = tuple(flux_from_q(q, g) for q, g in zip(q_stencil, g_stencil))
+
+    # Compute floored primitive/eigenvalue data once for the six cells used
+    # by the local Lax-Friedrichs alpha.  The earlier version recomputed this
+    # data inside every characteristic mode; keeping it local here avoids both
+    # global eigenvalue arrays and repeated per-mode work.
+    floored_stencil = tuple(floored_cell(q, g) for q, g in zip(q_stencil, g_stencil))
+
+    # Interface eigenvector building blocks at i + 1/2, following
+    # _eigenvector_building_blocks in _eigen_hydro.py.
+    cell_l = floored_stencil[2]
+    cell_r = floored_stencil[3]
+    rho_i, mn_i, mt1_i, mt2_i, energy_i, vn_i, vt1_i, vt2_i, v2_i, p_i, h_i, c_i = cell_l
+    rho_j, mn_j, mt1_j, mt2_j, energy_j, vn_j, vt1_j, vt2_j, v2_j, p_j, h_j, c_j = cell_r
+    rho_face = jnp.maximum(0.5 * (jnp.maximum(rho_i, rhomin) + jnp.maximum(rho_j, rhomin)), rhomin)
+    vn_face = 0.5 * (mn_i + mn_j) / rho_face
+    vt1_face = 0.5 * (mt1_i + mt1_j) / rho_face
+    vt2_face = 0.5 * (mt2_i + mt2_j) / rho_face
+    v2_face = vn_face * vn_face + vt1_face * vt1_face + vt2_face * vt2_face
+    if admissible_face_state:
+        # sound speed from the averaged pressure (see the native
+        # _eigenvector_building_blocks): positive and frame independent
+        c2_face = gamma * (0.5 * (p_i + p_j)) / rho_face
+        h_face = c2_face / gm1 + 0.5 * v2_face
+    else:
+        h_face = 0.5 * (h_i + h_j)
+        c2_face = gm1 * (h_face - 0.5 * v2_face)
+    c_face = jnp.sqrt(jnp.maximum(c2_face, 1e-12))
+    inv_c2 = jnp.where(c2_face > 0.0, 1.0 / c2_face, 0.0)
+    if frozen:
+        # the eigensystem (L and R are built from these face quantities only)
+        vn_face, vt1_face, vt2_face, v2_face, c2_face, h_face, c_face, inv_c2 = (
+            jax.lax.stop_gradient(value)
+            for value in (vn_face, vt1_face, vt2_face, v2_face, c2_face, h_face, c_face, inv_c2)
+        )
+
+    def left_project(mode: int, values):
+        """Project one local vector onto one Euler left eigenvector.
+
+        This is the local Pallas replacement for materialising
+        ``_eigen_L_row_hydro(..., mode)`` followed by a full-array einsum.
+        ``values`` is either a local conserved-state vector or a local flux
+        vector in the normal/tangential component order used by this axis.
+        """
+        if mode == 0:
+            acc = (0.5 * gm1 * v2_face + vn_face * c_face) * values[0]
+            acc = acc - (gm1 * vn_face + c_face) * values[1]
+            if ncomp == 3:
+                acc = acc + gm1 * values[2]
+            elif ncomp == 4:
+                acc = acc - gm1 * vt1_face * values[2] + gm1 * values[3]
+            else:
+                acc = (
+                    acc
+                    - gm1 * vt1_face * values[2]
+                    - gm1 * vt2_face * values[3]
+                    + gm1 * values[4]
+                )
+            return 0.5 * inv_c2 * acc
+
+        if mode == 1:
+            acc = (c2_face - 0.5 * gm1 * v2_face) * values[0]
+            acc = acc + gm1 * vn_face * values[1]
+            if ncomp == 3:
+                acc = acc - gm1 * values[2]
+            elif ncomp == 4:
+                acc = acc + gm1 * vt1_face * values[2] - gm1 * values[3]
+            else:
+                acc = (
+                    acc
+                    + gm1 * vt1_face * values[2]
+                    + gm1 * vt2_face * values[3]
+                    - gm1 * values[4]
+                )
+            return inv_c2 * acc
+
+        if mode == 2 and ncomp >= 4:
+            return -vt1_face * values[0] + values[2]
+
+        if mode == 3 and ncomp == 5:
+            return -vt2_face * values[0] + values[3]
+
+        # Right acoustic wave.
+        acc = (0.5 * gm1 * v2_face - vn_face * c_face) * values[0]
+        acc = acc - (gm1 * vn_face - c_face) * values[1]
+        if ncomp == 3:
+            acc = acc + gm1 * values[2]
+        elif ncomp == 4:
+            acc = acc - gm1 * vt1_face * values[2] + gm1 * values[3]
+        else:
+            acc = (
+                acc
+                - gm1 * vt1_face * values[2]
+                - gm1 * vt2_face * values[3]
+                + gm1 * values[4]
+            )
+        return 0.5 * inv_c2 * acc
+
+    def add_right_correction(flux_acc, mode: int, Fs):
+        """Add Fs times one local Euler right eigenvector to flux_acc.
+
+        This is the local Pallas replacement for materialising
+        ``_eigen_R_col_hydro(..., mode)`` followed by an outer-product style
+        einsum.  Returning a Python list keeps the component axis static and
+        avoids building small dense eigenvector arrays inside the kernel.
+        """
+        if mode == 0:
+            if ncomp == 3:
+                R = (1.0, vn_face - c_face, h_face - vn_face * c_face)
+            elif ncomp == 4:
+                R = (1.0, vn_face - c_face, vt1_face, h_face - vn_face * c_face)
+            else:
+                R = (1.0, vn_face - c_face, vt1_face, vt2_face, h_face - vn_face * c_face)
+        elif mode == 1:
+            if ncomp == 3:
+                R = (1.0, vn_face, 0.5 * v2_face)
+            elif ncomp == 4:
+                R = (1.0, vn_face, vt1_face, 0.5 * v2_face)
+            else:
+                R = (1.0, vn_face, vt1_face, vt2_face, 0.5 * v2_face)
+        elif mode == 2 and ncomp >= 4:
+            if ncomp == 4:
+                R = (0.0, 0.0, 1.0, vt1_face)
+            else:
+                R = (0.0, 0.0, 1.0, 0.0, vt1_face)
+        elif mode == 3 and ncomp == 5:
+            R = (0.0, 0.0, 0.0, 1.0, vt2_face)
+        else:
+            if ncomp == 3:
+                R = (1.0, vn_face + c_face, h_face + vn_face * c_face)
+            elif ncomp == 4:
+                R = (1.0, vn_face + c_face, vt1_face, h_face + vn_face * c_face)
+            else:
+                R = (1.0, vn_face + c_face, vt1_face, vt2_face, h_face + vn_face * c_face)
+        return _add_scaled_column(flux_acc, R, Fs)
+
+    def lambda_from_floored_cell(cell, mode: int):
+        vn = cell[5]
+        c = cell[11]
+        if mode == 0:
+            return vn - c
+        if mode == num_modes - 1:
+            return vn + c
+        return vn
+
+    def alpha_for_mode(mode: int):
+        amx = jnp.abs(lambda_from_floored_cell(floored_stencil[0], mode))
+        for k in range(1, 6):
+            amx = jnp.maximum(
+                amx,
+                jnp.abs(lambda_from_floored_cell(floored_stencil[k], mode)),
+            )
+        if frozen:
+            amx = jax.lax.stop_gradient(amx)
+        return amx
+
+    flux_acc = [
+        (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
+        for slot in range(ncomp)
+    ]
+
+    if positivity_preserving:
+        # One splitting speed (the stencil's spectral radius |v_n| + c) for
+        # every field that carries mass, and the two split fluxes kept
+        # apart, as in the native _weno_flux_x_native.
+        common_speed = jnp.abs(floored_stencil[0][5]) + floored_stencil[0][11]
+        for k in range(1, 6):
+            common_speed = jnp.maximum(
+                common_speed, jnp.abs(floored_stencil[k][5]) + floored_stencil[k][11]
+            )
+        if frozen:
+            common_speed = jax.lax.stop_gradient(common_speed)
+        safe_speed = jnp.maximum(common_speed, 1e-30)
+        central_state = [
+            (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot] + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
+            for slot in range(ncomp)
+        ]
+        plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
+        minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
+        plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+        minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
+
+    # The stencil differences (see ``_stencil_differences``) and the local
+    # Lax-Friedrichs speed of every mode are formed once, before the loop,
+    # so that the cell data of the outer stencil cells is no longer live in it.
+    flux_differences = _stencil_differences(f_stencil, ncomp)
+    state_differences = _stencil_differences(q_stencil, ncomp)
+    mode_speeds = {
+        mode: alpha_for_mode(mode)
+        for mode in range(num_modes)
+        if not (positivity_preserving and mode not in own_speed_modes)
+    }
+    for mode in range(num_modes):
+        d0, d1, d2, d3, d4 = (left_project(mode, difference) for difference in flux_differences)
+        dq0, dq1, dq2, dq3, dq4 = (left_project(mode, difference) for difference in state_differences)
+        if mode in own_speed_modes:
+            qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
+
+        # (under PP the mass-carrying fields use the common speed: skip their
+        # own stencil maximum, which would only be computed and discarded)
+        if positivity_preserving and mode not in own_speed_modes:
+            amx = common_speed
+        else:
+            amx = mode_speeds[mode]
+
+        aterm_p = 0.5 * (d0 + amx * dq0)
+        bterm_p = 0.5 * (d1 + amx * dq1)
+        cterm_p = 0.5 * (d2 + amx * dq2)
+        dterm_p = 0.5 * (d3 + amx * dq3)
+
+        IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
+        IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
+        IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
+        omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
+        second = (
+            omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+            + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0)
+        )
+
+        aterm_m = 0.5 * (d4 - amx * dq4)
+        bterm_m = 0.5 * (d3 - amx * dq3)
+        cterm_m = 0.5 * (d2 - amx * dq2)
+        dterm_m = 0.5 * (d1 - amx * dq1)
+
+        IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
+        IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
+        IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
+        omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
+        third = (
+            omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+            + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
+        )
+
+        if positivity_preserving:
+            zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
+            plus_acc = add_right_correction(plus_acc, mode, -second)
+            minus_acc = add_right_correction(minus_acc, mode, third)
+            # a field on its own speed also shifts the central part and
+            # the upwind cells' split states along its eigenvector
+            if mode in own_speed_modes:
+                speed_offset = amx - common_speed
+                central_projection = (
+                    -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
+                ) * (1.0 / 12.0)
+                central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
+                plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
+                minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
+                relative_offset = speed_offset / safe_speed
+                plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
+                minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
+            continue
+
+        Fs = -second + third
+        flux_acc = add_right_correction(flux_acc, mode, Fs)
+
+    if positivity_preserving:
+        flux_acc = positivity_preserving_flux_local(
+            q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
+            plus_acc, minus_acc, plus_shift, minus_shift,
+            common_speed, gm1, rhomin, pgmin,
+            frozen_theta=frozen,
+        )
+
+    return flux_acc
+
+
 def _weno_flux_hydro_pallas_local(
     conserved_state,
     params: SimulationParams,
@@ -559,8 +1038,7 @@ def _weno_flux_hydro_pallas_local(
     epsilon = config.weno_epsilon
     # WENO-Z is a static config choice, so the weight function can be bound
     # here and inlined into the Pallas kernel body below.
-    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
-    tiny = 1e-14
+    omega_weights = _weno_omega_weights_z_kernel if config.weno_z else _weno_omega_weights
     admissible_face_state = config.weno_admissible_face_state
     positivity_preserving = config.weno_positivity_preserving
     # fields that carry no mass keep their own splitting speed
@@ -603,13 +1081,10 @@ def _weno_flux_hydro_pallas_local(
             kk = (bk * bz + jnp.arange(bz)[None, None, :]) % nz
 
         gamma = gamma_ref[()]
-        gm1 = gamma - 1.0
         rhomin = rhomin_ref[()]
         pgmin = pgmin_ref[()]
         if has_g:
             dual_eta = eta_ref[()]
-            # typed tiny floor for the reliability test (x64/Triton dtype hygiene)
-            e_floor = (gamma - gamma) + 1e-30
 
         def q_at(var_index: int, offset: int):
             if ndim == 1:
@@ -640,55 +1115,6 @@ def _weno_flux_hydro_pallas_local(
         def q_local(offset: int):
             return tuple(q_at(idx, offset) for idx in local_indices)
 
-        def primitive_from_q(q, g=None):
-            rho = q[0]
-            mn = q[1]
-            if ncomp == 3:
-                mt1 = 0.0
-                mt2 = 0.0
-                energy = q[2]
-            elif ncomp == 4:
-                mt1 = q[2]
-                mt2 = 0.0
-                energy = q[3]
-            else:
-                mt1 = q[2]
-                mt2 = q[3]
-                energy = q[4]
-
-            inv_rho = 1.0 / rho
-            vn = mn * inv_rho
-            vt1 = mt1 * inv_rho
-            vt2 = mt2 * inv_rho
-            v2 = vn * vn + vt1 * vt1 + vt2 * vt2
-            e_E = energy - 0.5 * rho * v2
-            if g is None:
-                pressure = gm1 * e_E
-            else:
-                # Dual-energy switch (Bryan+95): use the advected g where the
-                # total-energy internal energy is cancellation-unreliable.
-                reliable = (e_E > dual_eta * jnp.maximum(energy, e_floor)) & (e_E == e_E)
-                pressure = gm1 * jnp.where(reliable, e_E, g)
-            return rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure
-
-        def floored_cell(q, g=None):
-            rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure = primitive_from_q(q, g)
-            troubled = (rho < rhomin) | (pressure < pgmin)
-            rho_f = jnp.where(troubled, jnp.maximum(rho, rhomin), rho)
-            pressure_f = jnp.where(troubled, jnp.maximum(pressure, pgmin), pressure)
-            energy_f = jnp.where(troubled, pressure_f / gm1 + 0.5 * rho_f * v2, energy)
-            specific_enthalpy = (energy_f + pressure_f) / rho_f
-            sound_speed = jnp.sqrt(jnp.maximum(gamma * jnp.abs(pressure_f / rho_f), 1e-12))
-            return rho_f, mn, mt1, mt2, energy_f, vn, vt1, vt2, v2, pressure_f, specific_enthalpy, sound_speed
-
-        def flux_from_q(q, g=None):
-            rho, mn, mt1, mt2, energy, vn, vt1, vt2, v2, pressure = primitive_from_q(q, g)
-            if ncomp == 3:
-                return (mn, mn * vn + pressure, (energy + pressure) * vn)
-            if ncomp == 4:
-                return (mn, mn * vn + pressure, mt1 * vn, (energy + pressure) * vn)
-            return (mn, mn * vn + pressure, mt1 * vn, mt2 * vn, (energy + pressure) * vn)
-
         qm2 = q_local(-2)
         qm1 = q_local(-1)
         q0 = q_local(0)
@@ -700,266 +1126,32 @@ def _weno_flux_hydro_pallas_local(
             g_stencil = tuple(g_at(off) for off in range(-2, 4))
         else:
             g_stencil = (None,) * 6
-        f_stencil = tuple(flux_from_q(q, g) for q, g in zip(q_stencil, g_stencil))
-
-        # Compute floored primitive/eigenvalue data once for the six cells used
-        # by the local Lax-Friedrichs alpha.  The earlier version recomputed this
-        # data inside every characteristic mode; keeping it local here avoids both
-        # global eigenvalue arrays and repeated per-mode work.
-        floored_stencil = tuple(floored_cell(q, g) for q, g in zip(q_stencil, g_stencil))
-
-        # Interface eigenvector building blocks at i + 1/2, following
-        # _eigenvector_building_blocks in _eigen_hydro.py.
-        cell_l = floored_stencil[2]
-        cell_r = floored_stencil[3]
-        rho_i, mn_i, mt1_i, mt2_i, energy_i, vn_i, vt1_i, vt2_i, v2_i, p_i, h_i, c_i = cell_l
-        rho_j, mn_j, mt1_j, mt2_j, energy_j, vn_j, vt1_j, vt2_j, v2_j, p_j, h_j, c_j = cell_r
-        rho_face = jnp.maximum(0.5 * (jnp.maximum(rho_i, rhomin) + jnp.maximum(rho_j, rhomin)), rhomin)
-        vn_face = 0.5 * (mn_i + mn_j) / rho_face
-        vt1_face = 0.5 * (mt1_i + mt1_j) / rho_face
-        vt2_face = 0.5 * (mt2_i + mt2_j) / rho_face
-        v2_face = vn_face * vn_face + vt1_face * vt1_face + vt2_face * vt2_face
-        if admissible_face_state:
-            # sound speed from the averaged pressure (see the native
-            # _eigenvector_building_blocks): positive and frame independent
-            c2_face = gamma * (0.5 * (p_i + p_j)) / rho_face
-            h_face = c2_face / gm1 + 0.5 * v2_face
-        else:
-            h_face = 0.5 * (h_i + h_j)
-            c2_face = gm1 * (h_face - 0.5 * v2_face)
-        c_face = jnp.sqrt(jnp.maximum(c2_face, 1e-12))
-        inv_c2 = jnp.where(c2_face > 0.0, 1.0 / c2_face, 0.0)
-
-        def left_project(mode: int, values):
-            """Project one local vector onto one Euler left eigenvector.
-
-            This is the local Pallas replacement for materialising
-            ``_eigen_L_row_hydro(..., mode)`` followed by a full-array einsum.
-            ``values`` is either a local conserved-state vector or a local flux
-            vector in the normal/tangential component order used by this axis.
-            """
-            if mode == 0:
-                acc = (0.5 * gm1 * v2_face + vn_face * c_face) * values[0]
-                acc = acc - (gm1 * vn_face + c_face) * values[1]
-                if ncomp == 3:
-                    acc = acc + gm1 * values[2]
-                elif ncomp == 4:
-                    acc = acc - gm1 * vt1_face * values[2] + gm1 * values[3]
-                else:
-                    acc = (
-                        acc
-                        - gm1 * vt1_face * values[2]
-                        - gm1 * vt2_face * values[3]
-                        + gm1 * values[4]
-                    )
-                return 0.5 * inv_c2 * acc
-
-            if mode == 1:
-                acc = (c2_face - 0.5 * gm1 * v2_face) * values[0]
-                acc = acc + gm1 * vn_face * values[1]
-                if ncomp == 3:
-                    acc = acc - gm1 * values[2]
-                elif ncomp == 4:
-                    acc = acc + gm1 * vt1_face * values[2] - gm1 * values[3]
-                else:
-                    acc = (
-                        acc
-                        + gm1 * vt1_face * values[2]
-                        + gm1 * vt2_face * values[3]
-                        - gm1 * values[4]
-                    )
-                return inv_c2 * acc
-
-            if mode == 2 and ncomp >= 4:
-                return -vt1_face * values[0] + values[2]
-
-            if mode == 3 and ncomp == 5:
-                return -vt2_face * values[0] + values[3]
-
-            # Right acoustic wave.
-            acc = (0.5 * gm1 * v2_face - vn_face * c_face) * values[0]
-            acc = acc - (gm1 * vn_face - c_face) * values[1]
-            if ncomp == 3:
-                acc = acc + gm1 * values[2]
-            elif ncomp == 4:
-                acc = acc - gm1 * vt1_face * values[2] + gm1 * values[3]
-            else:
-                acc = (
-                    acc
-                    - gm1 * vt1_face * values[2]
-                    - gm1 * vt2_face * values[3]
-                    + gm1 * values[4]
-                )
-            return 0.5 * inv_c2 * acc
-
-        def add_right_correction(flux_acc, mode: int, Fs):
-            """Add Fs times one local Euler right eigenvector to flux_acc.
-
-            This is the local Pallas replacement for materialising
-            ``_eigen_R_col_hydro(..., mode)`` followed by an outer-product style
-            einsum.  Returning a Python list keeps the component axis static and
-            avoids building small dense eigenvector arrays inside the kernel.
-            """
-            if mode == 0:
-                if ncomp == 3:
-                    R = (1.0, vn_face - c_face, h_face - vn_face * c_face)
-                elif ncomp == 4:
-                    R = (1.0, vn_face - c_face, vt1_face, h_face - vn_face * c_face)
-                else:
-                    R = (1.0, vn_face - c_face, vt1_face, vt2_face, h_face - vn_face * c_face)
-            elif mode == 1:
-                if ncomp == 3:
-                    R = (1.0, vn_face, 0.5 * v2_face)
-                elif ncomp == 4:
-                    R = (1.0, vn_face, vt1_face, 0.5 * v2_face)
-                else:
-                    R = (1.0, vn_face, vt1_face, vt2_face, 0.5 * v2_face)
-            elif mode == 2 and ncomp >= 4:
-                if ncomp == 4:
-                    R = (0.0, 0.0, 1.0, vt1_face)
-                else:
-                    R = (0.0, 0.0, 1.0, 0.0, vt1_face)
-            elif mode == 3 and ncomp == 5:
-                R = (0.0, 0.0, 0.0, 1.0, vt2_face)
-            else:
-                if ncomp == 3:
-                    R = (1.0, vn_face + c_face, h_face + vn_face * c_face)
-                elif ncomp == 4:
-                    R = (1.0, vn_face + c_face, vt1_face, h_face + vn_face * c_face)
-                else:
-                    R = (1.0, vn_face + c_face, vt1_face, vt2_face, h_face + vn_face * c_face)
-            return [flux_acc[slot] + R[slot] * Fs for slot in range(ncomp)]
-
-        def lambda_from_floored_cell(cell, mode: int):
-            vn = cell[5]
-            c = cell[11]
-            if mode == 0:
-                return vn - c
-            if mode == num_modes - 1:
-                return vn + c
-            return vn
-
-        def alpha_for_mode(mode: int):
-            amx = jnp.abs(lambda_from_floored_cell(floored_stencil[0], mode))
-            for k in range(1, 6):
-                amx = jnp.maximum(
-                    amx,
-                    jnp.abs(lambda_from_floored_cell(floored_stencil[k], mode)),
-                )
-            return amx
-
-        flux_acc = [
-            (-f_stencil[1][slot] + 7.0 * f_stencil[2][slot] + 7.0 * f_stencil[3][slot] - f_stencil[4][slot]) * (1.0 / 12.0)
-            for slot in range(ncomp)
-        ]
-
-        if positivity_preserving:
-            # One splitting speed (the stencil's spectral radius |v_n| + c) for
-            # every field that carries mass, and the two split fluxes kept
-            # apart, as in the native _weno_flux_x_native.
-            common_speed = jnp.abs(floored_stencil[0][5]) + floored_stencil[0][11]
-            for k in range(1, 6):
-                common_speed = jnp.maximum(
-                    common_speed, jnp.abs(floored_stencil[k][5]) + floored_stencil[k][11]
-                )
-            safe_speed = jnp.maximum(common_speed, 1e-30)
-            central_state = [
-                (-q_stencil[1][slot] + 7.0 * q_stencil[2][slot] + 7.0 * q_stencil[3][slot] - q_stencil[4][slot]) * (1.0 / 12.0)
-                for slot in range(ncomp)
-            ]
-            plus_acc = [0.5 * (flux_acc[slot] + common_speed * central_state[slot]) for slot in range(ncomp)]
-            minus_acc = [0.5 * (flux_acc[slot] - common_speed * central_state[slot]) for slot in range(ncomp)]
-            plus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
-            minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
-
-
-        for mode in range(num_modes):
-            s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
-            qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
-
-            d0 = s[1] - s[0]
-            d1 = s[2] - s[1]
-            d2 = s[3] - s[2]
-            d3 = s[4] - s[3]
-            d4 = s[5] - s[4]
-
-            dq0 = qproj[1] - qproj[0]
-            dq1 = qproj[2] - qproj[1]
-            dq2 = qproj[3] - qproj[2]
-            dq3 = qproj[4] - qproj[3]
-            dq4 = qproj[5] - qproj[4]
-
-            # (under PP the mass-carrying fields use the common speed: skip their
-            # own stencil maximum, which would only be computed and discarded)
-            if positivity_preserving and mode not in own_speed_modes:
-                amx = common_speed
-            else:
-                amx = alpha_for_mode(mode)
-
-            aterm_p = 0.5 * (d0 + amx * dq0)
-            bterm_p = 0.5 * (d1 + amx * dq1)
-            cterm_p = 0.5 * (d2 + amx * dq2)
-            dterm_p = 0.5 * (d3 + amx * dq3)
-
-            IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
-            IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
-            IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-            omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
-            second = (
-                omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
-                + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0)
-            )
-
-            aterm_m = 0.5 * (d4 - amx * dq4)
-            bterm_m = 0.5 * (d3 - amx * dq3)
-            cterm_m = 0.5 * (d2 - amx * dq2)
-            dterm_m = 0.5 * (d1 - amx * dq1)
-
-            IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
-            IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
-            IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-            omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
-            third = (
-                omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
-                + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0)
-            )
-
-            if positivity_preserving:
-                zero_acc = [plus_acc[0] * 0.0 for _ in range(ncomp)]
-                plus_acc = add_right_correction(plus_acc, mode, -second)
-                minus_acc = add_right_correction(minus_acc, mode, third)
-                # a field on its own speed also shifts the central part and
-                # the upwind cells' split states along its eigenvector
-                if mode in own_speed_modes:
-                    speed_offset = amx - common_speed
-                    central_projection = (
-                        -qproj[1] + 7.0 * qproj[2] + 7.0 * qproj[3] - qproj[4]
-                    ) * (1.0 / 12.0)
-                    central_shift = add_right_correction(zero_acc, mode, 0.5 * speed_offset * central_projection)
-                    plus_acc = [plus_acc[slot] + central_shift[slot] for slot in range(ncomp)]
-                    minus_acc = [minus_acc[slot] - central_shift[slot] for slot in range(ncomp)]
-                    relative_offset = speed_offset / safe_speed
-                    plus_shift = add_right_correction(plus_shift, mode, relative_offset * qproj[2])
-                    minus_shift = add_right_correction(minus_shift, mode, relative_offset * qproj[3])
-                continue
-
-            Fs = -second + third
-            flux_acc = add_right_correction(flux_acc, mode, Fs)
-
-        if positivity_preserving:
-            flux_acc = positivity_preserving_flux_local(
-                q_stencil[2], q_stencil[3], f_stencil[2], f_stencil[3],
-                plus_acc, minus_acc, plus_shift, minus_shift,
-                common_speed, gm1, rhomin, pgmin,
-            )
+        flux_acc = _weno_hydro_flux_from_window(
+            q_stencil,
+            g_stencil,
+            gamma,
+            rhomin,
+            pgmin,
+            dual_eta if has_g else None,
+            ncomp=ncomp,
+            num_modes=num_modes,
+            epsilon=epsilon,
+            omega_weights=omega_weights,
+            admissible_face_state=admissible_face_state,
+            positivity_preserving=positivity_preserving,
+            own_speed_modes=own_speed_modes,
+        )
 
         # Set every output component.  Hydro should fill all components, but the
         # explicit zeroing makes failures obvious if a future registry adds fields.
+        # Only variables outside the local component set are zeroed: every
+        # store is a separate memory transaction.
         zero = flux_acc[0] * 0.0
         for var in range(nvars):
-            flux_out_ref[var, ...] = zero
+            if var not in local_indices:
+                flux_out_ref[var, ...] = zero
         for slot, var in enumerate(local_indices):
-            flux_out_ref[var, ...] = flux_acc[slot]
+            flux_out_ref[var, ...] = _as_tile(flux_acc[slot], zero)
 
     kwargs = {}
     compiler_params = _pallas_compiler_params(config)
@@ -1001,6 +1193,322 @@ def _weno_flux_hydro_pallas_local(
         name=f"hydro_weno_flux_axis_{axis}" + ("_dual" if has_g else ""),
         **kwargs,
     )(*args)
+
+
+#: The six stencil offsets of the interface i + 1/2: cells i - 2 ... i + 3.
+STENCIL_OFFSETS = (-2, -1, 0, 1, 2, 3)
+
+
+def _weno_flux_hydro_pallas_vjp_local(
+    conserved_state,
+    flux_cotangent,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+    *,
+    axis: int,
+    internal_energy_density=None,
+):
+    """
+    Pallas adjoint of :func:`_weno_flux_hydro_pallas_local` on one shard.
+
+    Every interface gathers its six-cell window exactly as the forward kernel
+    does and runs ``jax.vjp`` of the shared window function
+    :func:`_weno_hydro_flux_from_window` against its flux cotangent, so the
+    backward is the transpose of the forward kernel by construction, frozen
+    linearisation (``weno_ad_frozen_weights``) included. The scatter of the six
+    window cotangents onto the cells is not done in the kernel (cross-block
+    accumulation): the kernel writes one buffer per stencil offset, and the sum
+    of the six rolled buffers outside is the cell cotangent.
+
+    The kernel always works along the leading spatial axis with the local
+    components in identity order: the Triton lowering of the in-kernel VJP
+    miscompiles a stencil on a non-leading axis or a permuted component gather
+    (both are exact in interpret mode). The flux axis and the components are
+    therefore permuted to the front in plain JAX and permuted back afterwards.
+
+    Args:
+        conserved_state: The conserved state (the forward's input).
+        flux_cotangent: The cotangent of the interface flux.
+        params: The simulation parameters (constants of the derivative).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The flux axis.
+        internal_energy_density: The dual-energy ``g`` as ``(1, *spatial)``, or
+            None.
+
+    Returns:
+        The cotangent of ``conserved_state``, and with dual energy also that of
+        ``internal_energy_density``.
+    """
+    has_g = internal_energy_density is not None
+    ndim = int(config.dimensionality)
+    local_indices = _hydro_indices_for_axis(config, registered_variables, axis)
+    component_order = jnp.asarray(local_indices)
+    ncomp = len(local_indices)
+    num_modes = ndim + 2
+    frozen = config.weno_ad_frozen_weights
+    if config.weno_z:
+        omega_weights = _weno_omega_weights_z
+    else:
+        # the overflow-free derivative of the exact weights (as the native tangent)
+        omega_weights = _weno_omega_weights_ad
+    positivity_preserving = config.weno_positivity_preserving
+    own_speed_modes = mass_free_modes(config) if positivity_preserving else ()
+
+    # -------------------------------------------------------------
+    # ====== ↓ Flux axis and components to the front ↓ ===========
+    # -------------------------------------------------------------
+    if axis == 0:
+        permutation = None
+        state_front, cotangent_front = conserved_state, flux_cotangent
+        energy_front = internal_energy_density
+    else:
+        permutation = [0, axis + 1] + [a for a in range(1, ndim + 1) if a != axis + 1]
+        state_front = jnp.transpose(conserved_state, permutation)
+        cotangent_front = jnp.transpose(flux_cotangent, permutation)
+        energy_front = jnp.transpose(internal_energy_density, permutation) if has_g else None
+    local_state = state_front[component_order]
+    local_cotangent = cotangent_front[component_order]
+    # -------------------------------------------------------------
+    # ====== ↑ Flux axis and components to the front ↑ ===========
+    # -------------------------------------------------------------
+
+    spatial_shape = tuple(int(x) for x in local_state.shape[1:])
+    n0 = spatial_shape[0]
+    # the block of the forward kernel (which divides the untransposed, possibly
+    # halo-padded shard), permuted with the axes
+    forward_block = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=tuple(int(x) for x in conserved_state.shape[1:]),
+    )[:ndim]
+    if permutation is None:
+        block = tuple(forward_block)
+    else:
+        block = tuple(forward_block[array_axis - 1] for array_axis in permutation[1:])
+    grid = tuple(spatial_shape[d] // block[d] for d in range(ndim)) + (1,) * (3 - ndim)
+
+    def index_map(bi, bj, bk):
+        return (0,) + (bi, bj, bk)[:ndim]
+
+    def whole_map(bi, bj, bk):
+        return (0,) * (ndim + 1)
+
+    def block_spec(num_rows):
+        return pl.BlockSpec((num_rows,) + block, index_map)
+
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+
+    def kernel(*refs):
+        if has_g:
+            q_ref, g_ref, cotangent_ref, gamma_ref, rhomin_ref, pgmin_ref, eta_ref, q_bar_ref, g_bar_ref = refs
+        else:
+            q_ref, cotangent_ref, gamma_ref, rhomin_ref, pgmin_ref, q_bar_ref = refs
+        program = (pl.program_id(0), pl.program_id(1), pl.program_id(2))
+        # the cells of this block along the flux (leading) axis, and off-axis
+        rows = program[0] * block[0] + jnp.arange(block[0])
+        if ndim >= 2:
+            rows = rows[:, None]
+            columns = program[1] * block[1] + jnp.arange(block[1])[None, :]
+        if ndim == 3:
+            rows = rows[..., None]
+            columns = columns[..., None]
+            depth = program[2] * block[2] + jnp.arange(block[2])[None, None, :]
+
+        def read(ref, row, offset):
+            shifted = (rows + offset) % n0
+            if ndim == 1:
+                return ref[row, shifted]
+            if ndim == 2:
+                return ref[row, shifted, columns]
+            return ref[row, shifted, columns, depth]
+
+        gamma = gamma_ref[()]
+        rhomin = rhomin_ref[()]
+        pgmin = pgmin_ref[()]
+        dual_eta = eta_ref[()] if has_g else None
+        q_stencil = tuple(
+            tuple(read(q_ref, slot, offset) for slot in range(ncomp)) for offset in STENCIL_OFFSETS
+        )
+        cotangent = [read(cotangent_ref, slot, 0) for slot in range(ncomp)]
+
+        def window_flux(q_window, g_window):
+            return _weno_hydro_flux_from_window(
+                q_window,
+                g_window,
+                gamma,
+                rhomin,
+                pgmin,
+                dual_eta,
+                ncomp=ncomp,
+                num_modes=num_modes,
+                epsilon=config.weno_epsilon,
+                omega_weights=omega_weights,
+                admissible_face_state=config.weno_admissible_face_state,
+                positivity_preserving=positivity_preserving,
+                own_speed_modes=own_speed_modes,
+                frozen=frozen,
+            )
+
+        if has_g:
+            g_stencil = tuple(read(g_ref, 0, offset) for offset in STENCIL_OFFSETS)
+            _, window_vjp = jax.vjp(window_flux, q_stencil, g_stencil)
+            q_window_bar, g_window_bar = window_vjp(cotangent)
+            for position in range(6):
+                g_bar_ref[position, ...] = g_window_bar[position]
+        else:
+            _, window_vjp = jax.vjp(lambda q_window: window_flux(q_window, (None,) * 6), q_stencil)
+            (q_window_bar,) = window_vjp(cotangent)
+        for position in range(6):
+            for slot in range(ncomp):
+                q_bar_ref[position * ncomp + slot, ...] = q_window_bar[position][slot]
+
+    whole_state_spec = pl.BlockSpec(local_state.shape, whole_map)
+    dtype = local_state.dtype
+    scalars = (
+        jnp.asarray(params.gamma, dtype=dtype),
+        jnp.asarray(params.minimum_density, dtype=dtype),
+        jnp.asarray(params.minimum_pressure, dtype=dtype),
+    )
+    out_shape = [jax.ShapeDtypeStruct((6 * ncomp,) + spatial_shape, dtype)]
+    out_specs = [block_spec(6 * ncomp)]
+    if has_g:
+        in_specs = [whole_state_spec, pl.BlockSpec(energy_front.shape, whole_map), whole_state_spec]
+        in_specs += [scalar_spec] * 4
+        args = (local_state, energy_front, local_cotangent) + scalars
+        args += (jnp.asarray(config.dual_energy_eta, dtype=dtype),)
+        out_shape.append(jax.ShapeDtypeStruct((6,) + spatial_shape, dtype))
+        out_specs.append(block_spec(6))
+    else:
+        in_specs = [whole_state_spec, whole_state_spec] + [scalar_spec] * 3
+        args = (local_state, local_cotangent) + scalars
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+    window_cotangents = pl.pallas_call(
+        kernel,
+        out_shape=tuple(out_shape),
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=tuple(out_specs),
+        interpret=config.backend_config.pallas_interpret,
+        name=f"hydro_weno_flux_vjp_axis_{axis}" + ("_dual" if has_g else ""),
+        **kwargs,
+    )(*args)
+
+    # -------------------------------------------------------------
+    # ====== ↓ Scatter the window cotangents onto the cells ↓ =====
+    # -------------------------------------------------------------
+    # The window position k of the interface at i holds cell i + offset_k, so
+    # the buffer of position k rolled by offset_k is that cell's share.
+    def scatter(buffers, num_rows):
+        total = None
+        for position, offset in enumerate(STENCIL_OFFSETS):
+            share = jnp.roll(buffers[position * num_rows:(position + 1) * num_rows], offset, axis=1)
+            total = share if total is None else total + share
+        return total
+
+    local_state_bar = scatter(window_cotangents[0], ncomp)
+    state_bar_front = jnp.zeros_like(state_front).at[component_order].set(local_state_bar)
+    energy_bar_front = scatter(window_cotangents[1], 1) if has_g else None
+    # -------------------------------------------------------------
+    # ====== ↑ Scatter the window cotangents onto the cells ↑ =====
+    # -------------------------------------------------------------
+
+    if permutation is not None:
+        inverse = [permutation.index(i) for i in range(ndim + 1)]
+        state_bar_front = jnp.transpose(state_bar_front, inverse)
+        if has_g:
+            energy_bar_front = jnp.transpose(energy_bar_front, inverse)
+    if has_g:
+        return state_bar_front, energy_bar_front
+    return state_bar_front
+
+
+def _weno_flux_hydro_pallas_vjp(
+    conserved_state,
+    flux_cotangent,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+    *,
+    axis: int,
+    internal_energy_density=None,
+):
+    """
+    Pallas adjoint of :func:`_weno_flux_hydro_pallas`, with the multi-GPU wrap.
+
+    On a mesh every shard runs :func:`_weno_flux_hydro_pallas_vjp_local` on its
+    halo-padded block: a cell's cotangent collects the six interfaces i - 3 ...
+    i + 2, whose windows reach five cells either side, so the state (and ``g``)
+    and the flux cotangent are padded by five cells along the flux axis and the
+    halo is stripped from the result.
+
+    Args:
+        conserved_state: The conserved state (the forward's input).
+        flux_cotangent: The cotangent of the interface flux.
+        params: The simulation parameters (constants of the derivative).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The flux axis.
+        internal_energy_density: The dual-energy ``g`` with the state's spatial
+            shape, or None.
+
+    Returns:
+        The cotangent of ``conserved_state``, and with dual energy the tuple of
+        it and the cotangent of ``internal_energy_density``.
+    """
+    ndim = int(config.dimensionality)
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=conserved_state.shape[1:],
+    )
+    halo = [0, 0, 0]
+    halo[int(axis)] = 5
+    halo = tuple(halo[:ndim])
+
+    if internal_energy_density is None:
+
+        def build_local(state_local, cotangent_local):
+            return _weno_flux_hydro_pallas_vjp_local(
+                state_local,
+                cotangent_local,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+            )
+
+        return _pallas_call_sharded(
+            build_local,
+            state_inputs=(conserved_state, flux_cotangent),
+            halo=halo,
+            block_shape=block_shape[:ndim],
+        )
+
+    def build_local_dual(state_local, energy_local, cotangent_local):
+        return _weno_flux_hydro_pallas_vjp_local(
+            state_local,
+            cotangent_local,
+            params,
+            config,
+            registered_variables,
+            axis=axis,
+            internal_energy_density=energy_local,
+        )
+
+    state_bar, energy_bar = _pallas_call_sharded(
+        build_local_dual,
+        state_inputs=(conserved_state, internal_energy_density[None], flux_cotangent),
+        halo=halo,
+        block_shape=block_shape[:ndim],
+        num_state_outputs=2,
+    )
+    return state_bar, energy_bar[0]
 
 
 # -----------------------------------------------------------------------------
@@ -1327,38 +1835,77 @@ def _update_cell_center_and_weno_flux_mhd_pallas_keep_halo_x_with_ct_mod(
     )
 
 
-def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
-                              ncomp, num_modes, use_approx_rsqrt=False,
-                              g_stencil=None, dual_eta=None,
-                              admissible_face_state=False, positivity_preserving=False,
-                              return_split=False):
-    """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
+class _MhdFace(NamedTuple):
+    """The face eigenstructure of an ideal-MHD interface (``_mhd_window_shared``)."""
 
-    With ``positivity_preserving`` and ``return_split`` it returns the two
-    split face fluxes and the splitting speed instead, for the paired
-    recombination, which needs the neighbouring interfaces too.
 
-    ``q_stencil`` is the tuple ``(q[-2], q[-1], q[0], q[+1], q[+2], q[+3])`` where
-    each entry is a length-8 tuple of the local conserved components in per-axis
-    characteristic order ``(rho, mn, mt1, mt2, Bn, Bt1, Bt2, energy)``.  Returns
-    the length-8 list of WENO interface fluxes ``flux_acc`` at ``i + 1/2``.
+    vn_face: object
+    vt1_face: object
+    vt2_face: object
+    v2_face: object
+    Bt1_face: object
+    Bt2_face: object
+    c_sq_face: object
+    c_face: object
+    inv_c_sq: object
+    lambda_fast: object
+    lambda_alfven: object
+    lambda_slow: object
+    bt_n1: object
+    bt_n2: object
+    sgn_bn: object
+    sgn_bt: object
+    am_fast: object
+    am_slow: object
+    sqrt_rho_face: object
 
-    Single source of truth for the MHD WENO arithmetic: the forward Pallas kernel
-    gathers ``q_stencil`` from ``q_ref`` and calls this; the adjoint kernel
-    gathers the same stencil and calls ``jax.vjp`` of this, so the Pallas
-    backward is the exact transpose of the Pallas forward by construction (no
-    separately-derived adjoint math).  Every operation is elementwise on the
-    gathered arrays — no ref reads, slices or rolls — which is what lets
-    ``jax.vjp`` lower inside the Triton kernel (validated bit-exact and
-    compile-at-parity on jax >= 0.10; the old auto-VJP Triton miscompile that
-    forced the hydro hand-derivation is gone).  ``b_eps`` and ``sqrt_floor`` are
-    passed in as already-typed scalars (x64 + Triton dtype hygiene)."""
+
+def _mhd_window_shared(
+    q_stencil,
+    gamma,
+    rhomin,
+    pgmin,
+    b_eps,
+    sqrt_floor,
+    *,
+    use_approx_rsqrt=False,
+    g_stencil=None,
+    dual_eta=None,
+    admissible_face_state=False,
+    frozen=False,
+):
+    """
+    The part of an ideal-MHD WENO window that every characteristic field
+    shares: the physical fluxes of the six cells, their floored primitive
+    and wave-speed data, and the face eigenstructure at i + 1/2 (the body of
+    ``_eigen_mhd._eigenvector_building_blocks``).
+
+    Part of :func:`_weno_mhd_flux_from_window` (whose arguments these are),
+    factored out so that the window adjoint can differentiate the window per
+    characteristic field (``_mhd_window_vjp_staged``).
+
+    Args:
+        q_stencil: The six cells ``(q[-2], ..., q[+3])``, each a length-8 tuple
+            of the local conserved components ``(rho, mn, mt1, mt2, Bn, Bt1,
+            Bt2, energy)``.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        b_eps: The floor of the squared transverse field (typed scalar).
+        sqrt_floor: The floor of the squared sound speed (typed scalar).
+        use_approx_rsqrt: The approximate-rsqrt square root (forward only).
+        g_stencil: The dual-energy ``g`` of the six cells, or None.
+        dual_eta: The dual-energy switch threshold (with ``g_stencil``).
+        admissible_face_state: Sound speed of the face state from the averaged
+            pressure.
+        frozen: Freeze the face eigenstructure for differentiation
+            (``weno_ad_frozen_weights``); the value is unchanged.
+
+    Returns:
+        ``(f_stencil, floored_stencil, face)``: the six cell fluxes, the six
+        floored cells and the ``_MhdFace`` of the interface.
+    """
     gm1 = gamma - 1.0
-    gam0 = 1.0 - gamma   # = -gm1
-    gam1 = 0.5 * (gamma - 1.0)
-    gam2 = (gamma - 2.0) / (gamma - 1.0)
-    epsilon = 1e-7
-    tiny = 1e-14
     # Properly-typed literal scalars derived from gamma so the dtype follows the
     # working dtype (bare 1.0 / -1.0 / 1/sqrt(2) arrive as f32 under x64 + Triton
     # and trip a ('f64','f32') assertion in _truediv_lowering_rule).
@@ -1455,22 +2002,6 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
             (energy + p_total) * vn - v_dot_B * Bn,  # energy
         )
 
-    def lambda_from_floored_cell(cell, mode):
-        vn = cell[8]; c_fast = cell[17]; c_alfven = cell[18]; c_slow = cell[19]
-        if mode == 0:
-            return vn - c_fast
-        if mode == 1:
-            return vn - c_alfven
-        if mode == 2:
-            return vn - c_slow
-        if mode == 3:
-            return vn
-        if mode == 4:
-            return vn + c_slow
-        if mode == 5:
-            return vn + c_alfven
-        return vn + c_fast
-
     f_stencil = tuple(flux_from_q(q, g) for q, g in zip(q_stencil, g_stencil))
     floored_stencil = tuple(floored_cell(q, g) for q, g in zip(q_stencil, g_stencil))
     cell_l = floored_stencil[2]  # offset 0  (cell i)
@@ -1554,6 +2085,75 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
     )
 
     sqrt_rho_face = jnp.sqrt(jnp.maximum(rho_face, rhomin))
+    face = _MhdFace(
+        vn_face,
+        vt1_face,
+        vt2_face,
+        v2_face,
+        Bt1_face,
+        Bt2_face,
+        c_sq_face,
+        c_face,
+        inv_c_sq,
+        lambda_fast,
+        lambda_alfven,
+        lambda_slow,
+        bt_n1,
+        bt_n2,
+        sgn_bn,
+        sgn_bt,
+        am_fast,
+        am_slow,
+        sqrt_rho_face,
+    )
+    if frozen:
+        # the eigenstructure (L and R are built from the face quantities only;
+        # the signs and the fast/Alfven ordering are piecewise constant)
+        face = _MhdFace(*(jax.lax.stop_gradient(value) for value in face))
+    return f_stencil, floored_stencil, face
+
+
+def _mhd_face_operators(face, gamma):
+    """
+    The characteristic projections of an ideal-MHD interface: ``left_project``
+    (``L_row[mode] . values``) and ``add_right_correction`` (``accumulator +
+    amplitude * R_col[mode]``) for the face eigenstructure ``face``.
+
+    Part of :func:`_weno_mhd_flux_from_window`, factored out so that the
+    window adjoint can rebuild the projections from the (differentiated)
+    face quantities.
+
+    Args:
+        face: The ``_MhdFace`` of the interface.
+        gamma: The adiabatic index.
+
+    Returns:
+        ``(left_project, add_right_correction)``.
+    """
+    gam0 = 1.0 - gamma   # = -gm1
+    gam1 = 0.5 * (gamma - 1.0)
+    gam2 = (gamma - 2.0) / (gamma - 1.0)
+    (
+        vn_face,
+        vt1_face,
+        vt2_face,
+        v2_face,
+        Bt1_face,
+        Bt2_face,
+        c_sq_face,
+        c_face,
+        inv_c_sq,
+        lambda_fast,
+        lambda_alfven,
+        lambda_slow,
+        bt_n1,
+        bt_n2,
+        sgn_bn,
+        sgn_bt,
+        am_fast,
+        am_slow,
+        sqrt_rho_face,
+    ) = face
     cs_geq_alfven = c_face >= lambda_alfven
 
     def left_project(mode, values):
@@ -1775,7 +2375,91 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
                 - am_slow * lambda_slow * (bt_n1 * vt1_face + bt_n2 * vt2_face) * sgn_bn,
             )
             scale = jnp.where(~cs_geq_alfven, sgn_bt, 1.0)
-        return [flux_acc[slot] + (R[slot] * scale) * Fs for slot in range(ncomp)]
+        # ``scale`` is +-1, so applying it to the amplitude instead of every
+        # component is exact.
+        if isinstance(scale, float):
+            return _add_scaled_column(flux_acc, R, Fs)
+        return _add_scaled_column(flux_acc, R, scale * Fs)
+
+    return left_project, add_right_correction
+
+
+def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floor,
+                              ncomp, num_modes, use_approx_rsqrt=False,
+                              g_stencil=None, dual_eta=None,
+                              admissible_face_state=False, positivity_preserving=False,
+                              return_split=False, weno_z=False, weno_epsilon=1e-7,
+                              omega_weights=None, frozen=False):
+    """Pure per-interface ideal-gas MHD WENO flux from a gathered 6-cell stencil.
+
+    ``weno_z`` selects the WENO-Z nonlinear weights and ``weno_epsilon`` is the
+    floor of the smoothness denominators, as ``SimulationConfig.weno_z`` and
+    ``SimulationConfig.weno_epsilon`` for the native kernel. ``omega_weights``
+    overrides the weight function (the adjoint kernel passes the Jiang-Shu
+    weights with the overflow-free derivative, ``_weno_omega_weights_ad``).
+    ``frozen`` freezes the nonlinear weights, the face eigensystem and the
+    splitting speeds for differentiation (``weno_ad_frozen_weights``, as the
+    native kernel does); the value is unchanged.
+
+    With ``positivity_preserving`` and ``return_split`` it returns the two
+    split face fluxes and the splitting speed instead, for the paired
+    recombination, which needs the neighbouring interfaces too.
+
+    ``q_stencil`` is the tuple ``(q[-2], q[-1], q[0], q[+1], q[+2], q[+3])`` where
+    each entry is a length-8 tuple of the local conserved components in per-axis
+    characteristic order ``(rho, mn, mt1, mt2, Bn, Bt1, Bt2, energy)``.  Returns
+    the length-8 list of WENO interface fluxes ``flux_acc`` at ``i + 1/2``.
+
+    Single source of truth for the MHD WENO arithmetic: the forward Pallas kernel
+    gathers ``q_stencil`` from ``q_ref`` and calls this; the adjoint kernel
+    gathers the same stencil and calls ``jax.vjp`` of this, so the Pallas
+    backward is the exact transpose of the Pallas forward by construction (no
+    separately-derived adjoint math).  Every operation is elementwise on the
+    gathered arrays — no ref reads, slices or rolls — which is what lets
+    ``jax.vjp`` lower inside the Triton kernel (validated bit-exact and
+    compile-at-parity on jax >= 0.10; the old auto-VJP Triton miscompile that
+    forced the hydro hand-derivation is gone).  ``b_eps`` and ``sqrt_floor`` are
+    passed in as already-typed scalars (x64 + Triton dtype hygiene)."""
+    gm1 = gamma - 1.0
+    epsilon = weno_epsilon
+    if omega_weights is None:
+        omega_weights = _weno_omega_weights_z_kernel if weno_z else _weno_omega_weights
+    if frozen:
+        unfrozen_omega_weights = omega_weights
+
+        def omega_weights(*args):
+            return tuple(jax.lax.stop_gradient(w) for w in unfrozen_omega_weights(*args))
+    tiny = 1e-14
+    f_stencil, floored_stencil, face = _mhd_window_shared(
+        q_stencil,
+        gamma,
+        rhomin,
+        pgmin,
+        b_eps,
+        sqrt_floor,
+        use_approx_rsqrt=use_approx_rsqrt,
+        g_stencil=g_stencil,
+        dual_eta=dual_eta,
+        admissible_face_state=admissible_face_state,
+        frozen=frozen,
+    )
+    left_project, add_right_correction = _mhd_face_operators(face, gamma)
+
+    def lambda_from_floored_cell(cell, mode):
+        vn = cell[8]; c_fast = cell[17]; c_alfven = cell[18]; c_slow = cell[19]
+        if mode == 0:
+            return vn - c_fast
+        if mode == 1:
+            return vn - c_alfven
+        if mode == 2:
+            return vn - c_slow
+        if mode == 3:
+            return vn
+        if mode == 4:
+            return vn + c_slow
+        if mode == 5:
+            return vn + c_alfven
+        return vn + c_fast
 
     def alpha_for_mode(mode):
         amx = jnp.abs(lambda_from_floored_cell(floored_stencil[0], mode))
@@ -1783,6 +2467,8 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
             amx = jnp.maximum(
                 amx, jnp.abs(lambda_from_floored_cell(floored_stencil[k], mode))
             )
+        if frozen:
+            amx = jax.lax.stop_gradient(amx)
         return amx
 
     # First-order centered part (1/12 stencil), one per component.
@@ -1812,22 +2498,28 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
 
+    # The stencil differences (see ``_stencil_differences``) and the local
+    # Lax-Friedrichs speed of every mode are formed once, before the loop,
+    # so that the cell data of the outer stencil cells is no longer live in it.
+    flux_differences = _stencil_differences(f_stencil, ncomp)
+    state_differences = _stencil_differences(q_stencil, ncomp)
+    mode_speeds = {
+        mode: alpha_for_mode(mode)
+        for mode in range(num_modes)
+        if not (positivity_preserving and mode not in own_speed_modes)
+    }
     for mode in range(num_modes):
-        s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
-        qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
-
-        d0 = s[1] - s[0]; d1 = s[2] - s[1]; d2 = s[3] - s[2]
-        d3 = s[4] - s[3]; d4 = s[5] - s[4]
-        dq0 = qproj[1] - qproj[0]; dq1 = qproj[2] - qproj[1]
-        dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
-        dq4 = qproj[5] - qproj[4]
+        d0, d1, d2, d3, d4 = (left_project(mode, difference) for difference in flux_differences)
+        dq0, dq1, dq2, dq3, dq4 = (left_project(mode, difference) for difference in state_differences)
+        if mode in own_speed_modes:
+            qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
 
         # (under PP the mass-carrying fields use the common speed: skip their
         # own stencil maximum, which would only be computed and discarded)
         if positivity_preserving and mode not in own_speed_modes:
             amx = common_speed
         else:
-            amx = alpha_for_mode(mode)
+            amx = mode_speeds[mode]
 
         aterm_p = 0.5 * (d0 + amx * dq0)
         bterm_p = 0.5 * (d1 + amx * dq1)
@@ -1836,7 +2528,7 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
         IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
         IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
-        omega0_p, omega2_p = _weno_omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
+        omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
         second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
                   + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0))
 
@@ -1847,7 +2539,7 @@ def _weno_mhd_flux_from_window(q_stencil, gamma, rhomin, pgmin, b_eps, sqrt_floo
         IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
         IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
         IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
-        omega0_m, omega2_m = _weno_omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
+        omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
         third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
                  + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
 
@@ -1892,6 +2584,7 @@ def _weno_flux_mhd_pallas_local(
     axis: int,
     internal_energy_density=None,
     inflow_reference=None,
+    split_only=False,
 ):
     """Single-shard ideal-gas MHD WENO build.  Mirrors
     ``_weno_flux_hydro_pallas`` but with 8 conserved variables and 7
@@ -1902,7 +2595,12 @@ def _weno_flux_mhd_pallas_local(
     lives in the shared pure :func:`_weno_mhd_flux_from_window`, which the
     kernel calls on the gathered 6-cell stencil.  No full-domain projection
     matrices are ever materialised —
-    every component is computed per-tile in registers."""
+    every component is computed per-tile in registers.
+
+    With ``split_only`` (positivity preservation) the kernel output is
+    returned before the recombination: the plus and minus split face fluxes
+    and the splitting speed, ``(2 * num_vars + 1, *spatial)`` (the Pallas
+    adjoint recomputes them)."""
     has_g = internal_energy_density is not None
     ndim = 3
     nvars = int(conserved_state.shape[0])
@@ -1989,17 +2687,21 @@ def _weno_flux_mhd_pallas_local(
             admissible_face_state=config.weno_admissible_face_state,
             positivity_preserving=positivity_preserving,
             return_split=positivity_preserving,
+            weno_z=config.weno_z,
+            weno_epsilon=config.weno_epsilon,
             **window_kwargs,
         )
         if positivity_preserving:
             # split face fluxes + splitting speed; recombined (paired) outside
             plus_acc, minus_acc, common_speed = window
             zero = common_speed * 0.0
-            for var in range(2 * nvars):
-                flux_out_ref[var, ...] = zero
+            for var in range(nvars):
+                if var not in local_indices:
+                    flux_out_ref[var, ...] = zero
+                    flux_out_ref[nvars + var, ...] = zero
             for slot, var in enumerate(local_indices):
-                flux_out_ref[var, ...] = plus_acc[slot]
-                flux_out_ref[nvars + var, ...] = minus_acc[slot]
+                flux_out_ref[var, ...] = _as_tile(plus_acc[slot], zero)
+                flux_out_ref[nvars + var, ...] = _as_tile(minus_acc[slot], zero)
             flux_out_ref[2 * nvars, ...] = common_speed
             return
         flux_acc = window
@@ -2007,11 +2709,14 @@ def _weno_flux_mhd_pallas_local(
         # Write every output component.  Hydro/MHD covers all conserved
         # variables, but explicitly zero anything not in ``local_indices``
         # (defensive — also makes the B_normal-flux = 0 invariant explicit).
+        # Only variables outside the local component set are zeroed: every
+        # store is a separate memory transaction.
         zero = flux_acc[0] * 0.0
         for var in range(nvars):
-            flux_out_ref[var, ...] = zero
+            if var not in local_indices:
+                flux_out_ref[var, ...] = zero
         for slot, var in enumerate(local_indices):
-            flux_out_ref[var, ...] = flux_acc[slot]
+            flux_out_ref[var, ...] = _as_tile(flux_acc[slot], zero)
 
     kwargs = {}
     compiler_params = _pallas_compiler_params(config)
@@ -2048,6 +2753,8 @@ def _weno_flux_mhd_pallas_local(
         **kwargs,
     )(*args)
 
+    if split_only:
+        return flux
     if positivity_preserving and inflow_reference is not None:
         # joint per-cell inflow limiting, fused into one kernel (it reads the
         # split fluxes of the interfaces i - 1/2, i + 1/2, i + 3/2)
@@ -2069,6 +2776,897 @@ def _weno_flux_mhd_pallas_local(
             params, config, registered_variables, axis=axis, inflow_reference=inflow_reference,
         )
     return flux
+
+
+#: Scratch channels of the staged MHD window adjoint, per characteristic field:
+#: the ten projected stencil differences (overwritten by their cotangents),
+#: the contractions of the right eigenvector with the output cotangents (one,
+#: or two under positivity preservation), the two reconstructions and the
+#: field's own splitting speed (overwritten by its cotangent).
+MHD_ADJOINT_SCRATCH_PER_FIELD = 15
+
+
+def _weno_split_reconstruction(differences, state_differences, splitting_speed, omega_weights, epsilon, tiny):
+    """
+    The two WENO5 reconstructions of one characteristic field from its
+    projected stencil differences (the arithmetic of the kernels' field loop).
+
+    Args:
+        differences: The five projected flux differences ``d0 ... d4``.
+        state_differences: The five projected state differences ``dq0 ... dq4``.
+        splitting_speed: The splitting speed of the field.
+        omega_weights: The nonlinear weight function.
+        epsilon: The regularisation of the smoothness indicators.
+        tiny: The floor of the weight sum.
+
+    Returns:
+        ``(second, third)``: the left-biased reconstruction of ``F^+`` and the
+        right-biased one of ``F^-``.
+    """
+    d0, d1, d2, d3, d4 = differences
+    dq0, dq1, dq2, dq3, dq4 = state_differences
+    amx = splitting_speed
+    aterm_p = 0.5 * (d0 + amx * dq0)
+    bterm_p = 0.5 * (d1 + amx * dq1)
+    cterm_p = 0.5 * (d2 + amx * dq2)
+    dterm_p = 0.5 * (d3 + amx * dq3)
+    IS0_p = 13.0 * (aterm_p - bterm_p) ** 2 + 3.0 * (aterm_p - 3.0 * bterm_p) ** 2
+    IS1_p = 13.0 * (bterm_p - cterm_p) ** 2 + 3.0 * (bterm_p + cterm_p) ** 2
+    IS2_p = 13.0 * (cterm_p - dterm_p) ** 2 + 3.0 * (3.0 * cterm_p - dterm_p) ** 2
+    omega0_p, omega2_p = omega_weights(IS0_p, IS1_p, IS2_p, epsilon, tiny)
+    second = (omega0_p * (aterm_p - 2.0 * bterm_p + cterm_p) * (1.0 / 3.0)
+              + (omega2_p - 0.5) * (bterm_p - 2.0 * cterm_p + dterm_p) * (1.0 / 6.0))
+
+    aterm_m = 0.5 * (d4 - amx * dq4)
+    bterm_m = 0.5 * (d3 - amx * dq3)
+    cterm_m = 0.5 * (d2 - amx * dq2)
+    dterm_m = 0.5 * (d1 - amx * dq1)
+    IS0_m = 13.0 * (aterm_m - bterm_m) ** 2 + 3.0 * (aterm_m - 3.0 * bterm_m) ** 2
+    IS1_m = 13.0 * (bterm_m - cterm_m) ** 2 + 3.0 * (bterm_m + cterm_m) ** 2
+    IS2_m = 13.0 * (cterm_m - dterm_m) ** 2 + 3.0 * (3.0 * cterm_m - dterm_m) ** 2
+    omega0_m, omega2_m = omega_weights(IS0_m, IS1_m, IS2_m, epsilon, tiny)
+    third = (omega0_m * (aterm_m - 2.0 * bterm_m + cterm_m) * (1.0 / 3.0)
+             + (omega2_m - 0.5) * (bterm_m - 2.0 * cterm_m + dterm_m) * (1.0 / 6.0))
+    return second, third
+
+
+def _mhd_window_vjp_staged(
+    read_window,
+    output_cotangents,
+    scratch_ref,
+    gamma,
+    rhomin,
+    pgmin,
+    b_eps,
+    sqrt_floor,
+    dual_eta,
+    *,
+    admissible_face_state,
+    positivity_preserving,
+    weno_epsilon,
+    omega_weights,
+    frozen,
+):
+    """
+    The VJP of the window function :func:`_weno_mhd_flux_from_window` (the
+    split face fluxes and the splitting speed under positivity preservation,
+    the interface flux otherwise), structured so that few values are live at
+    any time.
+
+    ``jax.vjp`` of the whole window keeps the forward intermediates of all
+    seven characteristic fields and the cotangents of the 80 stencil
+    differences live together; the kernel then spills so many registers that
+    it runs at ~70x the forward kernel (128^3, float32, GH200) and compiles for
+    minutes. The window flux is the central part plus one increment per field,
+
+        increment_m = R_m(face) * (third_m - second_m),
+        (second_m, third_m) = WENO(L_m(face) . (stencil differences), alpha_m),
+
+    linear in the increments and in the projections, so the reverse pass is
+    taken in stages, the per-field data passing through ``scratch_ref`` (a
+    block of the kernel's own output, private to the program):
+
+    1. the shared forward quantities (``_mhd_window_shared``), the projected
+       stencil differences of every field and the contractions ``R_m . F_bar``
+       of the right eigenvectors with the output cotangents;
+    2. a runtime loop over the fields: ``jax.vjp`` of the reconstruction
+       (``_weno_split_reconstruction``) against ``-R_m . F_bar^+`` and
+       ``R_m . F_bar^-``, giving the cotangents of the projections and of the
+       splitting speed; the loop body is compiled once;
+    3. the cotangent of the face eigenstructure, field by field, from
+       ``jax.vjp`` of ``L_m(face) . w_m + R_m(face) . r_m`` with the
+       contracted cotangents ``w_m = sum_k d_bar_k (difference k)`` and
+       ``r_m``, and the cotangents of the stencil differences
+       ``sum_m d_bar_m l_m`` (``l_m`` the left eigenvectors as coefficients);
+    4. ``jax.vjp`` of the cell quantities (fluxes, face, splitting speeds) on
+       the re-read window against the accumulated cotangents.
+
+    Every piece is the forward's own code (``_mhd_window_shared``,
+    ``_mhd_face_operators``), so the result is ``jax.vjp`` of the window up to
+    rounding (the order of the sums).
+
+    Args:
+        read_window: Returns the window ``(q_stencil, g_stencil)`` (``g_stencil``
+            None without dual energy) from the kernel's refs; called twice so
+            that the window need not stay live through the stages.
+        output_cotangents: The cotangents of the window outputs (a list of
+            tiles: the plus and the minus split fluxes and the speed under
+            positivity preservation, the flux otherwise).
+        scratch_ref: The scratch block, ``7 * MHD_ADJOINT_SCRATCH_PER_FIELD``
+            channels.
+        gamma: The adiabatic index.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        b_eps: The floor of the squared transverse field (typed scalar).
+        sqrt_floor: The floor of the squared sound speed (typed scalar).
+        dual_eta: The dual-energy switch threshold (with dual energy).
+        admissible_face_state: Sound speed of the face state from the averaged
+            pressure.
+        positivity_preserving: The positivity-preserving flux splitting.
+        weno_epsilon: The regularisation of the smoothness indicators.
+        omega_weights: The nonlinear weight function.
+        frozen: The frozen linearisation (``weno_ad_frozen_weights``).
+
+    Returns:
+        The cotangent of the window ``q_stencil`` and, with dual energy, of
+        ``g_stencil``.
+    """
+    num_components = 8
+    num_modes = 7
+    num_differences = 5
+    tiny = 1e-14
+    if frozen:
+        unfrozen_omega_weights = omega_weights
+
+        def omega_weights(*args):
+            return tuple(jax.lax.stop_gradient(w) for w in unfrozen_omega_weights(*args))
+
+    # the scratch channels of field m
+    def projection_channel(mode, k, state):
+        return mode * MHD_ADJOINT_SCRATCH_PER_FIELD + (num_differences if state else 0) + k
+
+    def contraction_channel(mode, sign):
+        return mode * MHD_ADJOINT_SCRATCH_PER_FIELD + 10 + sign
+
+    def reconstruction_channel(mode, which):
+        return mode * MHD_ADJOINT_SCRATCH_PER_FIELD + 12 + which
+
+    def speed_channel(mode):
+        return mode * MHD_ADJOINT_SCRATCH_PER_FIELD + 14
+
+    def cell_eigenvalue(speeds, mode):
+        """The eigenvalue of field ``mode`` of a cell (as ``lambda_from_floored_cell``)."""
+        normal_velocity, fast_speed, alfven_speed, slow_speed = speeds
+        signed_speed = (-fast_speed, -alfven_speed, -slow_speed, None, slow_speed, alfven_speed, fast_speed)[mode]
+        return normal_velocity if signed_speed is None else normal_velocity + signed_speed
+
+    def stencil_speed(cell_speeds, mode):
+        """The stencil maximum of |lambda_mode| (as ``alpha_for_mode``)."""
+        maximum = jnp.abs(cell_eigenvalue(cell_speeds[0], mode))
+        for cell in range(1, 6):
+            maximum = jnp.maximum(maximum, jnp.abs(cell_eigenvalue(cell_speeds[cell], mode)))
+        return maximum
+
+    def cell_quantities(q_window, g_window):
+        """The fluxes of the six cells, the face eigenstructure and the
+        splitting speeds (the common one, or one per field)."""
+        f_stencil, floored_stencil, face = _mhd_window_shared(
+            q_window,
+            gamma,
+            rhomin,
+            pgmin,
+            b_eps,
+            sqrt_floor,
+            g_stencil=g_window,
+            dual_eta=dual_eta,
+            admissible_face_state=admissible_face_state,
+            frozen=frozen,
+        )
+        zero = q_window[2][0] * 0.0
+        f_tiles = tuple(tuple(_as_tile(value, zero) for value in cell) for cell in f_stencil)
+        cell_speeds = tuple((cell[8], cell[17], cell[18], cell[19]) for cell in floored_stencil)
+        field_speeds = tuple(stencil_speed(cell_speeds, mode) for mode in range(num_modes))
+        if positivity_preserving:
+            speeds = field_speeds[0]
+            for mode in range(1, num_modes):
+                speeds = jnp.maximum(speeds, field_speeds[mode])
+        else:
+            speeds = field_speeds
+        if frozen:
+            speeds = jax.tree_util.tree_map(jax.lax.stop_gradient, speeds)
+        return f_tiles, face, speeds
+
+    # -------------------------------------------------------------
+    # ====== ↓ 1. Shared quantities and projections ↓ =============
+    # -------------------------------------------------------------
+    q_stencil, g_stencil = read_window()
+    f_tiles, face, speeds = cell_quantities(q_stencil, g_stencil)
+    zero = q_stencil[2][0] * 0.0
+    one = zero + 1.0
+    flux_differences = _stencil_differences(f_tiles, num_components)
+    state_differences = _stencil_differences(q_stencil, num_components)
+    left_project, add_right_correction = _mhd_face_operators(face, gamma)
+    if positivity_preserving:
+        plus_cotangent = output_cotangents[:num_components]
+        minus_cotangent = output_cotangents[num_components:2 * num_components]
+        contracted = (plus_cotangent, minus_cotangent)
+    else:
+        contracted = (output_cotangents,)
+    for mode in range(num_modes):
+        for k in range(num_differences):
+            scratch_ref[projection_channel(mode, k, False), ...] = left_project(mode, flux_differences[k])
+            scratch_ref[projection_channel(mode, k, True), ...] = left_project(mode, state_differences[k])
+        column = add_right_correction([zero] * num_components, mode, one)
+        for sign, cotangent in enumerate(contracted):
+            contraction = zero
+            for entry, value in zip(column, cotangent):
+                if not (isinstance(entry, float) and entry == 0.0):
+                    contraction = contraction + entry * value
+            scratch_ref[contraction_channel(mode, sign), ...] = contraction
+        if not positivity_preserving:
+            scratch_ref[speed_channel(mode), ...] = speeds[mode]
+    # -------------------------------------------------------------
+    # ====== ↑ 1. Shared quantities and projections ↑ =============
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====== ↓ 2. The reconstructions, field by field ↓ ===========
+    # -------------------------------------------------------------
+    def field_body(mode, common_speed_cotangent):
+        flux_projections = tuple(scratch_ref[projection_channel(mode, k, False)] for k in range(num_differences))
+        state_projections = tuple(scratch_ref[projection_channel(mode, k, True)] for k in range(num_differences))
+        splitting_speed = speeds if positivity_preserving else scratch_ref[speed_channel(mode)]
+        if positivity_preserving:
+            second_cotangent = -scratch_ref[contraction_channel(mode, 0)]
+            third_cotangent = scratch_ref[contraction_channel(mode, 1)]
+        else:
+            third_cotangent = scratch_ref[contraction_channel(mode, 0)]
+            second_cotangent = -third_cotangent
+        (second, third), reconstruction_vjp = jax.vjp(
+            lambda d, dq, alpha: _weno_split_reconstruction(d, dq, alpha, omega_weights, weno_epsilon, tiny),
+            flux_projections,
+            state_projections,
+            splitting_speed,
+        )
+        flux_projection_bar, state_projection_bar, speed_bar = reconstruction_vjp((second_cotangent, third_cotangent))
+        for k in range(num_differences):
+            scratch_ref[projection_channel(mode, k, False)] = flux_projection_bar[k]
+            scratch_ref[projection_channel(mode, k, True)] = state_projection_bar[k]
+        scratch_ref[reconstruction_channel(mode, 0)] = second
+        scratch_ref[reconstruction_channel(mode, 1)] = third
+        if positivity_preserving:
+            return common_speed_cotangent + speed_bar
+        scratch_ref[speed_channel(mode)] = speed_bar
+        return common_speed_cotangent
+
+    common_speed_cotangent = jax.lax.fori_loop(0, num_modes, field_body, zero)
+    # -------------------------------------------------------------
+    # ====== ↑ 2. The reconstructions, field by field ↑ ===========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====== ↓ 3. Eigenstructure and stencil differences ↓ ========
+    # -------------------------------------------------------------
+    # The window and its shared quantities are re-read and recomputed rather
+    # than kept live through the field loop.
+    q_stencil, g_stencil = read_window()
+    f_tiles, face, speeds = cell_quantities(q_stencil, g_stencil)
+    flux_differences = _stencil_differences(f_tiles, num_components)
+    state_differences = _stencil_differences(q_stencil, num_components)
+    left_project, add_right_correction = _mhd_face_operators(face, gamma)
+
+    def projection_bars(mode, state):
+        return [scratch_ref[projection_channel(mode, k, state), ...] for k in range(num_differences)]
+
+    face_cotangent = jax.tree_util.tree_map(jnp.zeros_like, face)
+    if not frozen:
+        for mode in range(num_modes):
+            flux_bars, state_bars = projection_bars(mode, False), projection_bars(mode, True)
+            contracted_differences = [
+                sum(flux_bars[k] * flux_differences[k][slot] + state_bars[k] * state_differences[k][slot]
+                    for k in range(num_differences))
+                for slot in range(num_components)
+            ]
+            second = scratch_ref[reconstruction_channel(mode, 0), ...]
+            third = scratch_ref[reconstruction_channel(mode, 1), ...]
+            if positivity_preserving:
+                column_cotangent = [
+                    -second * plus + third * minus for plus, minus in zip(plus_cotangent, minus_cotangent)
+                ]
+            else:
+                column_cotangent = [(third - second) * value for value in output_cotangents]
+
+            def eigenstructure_contraction(face_values, static_mode=mode, weights=contracted_differences,
+                                           column_weights=column_cotangent):
+                face_left_project, face_add_right_correction = _mhd_face_operators(face_values, gamma)
+                column = face_add_right_correction([zero] * num_components, static_mode, one)
+                total = face_left_project(static_mode, weights)
+                for entry, weight in zip(column, column_weights):
+                    if not (isinstance(entry, float) and entry == 0.0):
+                        total = total + entry * weight
+                return total
+
+            _, contraction_vjp = jax.vjp(eigenstructure_contraction, face)
+            (mode_face_cotangent,) = contraction_vjp(one)
+            face_cotangent = jax.tree_util.tree_map(lambda left, right: left + right, face_cotangent, mode_face_cotangent)
+
+    # The left eigenvectors as coefficients, l_m = d (L_m . v) / d v.
+    left_rows = []
+    for mode in range(num_modes):
+        _, row_vjp = jax.vjp(lambda values, static_mode=mode: left_project(static_mode, values), list(flux_differences[0]))
+        (row,) = row_vjp(one)
+        left_rows.append(row)
+    flux_difference_bars = []
+    state_difference_bars = []
+    for k in range(num_differences):
+        flux_bar = [zero] * num_components
+        state_bar = [zero] * num_components
+        for mode in range(num_modes):
+            flux_projection_bar = scratch_ref[projection_channel(mode, k, False), ...]
+            state_projection_bar = scratch_ref[projection_channel(mode, k, True), ...]
+            flux_bar = [value + flux_projection_bar * coefficient for value, coefficient in zip(flux_bar, left_rows[mode])]
+            state_bar = [value + state_projection_bar * coefficient for value, coefficient in zip(state_bar, left_rows[mode])]
+        flux_difference_bars.append(flux_bar)
+        state_difference_bars.append(state_bar)
+    # -------------------------------------------------------------
+    # ====== ↑ 3. Eigenstructure and stencil differences ↑ ========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ====== ↓ 4. Cell quantities ↓ ===============================
+    # -------------------------------------------------------------
+    # The central part: (-v[1] + 7 v[2] + 7 v[3] - v[4]) / 12 of the cell
+    # fluxes (and states), split as 0.5 (F_c +- alpha q_c) under positivity
+    # preservation.
+    central_weights = (0.0, -1.0 / 12.0, 7.0 / 12.0, 7.0 / 12.0, -1.0 / 12.0, 0.0)
+    if positivity_preserving:
+        central_flux_bar = [0.5 * (plus + minus) for plus, minus in zip(plus_cotangent, minus_cotangent)]
+        central_state_bar = [0.5 * speeds * (plus - minus) for plus, minus in zip(plus_cotangent, minus_cotangent)]
+    else:
+        central_flux_bar = list(output_cotangents)
+
+    def difference_transpose(difference_bars, position):
+        """The cotangent of cell ``position`` from those of v[k + 1] - v[k]."""
+        result = [zero] * num_components
+        if position >= 1:
+            result = [value + bar for value, bar in zip(result, difference_bars[position - 1])]
+        if position <= num_differences - 1:
+            result = [value - bar for value, bar in zip(result, difference_bars[position])]
+        return result
+
+    cell_flux_bars = []
+    direct_state_bars = []
+    for position in range(6):
+        flux_bar = difference_transpose(flux_difference_bars, position)
+        state_bar = difference_transpose(state_difference_bars, position)
+        weight = central_weights[position]
+        if weight != 0.0:
+            flux_bar = [value + weight * bar for value, bar in zip(flux_bar, central_flux_bar)]
+            if positivity_preserving:
+                state_bar = [value + weight * bar for value, bar in zip(state_bar, central_state_bar)]
+        cell_flux_bars.append(tuple(flux_bar))
+        direct_state_bars.append(state_bar)
+
+    if positivity_preserving:
+        central_state = [
+            sum(central_weights[position] * q_stencil[position][slot] for position in range(1, 5))
+            for slot in range(num_components)
+        ]
+        speeds_bar = common_speed_cotangent + output_cotangents[2 * num_components] + sum(
+            0.5 * (plus - minus) * state
+            for plus, minus, state in zip(plus_cotangent, minus_cotangent, central_state)
+        )
+    else:
+        speeds_bar = tuple(scratch_ref[speed_channel(mode), ...] for mode in range(num_modes))
+
+    if g_stencil is None:
+        _, cell_vjp = jax.vjp(lambda q_window: cell_quantities(q_window, None), q_stencil)
+        (q_bar,) = cell_vjp((tuple(cell_flux_bars), face_cotangent, speeds_bar))
+    else:
+        _, cell_vjp = jax.vjp(cell_quantities, q_stencil, g_stencil)
+        q_bar, g_bar = cell_vjp((tuple(cell_flux_bars), face_cotangent, speeds_bar))
+    q_bar = tuple(
+        tuple(value + direct for value, direct in zip(cell_bar, direct_bar))
+        for cell_bar, direct_bar in zip(q_bar, direct_state_bars)
+    )
+    # -------------------------------------------------------------
+    # ====== ↑ 4. Cell quantities ↑ ===============================
+    # -------------------------------------------------------------
+    if g_stencil is None:
+        return q_bar
+    return q_bar, g_bar
+
+
+def _weno_flux_mhd_pallas_window_vjp_local(
+    conserved_state,
+    window_cotangent,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+    *,
+    axis: int,
+    internal_energy_density=None,
+    staged=True,
+):
+    """
+    Pallas adjoint of the window kernel of :func:`_weno_flux_mhd_pallas_local`
+    on one shard: the interface flux, or under positivity preservation the
+    split face fluxes and the splitting speed (the kernel output before the
+    recombination).
+
+    The technique is that of :func:`_weno_flux_hydro_pallas_vjp_local`: every
+    interface gathers its six-cell window as the forward kernel does and
+    differentiates the forward's window function
+    (:func:`_weno_mhd_flux_from_window`) against its cotangent, frozen
+    linearisation (``weno_ad_frozen_weights``) included. The kernel writes one
+    buffer per stencil offset and the sum of the six rolled buffers outside is
+    the cell cotangent; the flux axis and the local components are permuted
+    to the front in plain JAX, because the Triton lowering of the in-kernel
+    VJP miscompiles a stencil on a non-leading axis or a permuted component
+    gather. Unlike the hydro adjoint the block is chosen for the permuted
+    array (the default block, a row along the contiguous last axis, for every
+    flux axis), so the reads stay coalesced.
+
+    The window is differentiated in stages (:func:`_mhd_window_vjp_staged`,
+    with a block of a second, discarded output as per-program scratch), which
+    keeps the kernel's registers in bounds (~2x faster than ``jax.vjp`` of
+    the whole window per characteristic field, ~4x faster than ``jax.vjp`` of
+    the whole window); ``staged=False`` runs the latter, the exact transpose of
+    the forward kernel, for tests. The Jiang-Shu weights are differentiated
+    through their overflow-free form (``_weno_omega_weights_ad``, as the
+    native tangent), the square roots with IEEE ``sqrt`` also when the forward
+    uses the approximate one.
+
+    Args:
+        conserved_state: The conserved state (the forward's input).
+        window_cotangent: The cotangent of the window kernel's output, laid out
+            as that output: ``(num_vars, *spatial)``, or under positivity
+            preservation ``(2 * num_vars + 1, *spatial)``.
+        params: The simulation parameters (constants of the derivative).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The flux axis.
+        internal_energy_density: The dual-energy ``g`` as ``(1, *spatial)``, or
+            None.
+        staged: Differentiate the window in stages (see above).
+
+    Returns:
+        The cotangent of ``conserved_state``, and with dual energy also that of
+        ``internal_energy_density`` (``(1, *spatial)``).
+    """
+    has_g = internal_energy_density is not None
+    ndim = 3
+    num_vars = int(conserved_state.shape[0])
+    local_indices = _mhd_indices_for_axis(config, registered_variables, axis)
+    component_order = jnp.asarray(local_indices)
+    num_components = len(local_indices)
+    num_modes = 7
+    positivity_preserving = config.weno_positivity_preserving
+    frozen = config.weno_ad_frozen_weights
+    if config.weno_z:
+        omega_weights = _weno_omega_weights_z_kernel
+    else:
+        # the overflow-free derivative of the exact weights (as the native tangent)
+        omega_weights = _weno_omega_weights_ad
+    # The window outputs and their channels in the kernel output: the local
+    # components (of the plus and the minus split flux and the speed).
+    if positivity_preserving:
+        output_channels = (
+            tuple(local_indices)
+            + tuple(num_vars + index for index in local_indices)
+            + (2 * num_vars,)
+        )
+    else:
+        output_channels = tuple(local_indices)
+    num_outputs = len(output_channels)
+
+    # -------------------------------------------------------------
+    # ====== ↓ Flux axis and components to the front ↓ ===========
+    # -------------------------------------------------------------
+    if axis == 0:
+        permutation = None
+        state_front, cotangent_front = conserved_state, window_cotangent
+        energy_front = internal_energy_density
+    else:
+        permutation = [0, axis + 1] + [a for a in range(1, ndim + 1) if a != axis + 1]
+        state_front = jnp.transpose(conserved_state, permutation)
+        cotangent_front = jnp.transpose(window_cotangent, permutation)
+        energy_front = jnp.transpose(internal_energy_density, permutation) if has_g else None
+    local_state = state_front[component_order]
+    local_cotangent = cotangent_front[jnp.asarray(output_channels)]
+    # -------------------------------------------------------------
+    # ====== ↑ Flux axis and components to the front ↑ ===========
+    # -------------------------------------------------------------
+
+    spatial_shape = tuple(int(x) for x in local_state.shape[1:])
+    n0 = spatial_shape[0]
+    block = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=spatial_shape,
+    )
+    grid = tuple(spatial_shape[d] // block[d] for d in range(ndim))
+
+    def index_map(bi, bj, bk):
+        return (0, bi, bj, bk)
+
+    def whole_map(bi, bj, bk):
+        return (0, 0, 0, 0)
+
+    def block_spec(num_rows):
+        return pl.BlockSpec((num_rows,) + block, index_map)
+
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+
+    def kernel(*refs):
+        if has_g:
+            (q_ref, g_ref, cotangent_ref, gamma_ref, rhomin_ref, pgmin_ref, b_eps_ref,
+             sqrt_floor_ref, eta_ref, q_bar_ref, scratch_ref, g_bar_ref) = refs
+        else:
+            (q_ref, cotangent_ref, gamma_ref, rhomin_ref, pgmin_ref, b_eps_ref,
+             sqrt_floor_ref, q_bar_ref, scratch_ref) = refs
+        # the cells of this block along the flux (leading) axis, and off-axis
+        rows = (pl.program_id(0) * block[0] + jnp.arange(block[0]))[:, None, None]
+        columns = (pl.program_id(1) * block[1] + jnp.arange(block[1]))[None, :, None]
+        depth = (pl.program_id(2) * block[2] + jnp.arange(block[2]))[None, None, :]
+
+        def read(ref, row, offset):
+            return ref[row, (rows + offset) % n0, columns, depth]
+
+        gamma = gamma_ref[()]
+        rhomin = rhomin_ref[()]
+        pgmin = pgmin_ref[()]
+        b_eps = b_eps_ref[()]
+        sqrt_floor = sqrt_floor_ref[()]
+        dual_eta = eta_ref[()] if has_g else None
+        q_stencil = tuple(
+            tuple(read(q_ref, slot, offset) for slot in range(num_components))
+            for offset in STENCIL_OFFSETS
+        )
+        cotangent = [read(cotangent_ref, slot, 0) for slot in range(num_outputs)]
+        zero = cotangent[0] * 0.0
+
+        def window_outputs(q_window, g_window):
+            window = _weno_mhd_flux_from_window(
+                q_window, gamma, rhomin, pgmin, b_eps, sqrt_floor,
+                num_components, num_modes,
+                g_stencil=g_window,
+                dual_eta=dual_eta,
+                admissible_face_state=config.weno_admissible_face_state,
+                positivity_preserving=positivity_preserving,
+                return_split=positivity_preserving,
+                weno_z=config.weno_z,
+                weno_epsilon=config.weno_epsilon,
+                omega_weights=omega_weights,
+                frozen=frozen,
+            )
+            if positivity_preserving:
+                plus_fluxes, minus_fluxes, common_speed = window
+                outputs = list(plus_fluxes) + list(minus_fluxes) + [common_speed]
+            else:
+                outputs = list(window)
+            # identically zero outputs (the normal-field flux) as tiles, so the
+            # output structure matches the cotangent tiles
+            return [_as_tile(output, zero) for output in outputs]
+
+        g_stencil = tuple(read(g_ref, 0, offset) for offset in STENCIL_OFFSETS) if has_g else None
+
+        def read_window():
+            window = tuple(
+                tuple(read(q_ref, slot, offset) for slot in range(num_components))
+                for offset in STENCIL_OFFSETS
+            )
+            if has_g:
+                return window, tuple(read(g_ref, 0, offset) for offset in STENCIL_OFFSETS)
+            return window, None
+
+        if staged:
+            window_bar = _mhd_window_vjp_staged(
+                read_window,
+                cotangent,
+                scratch_ref,
+                gamma,
+                rhomin,
+                pgmin,
+                b_eps,
+                sqrt_floor,
+                dual_eta,
+                admissible_face_state=config.weno_admissible_face_state,
+                positivity_preserving=positivity_preserving,
+                weno_epsilon=config.weno_epsilon,
+                omega_weights=omega_weights,
+                frozen=frozen,
+            )
+        elif has_g:
+            _, window_vjp = jax.vjp(window_outputs, q_stencil, g_stencil)
+            window_bar = window_vjp(cotangent)
+        else:
+            _, window_vjp = jax.vjp(lambda q_window: window_outputs(q_window, None), q_stencil)
+            (window_bar,) = window_vjp(cotangent)
+        if has_g:
+            q_window_bar, g_window_bar = window_bar
+            for position in range(6):
+                g_bar_ref[position, ...] = g_window_bar[position]
+        else:
+            q_window_bar = window_bar
+        for position in range(6):
+            for slot in range(num_components):
+                q_bar_ref[position * num_components + slot, ...] = q_window_bar[position][slot]
+
+    whole_state_spec = pl.BlockSpec(local_state.shape, whole_map)
+    whole_cotangent_spec = pl.BlockSpec(local_cotangent.shape, whole_map)
+    dtype = local_state.dtype
+    # b_eps and the sound-speed floor as typed scalars (x64 + Triton dtype
+    # hygiene), with the forward kernel's values
+    scalars = (
+        jnp.asarray(params.gamma, dtype=dtype),
+        jnp.asarray(params.minimum_density, dtype=dtype),
+        jnp.asarray(params.minimum_pressure, dtype=dtype),
+        jnp.asarray(1e-20, dtype=dtype),
+        jnp.asarray(1e-12, dtype=dtype),
+    )
+    # the window cotangents, then the scratch of the staged adjoint (discarded)
+    num_scratch = num_modes * MHD_ADJOINT_SCRATCH_PER_FIELD
+    out_shape = [
+        jax.ShapeDtypeStruct((6 * num_components,) + spatial_shape, dtype),
+        jax.ShapeDtypeStruct((num_scratch,) + spatial_shape, dtype),
+    ]
+    out_specs = [block_spec(6 * num_components), block_spec(num_scratch)]
+    if has_g:
+        in_specs = [whole_state_spec, pl.BlockSpec(energy_front.shape, whole_map), whole_cotangent_spec]
+        in_specs += [scalar_spec] * 6
+        args = (local_state, energy_front, local_cotangent) + scalars
+        args += (jnp.asarray(config.dual_energy_eta, dtype=dtype),)
+        out_shape.append(jax.ShapeDtypeStruct((6,) + spatial_shape, dtype))
+        out_specs.append(block_spec(6))
+    else:
+        in_specs = [whole_state_spec, whole_cotangent_spec] + [scalar_spec] * 5
+        args = (local_state, local_cotangent) + scalars
+
+    kwargs = {}
+    compiler_params = _pallas_compiler_params(config)
+    if compiler_params is not None:
+        kwargs["compiler_params"] = compiler_params
+    window_cotangents = pl.pallas_call(
+        kernel,
+        out_shape=tuple(out_shape),
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=tuple(out_specs),
+        interpret=config.backend_config.pallas_interpret,
+        name="mhd_weno_flux_vjp" + ("_dual" if has_g else ""),
+        **kwargs,
+    )(*args)
+
+    # -------------------------------------------------------------
+    # ====== ↓ Scatter the window cotangents onto the cells ↓ =====
+    # -------------------------------------------------------------
+    # The window position k of the interface at i holds cell i + offset_k, so
+    # the buffer of position k rolled by offset_k is that cell's share.
+    def scatter(buffers, num_rows):
+        total = None
+        for position, offset in enumerate(STENCIL_OFFSETS):
+            share = jnp.roll(buffers[position * num_rows:(position + 1) * num_rows], offset, axis=1)
+            total = share if total is None else total + share
+        return total
+
+    local_state_bar = scatter(window_cotangents[0], num_components)
+    state_bar_front = jnp.zeros_like(state_front).at[component_order].set(local_state_bar)
+    energy_bar_front = scatter(window_cotangents[2], 1) if has_g else None
+    # -------------------------------------------------------------
+    # ====== ↑ Scatter the window cotangents onto the cells ↑ =====
+    # -------------------------------------------------------------
+
+    if permutation is not None:
+        inverse = [permutation.index(i) for i in range(ndim + 1)]
+        state_bar_front = jnp.transpose(state_bar_front, inverse)
+        if has_g:
+            energy_bar_front = jnp.transpose(energy_bar_front, inverse)
+    if has_g:
+        return state_bar_front, energy_bar_front
+    return state_bar_front
+
+
+def _mhd_split_recombination(
+    conserved_state,
+    split_fluxes,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+    axis: int,
+    inflow_reference=None,
+):
+    """
+    The positivity-preserving ideal-MHD interface flux from the split face
+    fluxes of the Pallas window kernel, in native JAX: the array form of what
+    the forward evaluates after the kernel (``mhd_joint_recombination_pallas``
+    with an inflow reference, the paired scalings without). The Pallas adjoint
+    differentiates the recombination through it.
+
+    Args:
+        conserved_state: The conserved state.
+        split_fluxes: The ``(2 * num_vars + 1, *spatial)`` kernel output: the
+            plus and minus split face fluxes and the splitting speed.
+        params: The simulation parameters.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The flux axis.
+        inflow_reference: The ``(B, sum S)`` pair for the joint inflow
+            limiting, or None for the paired scalings.
+
+    Returns:
+        The interface flux.
+    """
+    num_vars = int(conserved_state.shape[0])
+    zero = jnp.zeros_like(conserved_state)
+    return positivity_preserving_interface_flux(
+        conserved_state,
+        mhd_physical_flux(conserved_state, params.gamma, registered_variables, axis),
+        split_fluxes[2 * num_vars],
+        split_fluxes[:num_vars],
+        split_fluxes[num_vars:2 * num_vars],
+        zero,
+        zero,
+        params,
+        config,
+        registered_variables,
+        axis=axis,
+        inflow_reference=inflow_reference,
+    )
+
+
+def _weno_flux_mhd_pallas_vjp(
+    conserved_state,
+    flux_cotangent,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+    *,
+    axis: int,
+    internal_energy_density=None,
+    inflow_reference=None,
+):
+    """
+    Pallas adjoint of :func:`_weno_flux_mhd_pallas`, with the multi-GPU wrap.
+
+    Without positivity preservation the interface flux is the window kernel's
+    output and its adjoint the window adjoint
+    (:func:`_weno_flux_mhd_pallas_window_vjp_local`). With it, the forward
+    recombines the split face fluxes of the kernel with those of the
+    neighbouring interfaces (and the inflow reference); here the split fluxes
+    are recomputed by the forward kernel, the recombination (joint inflow
+    limiting with the inflow reference, or the paired scalings without it,
+    dual energy) is differentiated in native JAX through its array form
+    (:func:`_mhd_split_recombination`), and its cotangent of the split fluxes
+    is pulled back by the window adjoint.
+
+    On a mesh every shard runs the window adjoint on its halo-padded block (a
+    cell's cotangent collects the six interfaces i - 3 ... i + 2, whose windows
+    reach five cells either side: halo 5 along the flux axis); the native
+    recombination runs under GSPMD.
+
+    Args:
+        conserved_state: The conserved state (the forward's input).
+        flux_cotangent: The cotangent of the interface flux.
+        params: The simulation parameters (constants of the derivative).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        axis: The flux axis.
+        internal_energy_density: The dual-energy ``g`` with the state's spatial
+            shape, or None.
+        inflow_reference: The ``(B, sum S)`` pair of ``mhd_inflow_reference``
+            (positivity preservation without dual energy), or None.
+
+    Returns:
+        The cotangent of ``conserved_state``; with dual energy the tuple of it
+        and the cotangent of ``internal_energy_density``; with an inflow
+        reference the tuple of it and the cotangents of the reference state
+        and of the speed sum.
+    """
+    ndim = 3
+    has_g = internal_energy_density is not None
+    energy_input = internal_energy_density[None] if has_g else None
+    block_shape = _as_3tuple_block_shape(
+        config.backend_config.pallas_block_shape,
+        ndim,
+        spatial_shape=conserved_state.shape[1:],
+    )
+    reference_cotangents = ()
+    if config.weno_positivity_preserving:
+
+        def split_local(state_local, *energy_local):
+            return _weno_flux_mhd_pallas_local(
+                state_local,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+                internal_energy_density=energy_local[0] if energy_local else None,
+                split_only=True,
+            )
+
+        split_fluxes = _weno5_shard_wrap(
+            split_local,
+            conserved_state,
+            config,
+            axis,
+            extra_state_inputs=(energy_input,) if has_g else (),
+        )
+
+        # The recombination is differentiated in native JAX, through its array
+        # form. A Pallas adjoint of it (jax.vjp of the recombination window in
+        # a kernel) was exact in isolation, but inside the reverse-mode time
+        # loop of a 128^3 run with all three axes on it returned
+        # inflow-reference cotangents that made the gradient wrong (each axis
+        # alone, and 64^3, were correct); the array form gives the
+        # native-tangent gradient.
+        reference = tuple(inflow_reference) if inflow_reference is not None else ()
+
+        def recombination(state, split, *reference_inputs):
+            return _mhd_split_recombination(
+                state,
+                split,
+                params,
+                config,
+                registered_variables,
+                axis,
+                inflow_reference=tuple(reference_inputs) if reference_inputs else None,
+            )
+
+        _, recombination_vjp = jax.vjp(recombination, conserved_state, split_fluxes, *reference)
+        state_bar, window_cotangent, *reference_cotangents = recombination_vjp(flux_cotangent)
+        reference_cotangents = tuple(reference_cotangents)
+    else:
+        state_bar = None
+        window_cotangent = flux_cotangent
+
+    halo = [0, 0, 0]
+    halo[int(axis)] = 5
+    if has_g:
+
+        def window_adjoint_dual(state_local, energy_local, cotangent_local):
+            return _weno_flux_mhd_pallas_window_vjp_local(
+                state_local,
+                cotangent_local,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+                internal_energy_density=energy_local,
+            )
+
+        window_state_bar, energy_bar = _pallas_call_sharded(
+            window_adjoint_dual,
+            state_inputs=(conserved_state, energy_input, window_cotangent),
+            halo=tuple(halo),
+            block_shape=block_shape,
+            num_state_outputs=2,
+        )
+    else:
+
+        def window_adjoint(state_local, cotangent_local):
+            return _weno_flux_mhd_pallas_window_vjp_local(
+                state_local,
+                cotangent_local,
+                params,
+                config,
+                registered_variables,
+                axis=axis,
+            )
+
+        window_state_bar = _pallas_call_sharded(
+            window_adjoint,
+            state_inputs=(conserved_state, window_cotangent),
+            halo=tuple(halo),
+            block_shape=block_shape,
+        )
+    state_bar = window_state_bar if state_bar is None else state_bar + window_state_bar
+    if has_g:
+        return state_bar, energy_bar[0]
+    if inflow_reference is not None:
+        return (state_bar,) + reference_cotangents
+    return state_bar
+
 
 
 # -----------------------------------------------------------------------------
@@ -2180,7 +3778,7 @@ def _weno_flux_mhd_iso_pallas_local(
     epsilon = config.weno_epsilon
     # WENO-Z is a static config choice, so the weight function can be bound
     # here and inlined into the Pallas kernel body below.
-    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
+    omega_weights = _weno_omega_weights_z_kernel if config.weno_z else _weno_omega_weights
     tiny = 1e-14
     b_eps_value = 1e-20
     positivity_preserving = config.weno_positivity_preserving
@@ -2478,7 +4076,11 @@ def _weno_flux_mhd_iso_pallas_local(
                     cs * am_slow * bt_n2 / sqrt_rho_face,
                 )
                 scale = jnp.where(~cs_geq_alfven, sgn_bt, 1.0)
-            return [flux_acc[slot] + (R[slot] * scale) * Fs for slot in range(ncomp)]
+            # ``scale`` is +-1, so applying it to the amplitude instead of
+            # every component is exact.
+            if isinstance(scale, float):
+                return _add_scaled_column(flux_acc, R, Fs)
+            return _add_scaled_column(flux_acc, R, scale * Fs)
 
         def alpha_for_mode(mode: int):
             amx = jnp.abs(lambda_from_floored_cell(floored_stencil[0], mode))
@@ -2512,22 +4114,28 @@ def _weno_flux_mhd_iso_pallas_local(
             minus_shift = [flux_acc[0] * 0.0 for _ in range(ncomp)]
 
 
+        # The stencil differences (see ``_stencil_differences``) and the local
+        # Lax-Friedrichs speed of every mode are formed once, before the loop,
+        # so that the cell data of the outer stencil cells is no longer live in it.
+        flux_differences = _stencil_differences(f_stencil, ncomp)
+        state_differences = _stencil_differences(q_stencil, ncomp)
+        mode_speeds = {
+            mode: alpha_for_mode(mode)
+            for mode in range(num_modes)
+            if not (positivity_preserving and mode not in own_speed_modes)
+        }
         for mode in range(num_modes):
-            s = tuple(left_project(mode, f_stencil[k]) for k in range(6))
-            qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
-
-            d0 = s[1] - s[0]; d1 = s[2] - s[1]; d2 = s[3] - s[2]
-            d3 = s[4] - s[3]; d4 = s[5] - s[4]
-            dq0 = qproj[1] - qproj[0]; dq1 = qproj[2] - qproj[1]
-            dq2 = qproj[3] - qproj[2]; dq3 = qproj[4] - qproj[3]
-            dq4 = qproj[5] - qproj[4]
+            d0, d1, d2, d3, d4 = (left_project(mode, difference) for difference in flux_differences)
+            dq0, dq1, dq2, dq3, dq4 = (left_project(mode, difference) for difference in state_differences)
+            if mode in own_speed_modes:
+                qproj = tuple(left_project(mode, q_stencil[k]) for k in range(6))
 
             # (under PP the mass-carrying fields use the common speed: skip their
             # own stencil maximum, which would only be computed and discarded)
             if positivity_preserving and mode not in own_speed_modes:
                 amx = common_speed
             else:
-                amx = alpha_for_mode(mode)
+                amx = mode_speeds[mode]
 
             aterm_p = 0.5 * (d0 + amx * dq0); bterm_p = 0.5 * (d1 + amx * dq1)
             cterm_p = 0.5 * (d2 + amx * dq2); dterm_p = 0.5 * (d3 + amx * dq3)
@@ -2574,11 +4182,14 @@ def _weno_flux_mhd_iso_pallas_local(
                 common_speed, 0.0, rhomin, 0.0, ideal_gas=False, magnetic_slots=(4, 5, 6),
             )
 
+        # Only variables outside the local component set are zeroed: every
+        # store is a separate memory transaction.
         zero = flux_acc[0] * 0.0
         for var in range(nvars):
-            flux_out_ref[var, ...] = zero
+            if var not in local_indices:
+                flux_out_ref[var, ...] = zero
         for slot, var in enumerate(local_indices):
-            flux_out_ref[var, ...] = flux_acc[slot]
+            flux_out_ref[var, ...] = _as_tile(flux_acc[slot], zero)
 
     kwargs = {}
     compiler_params = _pallas_compiler_params(config)
@@ -2705,7 +4316,7 @@ def _weno_flux_hydro_pallas_rhs_local(
     epsilon = config.weno_epsilon
     # WENO-Z is a static config choice, so the weight function can be bound
     # here and inlined into the Pallas kernel body below.
-    omega_weights = _weno_omega_weights_z if config.weno_z else _weno_omega_weights
+    omega_weights = _weno_omega_weights_z_kernel if config.weno_z else _weno_omega_weights
     tiny = 1e-14
 
     if ndim == 1:

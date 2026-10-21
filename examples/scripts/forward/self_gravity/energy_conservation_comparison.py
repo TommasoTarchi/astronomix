@@ -1,26 +1,34 @@
-"""Energy evolution across the self-gravity source-term schemes.
+"""Energy budget of Evrard's collapse across the self-gravity couplings.
 
-Figure: ``figures/energy_conservation_comparison.svg``
-(the former ``collapse_resolution_study.svg`` -- this is a method comparison at
-a single resolution, not a resolution study).
+Figure: ``figures/energy_conservation_comparison_fp64.{svg,pdf,png}`` (with
+``--double``; Fig. 14 of the methods paper).
 
-Runs the Evrard collapse at a single resolution with the three finite-difference
-self-gravity source-term schemes and compares the evolution of the energy
-budget (total / internal / kinetic / gravitational) and the relative total
-energy error.
+Runs the cold Evrard collapse (``e0 = 0.05``) at ``128^3`` with the
+finite-difference baseline (WENO-Z, positivity-preserving WENO, Pallas) and
+every self-gravity coupling: the simple source, the flux-based and the
+corrected flux-based coupling, and the corrected coupling with flux-corrected
+gravitational work, and with the second-order finite-volume scheme (VL2, PLM,
+HLLC, C_cfl = 0.3, native backend) with Athena++'s coupling, with and without
+the time-centred energy source of Mullen, Hanawa & Gammie (2021). It compares the evolution of the energy budget (total /
+internal / kinetic / gravitational) and the relative total-energy error, and
+records the smallest pressure of every run.
 
 Run from the repo root:
 
-    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/self_gravity/energy_conservation_comparison.py
+    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/self_gravity/energy_conservation_comparison.py --rerun --double
 
 Pass ``--rerun`` to re-run the simulations; otherwise the cached results in
-``data/energy_conservation_comparison.npz`` are used.
+``data/energy_conservation_comparison_fp64.npz`` are used.
+``--rerun --double --schemes 3 3_tc`` reruns only the finite-volume scheme.
 """
 
 # ==== GPU selection ====
-from autocvd import autocvd
+import os
 
-autocvd(num_gpus=1)
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
@@ -31,15 +39,11 @@ import sys
 # jax
 import jax
 
-# ``--double``: rerun Evrard's collapse in float64 to check whether the residual
-# energy errors are floating-point round-off. x64 must be set before any array
-# is created, hence before jax.numpy is imported below. Uses the native backend
-# (the Pallas kernel floors at reduced precision); see _collapse._backend_kwargs.
+# ``--double`` runs in float64, as in the paper. x64 must be set before any
+# array is created, hence before jax.numpy is imported (by the helpers below).
 DOUBLE = "--double" in sys.argv
 if DOUBLE:
     jax.config.update("jax_enable_x64", True)
-
-import jax.numpy as jnp
 
 # numerics
 import numpy as np
@@ -48,65 +52,81 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # astronomix constants
-from astronomix import (
-    NATIVE_JAX,
-    PALLAS,
-)
+from astronomix import PALLAS
 
 # figure helpers
-from _collapse import run_collapse
+from _collapse import (
+    COLD_INITIAL_ENERGY,
+    COURANT_NUMBER,
+    CollapseScheme,
+    relative_energy_error,
+    run_collapse,
+)
 from _common import (
+    COLLAPSE_COMPARISON_SCHEMES,
     DATA_DIR,
-    FIG_DIR,
-    SCHEMES,
     apply_paper_style,
+    save_figure,
 )
 
-RUN_BACKEND = NATIVE_JAX if DOUBLE else PALLAS
-_SUFFIX = "_fp64" if DOUBLE else ""
-_PREC_LABEL = "float64" if DOUBLE else "float32"
-
-# The three shared finite-difference self-gravity source-term schemes.
-ENERGY_SCHEMES = list(SCHEMES)
-
-
-def _scheme_key(scheme):
-    """Unique data key per scheme."""
-    return f"fd_{scheme.self_gravity_version}"
-
+SUFFIX = "_fp64" if DOUBLE else ""
+PRECISION_LABEL = "float64" if DOUBLE else "float32"
 
 RESOLUTION = 128
 T_END = 1.2
-DATA_FILE = DATA_DIR / f"energy_conservation_comparison{_SUFFIX}.npz"
-FIG_FILE = FIG_DIR / f"energy_conservation_comparison{_SUFFIX}.svg"
+NUM_SNAPSHOTS = 121
+DATA_FILE = DATA_DIR / f"energy_conservation_comparison{SUFFIX}.npz"
+FIGURE_STEM = f"energy_conservation_comparison{SUFFIX}"
 
 
-def run_and_cache():
-    """Run the collapse for every scheme and cache the energy diagnostics.
+def run_and_cache(schemes):
+    """Run the collapse for the given couplings and cache the energy diagnostics.
 
     Writes the per-scheme time series of the total / internal / kinetic /
-    gravitational energy to ``DATA_FILE`` so the figure can be re-styled without
-    re-running the simulations.
+    gravitational energy, the smallest final pressure and the number of steps
+    to ``DATA_FILE``. The cached data of schemes that are not run are kept.
+
+    Args:
+        schemes: The schemes to run.
     """
-    save_kwargs = {"resolution": np.array(RESOLUTION)}
-    for scheme in ENERGY_SCHEMES:
-        print(f"  {scheme.label} (N={RESOLUTION}, {_PREC_LABEL})", flush=True)
-        snapshots, _, _ = run_collapse(
+    save_kwargs = {}
+    if DATA_FILE.exists():
+        save_kwargs.update(np.load(DATA_FILE))
+    save_kwargs["resolution"] = np.array(RESOLUTION)
+    save_kwargs["courant_number"] = np.array(COURANT_NUMBER)
+    for scheme in schemes:
+        print(f"  {scheme.label} (N={RESOLUTION}, {PRECISION_LABEL})", flush=True)
+        snapshots, _, registered_variables = run_collapse(
             RESOLUTION,
-            scheme.self_gravity_version,
+            CollapseScheme(
+                self_gravity_version=scheme.self_gravity_version,
+                work_flux_correction=scheme.work_flux_correction,
+                time_centred_energy_source=scheme.time_centred_energy_source,
+            ),
             t_end=T_END,
-            backend=RUN_BACKEND,
-            solver_mode=scheme.solver_mode,
+            initial_energy=COLD_INITIAL_ENERGY,
+            backend=PALLAS,
+            num_snapshots=NUM_SNAPSHOTS,
         )
-        scheme_key = _scheme_key(scheme)
-        save_kwargs[f"time_{scheme_key}"] = np.asarray(snapshots.time_points)
-        save_kwargs[f"total_{scheme_key}"] = np.asarray(snapshots.total_energy)
-        save_kwargs[f"internal_{scheme_key}"] = np.asarray(snapshots.internal_energy)
-        save_kwargs[f"kinetic_{scheme_key}"] = np.asarray(snapshots.kinetic_energy)
-        save_kwargs[f"gravitational_{scheme_key}"] = np.asarray(
+        energy_error = np.asarray(relative_energy_error(snapshots))
+        minimum_pressure = float(
+            snapshots.final_state[registered_variables.pressure_index].min()
+        )
+        print(
+            f"    max |dE|/|E0| = {energy_error.max():.3e}, final {energy_error[-1]:.3e}, "
+            f"min p(t_end) = {minimum_pressure:.2e}, steps = {int(snapshots.num_iterations)}",
+            flush=True,
+        )
+        save_kwargs[f"time_{scheme.key}"] = np.asarray(snapshots.time_points)
+        save_kwargs[f"total_{scheme.key}"] = np.asarray(snapshots.total_energy)
+        save_kwargs[f"internal_{scheme.key}"] = np.asarray(snapshots.internal_energy)
+        save_kwargs[f"kinetic_{scheme.key}"] = np.asarray(snapshots.kinetic_energy)
+        save_kwargs[f"gravitational_{scheme.key}"] = np.asarray(
             snapshots.gravitational_energy
         )
-    jnp.savez(DATA_FILE, **save_kwargs)
+        save_kwargs[f"minimum_pressure_{scheme.key}"] = np.array(minimum_pressure)
+        save_kwargs[f"num_steps_{scheme.key}"] = np.array(int(snapshots.num_iterations))
+    np.savez(DATA_FILE, **save_kwargs)
     print(f"Saved -> {DATA_FILE}")
 
 
@@ -121,7 +141,7 @@ def plot():
     resolution = int(data["resolution"])
 
     apply_paper_style()
-    fig, (ax_terms, ax_err) = plt.subplots(2, 1, figsize=(9, 9))
+    fig, (ax_terms, ax_error) = plt.subplots(2, 1, figsize=(12, 9))
 
     # Fixed colours per energy component; line style distinguishes scheme.
     component_colors = {
@@ -132,23 +152,23 @@ def plot():
     }
 
     # --------------- ↓ Per-scheme curves ↓ ----------------
-    for scheme in ENERGY_SCHEMES:
-        scheme_key = _scheme_key(scheme)
-        time = data[f"time_{scheme_key}"]
+    for scheme in COLLAPSE_COMPARISON_SCHEMES:
+        time = data[f"time_{scheme.key}"]
         for component, color in component_colors.items():
             ax_terms.plot(
                 time,
-                data[f"{component}_{scheme_key}"],
+                data[f"{component}_{scheme.key}"],
                 color=color,
                 linestyle=scheme.linestyle,
-                linewidth=1.8,
+                linewidth=1.5,
             )
 
-        total = data[f"total_{scheme_key}"]
-        rel_err = np.abs(total - total[0]) / np.abs(total[0])
-        ax_err.plot(
-            time,
-            rel_err,
+        total = data[f"total_{scheme.key}"]
+        relative_error = np.abs(total - total[0]) / np.abs(total[0])
+        # The error is exactly zero at t = 0; leave that point off the log axis.
+        ax_error.plot(
+            time[1:],
+            relative_error[1:],
             color=scheme.color,
             linestyle=scheme.linestyle,
             linewidth=scheme.linewidth,
@@ -162,7 +182,7 @@ def plot():
     ax_terms.set_title(f"Energy budget ($N = {resolution}^3$)")
 
     # Two compact legends: colour encodes the energy component, line style the
-    # source-term scheme.
+    # coupling.
     component_handles = [
         plt.Line2D([], [], color=color, linewidth=2, label=component.capitalize())
         for component, color in component_colors.items()
@@ -175,7 +195,7 @@ def plot():
             linewidth=2,
             label=scheme.label,
         )
-        for scheme in ENERGY_SCHEMES
+        for scheme in COLLAPSE_COMPARISON_SCHEMES
     ]
     legend_components = ax_terms.legend(
         handles=component_handles,
@@ -184,25 +204,35 @@ def plot():
         title="component",
     )
     ax_terms.add_artist(legend_components)
+    # With six couplings the legends sit beside the axes, where they cover no
+    # curve.
     ax_terms.legend(
         handles=scheme_handles,
-        loc="lower left",
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
         fontsize="small",
-        title="scheme",
+        title="coupling",
     )
 
-    ax_err.set_yscale("log")
-    ax_err.set_xlabel("time")
-    ax_err.set_ylabel("relative total energy error")
-    ax_err.set_title("Relative total energy error")
-    ax_err.legend(fontsize="small")
+    ax_error.set_yscale("log")
+    ax_error.set_xlabel("time")
+    ax_error.set_ylabel("relative total energy error")
+    ax_error.set_title("Relative total energy error")
+    ax_error.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize="small")
 
     fig.suptitle(
-        f"Energy evolution across different source term schemes ({_PREC_LABEL})"
+        f"Evrard's collapse: energy evolution across the self-gravity couplings ({PRECISION_LABEL})"
     )
     fig.tight_layout()
-    fig.savefig(FIG_FILE)
-    print(f"Saved -> {FIG_FILE}")
+    print(f"Saved -> {save_figure(fig, FIGURE_STEM)}")
+
+    for scheme in COLLAPSE_COMPARISON_SCHEMES:
+        total = data[f"total_{scheme.key}"]
+        relative_error = np.abs(total - total[0]) / np.abs(total[0])
+        print(
+            f"  {scheme.label}: max |dE|/|E0| = {relative_error.max():.3e}, "
+            f"min p(t_end) = {float(data[f'minimum_pressure_{scheme.key}']):.2e}"
+        )
 
 
 def main():
@@ -214,12 +244,22 @@ def main():
     parser.add_argument(
         "--double",
         action="store_true",
-        help="run in float64 (native backend) to check for round-off-limited errors",
+        help="run in float64 (the figure of the paper)",
+    )
+    parser.add_argument(
+        "--schemes",
+        nargs="+",
+        default=None,
+        help="with --rerun, run only the schemes with these cache keys (e.g. 3 3_tc "
+        "for the finite-volume scheme) and keep the cached data of the others",
     )
     args = parser.parse_args()
 
+    schemes = COLLAPSE_COMPARISON_SCHEMES
+    if args.schemes is not None:
+        schemes = [scheme for scheme in COLLAPSE_COMPARISON_SCHEMES if scheme.key in args.schemes]
     if args.rerun or not DATA_FILE.exists():
-        run_and_cache()
+        run_and_cache(schemes)
     else:
         print(f"Using cached results in {DATA_FILE} (pass --rerun to recompute).")
     plot()

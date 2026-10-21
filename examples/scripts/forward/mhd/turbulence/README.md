@@ -190,6 +190,38 @@ overflows the Kokkos team-scratch limit, so 256^3 is decomposed into eight 128^3
 blocks — which is how AthenaPK is normally run anyway, and the block-boundary
 cost that carries is part of what the code costs at that size.
 
+## astronomix FD against astronomix FV (paper revision)
+
+The same estimator applied to astronomix's two discretisations: the finite
+difference scheme (WENO-Z + constrained transport, SSPRK4, `C_cfl = 1.5`,
+isothermal) and the finite volume scheme that reproduces AthenaPK's VL2 (PLM +
+HLLD + GLM, `gamma = 1.0001`, `C_cfl = 0.3`), both on the Pallas backend in double
+precision, with the same forcing seed and the zero-net-flux weak seed field:
+
+```bash
+bash run_dynamo_ladder.sh                       # FD and FV, N = 64, 128, 256 (Slurm)
+python make_mechanism_table.py --data data/fd_fv --summary
+python make_fd_fv_reynolds_figure.py --data data/fd_fv
+```
+
+At matched `E_B/E_K = 0.01` (`data/fd_fv/mechanism_summary.md`):
+
+| scheme | N | `nu_eff` | `eta_eff` | `Re` | `Rm` | `Pm` |
+|---|---|---|---|---|---|---|
+| FV VL2+GLM | 64 / 128 / 256 | 1.34e-3 / 6.04e-4 / 3.09e-4 | 2.18e-3 / 9.92e-4 / 4.89e-4 | 495 / 1105 / 2510 | 304 / 672 / 1586 | 0.61 / 0.61 / 0.63 |
+| FD WENO-Z+CT | 64 / 128 / 256 | 8.61e-4 / 3.66e-4 / 1.63e-4 | 7.44e-4 / 3.14e-4 / 1.34e-4 | 852 / 1888 / 4348 | 987 / 2202 / 5288 | 1.16 / 1.17 / 1.22 |
+
+The FV rows reproduce the AthenaPK PLM+VL2 rows above to 1-3 %; the FD scheme has
+0.5-0.6 times the viscosity and 0.3 times the resistivity of the FV scheme at
+the same N. With the positivity-preserving WENO (`--pp`) the FD `Pm` drops to
+1.0 (the common splitting speed raises both diffusivities).
+
+The paper's HOW-MHD turbulence figures (ISM and ICM at 256^3 and 512^3) come from
+`paper_turbulence.py`, which reduces every snapshot on the GPU and checkpoints
+between intervals so that long runs resume across Slurm jobs
+(`pytests/runners/turb_paper.sh`); `make_fig14.py` and `make_fig15.py` build the
+figures.
+
 ## Where the data lives
 
 Only the reduced per-run `.npz` files (a few hundred kB each: the scalar time

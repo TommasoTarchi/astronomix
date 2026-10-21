@@ -28,6 +28,14 @@ The Pallas backend of these helpers lives in
 ``_constrained_transport_pallas.py``; it is opt-in
 (``backend_config.pallas_ct``) and the predicates below fall
 through to the native implementation otherwise.
+
+The edge EMFs above are built by central high-order interpolation and
+carry upwind dissipation only through the WENO fluxes of the cell-centred
+field, which is itself a central interpolation of the interface fields.
+Near the Nyquist wavenumber that leaves the interface fields too little
+damping: a uniform field oblique to the grid lets grid-scale perturbations
+grow. ``ct_upwind_dissipation_rhs`` adds the missing upwind dissipation
+directly on the interface fields (``SimulationConfig.ct_upwind_dissipation``).
 """
 
 # general
@@ -35,12 +43,14 @@ from functools import partial
 
 # jax
 import jax
+import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import IDEAL_GAS
 
 # astronomix containers
 from astronomix.option_classes.simulation_config import SimulationConfig
+from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
@@ -49,6 +59,8 @@ from astronomix._finite_difference._magnetic_update._constrained_transport_palla
     _ct_rhs_pallas_supported,
     _ct_update_cell_center_fields_pallas,
     _ct_update_cell_center_fields_pallas_supported,
+    _ct_upwind_dissipation_pallas,
+    _ct_upwind_pallas_supported,
 )
 from astronomix._spatial_operators._differencing import finite_difference_int6
 from astronomix._spatial_operators._interpolate import (
@@ -57,6 +69,7 @@ from astronomix._spatial_operators._interpolate import (
     point_values_to_averages,
     point_values_to_averages_single_axis,
 )
+from astronomix._stencil_operations._stencil_operations import _shift
 
 XAXIS = 0
 YAXIS = 1
@@ -388,6 +401,215 @@ def update_cell_center_fields(
     # There is no energy to update for the isothermal equation of state.
 
     return conserved_new
+
+
+def _upwind_edge_jump(face_field, axis):
+    """
+    The jump at the half index i + 1/2 along ``axis`` of a field stored at the
+    integer positions i: its fifth-order upwind-biased interpolation from the
+    right (positions i - 1 ... i + 3) minus the one from the left (positions
+    i - 2 ... i + 2). It is O(dx^5) on smooth fields and about half the
+    first-order jump at the Nyquist wavenumber.
+
+    Args:
+        face_field: The field, stored at the integer positions along ``axis``.
+        axis: The axis of the jump.
+
+    Returns:
+        The jump, stored at index i for the half index i + 1/2.
+    """
+
+    def value_at(offset):
+        return _shift(face_field, -offset, axis=axis)
+
+    from_left = (
+        2.0 * value_at(-2)
+        - 13.0 * value_at(-1)
+        + 47.0 * value_at(0)
+        + 27.0 * value_at(1)
+        - 3.0 * value_at(2)
+    ) / 60.0
+    from_right = (
+        -3.0 * value_at(-1)
+        + 27.0 * value_at(0)
+        + 47.0 * value_at(1)
+        - 13.0 * value_at(2)
+        + 2.0 * value_at(3)
+    ) / 60.0
+    return from_right - from_left
+
+
+@partial(jax.jit, static_argnames=["registered_variables", "config"])
+def ct_upwind_dissipation_rhs(
+    conserved_state,
+    bx_interface,
+    by_interface,
+    bz_interface,
+    dt_tilde,
+    grid_spacing,
+    gamma,
+    params: SimulationParams,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """
+    Upwind dissipation of the edge EMFs on the interface fields, in the form
+    of the upwind constrained transport of Londrillo & Del Zanna (2004): every
+    edge EMF gets the jumps of the two interface-field components that meet at
+    the edge, reconstructed to the edge from both sides, times half the local
+    fast signal speed across each jump and the strength kappa
+    (``config.ct_upwind_strength``; 1 is the full upwind form),
+
+        Omega_z += -kappa (a_y / 2) (B_x^+y - B_x^-y) + kappa (a_x / 2) (B_y^+x - B_y^-x)
+
+    and cyclically for Omega_x and Omega_y, with a_d = |v_d| + c_fast,d the
+    largest over the (up to) four cells around the edge. The increments are the
+    discrete curl of these EMFs with the CT's own staggered derivative, so
+    div B = 0 is kept exactly. With fifth-order reconstructions the jumps are
+    O(dx^5) on smooth fields: the scheme keeps its order, while the
+    grid-scale modes of the interface fields, which the central CT
+    interpolations leave undamped, are damped at the local signal speed.
+    In 1D and 2D the fields are invariant along the collapsed axes. In 3D on
+    the Pallas backend the same arithmetic runs in two kernels
+    (``_constrained_transport_pallas._ct_upwind_dissipation_pallas``).
+
+    Args:
+        conserved_state: The conserved state (its cell-centred fields give
+            the signal speeds).
+        bx_interface: The B_x field at the x-interfaces.
+        by_interface: The B_y field at the y-interfaces.
+        bz_interface: The B_z field at the z-interfaces.
+        dt_tilde: The (stage) time step.
+        grid_spacing: The cell size.
+        gamma: The adiabatic index (ideal gas).
+        params: The simulation parameters (minimum density and pressure,
+            isothermal sound speed).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The increments of the interface fields (bx, by, bz).
+    """
+
+    if _ct_upwind_pallas_supported(conserved_state, config):
+        increments = _ct_upwind_dissipation_pallas(
+            conserved_state,
+            jnp.stack([bx_interface, by_interface, bz_interface]),
+            dt_tilde / grid_spacing,
+            gamma,
+            params,
+            config,
+            registered_variables,
+        )
+        return increments[0], increments[1], increments[2]
+
+    # -------------------------------------------------------------
+    # ========== ↓ Fast signal speed along every axis ↓ ===========
+    # -------------------------------------------------------------
+
+    density = jnp.maximum(
+        conserved_state[registered_variables.density_index],
+        params.minimum_density,
+    )
+    momentum_indices = (
+        registered_variables.momentum_index.x,
+        registered_variables.momentum_index.y,
+        registered_variables.momentum_index.z,
+    )
+    magnetic_indices = (
+        registered_variables.magnetic_index.x,
+        registered_variables.magnetic_index.y,
+        registered_variables.magnetic_index.z,
+    )
+    velocity = [conserved_state[index] / density for index in momentum_indices]
+    magnetic_field = [conserved_state[index] for index in magnetic_indices]
+    magnetic_field_squared = sum(component * component for component in magnetic_field)
+
+    if config.equation_of_state == IDEAL_GAS:
+        kinetic_energy = 0.5 * density * sum(component * component for component in velocity)
+        gas_pressure = (gamma - 1.0) * (
+            conserved_state[registered_variables.energy_index]
+            - kinetic_energy
+            - 0.5 * magnetic_field_squared
+        )
+        sound_speed_squared = gamma * jnp.maximum(gas_pressure, params.minimum_pressure) / density
+    else:
+        sound_speed_squared = params.isothermal_sound_speed ** 2
+
+    alfven_speed_squared = magnetic_field_squared / density
+    total_speed_squared = sound_speed_squared + alfven_speed_squared
+    signal_speed = []
+    for axis in range(3):
+        normal_alfven_speed_squared = magnetic_field[axis] * magnetic_field[axis] / density
+        discriminant = jnp.maximum(
+            total_speed_squared * total_speed_squared
+            - 4.0 * sound_speed_squared * normal_alfven_speed_squared,
+            0.0,
+        )
+        fast_speed = jnp.sqrt(0.5 * (total_speed_squared + jnp.sqrt(discriminant)))
+        signal_speed.append(jnp.abs(velocity[axis]) + fast_speed)
+
+    # -------------------------------------------------------------
+    # ========== ↑ Fast signal speed along every axis ↑ ===========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ================ ↓ Upwind edge EMFs and curl ↓ ==============
+    # -------------------------------------------------------------
+
+    # Omega_z lives on the (x, y) edges, Omega_x on the (y, z) edges and
+    # Omega_y on the (z, x) edges, with the CT's sign convention (the
+    # increments below are its curl, so each jump term diffuses its field
+    # component across the jump). Below 3D the fields are invariant along the
+    # collapsed axes, so jumps and differences along them vanish and the edge
+    # maxima run over the active axes only.
+    dimensionality = int(config.dimensionality)
+
+    def edge_maximum(cell_field, first_axis, second_axis):
+        maximum = cell_field
+        for axis in (first_axis, second_axis):
+            if axis < dimensionality:
+                maximum = jnp.maximum(maximum, _shift(maximum, -1, axis=axis))
+        return maximum
+
+    def upwind_term(speed_axis, first_axis, second_axis, face_field, jump_axis):
+        if jump_axis >= dimensionality:
+            return 0.0
+        return (
+            edge_maximum(signal_speed[speed_axis], first_axis, second_axis)
+            * _upwind_edge_jump(face_field, jump_axis)
+        )
+
+    def difference(edge_field, axis):
+        # An EMF built only from collapsed jumps is the plain number 0.
+        if axis >= dimensionality or isinstance(edge_field, float):
+            return 0.0
+        return finite_difference_int6(edge_field, axis)
+
+    half_strength = 0.5 * config.ct_upwind_strength
+    emf_z = half_strength * (
+        -upwind_term(1, XAXIS, YAXIS, bx_interface, YAXIS)
+        + upwind_term(0, XAXIS, YAXIS, by_interface, XAXIS)
+    )
+    emf_x = half_strength * (
+        -upwind_term(2, YAXIS, ZAXIS, by_interface, ZAXIS)
+        + upwind_term(1, YAXIS, ZAXIS, bz_interface, YAXIS)
+    )
+    emf_y = half_strength * (
+        -upwind_term(0, ZAXIS, XAXIS, bz_interface, XAXIS)
+        + upwind_term(2, ZAXIS, XAXIS, bx_interface, ZAXIS)
+    )
+
+    time_step_over_spacing = dt_tilde / grid_spacing
+    rhs_bx = time_step_over_spacing * (-difference(emf_z, YAXIS) + difference(emf_y, ZAXIS))
+    rhs_by = time_step_over_spacing * (-difference(emf_x, ZAXIS) + difference(emf_z, XAXIS))
+    rhs_bz = time_step_over_spacing * (-difference(emf_y, XAXIS) + difference(emf_x, YAXIS))
+
+    # -------------------------------------------------------------
+    # ================ ↑ Upwind edge EMFs and curl ↑ ==============
+    # -------------------------------------------------------------
+
+    return rhs_bx, rhs_by, rhs_bz
 
 
 @partial(jax.jit, static_argnames=["dimensionality"])

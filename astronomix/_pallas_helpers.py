@@ -30,6 +30,7 @@ from contextlib import contextmanager
 import jax
 import jax.numpy as jnp
 from jax.sharding import (
+    Mesh,
     NamedSharding,
     PartitionSpec,
 )
@@ -65,27 +66,91 @@ def _backend_is_pallas(config: SimulationConfig) -> bool:
     return config.backend_config.backend == PALLAS
 
 
-def _default_pallas_block_shape(ndim: int) -> tuple[int, int, int]:
+#: Cells per program of the default Pallas block: one cell per thread at the
+#: default ``pallas_num_warps = 4``.
+DEFAULT_BLOCK_CELLS = 128
+
+
+def _default_pallas_block_shape(ndim: int, spatial_shape=None) -> tuple[int, int, int]:
     """
     Return the default Pallas block shape ``(bx, by, bz)`` for ``ndim`` spatial
-    dimensions (inactive dimensions set to 1).
+    dimensions (inactive dimensions set to 1): ``DEFAULT_BLOCK_CELLS`` cells,
+    filled from the contiguous (last) spatial axis, i.e. ``(1, 1, 128)`` in 3D
+    and ``(1, 128)`` in 2D on production grids.
 
-    The 3D default (2, 2, 32) gives 128-cell blocks, one cell per thread at the
-    default ``num_warps=4``, with a 256-byte contiguous fast axis. Among the
-    128-cell shapes those with long z rows perform alike; larger blocks spill
-    registers and smaller ones leave threads idle.
+    The state is stored as (variable, x, y, z) with z contiguous, and a memory
+    transaction moves 128 contiguous bytes, so long rows along the last axis
+    read the stencils with the fewest transactions; 128 cells keep one cell
+    per thread at four warps. On a GH200 this was the fastest or within ~2 %
+    of the fastest block for every kernel family (finite-difference WENO
+    hydrodynamics, ideal and isothermal MHD with and without the
+    positivity-preserving WENO, Pallas CT, VL2) in both precisions: blocks with
+    short rows, e.g. (4, 4, 8), were 7-38 % slower, and in 2D the earlier
+    (16, 16) up to 2x slower (256 cells on four warps spill registers). The
+    block extent of 1 along x also keeps the block-rounded halo of an
+    x-sharded run at the stencil reach.
 
     Args:
         ndim: The number of spatial dimensions.
+        spatial_shape: Optional spatial shape of the array to be tiled. With
+            it, every axis gets the largest power of two that fits the
+            remaining cell budget and divides the extent (so a 64^3 grid gets
+            (1, 2, 64)).
 
     Returns:
         The block shape as a 3-tuple.
     """
-    if ndim == 1:
-        return (128, 1, 1)
-    if ndim == 2:
-        return (16, 16, 1)
-    return (2, 2, 32)
+    if spatial_shape is None:
+        extents = (DEFAULT_BLOCK_CELLS,) * ndim
+    else:
+        extents = tuple(int(extent) for extent in spatial_shape)
+    parts = [1, 1, 1]
+    remaining_cells = DEFAULT_BLOCK_CELLS
+    for axis in reversed(range(ndim)):
+        parts[axis] = _largest_tiling_block_size(remaining_cells, extents[axis])
+        remaining_cells //= parts[axis]
+    if _too_small_for_a_warp(parts, extents):
+        # No efficient tiling exists (e.g. an odd number of interior cells plus
+        # ghost cells): keep the full-size block, which does not tile the grid,
+        # so that the support predicates select the native kernels, as before.
+        return tuple(DEFAULT_BLOCK_CELLS if axis == ndim - 1 else 1 for axis in range(3))
+    return tuple(parts)
+
+
+def _too_small_for_a_warp(parts, extents) -> bool:
+    """
+    Whether a resolved block holds fewer cells than one warp although the grid
+    has more: such a block would leave most threads of a program idle.
+    """
+    block_cells = parts[0] * parts[1] * parts[2]
+    grid_cells = 1
+    for extent in extents:
+        grid_cells *= int(extent)
+    return block_cells < min(32, grid_cells)
+
+
+def _largest_tiling_block_size(requested_size: int, extent: int) -> int:
+    """
+    The largest power of two that is at most ``requested_size`` and divides
+    ``extent``.
+
+    Triton tiles must be powers of two, and the kernels tile the grid exactly,
+    so a block size must be both. Clamping a block to a smaller grid extent
+    (``min(32, 24) = 24``) would break the first rule, and keeping a block that
+    does not divide the extent (32 on 48 cells) the second, which makes the
+    support predicates drop the whole run to the native backend.
+
+    Args:
+        requested_size: The configured (or default) block size.
+        extent: The grid extent along the axis.
+
+    Returns:
+        The block size along the axis (1 if no larger power of two fits).
+    """
+    block_size = 1
+    while 2 * block_size <= requested_size and extent % (2 * block_size) == 0:
+        block_size *= 2
+    return block_size
 
 
 def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[int, int, int]:
@@ -94,11 +159,13 @@ def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[
     ``(bx, by, bz)`` with the inactive dimensions set to 1. The Pallas grid
     construction relies on this tuple being canonical.
 
-    When ``spatial_shape`` is given, each active block dimension is clamped to
-    its grid extent, so that a default tuned for production grids (e.g.
-    ``bz = 32``) stays a valid tiling on small grids (``bz -> nz``) instead of
-    failing the grid-divisibility support predicates, which would silently drop
-    the whole run to the native backend.
+    When ``spatial_shape`` is given, each active block dimension is reduced to
+    the largest power of two that is at most the requested size and divides
+    the grid extent (see ``_largest_tiling_block_size``), so that any block
+    stays a valid Triton tiling of any grid (``bz = 32`` becomes 16 on 48
+    cells and 8 on 24) instead of failing the grid-divisibility support
+    predicates, which would silently drop the whole run to the native
+    backend. ``None`` selects ``_default_pallas_block_shape``.
 
     Args:
         block_shape: The configured block shape (None, "bx,by,bz" or a tuple).
@@ -109,29 +176,25 @@ def _as_3tuple_block_shape(block_shape, ndim: int, spatial_shape=None) -> tuple[
         The block shape as a 3-tuple.
     """
     if block_shape is None:
-        parts = _default_pallas_block_shape(ndim)
-    elif isinstance(block_shape, str):
+        return _default_pallas_block_shape(ndim, spatial_shape)
+    if isinstance(block_shape, str):
         parts = tuple(int(part.strip()) for part in block_shape.split(",") if part.strip())
     else:
         parts = tuple(int(size) for size in block_shape)
-    if len(parts) == 1:
-        parts = (parts[0], 1, 1)
-    elif len(parts) == 2:
-        parts = (parts[0], parts[1], 1)
-    elif len(parts) >= 3:
-        parts = parts[:3]
-    else:
-        parts = _default_pallas_block_shape(ndim)
-    if ndim == 1:
-        parts = (parts[0], 1, 1)
-    elif ndim == 2:
-        parts = (parts[0], parts[1], 1)
+    if len(parts) == 0:
+        return _default_pallas_block_shape(ndim, spatial_shape)
+    parts = (tuple(parts[:ndim]) + (1, 1, 1))[:3]
+    parts = tuple(parts[axis] if axis < ndim else 1 for axis in range(3))
     if spatial_shape is not None:
-        parts = tuple(
-            min(int(block_size), int(extent))
-            for block_size, extent in zip(parts, tuple(spatial_shape) + (1, 1))
-        )[:3]
-        parts = tuple(parts) + (1,) * (3 - len(parts))
+        extents = tuple(int(extent) for extent in spatial_shape) + (1, 1)
+        resolved = tuple(
+            _largest_tiling_block_size(block_size, extent)
+            for block_size, extent in zip(parts, extents[:3])
+        )
+        # Without an efficient tiling the configured block is kept; it does not
+        # tile the grid, so the support predicates select the native kernels.
+        if not _too_small_for_a_warp(resolved, extents[:ndim]):
+            parts = resolved
     return parts
 
 
@@ -183,10 +246,18 @@ _pallas_spec_ctx: contextvars.ContextVar = contextvars.ContextVar(
     "astronomix_pallas_state_spec",
     default=None,
 )
+_pallas_halo_exchange_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "astronomix_pallas_halo_exchange",
+    default="pair_all_to_all",
+)
+
+#: The halo-exchange variants of ``BackendConfig.halo_exchange``.
+HALO_EXCHANGE_RING = "ppermute"
+HALO_EXCHANGE_PAIRS = "pair_all_to_all"
 
 
 @contextmanager
-def pallas_mesh_context(mesh, spec=None):
+def pallas_mesh_context(mesh, spec=None, halo_exchange=HALO_EXCHANGE_PAIRS):
     """
     Set the active mesh (and state PartitionSpec) for Pallas kernel sharding.
 
@@ -213,12 +284,18 @@ def pallas_mesh_context(mesh, spec=None):
         mesh: The device mesh, or None.
         spec: The PartitionSpec of the ``(var, x, y, z)`` state (the user's
             ``sharding.spec``), or None.
+        halo_exchange: How the halos are exchanged along a split axis
+            (``BackendConfig.halo_exchange``).
     """
+    if halo_exchange not in (HALO_EXCHANGE_RING, HALO_EXCHANGE_PAIRS):
+        raise ValueError(f"Unknown halo_exchange {halo_exchange!r}.")
     token = _pallas_mesh_ctx.set(mesh)
     token_spec = _pallas_spec_ctx.set(spec)
+    token_halo_exchange = _pallas_halo_exchange_ctx.set(halo_exchange)
     try:
         yield
     finally:
+        _pallas_halo_exchange_ctx.reset(token_halo_exchange)
         _pallas_spec_ctx.reset(token_spec)
         _pallas_mesh_ctx.reset(token)
 
@@ -569,7 +646,106 @@ def _local_edge_padding(array, width: int, axis: int, *, left: bool):
     return jnp.tile(edge, repetitions)
 
 
-def _pad_axis_with_halo(array, axis, padded_width, exchanged_width, mesh_axis_name, num_devices):
+def _neighbour_pairs(num_devices: int, phase: int) -> list:
+    """
+    The disjoint neighbour pairs of one phase of the pairwise halo exchange:
+    ``(0, 1), (2, 3), ...`` in phase 0 and ``(1, 2), ..., (N - 1, 0)`` in
+    phase 1, each pair ordered left neighbour first.
+    """
+    return [[left, (left + 1) % num_devices] for left in range(phase, num_devices, 2)]
+
+
+def _pairwise_halos(left_edge, right_edge, mesh_axis_name, num_devices: int):
+    """
+    The halos received from both ring neighbours, exchanged in two phases of
+    all-to-alls over disjoint neighbour pairs instead of two permutes over the
+    whole ring.
+
+    A collective over the whole ring runs on a communicator that spans every
+    device of the axis, and its cost grows with the device count; each
+    all-to-all here spans one pair. In a pair the left device sends its right
+    edge and receives the right device's left edge; every device is the left
+    member of the pair of one phase and the right member of the other. The
+    data that crosses devices is exactly the ring exchange's, so the halos are
+    bit-identical. Requires an even ``num_devices`` (the phases would overlap
+    otherwise) and a string ``mesh_axis_name`` (JAX rejects
+    ``axis_index_groups`` for integer axis names).
+
+    Args:
+        left_edge: This shard's left boundary planes.
+        right_edge: This shard's right boundary planes.
+        mesh_axis_name: The (string) mesh axis the array axis is split over.
+        num_devices: The number of devices along that axis (even).
+
+    Returns:
+        ``(left_halo, right_halo)``: the right edge of the left neighbour and
+        the left edge of the right neighbour.
+    """
+    device_index = jax.lax.axis_index(mesh_axis_name)
+    zero_planes = jnp.zeros_like(left_edge)
+    left_halo = zero_planes
+    right_halo = zero_planes
+    for phase in (0, 1):
+        is_left_member = (device_index % 2) == phase
+        # Slot 0 travels to the left member, slot 1 to the right member.
+        payload = jnp.stack(
+            (
+                jnp.where(is_left_member, zero_planes, left_edge),
+                jnp.where(is_left_member, right_edge, zero_planes),
+            ),
+            axis=0,
+        )
+        received = jax.lax.all_to_all(
+            payload,
+            mesh_axis_name,
+            split_axis=0,
+            concat_axis=0,
+            axis_index_groups=_neighbour_pairs(num_devices, phase),
+            tiled=False,
+        )
+        # The left member received its right neighbour's left edge in slot 1,
+        # the right member its left neighbour's right edge in slot 0.
+        right_halo = jnp.where(is_left_member, received[1], right_halo)
+        left_halo = jnp.where(is_left_member, left_halo, received[0])
+    return left_halo, right_halo
+
+
+def _string_axis_name(mesh_axis_name) -> str:
+    """A string version of a (possibly integer) mesh axis name."""
+    return mesh_axis_name if isinstance(mesh_axis_name, str) else f"mesh_axis_{mesh_axis_name}"
+
+
+def _with_string_axis_names(mesh, pspec):
+    """
+    The same device mesh and PartitionSpec with string axis names, for the
+    grouped collectives that JAX supports only on named axes.
+    """
+    named_mesh = Mesh(
+        mesh.devices,
+        tuple(_string_axis_name(name) for name in mesh.axis_names),
+        axis_types=mesh.axis_types,
+    )
+
+    def rename(entry):
+        if entry is None:
+            return None
+        if isinstance(entry, tuple):
+            return tuple(_string_axis_name(name) for name in entry)
+        return _string_axis_name(entry)
+
+    named_pspec = PartitionSpec(*(rename(entry) for entry in pspec))
+    return named_mesh, named_pspec
+
+
+def _pad_axis_with_halo(
+    array,
+    axis,
+    padded_width,
+    exchanged_width,
+    mesh_axis_name,
+    num_devices,
+    pairwise: bool = False,
+):
     """
     Pad ``array`` by ``padded_width`` cells on both sides of ``axis``: the
     innermost ``exchanged_width`` cells come from the neighbouring shards
@@ -582,6 +758,8 @@ def _pad_axis_with_halo(array, axis, padded_width, exchanged_width, mesh_axis_na
         exchanged_width: How many of those cells are real neighbour data.
         mesh_axis_name: The mesh axis the array axis is split over.
         num_devices: The number of devices along that mesh axis.
+        pairwise: Exchange over disjoint neighbour pairs
+            (``_pairwise_halos``) instead of permutes over the whole ring.
 
     Returns:
         The padded local array.
@@ -598,12 +776,20 @@ def _pad_axis_with_halo(array, axis, padded_width, exchanged_width, mesh_axis_na
         size = array.shape[axis]
         left_edge = jax.lax.slice_in_dim(array, 0, exchanged_width, axis=axis)
         right_edge = jax.lax.slice_in_dim(array, size - exchanged_width, size, axis=axis)
-        to_left = [(device, (device - 1) % num_devices) for device in range(num_devices)]
-        to_right = [(device, (device + 1) % num_devices) for device in range(num_devices)]
-        # Each device sends its right edge to the right neighbour, which
-        # installs it as its left halo; symmetrically for the right halo.
-        left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=to_right)
-        right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=to_left)
+        if pairwise:
+            left_halo, right_halo = _pairwise_halos(
+                left_edge,
+                right_edge,
+                mesh_axis_name,
+                num_devices,
+            )
+        else:
+            to_left = [(device, (device - 1) % num_devices) for device in range(num_devices)]
+            to_right = [(device, (device + 1) % num_devices) for device in range(num_devices)]
+            # Each device sends its right edge to the right neighbour, which
+            # installs it as its left halo; symmetrically for the right halo.
+            left_halo = jax.lax.ppermute(right_edge, mesh_axis_name, perm=to_right)
+            right_halo = jax.lax.ppermute(left_edge, mesh_axis_name, perm=to_left)
         pieces.extend((left_halo, array, right_halo))
     else:
         pieces.append(array)
@@ -687,6 +873,16 @@ def _pallas_call_sharded(
     if not sharded_axes:
         return kernel_build_fn(*state_inputs, *other_args)
 
+    # The pairwise exchange needs an even device count along every split axis
+    # and string axis names; the shard_map then runs on the same devices under
+    # string names.
+    pairwise = _pallas_halo_exchange_ctx.get() == HALO_EXCHANGE_PAIRS and all(
+        num_devices % 2 == 0 for _, _, num_devices in sharded_axes
+    )
+    if pairwise:
+        mesh, pspec = _with_string_axis_names(mesh, pspec)
+        sharded_axes = _spatial_sharded_axes(mesh, pspec, ndim)
+
     block_shape_3d = tuple(block_shape) + (1,) * max(0, 3 - len(block_shape))
     halo_3d = tuple(halo) + (0,) * max(0, 3 - len(halo))
     requested_input_halos = _normalize_input_halos(input_halos, len(state_inputs), ndim)
@@ -730,6 +926,7 @@ def _pallas_call_sharded(
                     exchanged_halos[input_index][spatial_axis],
                     mesh_axis_name,
                     num_devices,
+                    pairwise=pairwise,
                 )
 
         # Re-enter the wrapper with mesh=None so the recursive

@@ -21,7 +21,6 @@ import argparse
 import json
 import math
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -56,8 +55,13 @@ from astronomix._finite_volume._state_evolution._van_leer_integrator import _con
 
 # validation helpers
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from athenapk_runner import initial_output  # noqa: E402
-from benchmark import ATHENAPK_INPUT  # noqa: E402
+from athenapk_runner import (  # noqa: E402
+    athenapk_binary,
+    athenapk_environment,
+    cp_alfven_input,
+    initial_output,
+    performance_summary,
+)
 from cases import CASES_BY_NAME, astronomix_setup  # noqa: E402
 
 BOX = (3.0, 1.5, 1.5)
@@ -118,20 +122,23 @@ def athenapk_l1_error(conserved_state, resolution: int) -> float:
 def run_athenapk(resolution: int, run_directory: str):
     """Run AthenaPK to t = 5; returns (L1 error, cycles, wall seconds) and leaves the t=0 output."""
     input_file = os.path.join(run_directory, "cpaw.in")
-    text = ATHENAPK_INPUT.format(nx1=2 * resolution, nx2=resolution, nx3=resolution, cycles=-1)
-    text = text.replace("compute_error = false", "compute_error = true")
-    text += "<parthenon/output0>\nfile_type = hdf5\ndt = 10.0\nvariables = prim\n"
     with open(input_file, "w") as file:
-        file.write(text)
-    result = subprocess.run([os.environ["ATHENAPK_GPU_BIN"], "-i", input_file], cwd=run_directory, capture_output=True, text=True)
-    throughput = re.search(r"zone-cycles/wallsecond\s*=\s*([\d.eE+\-]+)", result.stdout)
-    if throughput is None:
+        file.write(cp_alfven_input(resolution, compute_error=True, output_variables="prim"))
+    result = subprocess.run(
+        [athenapk_binary(gpu=True), "-i", input_file],
+        cwd=run_directory,
+        capture_output=True,
+        text=True,
+        env=athenapk_environment(),
+    )
+    if result.returncode != 0:
         raise RuntimeError(f"AthenaPK failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}")
+    zone_cycles_per_second, _, _ = performance_summary(result.stdout)
     with open(os.path.join(run_directory, "cpaw-errors.dat")) as file:
         columns = [line.split() for line in file if not line.startswith("#")][-1]
     cycles = int(columns[3])
     l1_error = float(np.mean([float(value) for value in columns[5:13]]))
-    seconds = 2 * resolution**3 * cycles / float(throughput.group(1))
+    seconds = 2 * resolution**3 * cycles / zone_cycles_per_second
     return l1_error, cycles, seconds
 
 

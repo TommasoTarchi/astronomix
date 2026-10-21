@@ -10,6 +10,10 @@ the weighted pairs of each cell's update instead. Two checks:
   density and pressure stay positive to the end;
 * a circularly polarised Alfven wave at beta = 0.02: the limiter stays out of
   the way in smooth flow (an unpaired limiter falls back to first order here).
+
+Both run with and without the upwind dissipation of the CT edge EMFs
+(``ct_upwind_dissipation``), which the supersonic turbulence uses together with
+the positivity-preserving WENO.
 """
 
 # ==== GPU selection ====
@@ -19,6 +23,9 @@ if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFO
     autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
+
+# testing
+import pytest
 
 # jax
 import jax
@@ -74,7 +81,8 @@ _LIMITER_ONLY_POSITIVITY = PositivityConfig(clamp_in_estimates=False)
 _NEGLIGIBLE_FLOOR = 1e-30
 
 
-def test_low_beta_blast():
+@pytest.mark.parametrize("ct_upwind_dissipation", [False, True])
+def test_low_beta_blast(ct_upwind_dissipation):
     """Blast wave into beta = 2.5e-4 plasma: positive density and pressure to t = 0.01."""
     num_cells = 50
     periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
@@ -89,6 +97,7 @@ def test_low_beta_blast():
         boundary_settings=BoundarySettings(periodic, periodic, periodic),
         positivity_config=_LIMITER_ONLY_POSITIVITY,
         weno_positivity_preserving=True,
+        ct_upwind_dissipation=ct_upwind_dissipation,
     )
     params = SimulationParams(
         C_cfl=0.75,
@@ -129,7 +138,8 @@ def test_low_beta_blast():
     assert final[registered_variables.pressure_index].min() > 0.0
 
 
-def test_low_beta_alfven_wave_order():
+@pytest.mark.parametrize("ct_upwind_dissipation", [False, True])
+def test_low_beta_alfven_wave_order(ct_upwind_dissipation):
     """CP Alfven wave at beta = 0.02 converges at high order with the limiter on."""
     settings = CPAlfvenWave3DSettings(p_0=0.01, t_end=1.0)
     errors = []
@@ -143,6 +153,7 @@ def test_low_beta_alfven_wave_order():
             snapshot_settings=SnapshotSettings(return_states=False, return_final_state=True),
             num_snapshots=2,
             weno_positivity_preserving=True,
+            ct_upwind_dissipation=ct_upwind_dissipation,
         )
         params = SimulationParams(
             C_cfl=0.75,
@@ -174,5 +185,6 @@ def test_low_beta_alfven_wave_order():
 
 
 if __name__ == "__main__":
-    test_low_beta_blast()
-    test_low_beta_alfven_wave_order()
+    for ct_upwind_dissipation in (False, True):
+        test_low_beta_blast(ct_upwind_dissipation)
+        test_low_beta_alfven_wave_order(ct_upwind_dissipation)

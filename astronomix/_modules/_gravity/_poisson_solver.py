@@ -3,7 +3,9 @@ FFT-based Poisson solver for the gravitational potential.
 
 Solves Poisson's equation for the gravitational potential in Fourier space.
 Fully periodic domains use the spectral Green's function directly (with the
-Jeans swindle subtracting the mean density). Non-periodic (open) boundaries use
+Jeans swindle subtracting the mean density), or optionally
+(``GravityConfig.poisson_discrete_laplacian``) the Green's function of the
+second-order discrete Laplacian, as Athena++ does. Non-periodic (open) boundaries use
 the Hockney & Eastwood method, zero-padding the domain to twice its size and
 convolving with the isolated-system Green's function.
 """
@@ -67,12 +69,37 @@ def _active_x_sharded_mesh():
     return mesh, x_name
 
 
+def _negative_laplacian_symbol(
+    wavenumbers,
+    grid_spacing: float,
+    discrete_laplacian: bool,
+):
+    """
+    The Fourier symbol of minus the Laplacian along one axis: ``k^2`` for the
+    spectral operator, or ``(2 - 2 cos(k dx)) / dx^2`` for the second-order
+    (three-point) discrete Laplacian, as in Athena++'s FFT gravity
+    (``FFTGravity::ApplyKernel``, mode 0).
+
+    Args:
+        wavenumbers: The angular wavenumbers along the axis.
+        grid_spacing: The grid spacing.
+        discrete_laplacian: Whether to use the discrete Laplacian.
+
+    Returns:
+        The symbol, non-negative and zero only for ``k = 0``.
+    """
+    if discrete_laplacian:
+        return (2.0 - 2.0 * jnp.cos(wavenumbers * grid_spacing)) / grid_spacing**2
+    return wavenumbers**2
+
+
 def _periodic_poisson_3d_sharded(
     gas_density,
     grid_spacing: float,
     G,
     mesh,
     x_name,
+    discrete_laplacian: bool = False,
 ):
     """Distributed periodic Poisson solve for an X-sharded 3D density.
 
@@ -121,9 +148,9 @@ def _periodic_poisson_3d_sharded(
             k_base_y, (slab_index * local_cells_y,), (local_cells_y,)
         )
         k_squared = (
-            k_base_x.reshape(-1, 1, 1) ** 2
-            + k_local_y.reshape(1, -1, 1) ** 2
-            + k_base_z.reshape(1, 1, -1) ** 2
+            _negative_laplacian_symbol(k_base_x, grid_spacing, discrete_laplacian).reshape(-1, 1, 1)
+            + _negative_laplacian_symbol(k_local_y, grid_spacing, discrete_laplacian).reshape(1, -1, 1)
+            + _negative_laplacian_symbol(k_base_z, grid_spacing, discrete_laplacian).reshape(1, 1, -1)
         )
         k_squared = jnp.where(k_squared == 0, 1e-12, k_squared)
         greens_function = jnp.where(
@@ -176,6 +203,7 @@ def _compute_gravitational_potential(
     # padded field directly.
 
     dimensionality = config.dimensionality
+    discrete_laplacian = config.gravity_config.poisson_discrete_laplacian
 
     # The open-boundary branch is only taken when *no* boundary is periodic; a
     # mix of periodic and non-periodic boundaries is not yet supported, so the
@@ -242,30 +270,25 @@ def _compute_gravitational_potential(
                         G,
                         mesh,
                         x_name,
+                        discrete_laplacian,
                     )
 
         # Transform the density to Fourier space.
         density_k = fftn(gas_density)
 
-        # Build the squared wavenumber magnitude for the active dimensionality.
-        if dimensionality == 1:
-            num_cells_x = gas_density.shape[0]
-            k_base_x = jnp.fft.fftfreq(num_cells_x, d=grid_spacing) * 2 * jnp.pi
-            k = k_base_x
-            k_squared = k**2
-        elif dimensionality == 2:
-            num_cells_x, num_cells_y = gas_density.shape
-            k_base_x = jnp.fft.fftfreq(num_cells_x, d=grid_spacing) * 2 * jnp.pi
-            k_base_y = jnp.fft.fftfreq(num_cells_y, d=grid_spacing) * 2 * jnp.pi
-            kx, ky = jnp.meshgrid(k_base_x, k_base_y, indexing="ij")
-            k_squared = kx**2 + ky**2
-        elif dimensionality == 3:
-            num_cells_x, num_cells_y, num_cells_z = gas_density.shape
-            k_base_x = jnp.fft.fftfreq(num_cells_x, d=grid_spacing) * 2 * jnp.pi
-            k_base_y = jnp.fft.fftfreq(num_cells_y, d=grid_spacing) * 2 * jnp.pi
-            k_base_z = jnp.fft.fftfreq(num_cells_z, d=grid_spacing) * 2 * jnp.pi
-            kx, ky, kz = jnp.meshgrid(k_base_x, k_base_y, k_base_z, indexing="ij")
-            k_squared = kx**2 + ky**2 + kz**2
+        # The symbol of minus the Laplacian, sum_d k_d^2 (spectral) or its
+        # discrete-Laplacian counterpart, broadcast over the grid. It is
+        # called k_squared in both cases.
+        k_squared = jnp.zeros(gas_density.shape, dtype=gas_density.real.dtype)
+        for axis, num_cells in enumerate(gas_density.shape):
+            axis_wavenumbers = jnp.fft.fftfreq(num_cells, d=grid_spacing) * 2 * jnp.pi
+            broadcast_shape = [1] * dimensionality
+            broadcast_shape[axis] = num_cells
+            k_squared = k_squared + _negative_laplacian_symbol(
+                axis_wavenumbers,
+                grid_spacing,
+                discrete_laplacian,
+            ).reshape(broadcast_shape)
 
         # Regularise the k = 0 mode to avoid dividing by zero; its Green's-
         # function value is the finite constant -1 / (4 pi). This is harmless

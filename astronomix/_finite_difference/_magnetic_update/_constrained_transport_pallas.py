@@ -2,7 +2,7 @@
 Pallas backend for the constrained-transport (CT) helpers of
 ``_constrained_transport.py``.
 
-Two CT helpers are ported:
+Three CT helpers are ported:
 
 * ``update_cell_center_fields``: one Pallas kernel, three independent
   ``interp_face_to_center`` stencils (halo 3 per axis) plus the cell-centred
@@ -26,6 +26,11 @@ Two CT helpers are ported:
         the edge EMFs -> the interface-field increments (rhs_bx, rhs_by,
         rhs_bz), fusing the ``point_values_to_averages`` smoothing with the
         ``finite_difference_int6`` curl (halo 4 along the curl axis).
+
+* ``ct_upwind_dissipation_rhs``: two bounded-halo kernels (the upwind edge
+  EMFs from the state and the stacked interface fields, then their
+  sixth-order curl). Unlike the two above, which are opt-in
+  (``backend_config.pallas_ct``), it runs whenever the backend is Pallas.
 
 Multi-GPU: every entry point routes its ``pl.pallas_call`` through
 ``_pallas_call_sharded`` (a bare ``pl.pallas_call`` is opaque to GSPMD, which
@@ -1424,4 +1429,328 @@ def _ct_rhs_pallas_x_precomputed(
 
 # -------------------------------------------------------------
 # ============== ↑ Three-stage CT right-hand side ↑ ===========
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# ============ ↓ Upwind dissipation of the edge EMFs ↓ ========
+# -------------------------------------------------------------
+#
+# The Pallas form of ``_constrained_transport.ct_upwind_dissipation_rhs``, the
+# same arithmetic in two bounded-halo kernels: the upwind edge EMFs from the
+# state and the stacked interface fields (halo 3: the six-point jump stencil),
+# then their sixth-order curl (halo 3). Unlike the staged CT pipeline it runs
+# whenever the backend is Pallas: it replaces some twenty full-grid
+# temporaries of the native form by two outputs.
+
+def _ct_upwind_pallas_supported(state, config: SimulationConfig) -> bool:
+    """
+    Whether the Pallas upwind EMF dissipation can run (3D MHD on the Pallas
+    backend, block shape dividing the grid).
+
+    Args:
+        state: The conserved state.
+        config: The simulation configuration.
+
+    Returns:
+        True if the Pallas kernels can be used.
+    """
+    if pl is None:
+        return False
+    if not _backend_is_pallas(config):
+        return False
+    if not config.mhd or int(config.dimensionality) != 3:
+        return False
+    if state.ndim != 4:
+        return False
+    return _ct_pallas_block_ok(state.shape, config)
+
+
+def _upwind_jump(value_at):
+    """
+    The fifth-order upwind-biased jump at i + 1/2 (from the right minus from
+    the left) of ``_constrained_transport._upwind_edge_jump``; ``value_at(k)``
+    is the field at i + k.
+    """
+    from_left = (
+        2.0 * value_at(-2)
+        - 13.0 * value_at(-1)
+        + 47.0 * value_at(0)
+        + 27.0 * value_at(1)
+        - 3.0 * value_at(2)
+    ) / 60.0
+    from_right = (
+        -3.0 * value_at(-1)
+        + 27.0 * value_at(0)
+        + 47.0 * value_at(1)
+        - 13.0 * value_at(2)
+        + 2.0 * value_at(3)
+    ) / 60.0
+    return from_right - from_left
+
+
+def _ct_upwind_dissipation_pallas(
+    conserved_state,
+    interface_fields,
+    dt_over_dx,
+    gamma,
+    params,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """
+    The interface-field increments of the upwind EMF dissipation (Pallas).
+
+    Args:
+        conserved_state: The conserved state.
+        interface_fields: The stacked ``(3, nx, ny, nz)`` interface fields
+            (B_x, B_y, B_z).
+        dt_over_dx: The (stage) time step over the cell size.
+        gamma: The adiabatic index (ideal gas).
+        params: The simulation parameters (minimum density and pressure,
+            isothermal sound speed).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` increments (rhs_bx, rhs_by, rhs_bz).
+    """
+    ndim = int(config.dimensionality)
+    dtype = interface_fields.dtype
+    _, block_shape, _ = _ct_block_and_grid(interface_fields.shape[1:], config)
+    if config.equation_of_state == IDEAL_GAS:
+        sound_speed_squared = jnp.zeros((), dtype=dtype)
+    else:
+        sound_speed_squared = jnp.asarray(params.isothermal_sound_speed ** 2, dtype=dtype)
+
+    def build_emf(state_local, interface_local, *scalars):
+        return _ct_upwind_emf_pallas_local(
+            state_local,
+            interface_local,
+            *scalars,
+            config=config,
+            registered_variables=registered_variables,
+        )
+
+    emfs = _pallas_call_sharded(
+        build_emf,
+        state_inputs=(conserved_state, interface_fields),
+        other_args=(
+            jnp.asarray(params.minimum_density, dtype=dtype),
+            jnp.asarray(params.minimum_pressure, dtype=dtype),
+            sound_speed_squared,
+            jnp.asarray(gamma, dtype=dtype),
+        ),
+        halo=(3, 3, 3)[:ndim],
+        block_shape=block_shape[:ndim],
+    )
+
+    def build_curl(emf_local, time_step_over_spacing):
+        return _ct_plain_curl_pallas_local(emf_local, time_step_over_spacing, config)
+
+    return _pallas_call_sharded(
+        build_curl,
+        state_inputs=(emfs,),
+        other_args=(jnp.asarray(dt_over_dx, dtype=dtype),),
+        halo=(3, 3, 3)[:ndim],
+        block_shape=block_shape[:ndim],
+    )
+
+
+def _ct_upwind_emf_pallas_local(
+    state,
+    interface_fields,
+    minimum_density,
+    minimum_pressure,
+    sound_speed_squared,
+    gamma,
+    *,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+):
+    """
+    Single-shard build of the upwind edge EMFs, stacked as the output channels
+    0 = Omega_z, 1 = Omega_x, 2 = Omega_y: per edge, minus half the strength
+    times the largest signal speed across the jump of each of the two
+    interface-field components meeting there (signs as in the native form).
+
+    Args:
+        state: The conserved state (possibly halo-padded).
+        interface_fields: The stacked interface fields (possibly halo-padded).
+        minimum_density: The density floor of the speed estimate (scalar array).
+        minimum_pressure: The pressure floor of the speed estimate (scalar array).
+        sound_speed_squared: The isothermal sound speed squared (scalar array;
+            unused for an ideal gas).
+        gamma: The adiabatic index (scalar array; ideal gas only).
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` upwind EMFs.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(interface_fields.shape[1:], config)
+    nx, ny, nz = spatial_shape
+    extents = (nx, ny, nz)
+    ideal_gas = config.equation_of_state == IDEAL_GAS
+    half_strength = 0.5 * config.ct_upwind_strength
+    density_index = registered_variables.density_index
+    momentum_indices = (
+        registered_variables.momentum_index.x,
+        registered_variables.momentum_index.y,
+        registered_variables.momentum_index.z,
+    )
+    magnetic_indices = (
+        registered_variables.magnetic_index.x,
+        registered_variables.magnetic_index.y,
+        registered_variables.magnetic_index.z,
+    )
+    energy_index = registered_variables.energy_index if ideal_gas else None
+
+    state_spec = pl.BlockSpec(state.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    field_spec = pl.BlockSpec(interface_fields.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+    out_spec = pl.BlockSpec((3,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
+
+    def kernel(state_ref, field_ref, rhomin_ref, pmin_ref, cs2_ref, gamma_ref, out_ref):
+        cell = _block_cell_indices(block_shape, spatial_shape)
+        rhomin = rhomin_ref[()]
+
+        def signal_speeds(offset):
+            """|v_d| + c_fast,d along the three axes at a cell offset."""
+            index = tuple(
+                _wrapped_index(cell[axis], offset[axis], extents[axis]) for axis in range(3)
+            )
+            density = jnp.maximum(state_ref[(density_index,) + index], rhomin)
+            velocity = [state_ref[(m,) + index] / density for m in momentum_indices]
+            field = [state_ref[(b,) + index] for b in magnetic_indices]
+            field_squared = field[0] * field[0] + field[1] * field[1] + field[2] * field[2]
+            if ideal_gas:
+                kinetic = 0.5 * density * (
+                    velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]
+                )
+                pressure = (gamma_ref[()] - 1.0) * (
+                    state_ref[(energy_index,) + index] - kinetic - 0.5 * field_squared
+                )
+                cs2 = gamma_ref[()] * jnp.maximum(pressure, pmin_ref[()]) / density
+            else:
+                cs2 = cs2_ref[()]
+            total = cs2 + field_squared / density
+            speeds = []
+            for axis in range(3):
+                normal = field[axis] * field[axis] / density
+                discriminant = jnp.maximum(total * total - 4.0 * cs2 * normal, 0.0)
+                speeds.append(jnp.abs(velocity[axis]) + jnp.sqrt(0.5 * (total + jnp.sqrt(discriminant))))
+            return speeds
+
+        # The cells around the three kinds of edge: the origin and its
+        # neighbours one cell up along one or two of the edge-plane axes.
+        speed_cache = {}
+
+        def speeds_at(offset):
+            if offset not in speed_cache:
+                speed_cache[offset] = signal_speeds(offset)
+            return speed_cache[offset]
+
+        def edge_maximum(speed_axis, first_axis, second_axis):
+            values = []
+            for step_first in (0, 1):
+                for step_second in (0, 1):
+                    offset = [0, 0, 0]
+                    offset[first_axis] += step_first
+                    offset[second_axis] += step_second
+                    values.append(speeds_at(tuple(offset))[speed_axis])
+            return jnp.maximum(jnp.maximum(values[0], values[1]), jnp.maximum(values[2], values[3]))
+
+        def jump(channel, axis):
+            def value_at(shift):
+                index = list(cell)
+                index[axis] = _wrapped_index(cell[axis], shift, extents[axis])
+                return field_ref[(channel,) + tuple(index)]
+
+            return _upwind_jump(value_at)
+
+        # Omega_z (x, y edges): B_x jumps along y, B_y along x; Omega_x
+        # (y, z): B_y along z, B_z along y; Omega_y (z, x): B_z along x, B_x
+        # along z.
+        out_ref[0, ...] = half_strength * (
+            -edge_maximum(1, 0, 1) * jump(0, 1) + edge_maximum(0, 0, 1) * jump(1, 0)
+        )
+        out_ref[1, ...] = half_strength * (
+            -edge_maximum(2, 1, 2) * jump(1, 2) + edge_maximum(1, 1, 2) * jump(2, 1)
+        )
+        out_ref[2, ...] = half_strength * (
+            -edge_maximum(0, 2, 0) * jump(2, 0) + edge_maximum(2, 2, 0) * jump(0, 2)
+        )
+
+    out_shape = jax.ShapeDtypeStruct((3,) + tuple(spatial_shape), interface_fields.dtype)
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[state_spec, field_spec, scalar_spec, scalar_spec, scalar_spec, scalar_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_upwind_emf",
+        **_compiler_kwargs(config),
+    )(state, interface_fields, minimum_density, minimum_pressure, sound_speed_squared, gamma)
+
+
+def _ct_plain_curl_pallas_local(emf_slices, dt_over_dx, config: SimulationConfig):
+    """
+    Single-shard build of the sixth-order curl of the stacked upwind EMFs
+    (``finite_difference_int6``, no edge smoothing), with the stacked
+    interface-field increments as output:
+
+      rhs_bx = dt/dx (-D_y Omega_z + D_z Omega_y)
+      rhs_by = dt/dx (-D_z Omega_x + D_x Omega_z)
+      rhs_bz = dt/dx (-D_x Omega_y + D_y Omega_x)
+
+    Args:
+        emf_slices: The stacked EMFs, channels 0 = Omega_z, 1 = Omega_x,
+            2 = Omega_y (possibly halo-padded).
+        dt_over_dx: The time step over the cell size (scalar array).
+        config: The simulation configuration.
+
+    Returns:
+        The stacked ``(3, nx, ny, nz)`` increments.
+    """
+    spatial_shape, block_shape, grid = _ct_block_and_grid(emf_slices.shape[1:], config)
+
+    field_spec = pl.BlockSpec(emf_slices.shape, lambda bi, bj, bk: (0, 0, 0, 0))
+    scalar_spec = pl.BlockSpec((), lambda bi, bj, bk: ())
+    out_spec = pl.BlockSpec((3,) + block_shape, lambda bi, bj, bk: (0, bi, bj, bk))
+
+    def kernel(emf_ref, dt_over_dx_ref, out_ref):
+        ii, jj, kk = _block_cell_indices(block_shape, spatial_shape)
+
+        def difference(channel, axis):
+            read = _channel_reader(emf_ref, channel, ii, jj, kk, spatial_shape)
+
+            def value_at(shift):
+                offset = [0, 0, 0]
+                offset[axis] = shift
+                return read(tuple(offset))
+
+            return _sixth_order_difference(value_at)
+
+        scale = dt_over_dx_ref[()]
+        out_ref[0, ...] = scale * (-difference(0, 1) + difference(2, 2))
+        out_ref[1, ...] = scale * (-difference(1, 2) + difference(0, 0))
+        out_ref[2, ...] = scale * (-difference(2, 0) + difference(1, 1))
+
+    out_shape = jax.ShapeDtypeStruct((3,) + tuple(spatial_shape), emf_slices.dtype)
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=[field_spec, scalar_spec],
+        out_specs=out_spec,
+        interpret=config.backend_config.pallas_interpret,
+        name="ct_upwind_curl",
+        **_compiler_kwargs(config),
+    )(emf_slices, dt_over_dx)
+
+
+# -------------------------------------------------------------
+# ============ ↑ Upwind dissipation of the edge EMFs ↑ ========
 # -------------------------------------------------------------

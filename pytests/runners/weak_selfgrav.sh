@@ -13,7 +13,7 @@
 # JUPITER (see weak_hydro.sh for the launch pattern; BLOCK uses 'x'
 # separators).
 
-source /e/home/jusers/storcks1/jupiter/astronomix/pytests/runners/_env.sh
+source "${ASTRONOMIX_REPO:-/e/home/jusers/storcks1/jupiter/astronomix}/pytests/runners/_env.sh"
 
 BX="${BX:-64}"
 BY="${BY:-1024}"

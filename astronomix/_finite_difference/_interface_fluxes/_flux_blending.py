@@ -599,7 +599,32 @@ def _blend_interface_flux(
     # derivative carries no physical sensitivity, so the limiter is frozen at
     # its current activation for differentiation. The primal is untouched.
     blend_weight = jax.lax.stop_gradient(blend_weight)[None, ...]
-    return dF_weno * (1.0 - blend_weight) + lax_friedrichs_flux * blend_weight
+    blended_flux = dF_weno * (1.0 - blend_weight) + lax_friedrichs_flux * blend_weight
+
+    cold_factor = config.ad_tangent_llf_cold_factor
+    if cold_factor > 0.0:
+        # Tangent-only monotone linearisation in cold gas: on faces whose
+        # colder side lies below cold_factor times the floor specific pressure
+        # the derivative is taken through the Lax-Friedrichs flux. The value
+        # is the blended flux exactly (F_t - stop_gradient(F_t) is zero); the
+        # derivative is that of F_t.
+        face_min_specific_pressure, _, _, _ = _face_min_specific_pressure(
+            conserved_state,
+            axis,
+            params,
+            config,
+            registered_variables,
+            internal_energy_density=internal_energy_density,
+        )
+        cold_face = (
+            face_min_specific_pressure < cold_factor * params.minimum_specific_pressure
+        ).astype(blended_flux.dtype)
+        tangent_weight = jax.lax.stop_gradient(jnp.maximum(blend_weight[0], cold_face))[None, ...]
+        tangent_flux = dF_weno * (1.0 - tangent_weight) + lax_friedrichs_flux * tangent_weight
+        blended_flux = jax.lax.stop_gradient(blended_flux) + (
+            tangent_flux - jax.lax.stop_gradient(tangent_flux)
+        )
+    return blended_flux
 
 
 # -------------------------------------------------------------

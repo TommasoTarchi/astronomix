@@ -76,7 +76,7 @@ def _interior_spatial_shape(state, config: SimulationConfig):
 
 
 def _vl2_block_shape(state, config: SimulationConfig):
-    """The Pallas block shape, clamped to the updated (interior) extents."""
+    """The Pallas block shape, resolved on the updated (interior) extents."""
     ndim = int(config.dimensionality)
     return _as_3tuple_block_shape(
         config.backend_config.pallas_block_shape,
@@ -652,12 +652,22 @@ def _vl2_stage_pallas_once(
                 registered_variables=registered_variables,
             )
 
+        # The kernel reads the base state U^n only in the cell it updates, so
+        # its halo is never used: on a device mesh only the stage state (and
+        # the correction mask, read across faces) exchange their neighbours'
+        # cells, which saves a third of the corrector's communication.
+        input_halos = (
+            [halo]
+            + ([(0,) * ndim] if has_base else [])
+            + ([halo] if has_mask else [])
+        )
         return _pallas_call_sharded(
             local_build,
             state_inputs=tuple(state_inputs),
             halo=halo,
             block_shape=block_shape[:ndim],
             num_state_outputs=2 if report_failures else 1,
+            input_halos=tuple(input_halos),
         )
 
     def native_branch(

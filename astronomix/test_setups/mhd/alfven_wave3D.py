@@ -352,23 +352,42 @@ def build_cp_alfven_state_sharded(
 ) -> tuple[STATE_TYPE, SimulationConfig, SimulationParams]:
     """Memory-lean, sharding-aware CP Alfvén-wave setup for multi-GPU runs.
 
-    Identical physics to :func:`setup_cp_alfven_wave` (FD solver branch), but
-    the initial state is produced as a globally-sharded ``jax.Array`` with
-    each process computing only its local shard: the staggered edge grids,
-    the vector potential, its discrete curl and the face-to-center
-    interpolation are all evaluated inside a single jit under sharding
-    constraints, so the full global grid never lives on one device.  This is
-    what makes multi-node MHD weak-scaling runs possible.
+    Identical physics to :func:`setup_cp_alfven_wave`, but the initial state
+    is produced as a globally-sharded ``jax.Array`` with each process
+    computing only its local shard: the coordinate grids, the vector
+    potential and its discrete curl are all evaluated inside a single jit
+    under sharding constraints, so the full global grid never lives on one
+    device.  This is what makes multi-node MHD weak-scaling runs possible.
+
+    Both solver branches of :func:`setup_cp_alfven_wave` are reproduced:
+
+    - FINITE_DIFFERENCE (constrained transport): the vector potential on the
+      staggered edge grid, its discrete curl gives the divergence-free
+      face-centered field, and the cell-centered field follows by
+      face-to-center interpolation.
+    - FINITE_VOLUME (cell-centered fields, e.g. the VL2 GLM-MHD layout whose
+      cleaning scalar psi starts at zero): the central-difference curl of the
+      cell-centered vector potential; no face-centered fields are stored.
 
     ``config.num_cells`` must already be set (to the *global* grid shape).
-    Pass ``sharding=None`` to get the single-device lean path.  Only the
-    finite-difference (constrained-transport) solver branch is supported.
+    Pass ``sharding=None`` to get the single-device lean path.
+
+    Args:
+        config: Simulation configuration with the global ``num_cells`` and
+            the solver mode set.
+        params: Simulation parameters.
+        sharding: The ``NamedSharding`` of the ``(var, x, y, z)`` state, or
+            None for a single device.
+        settings: Problem constants.
+
+    Returns:
+        state: The globally-sharded initial primitive state.
+        config: The finalized configuration (CARTESIAN geometry, box_size
+            from ``settings``, 3D, periodic boundaries, MHD).
+        params: The parameters (t_end and gamma from ``settings``).
     """
-    if config.solver_mode != FINITE_DIFFERENCE:
-        raise ValueError(
-            "build_cp_alfven_state_sharded supports only the "
-            "FINITE_DIFFERENCE solver branch."
-        )
+    if config.solver_mode not in (FINITE_DIFFERENCE, FINITE_VOLUME):
+        raise ValueError(f"Unsupported solver_mode: {config.solver_mode}")
 
     config = config._replace(
         geometry=CARTESIAN,
@@ -405,17 +424,21 @@ def build_cp_alfven_state_sharded(
             return field
         return jax.lax.with_sharding_constraint(field, spatial_sharding)
 
-    def _evaluate_wave_fields():
-        # Cell-center and staggered-edge coordinate lines (matching the FD
-        # branch of _generate_state); the 3D meshgrids are constrained to the
-        # target sharding immediately so the partitioner materialises only
-        # each device's shard of every coordinate and field array.
-        x_l = jnp.linspace(dx, Lx, nx, endpoint=True)
-        y_l = jnp.linspace(dx, Ly, ny, endpoint=True)
-        z_l = jnp.linspace(dx, Lz, nz, endpoint=True)
+    # Cell-center and staggered-edge coordinate lines (matching
+    # _generate_state); every 3D meshgrid built from them is constrained to
+    # the target sharding immediately so the partitioner materialises only
+    # each device's shard of every coordinate and field array.
+    def _cell_center_lines():
         x_c = jnp.linspace(dx / 2, Lx + dx / 2, nx, endpoint=False)
         y_c = jnp.linspace(dx / 2, Ly + dx / 2, ny, endpoint=False)
         z_c = jnp.linspace(dx / 2, Lz + dx / 2, nz, endpoint=False)
+        return x_c, y_c, z_c
+
+    def _evaluate_finite_difference_wave_fields():
+        x_l = jnp.linspace(dx, Lx, nx, endpoint=True)
+        y_l = jnp.linspace(dx, Ly, ny, endpoint=True)
+        z_l = jnp.linspace(dx, Lz, nz, endpoint=True)
+        x_c, y_c, z_c = _cell_center_lines()
 
         # A_x lives on yz-edges  (i,   j+1/2, k+1/2)  ->  (x_c, y_l, z_l)
         Xax, Yax, Zax = (
@@ -462,13 +485,57 @@ def build_cp_alfven_state_sharded(
         )
         return rho, v_x, v_y, v_z, p, B_x, B_y, B_z, bxb, byb, bzb
 
-    out_shardings = (
-        None if spatial_sharding is None else (spatial_sharding,) * 11
-    )
-    rho, v_x, v_y, v_z, p, B_x, B_y, B_z, bxb, byb, bzb = jax.jit(
-        _evaluate_wave_fields,
-        out_shardings=out_shardings,
-    )()
+    def _evaluate_finite_volume_wave_fields():
+        x_c, y_c, z_c = _cell_center_lines()
+        Xc, Yc, Zc = (
+            _constrain(g) for g in jnp.meshgrid(x_c, y_c, z_c, indexing="ij")
+        )
+
+        # Vector potential at the cell centers and its central-difference curl,
+        # exactly as the FINITE_VOLUME branch of _generate_state; the periodic
+        # rolls along the sharded axis become neighbour exchanges under GSPMD.
+        A_x_center, A_y_center, A_z_center = _vector_potential(
+            Xc, Yc, Zc, t=0.0, settings=settings
+        )
+
+        def central_difference(field, axis):
+            return (
+                jnp.roll(field, -1, axis=axis) - jnp.roll(field, 1, axis=axis)
+            ) / (2 * dx)
+
+        B_x = central_difference(A_z_center, _YAXIS) \
+            - central_difference(A_y_center, _ZAXIS) \
+            + _R[0, 0] * settings.b_parallel
+        B_y = central_difference(A_x_center, _ZAXIS) \
+            - central_difference(A_z_center, _XAXIS) \
+            + _R[1, 0] * settings.b_parallel
+        B_z = central_difference(A_y_center, _XAXIS) \
+            - central_difference(A_x_center, _YAXIS) \
+            + _R[2, 0] * settings.b_parallel
+
+        rho, v_x, v_y, v_z, p, _, _, _ = _wave_primitive_state(
+            Xc, Yc, Zc, t=0.0, settings=settings
+        )
+        return rho, v_x, v_y, v_z, p, B_x, B_y, B_z
+
+    if config.solver_mode == FINITE_DIFFERENCE:
+        out_shardings = (
+            None if spatial_sharding is None else (spatial_sharding,) * 11
+        )
+        rho, v_x, v_y, v_z, p, B_x, B_y, B_z, bxb, byb, bzb = jax.jit(
+            _evaluate_finite_difference_wave_fields,
+            out_shardings=out_shardings,
+        )()
+    else:
+        out_shardings = (
+            None if spatial_sharding is None else (spatial_sharding,) * 8
+        )
+        rho, v_x, v_y, v_z, p, B_x, B_y, B_z = jax.jit(
+            _evaluate_finite_volume_wave_fields,
+            out_shardings=out_shardings,
+        )()
+        # The cell-centered layout stores no face-centered fields.
+        bxb, byb, bzb = None, None, None
 
     state = construct_primitive_state(
         config=config,

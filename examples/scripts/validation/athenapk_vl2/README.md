@@ -175,6 +175,46 @@ the first three digits) where AthenaPK needs 49 s.
 
 ![CP Alfvén convergence and time to solution](figures/alfven_convergence_a100.png)
 
+### GH200 (JUPITER), double and single precision
+
+Same benchmark on one GH200 (exclusive node), with our AthenaPK builds
+(commit `6d31f70`, Kokkos CUDA for Hopper; double, and single with
+`PARTHENON_SINGLE_PRECISION=ON`), one precision per process
+(`results/benchmark_gh200_{double,single}.json`, figure
+`pytests/mhd/figures/gh200/fv_athenapk_single_precision.svg`):
+
+| N | astronomix sp | AthenaPK sp | ratio | astronomix dp | AthenaPK dp | ratio |
+|---|---|---|---|---|---|---|
+| 16 | 0.025 ms | 0.569 ms | 23× | 0.052 ms | 0.625 ms | 12× |
+| 32 | 0.044 ms | 0.983 ms | 22× | 0.096 ms | 1.15 ms | 12× |
+| 64 | 0.204 ms | 3.28 ms | 16× | 0.715 ms | 4.00 ms | 5.6× |
+| 128 | 1.52 ms | 12.0 ms | 7.9× | 5.61 ms | 15.4 ms | 2.7× |
+| 256 | 13.4 ms | 57.4 ms | 4.3× | 45.3 ms | 83.5 ms | 1.8× |
+| 384 | 47.3 ms | 176 ms (2 blocks) | 3.7× | 148 ms | out of memory | – |
+| 512 | 110 ms | out of memory | – | out of memory | out of memory | – |
+
+astronomix sustains ~2400-2750 million cell updates per second in single and
+~740-760 million in double precision from N = 64 on; AthenaPK reaches 585 (single)
+and 402 (double) million at N = 256. Single precision gains a factor 3.1-3.7 for
+astronomix (N >= 64) but only 1.2-1.5× for AthenaPK. AthenaPK's
+single meshblock does not fit beyond N = 256 in either precision; in single
+precision N = 384 runs with two 384³ meshblocks, in double no meshblock size
+fits (astronomix: N = 384 in double, 512 in single). The full runs to t = 5
+(`examples/scripts/forward/mhd/alfven_convergence.py`) give the same times per
+step (N = 128: 5.63 ms astronomix, 15.5 ms AthenaPK), and the L1 errors of
+astronomix's FV scheme and AthenaPK VL2+PLM coincide at every N (N = 128:
+2.9298e-4 against 2.9286e-4 in astronomix's error definition, 3.1069e-4 against
+3.1063e-4 in AthenaPK's, 1670 cycles both); in single precision both change
+only in the third digit. The compilation of the fused kernels takes ~30 s.
+
+**AthenaPK in single precision.** `cpaw.cpp` computes the wave angles only if
+the input angles equal the sentinel `-999.9`, a comparison of the parsed `Real`
+with a double literal that is never true for a `float`; the single-precision
+build then runs a wave along a wrong direction (L1 ~4e-2 at every N). The
+input files written here (`athenapk_runner.cp_alfven_input`) therefore set
+`ang_2` and `ang_3` explicitly, with cpaw.cpp's own formulas (the double build
+is unaffected: identical errors and cycle counts).
+
 ### Where the time goes
 
 Each VL2 step is one reduction (time step and `c_h`, 0.3 ms at N = 128) and two
@@ -226,6 +266,18 @@ python benchmark.py --resolutions 16 32 64 128 --output results/benchmark.json
 python alfven_convergence.py --resolutions 8 16 32 64 128 --native \
     --output results/convergence.json --figure figures/convergence.png
 python make_regression_data.py      # refresh the pytest reference data
+```
+
+On JUPITER (GH200) all CP Alfvén data of the paper (AthenaPK references
+`athenapk_alfven_reference.py`, the astronomix sweeps, this benchmark in both
+precisions and its figure `fv_athenapk_single_precision.py`) come from
+`examples/scripts/forward/mhd/generate_alfven_data.py`, run inside a single-GPU
+job through `jupiter_athenapk.sh` (which points the scripts at the GH200 builds
+and their module libraries):
+
+```bash
+sbatch --exclusive pytests/runners/gpu1.sh bash $PWD/examples/scripts/validation/athenapk_vl2/jupiter_athenapk.sh \
+    python $PWD/examples/scripts/forward/mhd/generate_alfven_data.py --steps athenapk_double astronomix_double
 ```
 
 Cases with their own initial condition (blasts, rotor, Brio–Wu, Einfeldt,

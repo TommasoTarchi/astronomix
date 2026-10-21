@@ -129,6 +129,10 @@ def _evolve_state_fd(
             )
         passive_scalars = primitive_state[passive_scalar_index:]
         primitive_state = primitive_state[:passive_scalar_index]
+        # the pre-step fluid state, for the arrival-time tangent of the shock
+        # history (``config.ad_shock_arrival``; same layout as the state the
+        # history update receives)
+        previous_fluid_state = primitive_state if config.ad_shock_arrival else None
         registered_variables = registered_variables._replace(
             num_vars=passive_scalar_index,
             passive_scalar_index=-1,
@@ -393,6 +397,7 @@ def _evolve_state_fd(
                         dt,
                         gamma,
                         config.shock_entropy_jump,
+                        previous_primitive_state=previous_fluid_state,
                     ),
                 ],
                 axis=0,

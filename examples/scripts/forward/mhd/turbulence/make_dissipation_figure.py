@@ -45,6 +45,7 @@ from make_convergence_figures import SERIES, STYLE, series_of
 
 HERE = Path(__file__).resolve().parent
 T_V, T_MAG = 3, 4          # rows added by snapshot_spectra(transfer=True)
+T_PSI = 5                  # GLM cleaning transfer of astronomix's VL2 runs
 
 
 def _dEdt(E, t):
@@ -71,6 +72,12 @@ def dissipation_series(run, deconvolve=False):
     transfer spectra, so a deconvolved ``D / 2k^2E`` would mix corrected and
     uncorrected rows and lands ~20% low on ``eta``. Both terms are taken raw,
     which makes the ratio a self-consistent property of the stored field.
+
+    ``T_psi`` is the GLM cleaning transfer where the run recorded one (the VL2
+    runs of ``dynamo_convergence.py``), else ``None``. It is *not* added to
+    the ideal transfer: the cleaning sink is part of what the induction
+    discretisation removes, so it stays inside ``D_B`` and is reported
+    separately (``make_mechanism_table.cleaning_resistivity``).
     """
     if deconvolve:
         raise ValueError("dissipation_series: the transfer spectra are not "
@@ -84,6 +91,7 @@ def dissipation_series(run, deconvolve=False):
                 D_v=spec[:, T_V] - _dEdt(spec[:, E_V], t),
                 D_B=spec[:, T_MAG] - _dEdt(spec[:, E_MAG], t),
                 E_v=spec[:, E_V], E_B=spec[:, E_MAG],
+                T_psi=spec[:, T_PSI] if spec.shape[1] > T_PSI else None,
                 ratio=np.asarray(run["E_B"]) / np.maximum(np.asarray(run["E_K"]), 1e-30))
 
 
@@ -122,7 +130,6 @@ def main():
 
     fig, axes = plt.subplots(2, 2, figsize=(13.0, 9.0))
     for run, d in measured:
-        st, _ = style_of = None, None
         st = dict(STYLE.get(int(run["N"]), STYLE[128]))
         st["color"] = SERIES[series_of(run)][0]
         st["label"] = f"{SERIES[series_of(run)][1]}, N={int(run['N'])}"

@@ -16,7 +16,7 @@ set -euo pipefail
 
 REPO=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 HERE="$REPO/examples/scripts/forward/mhd/turbulence"
-RUN="$REPO/examples/gallery/supernova_showcase/run.sh"
+RUN="$REPO/examples/scripts/run.sh"
 N="${1:-64}"
 WEIGHTS="${2:-both}"
 OUT="$HERE/data/calibration_astro"

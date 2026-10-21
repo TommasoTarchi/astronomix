@@ -1016,6 +1016,7 @@ def update_shock_history(
     entropy_jump: Union[float, Float[Array, ""]],
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
+    previous_primitive_state=None,
 ):
     """
     Advance the ``NUM_SHOCK_HISTORY_SCALARS`` (four) shock-history scalars
@@ -1039,6 +1040,9 @@ def update_shock_history(
         entropy_jump: The entropy-rise threshold, in nats.
         config: The simulation configuration.
         registered_variables: The registered variables.
+        previous_primitive_state: The fluid state BEFORE this step's hydro update
+            (same layout as ``primitive_state``); only read by the arrival-time
+            tangent (``config.ad_shock_arrival``).
 
     Returns:
         The updated shock-history scalars, same shape as ``history``.
@@ -1164,14 +1168,47 @@ def update_shock_history(
     # ionization age or a negative time since shocking is meaningless
     # downstream, and the clamp cannot mask a real effect because the true value
     # can never be below zero.
-    time_since_shock = _max_keep_derivative(
-        history[TIME_SINCE_SHOCK_SLOT] + shocked_fraction * dt,
-        0.0,
+    # ``config.ad_shock_latch_transport`` False: the increments see the shocked
+    # fraction as a constant (same primal; see the option).
+    accumulated_fraction = (
+        shocked_fraction if config.ad_shock_latch_transport
+        else jax.lax.stop_gradient(shocked_fraction)
     )
-    density_time = _max_keep_derivative(
-        history[DENSITY_TIME_SLOT] + shocked_fraction * density * dt,
-        0.0,
-    )
+    time_since_shock = history[TIME_SINCE_SHOCK_SLOT] + accumulated_fraction * dt
+    density_time = history[DENSITY_TIME_SLOT] + accumulated_fraction * density * dt
+    if config.ad_shock_arrival and previous_primitive_state is not None:
+        # The arrival-time tangent (``config.ad_shock_arrival``). A cell whose
+        # entropy rise crosses the threshold during this step -- a = rise - jump
+        # goes from a_prev <= 0 to a_now > 0 under compression -- was crossed a
+        # fraction f = a_now / (a_now - a_prev) of the step before its end. The
+        # primal counts the whole step (the boolean latch); the tangent of the
+        # accumulators takes the derivative of f dt (resp. rho f dt): if the shock
+        # arrives delta_t earlier, both a's shift by (da/dt) delta_t and d(f dt) =
+        # delta_t, exactly, however strong the shock and however many steps the
+        # crossing takes. The added value is exactly zero (f minus itself), so the
+        # primal is unchanged bit for bit; nothing is added outside the crossing
+        # step, so nothing leaks into quiescent or accumulates in shocked gas.
+        entropy_previous = specific_entropy(previous_primitive_state, gamma, registered_variables)
+        rise_previous = entropy_previous - entropy_initial - entropy_jump
+        rise_now = entropy_rise - entropy_jump
+        crossing = jax.lax.stop_gradient(
+            ((rise_previous <= 0.0) & (rise_now > 0.0) & (velocity_divergence_times_dx < 0.0))
+            .astype(rise_now.dtype)
+        )
+        denominator = jnp.where(crossing > 0.0, rise_now - rise_previous, 1.0)
+        fraction_after = jnp.where(crossing > 0.0, rise_now / denominator, 0.0)
+        weight = crossing
+        if config.ad_shock_arrival_damping > 0.0:
+            # slow crossings (small rise change in the step) damped, tangent only
+            damping = config.ad_shock_arrival_damping
+            weight = crossing * jax.lax.stop_gradient(
+                denominator ** 2 / (denominator ** 2 + damping ** 2)
+            )
+        arrival = weight * (fraction_after - jax.lax.stop_gradient(fraction_after))
+        time_since_shock = time_since_shock + arrival * dt
+        density_time = density_time + arrival * density * dt
+    time_since_shock = _max_keep_derivative(time_since_shock, 0.0)
+    density_time = _max_keep_derivative(density_time, 0.0)
 
     # -------------------------------------------------------------
     # ===================== ↑ Accumulators ↑ =======================

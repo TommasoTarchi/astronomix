@@ -416,6 +416,101 @@ def test_smooth_shock_latch():
     # --------------- ↑ Quiescent gas ↑ ----------------
 
 
+def test_shock_arrival_tangent():
+    """
+    ``ad_shock_arrival`` leaves the primal of the shock-history update unchanged
+    bit for bit, adds nothing in quiescent never-shocked gas, and gives the
+    accumulators the derivative of the shock ARRIVAL time: on the blast, the
+    derivative of the time since shock and of the ionization age with respect to
+    the ejecta speed (which moves the arrival) matches central finite
+    differences, where the boolean latch's tangent (transport only) misses most
+    of it. The comparison uses the exact WENO-weight tangent: the frozen-weight
+    linearisation misplaces the shock front itself (it gave 57 % of the
+    finite-difference value for the time since shock).
+    """
+    config, registered_variables, state = setup_blast()
+    arrival_config = config._replace(ad_shock_arrival=True)
+    fluid_registry = fluid_only_registry(registered_variables)
+
+    # --------------- ↓ The update: primal and quiescent gas ↓ ----------------
+
+    evolved_state = time_integration(state, config, blast_params(t_end=2 * DT_FIXED), registered_variables)
+    previous_fluid = get_fluid_state(state, registered_variables)
+    evolved_fluid = get_fluid_state(evolved_state, registered_variables)
+    evolved_history = get_shock_history(evolved_state, registered_variables)
+    pressure_index = registered_variables.pressure_index
+
+    def history_update(latch_config, fluid_state, previous, history):
+        def update(pressure):
+            return update_shock_history(
+                history,
+                fluid_state.at[pressure_index].set(pressure),
+                1e-3,
+                GAMMA,
+                latch_config.shock_entropy_jump,
+                latch_config,
+                fluid_registry,
+                previous_primitive_state=previous,
+            )
+        return update
+
+    pressure = evolved_fluid[pressure_index]
+    plain, plain_tangent = jax.jvp(history_update(config, evolved_fluid, previous_fluid, evolved_history),
+                                   (pressure,), (pressure * 1e-2,))
+    arrival, arrival_tangent = jax.jvp(history_update(arrival_config, evolved_fluid, previous_fluid,
+                                                      evolved_history), (pressure,), (pressure * 1e-2,))
+    np.testing.assert_array_equal(_bits(plain), _bits(arrival))
+    assert bool(jnp.all(jnp.isfinite(arrival_tangent)))
+    # the arrival term acts on the accumulators only, and only where a crossing happened
+    changed = np.asarray(arrival_tangent[TIME_SINCE_SHOCK_SLOT] != plain_tangent[TIME_SINCE_SHOCK_SLOT])
+    assert changed.any()
+    np.testing.assert_array_equal(np.asarray(arrival_tangent[SHOCKED_FRACTION_SLOT]),
+                                  np.asarray(plain_tangent[SHOCKED_FRACTION_SLOT]))
+
+    # quiescent, never-shocked gas: the initial state, unchanged from the previous one
+    initial_fluid = get_fluid_state(state, registered_variables)
+    initial_history = get_shock_history(state, registered_variables)
+    initial_pressure = initial_fluid[pressure_index]
+    _, quiet_plain = jax.jvp(history_update(config, initial_fluid, initial_fluid, initial_history),
+                             (initial_pressure,), (initial_pressure * 1e-2,))
+    _, quiet_arrival = jax.jvp(history_update(arrival_config, initial_fluid, initial_fluid, initial_history),
+                               (initial_pressure,), (initial_pressure * 1e-2,))
+    np.testing.assert_array_equal(np.asarray(quiet_arrival), np.asarray(quiet_plain))
+
+    # --------------- ↑ The update: primal and quiescent gas ↑ ----------------
+
+    # --------------- ↓ The blast: arrival-time derivative vs FD ↓ ----------------
+
+    weights = jnp.asarray(np.random.default_rng(0).random(state.shape[1:]))
+    velocity_rows = [registered_variables.velocity_index.x, registered_variables.velocity_index.y,
+                     registered_variables.velocity_index.z]
+    params = blast_params(t_end=0.06)
+
+    def accumulators(latch_config):
+        def objective(speed_factor):
+            scaled = state
+            for row in velocity_rows:
+                scaled = scaled.at[row].set(state[row] * speed_factor)
+            history = get_shock_history(time_integration(scaled, latch_config, params, registered_variables),
+                                        registered_variables)
+            return jnp.stack([jnp.sum(weights * history[TIME_SINCE_SHOCK_SLOT]),
+                              jnp.sum(weights * history[DENSITY_TIME_SLOT])])
+        return objective
+
+    exact = dict(weno_ad_frozen_weights=False)
+    step = 0.02
+    finite_difference = (accumulators(config._replace(**exact))(1.0 + step)
+                         - accumulators(config._replace(**exact))(1.0 - step)) / (2 * step)
+    _, latch_derivative = jax.jvp(accumulators(config._replace(**exact)), (1.0,), (1.0,))
+    _, arrival_derivative = jax.jvp(accumulators(config._replace(ad_shock_arrival=True, **exact)), (1.0,), (1.0,))
+    ratio = np.asarray(arrival_derivative / finite_difference)
+    # 2026-10-12: 0.96 (time since shock), 1.07 (ionization age); the latch alone 0.06 / 0.34
+    assert np.all((ratio > 0.85) & (ratio < 1.15)), ratio
+    assert np.all(np.asarray(latch_derivative / finite_difference) < 0.5)
+
+    # --------------- ↑ The blast: arrival-time derivative vs FD ↑ ----------------
+
+
 def test_masked_substeps_reverse_vs_dynamic_jvp():
     """
     With several passive-scalar sub-steps (some taken, some masked off), the VJP

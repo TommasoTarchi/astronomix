@@ -1,18 +1,29 @@
-"""Fixed-timestep convergence of the energy error for the mild Evrard collapse.
+"""Fixed-time-step convergence of the energy error in Evrard's collapse.
 
-Companion to ``evrard_energy_convergence`` (which varies the spatial resolution):
-here the resolution is fixed at 32^3 and the *timestep* is varied, using the
-fixed-timestep driver (``dt = t_end / num_timesteps``). It isolates the temporal
-component of the energy error.
+Figure: ``figures/evrard_timestep_convergence_fp64.{svg,pdf,png}`` (Fig. 16 of
+the methods paper).
 
-The non-conservative simple source has a purely spatial error, so its energy
-error is flat in dt (pinned at the ~12% spatial floor at 32^3). The conservative
-flux schemes conserve energy exactly in the continuous limit, so their energy
-error is the temporal-integration error and converges at the time integrator's
-order (RK4_SSP -> ~dt^4) until it reaches the round-off floor. In float32 that
-floor is so high that the conservative error is instead dominated by round-off,
-which *grows* with the number of steps (~1/dt); float64 exposes the true dt^4
-convergence down to ~1e-13.
+The resolution is fixed at 32^3 and the time step is varied with the
+fixed-step driver (``dt = t_end / num_timesteps``), isolating the temporal part
+of the energy error. Two collapses share the figure: the standard cold Evrard
+collapse (``e0 = 0.05``), where the grid does not resolve the pressure scale
+height and the scheme needs positivity-preserving WENO to complete, and the
+milder ``e0 = 0.2`` collapse. Both run to ``t = 1.2``, past the formation of the
+central accretion shock and its outward propagation through the infalling gas.
+
+The non-conservative simple source has a purely spatial energy error, flat in
+``dt``. The flux-based (conservative) couplings conserve total energy exactly in
+the semi-discrete limit, so their energy error is the time integrator's and
+converges with ``dt`` until the float64 round-off floor. The scheme is the
+baseline (WENO-Z, positivity-preserving WENO); the positivity limiter and the
+flux-corrected work depend on the state only, never on ``dt``, so the
+Runge-Kutta stages stay consistent and the energy error keeps converging. In
+the mild collapse it approaches ``dt^4``; in the cold collapse it is produced
+in bursts while the central accretion shock forms, where the scheme's
+switches (limiter, splitting speeds, weights) make the right-hand side only
+Lipschitz, and it falls irregularly, roughly as ``dt^3`` (see
+``evrard_order_diagnostics.py``). At the smallest steps the error reaches
+the float64 round-off floor.
 
 Run from the repo root:
 
@@ -20,9 +31,12 @@ Run from the repo root:
 """
 
 # ==== GPU selection ====
-from autocvd import autocvd
+import os
 
-autocvd(num_gpus=1)
+if os.environ.get("CUDA_VISIBLE_DEVICES") is None and os.environ.get("JAX_PLATFORMS") != "cpu":
+    from autocvd import autocvd
+
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
@@ -33,13 +47,12 @@ import sys
 # jax
 import jax
 
-# ``--double`` reruns in float64 to expose the dt^4 convergence. x64 must be set
-# before any array is created, hence before jax.numpy is imported below.
+# ``--double`` runs in float64, which the dt^4 convergence needs to be visible
+# below 1e-8. x64 must be set before any array is created, hence before
+# jax.numpy is imported (by the helpers below).
 DOUBLE = "--double" in sys.argv
 if DOUBLE:
     jax.config.update("jax_enable_x64", True)
-
-import jax.numpy as jnp
 
 # numerics
 import numpy as np
@@ -48,227 +61,243 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # astronomix constants
-from astronomix import (
-    NATIVE_JAX,
-    PALLAS,
-)
-from astronomix.option_classes.simulation_config import (
-    FOURTH_ORDER_CONSERVATIVE,
-    SECOND_ORDER_CONSERVATIVE,
-    SIMPLE_SOURCE,
-)
-
-# astronomix containers
-from astronomix import SimulationParams
-
-# astronomix functions
-from astronomix import (
-    get_helper_data,
-    get_registered_variables,
-    time_integration,
-    construct_primitive_state,
-    finalize_config,
-)
-
+from astronomix import PALLAS
 
 # figure helpers
 from _collapse import (
-    GAMMA,
-    collapse_config,
+    COLD_INITIAL_ENERGY,
+    MILD_INITIAL_ENERGY,
+    CollapseScheme,
+    relative_energy_error,
+    run_collapse,
 )
 from _common import (
+    COLLAPSE_SCHEMES,
+    CONSERVATIVE_SCHEMES,
+    CORRECTED_SCHEME,
+    SIMPLE_SCHEME,
     DATA_DIR,
-    FIG_DIR,
-    SCHEMES,
     apply_paper_style,
+    observed_orders,
+    save_figure,
 )
 
-RUN_BACKEND = NATIVE_JAX if DOUBLE else PALLAS
-_SUFFIX = "_fp64" if DOUBLE else ""
-_PREC_LABEL = "float64" if DOUBLE else "float32"
+SUFFIX = "_fp64" if DOUBLE else ""
+PRECISION_LABEL = "float64" if DOUBLE else "float32"
 
-N = 32
+NUM_CELLS = 32
 T_END = 1.2
-INITIAL_ENERGY = 0.20
-NUM_TIMESTEPS = [250, 500, 1000, 2000, 4000, 8000, 16000]
+NUM_TIMESTEPS = [250, 500, 1000, 2000, 4000, 8000, 16000, 32000]
+NUM_SNAPSHOTS = 121
 
-DATA_FILE = DATA_DIR / f"evrard_timestep_convergence{_SUFFIX}.npz"
-FIG_FILE = FIG_DIR / f"evrard_timestep_convergence{_SUFFIX}.svg"
+#: The reference slopes pass through the corrected coupling at this many
+#: steps and are drawn down to the time step where the round-off floor
+#: starts to matter.
+GUIDE_ANCHOR_STEPS = 1000
+GUIDE_SMALLEST_DT = 1.4e-4
+
+#: The level below which the final energy error is float64 round-off (the
+#: signed errors of all couplings at the smallest steps scatter below it).
+ROUND_OFF_FLOOR = 3e-13
+
+#: The two collapses of the figure: (data key, panel title, e0).
+CASES = [
+    ("cold", "cold Evrard collapse", COLD_INITIAL_ENERGY),
+    ("mild", "mild collapse", MILD_INITIAL_ENERGY),
+]
+
+FIGURE_STEM = f"evrard_timestep_convergence{SUFFIX}"
 
 
-def _run(version, num_timesteps):
-    """Run one fixed-timestep collapse and return its final energy error.
+def data_file(case_key):
+    """The cache file of one collapse."""
+    return DATA_DIR / f"evrard_timestep_convergence{SUFFIX}_{case_key}.npz"
+
+
+def run_and_cache(case_key, initial_energy):
+    """Sweep the fixed time step for every scheme of one collapse and cache it.
+
+    Stores, per scheme, the final relative energy error for every step count
+    and the total-energy history (``NUM_SNAPSHOTS`` points) of every run.
 
     Args:
-        version: The self-gravity source-term scheme.
-        num_timesteps: The number of fixed steps to integrate ``T_END`` with
-            (``dt = T_END / num_timesteps``).
-
-    Returns:
-        The final relative total-energy error ``|E(t_end) - E(0)| / |E(0)|``.
+        case_key: The data key of the collapse (``cold`` or ``mild``).
+        initial_energy: The initial thermal energy per unit mass.
     """
-    config = collapse_config(N, version, want_states=False, backend=RUN_BACKEND)
-    config = config._replace(fixed_timestep=True, num_timesteps=int(num_timesteps))
-    params = SimulationParams(
-        t_end=T_END, dt_max=jnp.inf, minimum_density=1e-5, minimum_pressure=3e-6
-    )
-    helper_data = get_helper_data(config)
-    registered_variables = get_registered_variables(config)
-    R = 1.0
-    M = 1.0
-    rho = jnp.where(
-        helper_data.r <= R, M / (2 * jnp.pi * R**2 * helper_data.r), 1e-4
-    )
-    v = jnp.zeros_like(rho)
-    p = (GAMMA - 1) * rho * INITIAL_ENERGY
-    p = jnp.where(p < params.minimum_pressure, params.minimum_pressure, p)
-    state = construct_primitive_state(
-        config=config,
-        registered_variables=registered_variables,
-        density=rho,
-        velocity_x=v,
-        velocity_y=v,
-        velocity_z=v,
-        gas_pressure=p,
-    )
-    config = finalize_config(config, state.shape)
-    snapshots = jax.block_until_ready(
-        time_integration(state, config, params, registered_variables)
-    )
-    total_energy = snapshots.total_energy
-    return float(
-        jnp.abs(total_energy[-1] - total_energy[0]) / jnp.abs(total_energy[0])
-    )
-
-
-def run_and_cache():
-    """Sweep the fixed timestep for every scheme and cache the energy errors."""
-    timesteps = np.array([T_END / num_timesteps for num_timesteps in NUM_TIMESTEPS])
-    errors = {scheme.self_gravity_version: [] for scheme in SCHEMES}
-    for num_timesteps in NUM_TIMESTEPS:
-        for scheme in SCHEMES:
-            error = _run(scheme.self_gravity_version, num_timesteps)
-            errors[scheme.self_gravity_version].append(error)
+    save_kwargs = {
+        "num_timesteps": np.array(NUM_TIMESTEPS),
+        "dt": T_END / np.array(NUM_TIMESTEPS, dtype=float),
+        "initial_energy": np.array(initial_energy),
+    }
+    for scheme in COLLAPSE_SCHEMES:
+        collapse_scheme = CollapseScheme(
+            self_gravity_version=scheme.self_gravity_version,
+            work_flux_correction=scheme.work_flux_correction,
+        )
+        final_errors = []
+        energy_histories = []
+        minimum_pressures = []
+        for num_timesteps in NUM_TIMESTEPS:
+            snapshots, _, registered_variables = run_collapse(
+                NUM_CELLS,
+                collapse_scheme,
+                T_END,
+                initial_energy=initial_energy,
+                backend=PALLAS,
+                num_snapshots=NUM_SNAPSHOTS,
+                fixed_num_timesteps=num_timesteps,
+            )
+            final_errors.append(float(relative_energy_error(snapshots)[-1]))
+            energy_histories.append(np.asarray(snapshots.total_energy))
+            minimum_pressures.append(
+                float(snapshots.final_state[registered_variables.pressure_index].min())
+            )
             print(
-                f"  nts={num_timesteps:6d} dt={T_END / num_timesteps:.2e} "
-                f"{scheme.label}: {error:.4e}",
+                f"  {case_key} nts={num_timesteps:6d} dt={T_END / num_timesteps:.2e} "
+                f"{scheme.label}: dE/E = {final_errors[-1]:.4e}, "
+                f"min p = {minimum_pressures[-1]:.2e}",
                 flush=True,
             )
-    save_kwargs = {"dt": timesteps, "num_timesteps": np.array(NUM_TIMESTEPS)}
-    for version, version_errors in errors.items():
-        save_kwargs[f"energy_error_{version}"] = np.array(version_errors)
-    np.savez(DATA_FILE, **save_kwargs)
-    print(f"Saved -> {DATA_FILE}")
+        print(
+            f"  {case_key} {scheme.label}: observed orders "
+            + " ".join(f"{order:.2f}" for order in observed_orders(save_kwargs["dt"], final_errors)),
+            flush=True,
+        )
+        save_kwargs[f"energy_error_{scheme.key}"] = np.array(final_errors)
+        save_kwargs[f"total_energy_{scheme.key}"] = np.array(energy_histories)
+        save_kwargs[f"minimum_pressure_{scheme.key}"] = np.array(minimum_pressures)
+        save_kwargs["time"] = np.asarray(snapshots.time_points)
+    np.savez(data_file(case_key), **save_kwargs)
+    print(f"Saved -> {data_file(case_key)}")
+
+
+def signed_final_errors(data, scheme):
+    """The signed relative energy error ``(E(t_end) - E_0) / |E_0|`` per step count.
+
+    Args:
+        data: The cache of one collapse.
+        scheme: The coupling.
+
+    Returns:
+        The signed error per entry of ``data["num_timesteps"]``.
+    """
+    total_energy = data[f"total_energy_{scheme.key}"]
+    return (total_energy[:, -1] - total_energy[:, 0]) / np.abs(total_energy[:, 0])
 
 
 def plot():
-    """Draw the two-panel fixed-timestep convergence figure from the cache.
+    """Draw the two-panel (cold, mild) figure from the caches.
 
-    The left panel shows the (dt-flat) non-conservative simple source; the right
-    panel shows the flux-based conservative schemes together with a reference
-    slope (``dt^4`` in float64, ``dt^-1`` round-off growth in float32).
+    Each panel shows ``|Delta E| / |E_0|`` against the time step for every
+    coupling, ``dt^3`` and ``dt^4`` guides through the corrected coupling at
+    ``GUIDE_ANCHOR_STEPS`` steps, and the
+    float64 round-off floor of the energy error.
     """
-    data = np.load(DATA_FILE)
-    dt = data["dt"]
-
     apply_paper_style()
-    by_version = {scheme.self_gravity_version: scheme for scheme in SCHEMES}
-    panels = [
-        ("non-conservative source", [SIMPLE_SOURCE]),
-        (
-            "flux-based (conservative) sources",
-            [SECOND_ORDER_CONSERVATIVE, FOURTH_ORDER_CONSERVATIVE],
-        ),
-    ]
-
-    order = np.argsort(dt)
-    sorted_timesteps = dt[order]
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
-    for ax, (subtitle, versions) in zip(axes, panels):
-        for version in versions:
-            scheme = by_version[version]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.4), sharey=True)
+    for ax, (case_key, title, initial_energy) in zip(axes, CASES):
+        data = np.load(data_file(case_key))
+        dt = data["dt"]
+        # The simple source sits ~8 decades above the conservative couplings
+        # and is flat in dt; it is quoted instead of drawn, so the axis can
+        # resolve the convergence of the conservative ones.
+        simple_errors = data[f"energy_error_{SIMPLE_SCHEME.key}"]
+        ax.text(
+            0.03,
+            0.96,
+            f"{SIMPLE_SCHEME.label}: $|\\Delta E|/|E_0| = {simple_errors.mean():.2f}$ at every $\\Delta t$",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=10,
+            color=SIMPLE_SCHEME.color,
+        )
+        for scheme in CONSERVATIVE_SCHEMES:
             ax.plot(
                 dt,
-                data[f"energy_error_{version}"],
+                data[f"energy_error_{scheme.key}"],
                 marker=scheme.marker,
                 linestyle=scheme.linestyle,
                 color=scheme.color,
-                linewidth=2.0,
+                linewidth=scheme.linewidth,
                 label=scheme.label,
             )
 
-        # Reference slope, on the conservative panel only. In float64 the error
-        # converges at the RK4 order (dt^4) until the round-off floor; in float32
-        # it is round-off-limited and grows ~1/dt.
-        if FOURTH_ORDER_CONSERVATIVE in versions:
-            conservative_sorted = data[
-                f"energy_error_{FOURTH_ORDER_CONSERVATIVE}"
-            ][order]
-            if DOUBLE:
-                # Anchor the guide only on the converging branch (dt >= dt_min).
-                min_index = int(np.argmin(conservative_sorted))
-                guide_timesteps = sorted_timesteps[min_index:]
-                guide = conservative_sorted[-1] * (
-                    guide_timesteps / sorted_timesteps[-1]
-                ) ** 4
-                ax.plot(
-                    guide_timesteps,
-                    guide,
-                    color="0.4",
-                    linestyle=":",
-                    linewidth=1.5,
-                    label=r"$\propto \Delta t^4$ (RK4)",
-                )
-            else:
-                guide = conservative_sorted[-1] * (
-                    sorted_timesteps / sorted_timesteps[-1]
-                ) ** (-1)
-                ax.plot(
-                    sorted_timesteps,
-                    guide,
-                    color="0.4",
-                    linestyle=":",
-                    linewidth=1.5,
-                    label=r"$\propto \Delta t^{-1}$ (round-off)",
-                )
+        # Reference slopes through the corrected coupling, drawn over the
+        # time steps above the round-off floor.
+        anchor_index = list(data["num_timesteps"]).index(GUIDE_ANCHOR_STEPS)
+        anchor_dt = dt[anchor_index]
+        anchor_error = data[f"energy_error_{CORRECTED_SCHEME.key}"][anchor_index]
+        guide_dt = np.sort(dt[dt >= GUIDE_SMALLEST_DT])
+        for exponent, linestyle in ((3, (0, (1, 1))), (4, (0, (5, 2)))):
+            ax.plot(
+                guide_dt,
+                anchor_error * 2.0 * (guide_dt / anchor_dt) ** exponent,
+                color="0.45",
+                linestyle=linestyle,
+                linewidth=1.2,
+                label=rf"$\propto \Delta t^{exponent}$",
+            )
 
+        ax.axhspan(
+            1e-14,
+            ROUND_OFF_FLOOR,
+            color="0.9",
+            zorder=0,
+            label="float64 round-off floor",
+        )
         ax.set_xscale("log")
         ax.set_yscale("log")
-        # The simple source is essentially flat in dt; pad its y-range so the
-        # near-constant line reads as flat rather than auto-zooming onto round-off.
-        if versions == [SIMPLE_SOURCE]:
-            simple_errors = data[f"energy_error_{SIMPLE_SOURCE}"]
-            ax.set_ylim(float(simple_errors.min()) / 5, float(simple_errors.max()) * 5)
-        ax.set_xlabel(r"timestep $\Delta t$")
-        ax.set_title(subtitle)
+        ax.set_ylim(1e-14, 1e-7)
+        ax.set_xlabel(r"time step $\Delta t$")
+        ax.set_title(rf"{title} ($e_{{th,0}} = {initial_energy}$)")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend()
     axes[0].set_ylabel(r"final relative total energy error $|\Delta E| / |E_0|$")
-
+    handles, labels = axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=10, frameon=False)
     fig.suptitle(
-        f"Mild Evrard collapse ($N = {N}^3$, $e_0 = {INITIAL_ENERGY}$, {_PREC_LABEL}): "
-        "energy conservation vs fixed timestep"
+        f"Evrard's collapse, $N = {NUM_CELLS}^3$, $t = {T_END}$ ({PRECISION_LABEL}): "
+        "energy error vs fixed time step"
     )
-    fig.tight_layout()
-    fig.savefig(FIG_FILE)
-    print(f"Saved -> {FIG_FILE}")
+    fig.tight_layout(rect=(0, 0.1, 1, 1))
+    figure_path = save_figure(fig, FIGURE_STEM, extensions=("svg", "pdf", "png"))
+    print(f"Saved -> {figure_path}")
+
+    # The signed errors and the observed orders between successive time
+    # steps, for the text.
+    for case_key, _, _ in CASES:
+        data = np.load(data_file(case_key))
+        for scheme in CONSERVATIVE_SCHEMES:
+            signed_errors = signed_final_errors(data, scheme)
+            orders = observed_orders(data["dt"], np.abs(signed_errors))
+            print(f"  {case_key} {scheme.label}:")
+            print("    signed dE/E  " + " ".join(f"{error:+.2e}" for error in signed_errors))
+            print("    orders       " + " ".join(f"{order:.2f}" for order in orders))
 
 
 def main():
-    """Parse arguments, (re)run or load the cache, then draw the figure."""
+    """Parse arguments, (re)run or load the caches, then draw the figure."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rerun", action="store_true", help="re-run simulations")
     parser.add_argument(
-        "--double", action="store_true",
-        help="run in float64 (native backend) to expose the dt^4 convergence",
+        "--double",
+        action="store_true",
+        help="run in float64 (the figure of the paper)",
+    )
+    parser.add_argument(
+        "--cases",
+        default="cold,mild",
+        help="comma-separated collapses to (re)run: cold, mild",
     )
     args = parser.parse_args()
-    if args.rerun or not DATA_FILE.exists():
-        run_and_cache()
-    else:
-        print(f"Using cached results in {DATA_FILE} (pass --rerun to recompute).")
-    plot()
+    for case_key, _, initial_energy in CASES:
+        if case_key not in args.cases.split(","):
+            continue
+        if args.rerun or not data_file(case_key).exists():
+            run_and_cache(case_key, initial_energy)
+        else:
+            print(f"Using cached results in {data_file(case_key)} (pass --rerun to recompute).")
+    if all(data_file(case_key).exists() for case_key, _, _ in CASES):
+        plot()
 
 
 if __name__ == "__main__":

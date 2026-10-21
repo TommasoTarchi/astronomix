@@ -1,9 +1,10 @@
-"""The single shell-averaged spectral estimator both codes are measured with.
+"""The single shell-averaged spectral estimator every scheme is measured with.
 
-``dynamo_convergence.py`` reduces astronomix snapshots on the GPU while they are
-still in memory; ``athenapk_turb.py`` reduces AthenaPK's Parthenon ``.phdf``
-dumps from disk. Both call :func:`snapshot_spectra` here, so any difference in
-the resulting spectra is a difference in the solvers, not in the diagnostics.
+``dynamo_convergence.py`` reduces astronomix snapshots (finite-difference WENO +
+CT, or the finite-volume VL2 + GLM scheme) on the GPU while they are still in
+memory; ``athenapk_turb.py`` reduces AthenaPK's Parthenon ``.phdf`` dumps from
+disk. All of them call :func:`snapshot_spectra` here, so any difference in the
+resulting spectra is a difference in the solvers, not in the diagnostics.
 
 Convention: ``E(n)`` is shell-summed over integer mode shells ``n = |k| L / 2pi``
 and normalised so that ``sum_n E_kin(n) == mean(0.5 rho |v|^2)`` and
@@ -280,6 +281,47 @@ def transfer_spectra(rho, vx, vy, vz, bx, by, bz, sound_speed, grid_spacing,
 
 #: Names of the two transfer spectra :func:`transfer_spectra` returns.
 TRANSFER_NAMES = ("T_v", "T_mag")
+
+
+def glm_cleaning_transfer(bx, by, bz, psi, grid_spacing):
+    """Rate of change of each shell's magnetic energy due to GLM cleaning.
+
+    A GLM scheme evolves ``dB/dt = curl(v x B) - grad psi``, and the ideal
+    transfer of :func:`transfer_spectra` carries only the first term, so the
+    magnetic dissipation ``D_B = T_mag - dE_B/dt`` of a GLM run also contains
+    the cleaning coupling. This is that coupling, shell by shell,
+
+        ``T_psi(n) = sum_shell Re[B-hat* . (-i k psi-hat)] / N^6``,
+
+    normalised like ``T_mag``, so ``-T_psi / D_B`` is the share of the measured
+    numerical resistivity that is the divergence cleaning. It is a product of
+    two transforms at the same wavevector, not a convolution, so it carries no
+    aliases and needs no dealiasing. Only the longitudinal (``k || B-hat``) part
+    of the field contributes, which a divergence-free field does not have.
+
+    Args:
+        bx, by, bz: Cell-centred magnetic field, each ``(N, N, N)``.
+        psi: The GLM cleaning scalar, ``(N, N, N)``.
+        grid_spacing: Cell size.
+
+    Returns:
+        ``T_psi`` in shells ``n = 0 .. N/2``.
+    """
+    N = bx.shape[0]
+    n_tot = float(N) ** 3
+    kx, ky, kz = _wavevectors(N, grid_spacing * N)
+    psi_hat = jnp.fft.fftn(psi)
+    gradient_hat = jnp.stack([1j * kx * psi_hat, 1j * ky * psi_hat, 1j * kz * psi_hat])
+    b_hat = _fft_vec(bx, by, bz)
+    return _shell_sum(
+        -jnp.real(jnp.sum(jnp.conj(b_hat) * gradient_hat, axis=0)) / n_tot ** 2,
+        N,
+    )
+
+
+#: Name of the spectrum :func:`glm_cleaning_transfer` returns. A GLM run stores
+#: it as the row after the two ideal transfer spectra.
+GLM_TRANSFER_NAME = "T_psi"
 # -------------------------------------------------------------
 # ============= ↑ Spectral transfer / dissipation ↑ ===========
 # -------------------------------------------------------------
@@ -300,9 +342,10 @@ def snapshot_spectra(rho, vx, vy, vz, bx, by, bz, sound_speed, grid_spacing,
 
     Args:
         rho, vx, vy, vz, bx, by, bz: Cell fields, each ``(N, N, N)``. The
-            magnetic field is the cell-centred one in both codes (astronomix
-            averages its staggered field to centres for output; AthenaPK's
-            GLM-MHD field is cell-centred to begin with).
+            magnetic field is the cell-centred one in every scheme (the
+            finite-difference CT scheme averages its staggered field to
+            centres; the GLM-MHD fields of astronomix's VL2 scheme and of
+            AthenaPK are cell-centred to begin with).
         sound_speed: Isothermal sound speed ``a``, for the Mach number.
         grid_spacing: Cell size, for the ``div B`` diagnostic.
         spectra: When False, return a zero-filled spectrum array instead of

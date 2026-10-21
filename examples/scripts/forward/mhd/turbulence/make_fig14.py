@@ -1,129 +1,198 @@
 """
-HOW-MHD (Seo & Ryu 2023) Fig. 14 reproduction -- plain matplotlib style.
-This is the paper `turbulence_slices` figure.
+The paper's ``turbulence_slices`` figure (the analogue of HOW-MHD, Seo & Ryu
+2023, Fig. 14): mid-plane slices of the magnetic energy log10 E_B of the
+driven isothermal-MHD turbulence runs of ``paper_turbulence.py``, 2x2:
 
-2D slices of the magnetic energy log E_B for isothermal-MHD turbulence:
+  rows    : ISM (M_turb ~ 10, beta_p = 0.1) / ICM (M_turb ~ 0.5, beta_p = 1e6)
+  columns : the lowest and the highest resolution present in the
+            script-relative data/ directory (paper: 256^3 and 512^3)
 
-  WENO ISM  (M_turb ~ 10,  beta_p = 0.1)    -- top row
-  WENO ICM  (M_turb ~ 0.5, beta_p = 10^6)   -- bottom row
+The slice is the one the run kept, from its last alive snapshot (normally
+the final one); the title gives the mass-weighted M_S = sqrt(2 E_K) / a of that
+snapshot. E_B from the default v_rms ~ 1 normalisation is converted to
+HOW-MHD's a = 1 normalisation by the exact similarity scaling
+E_B^paper = M_turb^2 E_B, so the colour ranges match theirs (ISM 0..3,
+ICM -6..0).
 
-Layout is 2x2: rows are ISM / ICM, columns are a lower- and a higher-resolution
-run so the convergence is visible. Each column picks the lowest / highest
-resolution whose npz is present in the script-relative data/ dir (paper: 256^3
-and 512^3; a cheaper resolution such as 128^3 is picked up automatically), so
-dropping in the H200 512^3 npz upgrades the figure automatically.
-
-E_B is run in the cheap v_rms~1 normalisation and converted to the paper's a=1
-normalisation by the exact similarity scaling E_B^paper = M_turb^2 * E_B, so the
-colorbars match the paper (ISM 0..3, ICM -6..0).
+Writes figures/turbulence_slices.{svg,pdf,png}. ``--suffix S`` reads the runs
+tagged ``<case>_N<N>S`` instead (e.g. ``_uct0.03``, the runs with the upwind EMF
+dissipation).
 """
+
+# general
+import sys
 from pathlib import Path
+
+# numerics
 import numpy as np
+
+# plotting
 import matplotlib.pyplot as plt
 
-# script-relative dirs (data/ shared with paper_turbulence.py)
+
+#: Script-relative directories (data/ is shared with paper_turbulence.py).
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA = SCRIPT_DIR / "data"
-FIG = SCRIPT_DIR / "figures"
-FIG.mkdir(exist_ok=True)
+DATA_DIR = SCRIPT_DIR / "data"
 
-# resolutions to look for, low to high (paper runs: 256 and 512; 128 = cheap default)
-RESOLUTIONS = ("128", "256", "512")
+#: Suffix of the run tags to draw (``--suffix``; empty: the plain runs).
+RUN_SUFFIX = sys.argv[sys.argv.index("--suffix") + 1] if "--suffix" in sys.argv else ""
+FIGURE_DIR = SCRIPT_DIR / "figures"
 
+#: Resolutions looked for, low to high (paper: 256 and 512).
+RESOLUTIONS = (128, 256, 512)
 
-def load(tag):
-    f = DATA / f"paper_{tag}.npz"
-    return dict(np.load(f, allow_pickle=True)) if f.exists() else None
+#: Rows: case, row label, colour range of log10 E_B (HOW-MHD's).
+ROWS = (
+    ("ISM", "WENO ISM", (0.0, 3.0)),
+    ("ICM", "WENO ICM", (-6.0, 0.0)),
+)
 
-
-def best_lores(case):
-    """Lowest resolution present for the low-res column."""
-    for res in RESOLUTIONS:
-        d = load(f"{case}_N{res}")
-        if d is not None:
-            return d
-    return None
+#: The unit box, centred, as the image extent.
+EXTENT = [-0.5, 0.5, -0.5, 0.5]
 
 
-def best_hires(case):
-    """Highest resolution present for the high-resolution column."""
-    for res in reversed(RESOLUTIONS):
-        d = load(f"{case}_N{res}")
-        if d is not None:
-            return d
-    return None
+def load_run(case, resolution):
+    """The reduced data of one run, or ``None`` if its npz is absent."""
+    path = DATA_DIR / f"paper_{case}_N{resolution}{RUN_SUFFIX}.npz"
+    return dict(np.load(path, allow_pickle=True)) if path.exists() else None
 
 
-def log_EB_paper(d):
-    """log10 E_B in the paper's a=1 normalisation (E_B^paper = M_turb^2 E_B)."""
-    EB = np.asarray(d["EB_slice"], dtype=np.float64)
-    lam2 = float(d["mturb_aim"]) ** 2
-    EB = np.where(EB > 0, EB, np.nan) * lam2
-    return np.log10(EB)
+def lowest_and_highest_resolution(case):
+    """The runs for the two columns: the lowest and highest resolution present."""
+    runs = [run for run in (load_run(case, resolution) for resolution in RESOLUTIONS) if run is not None]
+    if not runs:
+        return None, None
+    if len(runs) == 1:
+        return runs[0], None
+    return runs[0], runs[-1]
 
 
-def _beta_str(b):
-    """Plasma beta as a compact LaTeX string (10^6 for big, 0.1 for small)."""
-    b = float(b)
-    if b >= 100:
-        return rf"10^{{{int(round(np.log10(b)))}}}"
-    return f"{b:g}"
+def log_magnetic_energy_paper_units(run):
+    """
+    log10 E_B of the kept slice in HOW-MHD's a = 1 normalisation.
+
+    A run in the v_rms ~ 1 normalisation has velocities and fields smaller by
+    M_turb than the same flow at a = 1, so E_B^paper = M_turb^2 E_B (the aimed
+    M_turb, which sets the normalisation); a run made with ``--norm paper`` is
+    already in those units.
+
+    Args:
+        run: The reduced data of a run.
+
+    Returns:
+        The slice of log10 E_B (NaN where E_B <= 0).
+    """
+    magnetic_energy = np.asarray(run["EB_slice"], dtype=np.float64)
+    normalisation = str(run.get("norm", "vrms1"))
+    scale = float(run["mturb_aim"]) ** 2 if normalisation == "vrms1" else 1.0
+    magnetic_energy = np.where(magnetic_energy > 0, magnetic_energy, np.nan) * scale
+    return np.log10(magnetic_energy)
 
 
-# rows: (case label, lo-res dict, hi-res dict, colorbar range)
-rows = [
-    ("WENO ISM", best_lores("ISM"), best_hires("ISM"), (0.0, 3.0)),
-    ("WENO ICM", best_lores("ICM"), best_hires("ICM"), (-6.0, 0.0)),
-]
-extent = [-0.5, 0.5, -0.5, 0.5]
+def mach_numbers(run, mass_weighted=True):
+    """
+    The turbulent Mach number per snapshot: mass-weighted, sqrt(2 E_K / <rho>) / a
+    (<rho> = 1), or volume-weighted, v_rms / a. The volume-weighted value of the
+    supersonic runs is dominated by the fast, near-vacuum cells; the
+    mass-weighted one is what the driving sets. Older reduced files carry no
+    ``Ms_mass_t``; it then follows from ``EK_t`` and ``sound_t`` (or ``a``).
+    """
+    if not mass_weighted:
+        return np.asarray(run["Ms_t"], dtype=float)
+    if "Ms_mass_t" in run:
+        return np.asarray(run["Ms_mass_t"], dtype=float)
+    sound_speed = np.asarray(run["sound_t"], dtype=float) if "sound_t" in run else float(run["a"])
+    return np.sqrt(2.0 * np.asarray(run["EK_t"], dtype=float)) / sound_speed
 
-fig, axes = plt.subplots(2, 2, figsize=(9.0, 8.6))
-row_im = {}  # one representative mappable per row (both columns share vmin/vmax)
-for i, (title, d_lo, d_hi, (vmin, vmax)) in enumerate(rows):
-    for j, d in enumerate((d_lo, d_hi)):
-        ax = axes[i, j]
-        if d is None:
-            ax.text(0.5, 0.5, "512$^3$ pending\n(run on H200)", ha="center",
-                    va="center", transform=ax.transAxes, fontsize=12, color="0.4")
-            ax.set_xticks([]); ax.set_yticks([])
-            continue
-        img = log_EB_paper(d)
-        im = ax.imshow(img.T, origin="lower", extent=extent, cmap="Blues",
-                       vmin=vmin, vmax=vmax, interpolation="nearest", aspect="equal")
-        row_im[i] = im
-        N = int(d["N"])
-        # label with the M_turb of the snapshot the slice was taken from (the
-        # last *alive* snapshot = first_bad-1), not Ms_t[-1] which is the NaN->0
-        # final snapshot when a run blows up only at late time (e.g. ISM 512^3).
-        ms = np.asarray(d["Ms_t"], dtype=float)
-        fb = int(d["first_bad"])
-        slice_idx = (fb - 1) if fb >= 0 else (len(ms) - 1)
-        Mlast = float(ms[slice_idx])
-        beta_str = _beta_str(d["beta"])
-        ax.set_title(
-            rf"$N={N}^3$,  $M_S={Mlast:.1f}$,  $\beta_p={beta_str}$",
-            fontsize=13, pad=12,
-        )
-        ax.set_xticks([]); ax.set_yticks([])  # unit box [0,1]^3 — axes unlabeled
 
-fig.tight_layout()
-# Move the two columns close together, then attach ONE shared colorbar per row
-# on the far right (both columns share vmin/vmax, so no inter-column colorbar is
-# needed). Extra title pad keeps titles clear of the panels above.
-fig.subplots_adjust(wspace=0.03, hspace=0.12)
-for i in range(len(rows)):
-    if i in row_im:
-        cb = fig.colorbar(row_im[i], ax=list(axes[i, :]), fraction=0.046, pad=0.02)
-        cb.set_label(r"$\log_{10} E_B$")
-out = FIG / "turbulence_slices"
-fig.savefig(str(out) + ".png", dpi=200, bbox_inches="tight")
-fig.savefig(str(out) + ".pdf", bbox_inches="tight")
-print("wrote", str(out) + ".png/.pdf")
+def slice_mach_number(run, mass_weighted=True):
+    """
+    M_turb (see ``mach_numbers``) of the snapshot the slice was taken from.
 
-for title, d_lo, d_hi, _ in rows:
-    for d in (d_lo, d_hi):
-        if d is None:
-            continue
-        img = log_EB_paper(d)
-        print(f"{title} N={int(d['N'])}: M_turb(last)={float(d['Ms_t'][-1]):.2f}, "
-              f"log E_B range [{np.nanmin(img):.2f}, {np.nanmax(img):.2f}]")
+    Older reduced files carry no ``slice_index``; for them the slice is the
+    last snapshot before the first non-finite one.
+    """
+    mach = mach_numbers(run, mass_weighted)
+    if "slice_index" in run:
+        return float(mach[int(run["slice_index"])])
+    first_bad = int(run["first_bad"])
+    return float(mach[first_bad - 1 if first_bad >= 0 else -1])
+
+
+def beta_label(beta):
+    """Plasma beta as a compact LaTeX string (10^6 for large values, 0.1 for small)."""
+    beta = float(beta)
+    if beta >= 100:
+        return rf"10^{{{int(round(np.log10(beta)))}}}"
+    return f"{beta:g}"
+
+
+def main():
+    """Draw and write the 2x2 slice figure."""
+    FIGURE_DIR.mkdir(exist_ok=True)
+    rows = [(label, *lowest_and_highest_resolution(case), color_range) for case, label, color_range in ROWS]
+
+    figure, axes = plt.subplots(2, 2, figsize=(9.0, 8.6))
+    # One representative image per row: both columns share the colour range.
+    row_images = {}
+    for row, (label, low_resolution_run, high_resolution_run, (vmin, vmax)) in enumerate(rows):
+        for column, run in enumerate((low_resolution_run, high_resolution_run)):
+            axis = axes[row, column]
+            axis.set_xticks([])
+            axis.set_yticks([])
+            if run is None:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "pending",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                    fontsize=12,
+                    color="0.4",
+                )
+                continue
+            row_images[row] = axis.imshow(
+                log_magnetic_energy_paper_units(run).T,
+                origin="lower",
+                extent=EXTENT,
+                cmap="Blues",
+                vmin=vmin,
+                vmax=vmax,
+                interpolation="nearest",
+                aspect="equal",
+            )
+            axis.set_title(
+                rf"$N={int(run['N'])}^3$,  $M_S={slice_mach_number(run):.1f}$,  "
+                rf"$\beta_p={beta_label(run['beta'])}$",
+                fontsize=13,
+                pad=12,
+            )
+
+    figure.tight_layout()
+    # Bring the two columns close together and attach one colour bar per row
+    # on the far right (the columns share the range); the extra title pad
+    # keeps the titles clear of the panels above.
+    figure.subplots_adjust(wspace=0.03, hspace=0.12)
+    for row, image in row_images.items():
+        colorbar = figure.colorbar(image, ax=list(axes[row, :]), fraction=0.046, pad=0.02)
+        colorbar.set_label(r"$\log_{10} E_B$")
+
+    out = FIGURE_DIR / "turbulence_slices"
+    figure.savefig(str(out) + ".svg", bbox_inches="tight")
+    figure.savefig(str(out) + ".pdf", bbox_inches="tight")
+    figure.savefig(str(out) + ".png", dpi=200, bbox_inches="tight")
+    print("wrote", str(out) + ".svg/.pdf/.png")
+
+    for label, low_resolution_run, high_resolution_run, _ in rows:
+        for run in (low_resolution_run, high_resolution_run):
+            if run is None:
+                continue
+            image = log_magnetic_energy_paper_units(run)
+            print(f"{label} N={int(run['N'])}: M_turb(slice) mass-weighted={slice_mach_number(run):.2f} "
+                  f"volume-weighted={slice_mach_number(run, mass_weighted=False):.2f}, "
+                  f"log E_B range [{np.nanmin(image):.2f}, {np.nanmax(image):.2f}]")
+
+
+if __name__ == "__main__":
+    main()

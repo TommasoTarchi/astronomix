@@ -88,9 +88,14 @@ Things that **didn't** help much on this workload:
   and `F_{i-1/2}` inside the same Pallas program (eliminates the dF
   buffer entirely but doubles WENO compute — net runtime regression on
   A100 because the kernel is compute-bound, not bandwidth-bound).
-- Tuning `pallas_block_shape` away from `(4, 4, 8)`.  Larger normal-axis
-  tiles helped halo overhead in theory but hurt occupancy in practice;
-  `(8,8,8)` was ~3× slower and `(16,8,4)` was ~10× slower.
+- Blocks larger than 128 cells or with more than 4 warps.  `(8,8,8)` was
+  ~3× slower and `(16,8,4)` ~10× slower; on a GH200, 8 warps on 128-cell
+  blocks are 1.6-3.8× slower and 2 warps (2 cells per thread) 1.2-4× slower
+  (spills).  What does matter among 128-cell blocks is the orientation: the
+  state is `(channel, x, y, z)` with z contiguous, so blocks long in z read
+  whole 128-byte transactions.  The default is therefore 128 cells filled
+  from the last axis, `(1, 1, 128)` in 3D (`_default_pallas_block_shape`):
+  on a GH200 up to 30 % faster than `(4, 4, 8)` for the FD kernels.
 
 ---
 
@@ -593,9 +598,9 @@ output across many timesteps.
   path);
 - block shape must divide every spatial dim (including ghost-cell
   padding when the FV path keeps `boundary_handling=GHOST_CELLS`).
-  Default `(4, 4, 8)` works for 128³ + 2 ghost = 132³ only if the user
-  bumps the z-block down to 4 — `(4, 4, 4)` is a safe choice across
-  the supported resolutions.
+  `_as_3tuple_block_shape` resolves each axis to the largest power of two
+  that divides the extent (and keeps the full block, i.e. falls back to
+  native, if that would leave fewer than 32 cells per block).
 
 **Known limitations:**
 
@@ -803,7 +808,8 @@ Design notes worth keeping:
   avoids it at the price of three state-sized buffers and 2–3× DRAM traffic.
 - **The kernel is FP64-compute bound** (~70 % of A100 FP64 peak, card at its
   power cap; 254–255 registers, ≤64 B spills, 12.5 % occupancy). Block shape
-  barely matters among 128-cell blocks on 4 warps; default (2, 2, 32).
+  barely matters among 128-cell blocks on 4 warps in fp64; in fp32 the
+  library default `(1, 1, 128)` is 10 % faster for MHD than `(2, 2, 32)`.
 - **Ghost-cell layout** without block-aligned interiors: the grid covers only
   the interior, outputs are whole-array specs written with explicit indices,
   and the ghost cells are refilled by the boundary handler afterwards.
@@ -903,7 +909,9 @@ happens.  The ``pallasify`` skill must enforce this — see its
 
 - **Pallas block shape must divide every spatial dim.**  Enforce in the
   `_supported` predicate; do NOT silently round up — that masks bugs.
-  We use `(4, 4, 8)` by default in 3D.
+  The 3D default is `(1, 1, 128)` (128 cells along the contiguous z axis);
+  with a y- or z-sharded mesh its z extent rounds the halo up to 128 cells,
+  so pass a smaller z block there.
 - **`pl.BlockSpec((), lambda bi, bj, bk: ())`** is the spec for a
   scalar input.  Always `dtype`-cast scalars before passing them:
   `jnp.asarray(value, dtype=state.dtype)`.  Otherwise mixed-precision
@@ -955,7 +963,7 @@ from astronomix.option_classes.simulation_config import (
 
 cfg = SimulationConfig(
     backend=PALLAS,
-    pallas_block_shape=(4, 4, 8),
+    pallas_block_shape=None,          # library default (1, 1, 128)
     pallas_use_triton=True,
 
     solver_mode=FINITE_DIFFERENCE,

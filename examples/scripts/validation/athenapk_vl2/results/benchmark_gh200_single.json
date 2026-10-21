@@ -1,0 +1,379 @@
+[
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 16,
+  "cells": 8192,
+  "steps_per_repetition": 500,
+  "milliseconds_per_step": 0.02505537588149309,
+  "all_milliseconds_per_step": [
+   0.02509825793094933,
+   0.025071953888982534,
+   0.02507566404528916,
+   0.02505537588149309,
+   0.025083792163059115
+  ],
+  "zone_cycles_per_second": 326955781.4157935,
+  "temporary_memory_mib": 0.28322601318359375,
+  "compile_seconds": 29.47959673195146,
+  "first_run_seconds": 0.013901644968427718,
+  "density_deviation": 0.0043825507164001465,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 165.53 W, 0x0000000000000000",
+   "1980 MHz, 165.94 W, 0x0000000000000000",
+   "1980 MHz, 166.51 W, 0x0000000000000000",
+   "1980 MHz, 167.05 W, 0x0000000000000000",
+   "1980 MHz, 167.63 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 16,
+  "cells": 8192,
+  "meshblock": [
+   32,
+   16,
+   16
+  ],
+  "meshblocks": 1,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 0.5688888888888889,
+  "all_milliseconds_per_step": [
+   0.5688888888888889,
+   0.5688888888888889,
+   0.5688888888888889
+  ],
+  "zone_cycles_per_second": 14400000.0,
+  "process_seconds": [
+   0.668970994069241,
+   0.6465912830317393,
+   0.6312155179912224
+  ],
+  "gpu_status": [
+   "1980 MHz, 150.46 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 32,
+  "cells": 65536,
+  "steps_per_repetition": 500,
+  "milliseconds_per_step": 0.04441940994001925,
+  "all_milliseconds_per_step": [
+   0.04441940994001925,
+   0.044569999910891056,
+   0.04465351579710841,
+   0.04458804614841938,
+   0.04455944010987878
+  ],
+  "zone_cycles_per_second": 1475391052.8864534,
+  "temporary_memory_mib": 2.2519760131835938,
+  "compile_seconds": 29.4332764899591,
+  "first_run_seconds": 0.023207669029943645,
+  "density_deviation": 0.004365086555480957,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 170.82 W, 0x0000000000000000",
+   "1980 MHz, 175.04 W, 0x0000000000000000",
+   "1980 MHz, 178.55 W, 0x0000000000000000",
+   "1980 MHz, 182.60 W, 0x0000000000000000",
+   "1980 MHz, 186.77 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 32,
+  "cells": 65536,
+  "meshblock": [
+   64,
+   32,
+   32
+  ],
+  "meshblocks": 1,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 0.9825487256371814,
+  "all_milliseconds_per_step": [
+   0.9825487256371814,
+   0.9869879518072289,
+   0.9914674735249622
+  ],
+  "zone_cycles_per_second": 66700000.0,
+  "process_seconds": [
+   0.6890113820554689,
+   0.676565133035183,
+   0.6802991179283708
+  ],
+  "gpu_status": [
+   "1980 MHz, 155.95 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 64,
+  "cells": 524288,
+  "steps_per_repetition": 190,
+  "milliseconds_per_step": 0.20405946323942198,
+  "all_milliseconds_per_step": [
+   0.20405946323942198,
+   0.20457128442725853,
+   0.20462686294003538,
+   0.20451436284929514,
+   0.2044212214011503
+  ],
+  "zone_cycles_per_second": 2569290302.3314114,
+  "temporary_memory_mib": 18.001976013183594,
+  "compile_seconds": 29.457486890023574,
+  "first_run_seconds": 0.03988154896069318,
+  "density_deviation": 0.0008768439292907715,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 189.96 W, 0x0000000000000000",
+   "1980 MHz, 203.21 W, 0x0000000000000000",
+   "1980 MHz, 215.52 W, 0x0000000000000000",
+   "1980 MHz, 230.05 W, 0x0000000000000000",
+   "1980 MHz, 241.73 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 64,
+  "cells": 524288,
+  "meshblock": [
+   128,
+   64,
+   64
+  ],
+  "meshblocks": 1,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 3.2768,
+  "all_milliseconds_per_step": [
+   3.2974088050314467,
+   3.2768,
+   3.2768
+  ],
+  "zone_cycles_per_second": 160000000.0,
+  "process_seconds": [
+   0.9580675300676376,
+   0.9511172190541402,
+   0.9405910639325157
+  ],
+  "gpu_status": [
+   "1980 MHz, 179.05 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 128,
+  "cells": 4194304,
+  "steps_per_repetition": 23,
+  "milliseconds_per_step": 1.5234620887381227,
+  "all_milliseconds_per_step": [
+   1.525123259457557,
+   1.5234620887381227,
+   1.5269263455158342,
+   1.5272630439342365,
+   1.5268846131537273
+  ],
+  "zone_cycles_per_second": 2753139727.601705,
+  "temporary_memory_mib": 144.0019760131836,
+  "compile_seconds": 26.715394667931832,
+  "first_run_seconds": 0.0360774639993906,
+  "density_deviation": 9.435415267944336e-05,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 188.46 W, 0x0000000000000000",
+   "1980 MHz, 204.08 W, 0x0000000000000000",
+   "1980 MHz, 219.77 W, 0x0000000000000000",
+   "1980 MHz, 234.21 W, 0x0000000000000000",
+   "1980 MHz, 249.75 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 128,
+  "cells": 4194304,
+  "meshblock": [
+   256,
+   128,
+   128
+  ],
+  "meshblocks": 1,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 11.983725714285715,
+  "all_milliseconds_per_step": [
+   11.983725714285715,
+   12.052597701149425,
+   11.983725714285715
+  ],
+  "zone_cycles_per_second": 350000000.0,
+  "process_seconds": [
+   2.0193304929416627,
+   2.0295146370772272,
+   2.0161407560808584
+  ],
+  "gpu_status": [
+   "1980 MHz, 290.07 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 256,
+  "cells": 33554432,
+  "steps_per_repetition": 10,
+  "milliseconds_per_step": 13.399527303408831,
+  "all_milliseconds_per_step": [
+   13.399527303408831,
+   13.411085505504161,
+   13.415766996331513,
+   13.408061594236642,
+   13.406775100156665
+  ],
+  "zone_cycles_per_second": 2504150425.6246243,
+  "temporary_memory_mib": 1152.0019760131836,
+  "compile_seconds": 26.941777170985006,
+  "first_run_seconds": 0.13538042909931391,
+  "density_deviation": 1.1980533599853516e-05,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 272.92 W, 0x0000000000000000",
+   "1980 MHz, 324.82 W, 0x0000000000000000",
+   "1980 MHz, 377.03 W, 0x0000000000000000",
+   "1980 MHz, 325.42 W, 0x0000000000000000",
+   "1980 MHz, 328.30 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 256,
+  "cells": 33554432,
+  "meshblock": [
+   512,
+   256,
+   256
+  ],
+  "meshblocks": 1,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 57.35800341880342,
+  "all_milliseconds_per_step": [
+   57.65366323024055,
+   57.35800341880342,
+   57.95238687392055
+  ],
+  "zone_cycles_per_second": 585000000.0,
+  "process_seconds": [
+   8.164911114028655,
+   8.123917710967362,
+   8.172882623970509
+  ],
+  "gpu_status": [
+   "1980 MHz, 365.96 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 384,
+  "cells": 113246208,
+  "steps_per_repetition": 10,
+  "milliseconds_per_step": 47.33371129259467,
+  "all_milliseconds_per_step": [
+   47.356462792959064,
+   47.33882469590753,
+   47.33371129259467,
+   47.39426369778812,
+   47.416736802551895
+  ],
+  "zone_cycles_per_second": 2392506416.831872,
+  "temporary_memory_mib": 3888.0019760131836,
+  "compile_seconds": 26.87237588595599,
+  "first_run_seconds": 0.47402893903199583,
+  "density_deviation": 7.569789886474609e-06,
+  "finite": true,
+  "gpu_status": [
+   "1980 MHz, 508.60 W, 0x0000000000000000",
+   "1980 MHz, 464.86 W, 0x0000000000000000",
+   "1980 MHz, 483.20 W, 0x0000000000000000",
+   "1980 MHz, 463.15 W, 0x0000000000000000",
+   "1980 MHz, 477.86 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "AthenaPK",
+  "precision": "single",
+  "resolution": 384,
+  "cells": 113246208,
+  "meshblock": [
+   384,
+   384,
+   384
+  ],
+  "meshblocks": 2,
+  "cycles_timed": 100,
+  "milliseconds_per_step": 175.57551627906977,
+  "all_milliseconds_per_step": [
+   175.57551627906977,
+   175.57551627906977,
+   175.57551627906977
+  ],
+  "zone_cycles_per_second": 645000000.0,
+  "process_seconds": [
+   24.108188088051975,
+   24.22621023794636,
+   24.113147818949074
+  ],
+  "gpu_status": [
+   "1980 MHz, 374.17 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ },
+ {
+  "code": "astronomix pallas",
+  "precision": "single",
+  "resolution": 512,
+  "cells": 268435456,
+  "steps_per_repetition": 10,
+  "milliseconds_per_step": 110.05875150440261,
+  "all_milliseconds_per_step": [
+   110.0817080005072,
+   110.06948740687221,
+   110.05875150440261,
+   110.29244300443679,
+   110.30925869708881
+  ],
+  "zone_cycles_per_second": 2439019635.7012277,
+  "temporary_memory_mib": 9216.001976013184,
+  "compile_seconds": 27.690333882928826,
+  "first_run_seconds": 1.0998496749671176,
+  "density_deviation": 4.410743713378906e-06,
+  "finite": true,
+  "gpu_status": [
+   "1965 MHz, 526.34 W, 0x0000000000000004",
+   "1965 MHz, 513.10 W, 0x0000000000000004",
+   "1965 MHz, 543.83 W, 0x0000000000000004",
+   "1965 MHz, 520.65 W, 0x0000000000000004",
+   "1980 MHz, 519.01 W, 0x0000000000000000"
+  ],
+  "device": "NVIDIA GH200 120GB"
+ }
+]

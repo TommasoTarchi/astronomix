@@ -15,26 +15,43 @@ being AthenaPK's own GPU-vs-CPU difference), the CP Alfvén convergence study an
 the A100 benchmark (Pallas 9.25 ms per step at 2 x 128³ in double precision
 against AthenaPK's 25.4 ms). `pytests/mhd/vl2_athenapk_regression.py` guards it.
 
-**Next.** The same benchmark on H100/H200 and at larger N (the scheme is
-FP64-compute bound on the A100), strong and weak scaling on several GPUs against
-AthenaPK's own scaling, single precision, and the turbulence driving of the
-dynamo study (below) under VL2.
+**Done since** (paper revision, branch `paper-revision`): AthenaPK builds for the
+JUPITER GH200 nodes in double and single precision
+(`/e/project1/astronomix/storcks1/athenapk_build/`, `jupiter_athenapk.sh`), the
+single-GPU comparison on GH200 in both precisions (`benchmark.py`,
+`fv_athenapk_single_precision.py`; VL2 Pallas 2.8x faster per step than AthenaPK
+in double, 6.9x in single precision at N = 128), and strong/weak scaling of VL2 to
+128 GPUs (`examples/scripts/scaling/`).
+
+**Next.** Scaling against AthenaPK's own multi-GPU scaling; the VL2 Pallas kernels
+on multiple nodes are communication bound (FV weak-scaling efficiency 58-65 % at
+128 GPUs, at eight to nine times the FD throughput per GPU).
 
 ## 2. Cas A at high resolution
 
-**In place.** The calibrated pipeline, the JAX observation model, the X-ray fit and
-the 4D-Var live in
-[`examples/gallery/supernova_showcase`](examples/gallery/supernova_showcase); start
-with its `OVERVIEW.md`, `ROADMAP.md` and `HANDOFF_LARGER_CLUSTER.md`. The scripts
-run on the positivity-preserving WENO (`weno_positivity_preserving=True`, set by
-`_common.make_fd_config`), whose gradients are finite in single precision. The
-`run.sh` wrapper imports the checkout it lives in.
+**In place.** The calibrated pipeline, the X-ray fit and the 4D-Var moved to their own
+repository, [casanova](https://github.com/leo1200/casanova) (2026-10-20, with the history
+of `examples/gallery/supernova_showcase`), and the JAX observation model to
+[observistix](https://github.com/leo1200/observistix); start with casanova's `OVERVIEW.md`,
+`ROADMAP.md` and `HANDOFF_LARGER_CLUSTER.md`. The scripts run on the
+positivity-preserving WENO (`weno_positivity_preserving=True`, set by
+`_common.make_fd_config`), whose gradients are finite in single precision. Its
+`run.sh` imports the astronomix and observistix checkouts next to it.
 
-**Next** (details in `HANDOFF_LARGER_CLUSTER.md`): the gates G0-G2 on a GPU (the
-PP re-baseline at 128³ and the long-window tangent test), the PP-native cold-face
-tangent only if G2 needs it (P2), a separate frozen-theta switch (P3), then the
-448³ and 512³ runs. Callers outside the repository still pass the removed
-`--positivity` flag.
+**On JUPITER** (casanova's `jupiter/README.md`):
+the observation data rebuilt from the public Chandra archive (no CIAO on aarch64:
+`--responses tables`), the ICs from Orlando's delivery, gates G0-G5 measured, the
+cold-face tangent (P2, `ad_tangent_llf_cold_factor`) added after G2 failed at
+256³/512³, the hydro WENO Pallas adjoint back (`BackendConfig.pallas_adjoint`),
+deterministic scatters made cheap, `casa_4dvar` across nodes (`CASA_DISTRIBUTED=1`),
+a 128³ refit and the 512³ 4D-Var on 8 GH200 (198-835 s per gradient, <= 66 GB/GPU),
+which improves the held-out 2019/2022 score by 17.2 % (128³: 12.3 %).
+
+**Next**: the CIAO responses (built on an x86 machine), a longer refit and the
+Bayesian stage of the hand-off on the 512³ analysis; a separate frozen-theta switch
+(P3); the MHD WENO Pallas adjoint; the native-vs-Pallas dual-energy forward
+difference in kinetic-dominated cells. Callers outside the repository still pass
+the removed `--positivity` flag.
 
 ## 3. Second-order FV against fifth-order FD: spectra, dynamo, Prandtl number
 
@@ -47,13 +64,14 @@ at matched E_B/E_K (Pm_num is a scheme constant: CT ~1.21, every GLM scheme
 forcing (`TurbulentForcingConfig.forcing_modes`). The hydro counterpart against
 AthenaK is in `examples/scripts/forward/hydro/turbulence`.
 
-**Next.** Run the same study with astronomix's own VL2 scheme, so FV and FD share
-the code, the forcing realisation and the diagnostics: `dynamo_convergence.py`
-needs a `--scheme vl2` path (ideal gas with gamma close to 1 as in
-`athenapk_turb.py`, the GLM psi instead of face fields in the reduction, the
-VL2 time step in the step-count reconstruction). Then compare spectra, dynamo
-growth rates and Pm_num of the two discretisations, also against the literature
-(e.g. arXiv:astro-ph/0109497).
+**Done since** (paper revision): the study with astronomix's own VL2 scheme
+(`dynamo_convergence.py --scheme {fd,vl2}`, data in `data/fd_fv/`,
+`make_fd_fv_reynolds_figure.py`): with the same forcing and diagnostics, FD
+(WENO-Z + CT) has Pm 1.16-1.22 and FV (VL2 + GLM) 0.61-0.63 at N = 64-256 (VL2
+reproduces the earlier AthenaPK PLM numbers to 1-3 %); Re and Rm grow as N^1.2.
+
+**Next.** Compare against the literature (e.g. arXiv:astro-ph/0109497) and with
+explicit diffusivities at fixed Pm.
 
 ## Known open issues
 
@@ -70,6 +88,20 @@ growth rates and Pm_num of the two discretisations, also against the literature
   used only without positivity-preserving WENO, dual energy and the cold-crush
   blend; porting it to the SSPRK4 integrator and to the PP data flow is open.
 - The pairwise `all_to_all` halo exchange of the multi-GPU scaling work
-  (esovetkin/optim_scaling, 256483e) helped from 32 GPUs on but is not merged
-  (it fails with integer mesh-axis names); a pairwise-`ppermute` variant is the
-  candidate to benchmark.
+  (esovetkin/optim_scaling, 256483e) is now merged and the default for
+  multi-device meshes (`BackendConfig.halo_exchange = "pair_all_to_all"`; the
+  shard_map of the exchange runs under string axis names, which JAX needs for
+  `axis_index_groups`). It needs ~10 % of the device memory for NCCL (the
+  sharded runners set a 90 % XLA pool); `"ppermute"` restores the ring exchange.
+- `_as_3tuple_block_shape` (`_pallas_helpers.py`) clamps the Pallas block to the
+  padded extent, which can give a non-power-of-two block that Triton cannot lower
+  (e.g. 1D finite difference with open boundaries at N = 64); a block shape that
+  does not divide the grid silently falls back to the native backend.
+- `analysis_helpers/_exposed_rhs.py` does not support fully periodic
+  (`PERIODIC_ROLL`) layouts.
+- Multi-node runs should use one process per node driving its four GPUs
+  (`PROCESS_LAYOUT=node`, the runners' default): one process per GPU is ~30 %
+  slower per step across nodes, for a reason not yet identified. At 128 GPUs
+  the NCCL buffers need more than the 8 % of device memory that the default
+  92 % XLA pool leaves free (`XLA_PYTHON_CLIENT_MEM_FRACTION` 0.85-0.90, and
+  `NCCL_NVLS_ENABLE=0 NCCL_BUFFSIZE=1048576` for FD MHD).

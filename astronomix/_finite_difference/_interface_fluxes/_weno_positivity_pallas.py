@@ -11,7 +11,10 @@ kernels compute the same quantities in one pass each:
   then sum_d S_d);
 * ``mhd_joint_recombination_pallas``: per interface, the limited flux from the
   split face fluxes of the WENO kernel (three neighbouring interfaces), the
-  state at cells i, i + 1 and the reference at cells i, i + 1.
+  state at cells i, i + 1 and the reference at cells i, i + 1; its arithmetic
+  is the window function ``_joint_recombination_window``. (The reverse mode of
+  ``BackendConfig.pallas_adjoint`` differentiates the array form instead, see
+  ``_weno_flux_mhd_pallas_vjp``.)
 
 Both read their inputs with periodic (modular) indexing inside the local
 array, like the WENO kernels, so they run unchanged inside the multi-GPU
@@ -219,6 +222,108 @@ def mhd_inflow_reference_pallas(
     return out[:nvars], out[nvars]
 
 
+def _joint_recombination_window(
+    q_left,
+    q_right,
+    plus_here,
+    plus_right,
+    minus_left,
+    minus_here,
+    speeds,
+    reference_left,
+    reference_right,
+    speed_sum_left,
+    speed_sum_right,
+    gm1,
+    rhomin,
+    pgmin,
+    faces,
+):
+    """
+    The limited ideal-MHD interface flux at i + 1/2 from its window (the
+    arithmetic of ``mhd_joint_recombination_pallas`` for one interface).
+
+    Args:
+        q_left: The local state of cell i (``(rho, m_n, m_t1, m_t2, B_n, B_t1,
+            B_t2, E)``).
+        q_right: That of cell i + 1.
+        plus_here: The plus split face flux of the interface i + 1/2.
+        plus_right: That of the interface i + 3/2.
+        minus_left: The minus split face flux of the interface i - 1/2.
+        minus_here: That of the interface i + 1/2.
+        speeds: The splitting speeds of the interfaces i - 1/2, i + 1/2,
+            i + 3/2 (the kernel output, before the floor).
+        reference_left: The inflow reference state of cell i.
+        reference_right: That of cell i + 1.
+        speed_sum_left: The summed splitting speeds of cell i.
+        speed_sum_right: Those of cell i + 1.
+        gm1: gamma - 1.
+        rhomin: The density floor.
+        pgmin: The pressure floor.
+        faces: The number of faces of a cell, ``2 * dimensionality``.
+
+    Returns:
+        The interface flux as a list of the eight local components.
+    """
+
+    def fraction(base, step):
+        return _local_admissible_fraction(base, step, gm1, rhomin, pgmin, True, MAGNETIC_SLOTS)
+
+    def pair_fraction(base, first, second):
+        both = tuple(a + b for a, b in zip(first, second))
+        return jnp.minimum(jnp.minimum(fraction(base, first), fraction(base, second)), fraction(base, both))
+
+    f_left, f_right = _local_mhd_flux(q_left, gm1), _local_mhd_flux(q_right, gm1)
+    alpha = {offset: jnp.maximum(speed, 1e-30) for offset, speed in zip((-1, 0, 1), speeds)}
+    # One reciprocal per splitting speed instead of a division per
+    # component: divisions are long instruction sequences on the GPU (and
+    # in double precision especially), the scalings need only round-off
+    # accuracy.
+    inverse_alpha = {offset: 1.0 / alpha[offset] for offset in (-1, 0, 1)}
+    plus = {0: plus_here, 1: plus_right}
+    minus = {-1: minus_left, 0: minus_here}
+
+    def plus_step(offset, state, flux):
+        inverse = inverse_alpha[offset]
+        return tuple(2.0 * plus[offset][s] * inverse - (state[s] + flux[s] * inverse) for s in range(8))
+
+    def minus_step(offset, state, flux):
+        inverse = inverse_alpha[offset]
+        return tuple(-2.0 * minus[offset][s] * inverse - (state[s] - flux[s] * inverse) for s in range(8))
+
+    step_plus_here = plus_step(0, q_left, f_left)       # face i+1/2, from cell i
+    step_minus_here = minus_step(0, q_right, f_right)   # face i+1/2, from cell i+1
+    step_minus_left = minus_step(-1, q_left, f_left)    # face i-1/2, from cell i
+    step_plus_right = plus_step(1, q_right, f_right)    # face i+3/2, from cell i+1
+
+    def own(state, step_plus, alpha_plus, step_minus, alpha_minus):
+        total = alpha_plus + alpha_minus
+        return pair_fraction(
+            state,
+            tuple(-(alpha_plus / total) * x for x in step_plus),
+            tuple(-(alpha_minus / total) * x for x in step_minus),
+        )
+
+    own_left = own(q_left, step_plus_here, alpha[0], step_minus_left, alpha[-1])
+    own_right = own(q_right, step_plus_right, alpha[1], step_minus_here, alpha[0])
+    share_left = faces * alpha[0] / speed_sum_left
+    share_right = faces * alpha[0] / speed_sum_right
+    # cell i's right inflow face and cell i+1's left inflow face are this one
+    right_inflow = fraction(reference_left, tuple(share_left * x for x in step_minus_here))
+    left_inflow = fraction(reference_right, tuple(share_right * x for x in step_plus_here))
+    theta_plus = jnp.minimum(own_left, left_inflow)
+    theta_minus = jnp.minimum(right_inflow, own_right)
+
+    a = alpha[0]
+    inverse_a = inverse_alpha[0]
+    flux = []
+    for slot in range(8):
+        plus_flux = 0.5 * a * (q_left[slot] + f_left[slot] * inverse_a + theta_plus * step_plus_here[slot])
+        minus_flux = -0.5 * a * (q_right[slot] - f_right[slot] * inverse_a + theta_minus * step_minus_here[slot])
+        flux.append(plus_flux + minus_flux)
+    return flux
+
+
 def mhd_joint_recombination_pallas(
     conserved_state,
     split_flux,
@@ -261,60 +366,29 @@ def mhd_joint_recombination_pallas(
         def local(read, offset, base=0):
             return tuple(read(base + var, axis, offset) for var in local_indices)
 
-        def fraction(base, step):
-            return _local_admissible_fraction(base, step, gm1, rhomin, pgmin, True, MAGNETIC_SLOTS)
-
-        def pair_fraction(base, first, second):
-            both = tuple(a + b for a, b in zip(first, second))
-            return jnp.minimum(jnp.minimum(fraction(base, first), fraction(base, second)), fraction(base, both))
-
-        q_left, q_right = local(q_at, 0), local(q_at, 1)
-        f_left, f_right = _local_mhd_flux(q_left, gm1), _local_mhd_flux(q_right, gm1)
-        alpha = {offset: jnp.maximum(split_at(2 * nvars, axis, offset), 1e-30) for offset in (-1, 0, 1)}
-        plus = {offset: local(split_at, offset) for offset in (0, 1)}
-        minus = {offset: local(split_at, offset, nvars) for offset in (-1, 0)}
-
-        def plus_step(offset, state, flux):
-            a = alpha[offset]
-            return tuple(2.0 * plus[offset][s] / a - (state[s] + flux[s] / a) for s in range(8))
-
-        def minus_step(offset, state, flux):
-            a = alpha[offset]
-            return tuple(-2.0 * minus[offset][s] / a - (state[s] - flux[s] / a) for s in range(8))
-
-        step_plus_here = plus_step(0, q_left, f_left)       # face i+1/2, from cell i
-        step_minus_here = minus_step(0, q_right, f_right)   # face i+1/2, from cell i+1
-        step_minus_left = minus_step(-1, q_left, f_left)    # face i-1/2, from cell i
-        step_plus_right = plus_step(1, q_right, f_right)    # face i+3/2, from cell i+1
-
-        def own(state, step_plus, alpha_plus, step_minus, alpha_minus):
-            total = alpha_plus + alpha_minus
-            return pair_fraction(
-                state,
-                tuple(-(alpha_plus / total) * x for x in step_plus),
-                tuple(-(alpha_minus / total) * x for x in step_minus),
-            )
-
-        own_left = own(q_left, step_plus_here, alpha[0], step_minus_left, alpha[-1])
-        own_right = own(q_right, step_plus_right, alpha[1], step_minus_here, alpha[0])
-        reference_left = local(reference_at, 0)
-        reference_right = local(reference_at, 1)
-        share_left = faces * alpha[0] / speed_sum_at(0, axis, 0)
-        share_right = faces * alpha[0] / speed_sum_at(0, axis, 1)
-        # cell i's right inflow face and cell i+1's left inflow face are this one
-        right_inflow = fraction(reference_left, tuple(share_left * x for x in step_minus_here))
-        left_inflow = fraction(reference_right, tuple(share_right * x for x in step_plus_here))
-        theta_plus = jnp.minimum(own_left, left_inflow)
-        theta_minus = jnp.minimum(right_inflow, own_right)
-
-        a = alpha[0]
-        zero = a * 0.0
+        flux = _joint_recombination_window(
+            local(q_at, 0),
+            local(q_at, 1),
+            local(split_at, 0),
+            local(split_at, 1),
+            local(split_at, -1, nvars),
+            local(split_at, 0, nvars),
+            tuple(split_at(2 * nvars, axis, offset) for offset in (-1, 0, 1)),
+            local(reference_at, 0),
+            local(reference_at, 1),
+            speed_sum_at(0, axis, 0),
+            speed_sum_at(0, axis, 1),
+            gm1,
+            rhomin,
+            pgmin,
+            faces,
+        )
+        zero = flux[0] * 0.0
         for var in range(nvars):
-            out_ref[var, ...] = zero
+            if var not in local_indices:
+                out_ref[var, ...] = zero
         for slot, var in enumerate(local_indices):
-            plus_flux = 0.5 * a * (q_left[slot] + f_left[slot] / a + theta_plus * step_plus_here[slot])
-            minus_flux = -0.5 * a * (q_right[slot] - f_right[slot] / a + theta_minus * step_minus_here[slot])
-            out_ref[var, ...] = plus_flux + minus_flux
+            out_ref[var, ...] = flux[slot]
 
     kwargs = {}
     compiler_params = _pallas_compiler_params(config)
@@ -351,20 +425,34 @@ def mhd_inflow_reference_dispatch(
     registered_variables: RegisteredVariables,
 ):
     """``mhd_inflow_reference`` with the Pallas kernel where the ideal-MHD
-    Pallas WENO runs (3D), the array form elsewhere."""
+    Pallas WENO runs (3D), the array form elsewhere. Like the Pallas WENO
+    fluxes, the Pallas path sits behind ``diffable_pallas_call``, so its
+    tangent (and the reverse sweep) runs the array form, in the same
+    ``shard_map`` + halo exchange as the primal."""
     from astronomix._finite_difference._interface_fluxes._weno_pallas import _mhd_pallas_flux_supported
     from astronomix._finite_difference._interface_fluxes._weno_positivity import mhd_inflow_reference
-    from astronomix._pallas_helpers import _pallas_call_sharded
+    from astronomix._pallas_helpers import _pallas_call_sharded, diffable_pallas_call
 
     if config.dimensionality != 3 or not _mhd_pallas_flux_supported(conserved_state, config):
         return mhd_inflow_reference(conserved_state, params, config, registered_variables)
     nvars = int(conserved_state.shape[0])
     _, block = _grid_and_indices(tuple(int(x) for x in conserved_state.shape[1:]), config)
 
-    def build(state_local):
-        reference, speed_sum = mhd_inflow_reference_pallas(state_local, params, config, registered_variables)
-        return jnp.concatenate([reference, speed_sum[None]], axis=0)
+    def sharded(reference_fn, block_shape):
+        def run(state, params):
+            def build(state_local):
+                reference, speed_sum = reference_fn(state_local, params, config, registered_variables)
+                return jnp.concatenate([reference, speed_sum[None]], axis=0)
 
-    # the face speeds reach cells i -+ 3 along every axis
-    out = _pallas_call_sharded(build, state_inputs=(conserved_state,), halo=(4, 4, 4), block_shape=block)
-    return out[:nvars], out[nvars]
+            # the face speeds reach cells i -+ 3 along every axis
+            out = _pallas_call_sharded(build, state_inputs=(state,), halo=(4, 4, 4), block_shape=block_shape)
+            return out[:nvars], out[nvars]
+
+        return run
+
+    return diffable_pallas_call(
+        conserved_state,
+        params,
+        pallas_branch=sharded(mhd_inflow_reference_pallas, block),
+        native_branch=sharded(mhd_inflow_reference, (1, 1, 1)),
+    )

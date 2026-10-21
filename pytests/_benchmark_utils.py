@@ -1001,6 +1001,29 @@ def _build_global_sharding(mesh_shape):
     return jax.NamedSharding(mesh, P(VARAXIS, XAXIS, YAXIS, ZAXIS))
 
 
+def _state_extrema(state):
+    """
+    Per-variable minimum and maximum of a (possibly multi-process sharded)
+    state, as host arrays on every process.
+
+    Args:
+        state: The ``(var, x, y, z)`` state.
+
+    Returns:
+        ``(minimum, maximum)``, each a numpy array of length ``num_vars``.
+    """
+    spatial_axes = tuple(range(1, state.ndim))
+    minimum, maximum = jax.jit(
+        lambda array: (jnp.min(array, axis=spatial_axes), jnp.max(array, axis=spatial_axes))
+    )(state)
+    # The reductions are replicated on every device, so each process reads its
+    # own copy.
+    return (
+        np.asarray(minimum.addressable_shards[0].data),
+        np.asarray(maximum.addressable_shards[0].data),
+    )
+
+
 def run_weak_scaling_point(
     state_builder: Callable,
     base_config: SimulationConfig,
@@ -1015,6 +1038,7 @@ def run_weak_scaling_point(
     name: str,
     data_dir: str,
     setup_key: str = "hydro_weak",
+    solver_label: str = "FD (Pallas)",
 ) -> dict:
     """One weak-scaling point: build the globally-sharded IC, run a fixed
     number of timesteps, record runtime + per-device memory + throughput.
@@ -1024,6 +1048,28 @@ def run_weak_scaling_point(
     :func:`astronomix.test_setups.hydrodynamics.sound_wave3D.build_sound_wave_state_sharded`).
     Only process 0 writes the result files.  ``jax.distributed.initialize``
     must already have been called by the driver.
+
+    The same measurement serves a strong-scaling point: ``global_cells`` is
+    then held fixed while the mesh grows.
+
+    Args:
+        state_builder: The sharding-aware initial-condition builder.
+        base_config: The simulation configuration without the grid.
+        settings: The problem settings handed to ``state_builder``.
+        mesh_shape: The ``(var, x, y, z)`` device mesh shape.
+        global_cells: The global grid ``(nx, ny, nz)``.
+        box_size: The box size (recorded only; ``settings`` sets it).
+        cfl: The CFL number (unused with the fixed time step, recorded).
+        dt: The fixed time step.
+        num_timesteps: The number of time steps per run.
+        name: The result-file prefix (``{name}_G{G:03d}.{npz,json}``).
+        data_dir: The result directory.
+        setup_key: The setup name recorded in the metadata.
+        solver_label: The solver label recorded in the metadata.
+
+    Returns:
+        A dict with the warm runtime, the cold runtime, the deduced warm-up,
+        the cell count, the throughput and the per-device temporary memory.
     """
     from jax.experimental import multihost_utils as mh
 
@@ -1045,13 +1091,45 @@ def run_weak_scaling_point(
     params = params._replace(t_end=float(dt) * int(num_timesteps))
 
     registered_variables = get_registered_variables(config)
-    result = time_integration(
-        state, config, params, registered_variables, sharding=sharding
-    )
-    if getattr(result, "final_state", None) is not None:
-        result.final_state.block_until_ready()
+
+    def _one_run(initial_state):
+        """Integrate once and wait for the device to finish."""
+        run_result = time_integration(
+            initial_state, config, params, registered_variables, sharding=sharding
+        )
+        if getattr(run_result, "final_state", None) is not None:
+            run_result.final_state.block_until_ready()
+        return run_result
+
+    result = _one_run(state)
+    runtime_cold = float(result.runtime)
+
+    # The timer inside time_integration excludes compilation (AOT compile runs
+    # first), but the timed call is still the FIRST execution of the compiled
+    # program: one-time costs (NCCL communicator setup, allocator growth,
+    # module load) land inside the timed window and grow with node count.
+    # Deduce them via T(n) = W + n*s with two points on the SAME allocation:
+    # rebuild the (donated) initial state and rerun the identical executable.
+    # The warm second run gives the clean per-step cost; W = cold - warm.
+    #
+    # Free the cold run's outputs BEFORE the warm run: holding its final state
+    # alongside the fresh IC and the run's transients overflows device memory
+    # on rungs that fill the GPU (the compiled footprint is sized to the card).
+    del result
+    del state
+    state, config, params = state_builder(config, params, sharding, settings)
+    params = params._replace(t_end=float(dt) * int(num_timesteps))
+    result = _one_run(state)
+
+    # Integrity check of the timed run: the benchmark waves are tiny
+    # perturbations of a uniform background, so the per-variable extrema of
+    # the final state must stay at the background values. A kernel that
+    # computed from wrong neighbours or wrong addresses (halo exchange,
+    # indexing of very large shards) would show up here.
+    final_state_minimum, final_state_maximum = _state_extrema(result.final_state)
 
     runtime = float(result.runtime)
+    warmup_s = runtime_cold - runtime
     iters = int(result.num_iterations)
     temp = int(result.temporary_memory_bytes)
     arg = int(result.argument_memory_bytes)
@@ -1065,6 +1143,7 @@ def run_weak_scaling_point(
 
     # Gather each process's own measured runtime to expose load skew.
     runtimes = np.asarray(mh.process_allgather(jnp.asarray(runtime)))
+    runtimes_cold = np.asarray(mh.process_allgather(jnp.asarray(runtime_cold)))
 
     if process_index == 0:
         rec = dict(
@@ -1073,18 +1152,27 @@ def run_weak_scaling_point(
             global_cells=list(global_cells),
             total_cells=total_cells,
             runtime=runtime,
+            runtime_cold=runtime_cold,
+            warmup_s=warmup_s,
             runtimes=runtimes,
+            runtimes_cold=runtimes_cold,
             iterations=iters,
             temp_bytes_per_dev=temp,
             arg_bytes_per_dev=arg,
             total_bytes_per_dev=tot,
             cells_per_s_per_gpu=cells_per_s_per_gpu,
             dt=float(dt),
+            final_state_min=final_state_minimum,
+            final_state_max=final_state_maximum,
         )
         meta = dict(
             _gpu_metadata(G),
             setup=setup_key,
-            solver_label="FD (Pallas)",
+            solver_label=solver_label,
+            solver_mode=int(config.solver_mode),
+            weno_z=bool(config.weno_z),
+            riemann_solver=int(config.riemann_solver),
+            pallas_ct=bool(config.backend_config.pallas_ct),
             pallas_block_shape=list(base_config.backend_config.pallas_block_shape or []),
             time_integrator=int(getattr(base_config, "time_integrator", -1)),
             num_timesteps=int(num_timesteps),
@@ -1093,12 +1181,21 @@ def run_weak_scaling_point(
         _write_results(data_dir, f"{name}_G{G:03d}", rec, meta)
         print(
             f"[{name}] G={G} {global_cells} runtime={runtime:.3f}s "
+            f"(cold={runtime_cold:.3f}s, warmup={warmup_s:.3f}s) "
             f"iters={iters} temp/dev={temp / 1024**3:.2f}GB "
-            f"throughput={cells_per_s_per_gpu:.3e} cells/s/GPU"
+            f"throughput={cells_per_s_per_gpu:.3e} cells/s/GPU",
+            flush=True,
+        )
+        print(
+            f"[{name}] final state per variable: "
+            f"min={np.array2string(final_state_minimum, precision=6)} "
+            f"max={np.array2string(final_state_maximum, precision=6)}",
+            flush=True,
         )
 
     mh.sync_global_devices("weak_scaling_point_done")
     return dict(
-        G=G, runtime=runtime, total_cells=total_cells,
+        G=G, runtime=runtime, runtime_cold=runtime_cold, warmup_s=warmup_s,
+        total_cells=total_cells,
         cells_per_s_per_gpu=cells_per_s_per_gpu, temp_bytes_per_dev=temp,
     )

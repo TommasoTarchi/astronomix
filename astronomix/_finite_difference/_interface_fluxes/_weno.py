@@ -110,6 +110,7 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
+    BACKWARDS,
     IDEAL_GAS,
     ISOTHERMAL,
 )
@@ -161,6 +162,7 @@ from astronomix._pallas_helpers import (
     _pallas_call_sharded,
     diffable_pallas_call,
     diffable_pallas_call_n,
+    pallas_vjp_call,
 )
 
 # astronomix functions (Pallas backend; ``_weno_pallas.py`` imports the native
@@ -170,8 +172,10 @@ from astronomix._finite_difference._interface_fluxes._weno_pallas import (
     _mhd_iso_pallas_flux_supported,
     _mhd_pallas_flux_supported,
     _weno_flux_hydro_pallas,
+    _weno_flux_hydro_pallas_vjp,
     _weno_flux_mhd_iso_pallas,
     _weno_flux_mhd_pallas,
+    _weno_flux_mhd_pallas_vjp,
 )
 
 
@@ -1021,11 +1025,17 @@ def _weno_flux_axis_dispatch(
     ``params`` (so gradients w.r.t. physical parameters that enter the flux are
     non-zero), and the backward is standard native-JAX AD, which compiles fast.
 
-    A hand-written Pallas adjoint behind ``jax.custom_vjp`` would keep the
-    backward on the GPU, but it raises under forward-mode AD, gives a zero
-    cotangent for ``params`` and has a pathologically slow Triton lowering.
-    The native tangent avoids all three at the cost of a native-speed (not
-    Pallas-speed) backward pass — a trade the differentiable examples want.
+    The native tangent also re-runs the native forward for its linearisation,
+    so the reverse sweep runs at native-JAX speed. In reverse mode
+    (``differentiation_mode == BACKWARDS``, ``backend_config.pallas_adjoint``)
+    the ideal-gas hydro and ideal-MHD fluxes therefore take a Pallas adjoint
+    instead (``pallas_vjp_call`` around ``_weno_flux_hydro_pallas_vjp`` /
+    ``_weno_flux_mhd_pallas_vjp``: ``jax.vjp`` of the forward kernel's window
+    function inside a Pallas kernel; the positivity-preserving recombination
+    of MHD is differentiated in native JAX). It differentiates with respect to
+    the state, the dual-energy ``g`` and the MHD inflow reference only
+    (``params`` get a zero cotangent) and does not support forward mode, which
+    is why it is tied to BACKWARDS.
 
     TODO: wrap the ideal- and isothermal-MHD tangents in
     ``_native_tangent_sharded`` like the hydro and dual-energy ones; they still
@@ -1048,6 +1058,9 @@ def _weno_flux_axis_dispatch(
         The WENO interface fluxes along ``axis``.
     """
     native_flux = _weno_flux_native_for_axis(axis)
+    use_pallas_adjoint = (
+        config.differentiation_mode == BACKWARDS and config.backend_config.pallas_adjoint
+    )
 
     if internal_energy_density is not None:
         # Coupled dual-energy recovery: the hydro and MHD Pallas WENO kernels
@@ -1056,6 +1069,68 @@ def _weno_flux_axis_dispatch(
         # has no energy equation, so g never arrives there.
         hydro_supported = _hydro_pallas_axis_supported(conserved_state, axis, config)
         mhd_supported = _mhd_pallas_flux_supported(conserved_state, config)
+        if hydro_supported and use_pallas_adjoint:
+
+            def pallas_forward(inputs, params):
+                state, internal_energy = inputs
+                return _weno_flux_hydro_pallas(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    internal_energy_density=internal_energy,
+                )
+
+            def pallas_backward(inputs, params, flux_cotangent):
+                state, internal_energy = inputs
+                return _weno_flux_hydro_pallas_vjp(
+                    state,
+                    flux_cotangent,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    internal_energy_density=internal_energy,
+                )
+
+            return pallas_vjp_call(
+                (conserved_state, internal_energy_density),
+                params,
+                pallas_forward=pallas_forward,
+                pallas_backward=pallas_backward,
+            )
+        if mhd_supported and use_pallas_adjoint:
+
+            def pallas_forward(inputs, params):
+                state, internal_energy = inputs
+                return _weno_flux_mhd_pallas(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    internal_energy_density=internal_energy,
+                )
+
+            def pallas_backward(inputs, params, flux_cotangent):
+                state, internal_energy = inputs
+                return _weno_flux_mhd_pallas_vjp(
+                    state,
+                    flux_cotangent,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    internal_energy_density=internal_energy,
+                )
+
+            return pallas_vjp_call(
+                (conserved_state, internal_energy_density),
+                params,
+                pallas_forward=pallas_forward,
+                pallas_backward=pallas_backward,
+            )
         if hydro_supported or mhd_supported:
             kernel = _weno_flux_hydro_pallas if hydro_supported else _weno_flux_mhd_pallas
 
@@ -1092,6 +1167,26 @@ def _weno_flux_axis_dispatch(
         )
 
     if _hydro_pallas_axis_supported(conserved_state, axis, config):
+        if use_pallas_adjoint:
+            return pallas_vjp_call(
+                conserved_state,
+                params,
+                pallas_forward=lambda state, params: _weno_flux_hydro_pallas(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                ),
+                pallas_backward=lambda state, params, flux_cotangent: _weno_flux_hydro_pallas_vjp(
+                    state,
+                    flux_cotangent,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                ),
+            )
 
         def pallas_branch(state, params):
             return _weno_flux_hydro_pallas(
@@ -1113,6 +1208,42 @@ def _weno_flux_axis_dispatch(
         )
 
     if _mhd_pallas_flux_supported(conserved_state, config):
+        if use_pallas_adjoint:
+            # The inflow reference (when present) is differentiable input of
+            # the flux; its cotangents leave through the reference's own
+            # boundary (``mhd_inflow_reference_dispatch``).
+            reference = tuple(inflow_reference) if inflow_reference is not None else ()
+
+            def pallas_forward(inputs, params):
+                state, *reference_inputs = inputs
+                return _weno_flux_mhd_pallas(
+                    state,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    inflow_reference=tuple(reference_inputs) if reference_inputs else None,
+                )
+
+            def pallas_backward(inputs, params, flux_cotangent):
+                state, *reference_inputs = inputs
+                cotangents = _weno_flux_mhd_pallas_vjp(
+                    state,
+                    flux_cotangent,
+                    params,
+                    config,
+                    registered_variables,
+                    axis=axis,
+                    inflow_reference=tuple(reference_inputs) if reference_inputs else None,
+                )
+                return cotangents if reference_inputs else (cotangents,)
+
+            return pallas_vjp_call(
+                (conserved_state,) + reference,
+                params,
+                pallas_forward=pallas_forward,
+                pallas_backward=pallas_backward,
+            )
         if inflow_reference is not None:
 
             def pallas_branch(state, params, reference_state, speed_sum):

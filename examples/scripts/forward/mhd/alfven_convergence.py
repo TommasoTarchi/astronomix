@@ -1,68 +1,83 @@
-"""3D circularly-polarized Alfvén-wave convergence — paper figure (double precision).
+"""
+3D circularly polarized Alfvén wave: L1 convergence and single-GPU runtime of
+astronomix (Pallas backend) against AthenaPK -- the paper's convergence figure
+and single-GPU performance figure.
 
-Runs the L1-convergence + runtime sweep over N = 8..128 in *double precision*
-for the two MHD methods-paper configurations — FV (JAX) and FD (Pallas) — against
-the analytic CP-Alfvén-wave solution, with the AthenaPK references overlaid, and
-writes
+The wave (grid 2N x N x N, box 3 x 1.5 x 1.5, five periods to t = 5) is run for
+N = 8 ... 128 with
 
-    figures/alfven_wave3D_dp_convergence.svg   (average L1 error vs N, paper figure)
-    figures/alfven_wave3D_dp_runtime.svg        (error/runtime diagnostics)
+* FV (Pallas): AthenaPK's scheme, VL2 + PLM + HLLD + GLM, C_cfl = 0.3,
+* FD (Pallas): WENO-Z, SSPRK4, C_cfl = 1.5 (IEEE square root),
 
-The fast correctness version (single low resolution) lives in
-``pytests/mhd/alfven_wave3D.py``; this script is the full double-precision sweep
-that produces the paper figure. It reuses the shared benchmark harness in
-``pytests/_benchmark_utils.py`` and the AthenaPK reference NPZs (measured by
-P. Grete, single meshblock + ``minimum_number_of_teams_for_boundary_kernel=256``)
-shipped under ``pytests/mhd/data/athenapk/<node>/``.
+* FD in the setup of the supersonic turbulence (Pallas): WENO-Z with
+  positivity-preserving WENO and the upwind dissipation of the CT edge EMFs
+  (``ct_upwind_dissipation``, strength 0.03), C_cfl = 0.75; drawn in the
+  convergence figure, it must keep the fifth order,
 
-Runtimes are only comparable within one GPU generation, so results are stored
-per node: the sweep derives its node tag from the live device (a100 / h100 /
-h200 / ...) and writes
+and three diagnostics that are not drawn: FD with positivity-preserving WENO at
+C_cfl = 0.75 (the CFL bound of the positivity proof; it must keep the fifth
+order), FD at C_cfl = 0.75 without PP (separates the effect of the CFL number
+from that of PP) and FD with the approximate reciprocal square root
+(``BackendConfig.use_approximate_rsqrt``).
 
-    pytests/mhd/data/astronomix/<node>/alfven_wave3D_dp_convergence_<benchmark>.npz
-    pytests/mhd/figures/<node>/alfven_wave3D_dp_{convergence,runtime}.svg
+Timing: every run is executed once cold (compilation plus first run) and then
+repeated warm until at least three repetitions and one second of wall time are
+reached (one repetition for runs longer than 10 s). The runtime is the fastest
+warm repetition (the timer inside ``time_integration`` starts after the
+ahead-of-time compilation); the compile time is stored separately as the cold
+wall time minus that runtime. The L1 error is the mean over rho, v, p and B of
+the mean absolute difference to the analytic state, which is evaluated with the
+same discrete-curl magnetic field as the initial condition; AthenaPK's own
+definition (the conserved variables against the point values of the analytic
+wave, ``cpaw.cpp``) is stored alongside.
 
-overlaying the AthenaPK references measured on that SAME node. Nothing is
-hand-copied and two nodes never write the same file, so a run cannot be filed
-under the wrong hardware.
+Results are stored per GPU generation (the node tag comes from the live device):
 
-    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/alfven_convergence.py
+    pytests/mhd/data/astronomix/<node>/alfven_wave3D_<dp|sp>_convergence_<benchmark>.npz
+    pytests/mhd/figures/<node>/alfven_wave3D_<dp|sp>_{convergence,runtime}.{svg,pdf,png}
 
-To generate *all* the astronomix Alfvén data (this sweep plus the sp/dp
-per-iteration runs) with one command, use ``generate_alfven_data.py``.
+with the AthenaPK references of the same node
+(``pytests/mhd/data/athenapk/<node>/``, written by
+``examples/scripts/validation/athenapk_vl2/athenapk_alfven_reference.py``)
+overlaid. Usage:
 
-With ``--replot`` the sweep is skipped and the figures are regenerated on the
-CPU from the NPZs saved by previous runs -- by default for every node found on
-disk, or for one node with ``--node <tag>``:
+    PYTHONPATH=<repo> python alfven_convergence.py [--single] [--resolutions 8 16 32 64 128]
+        [--benchmarks fv_vl2 fd_wenoz ...]
+    PYTHONPATH=<repo> python alfven_convergence.py --replot [--node gh200] [--single]
 
-    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/alfven_convergence.py --replot
+``--single`` runs in single precision (``jax_enable_x64`` off; a separate
+process, since the flag is global). ``--replot`` redraws the figures on the CPU
+from the stored data.
 """
 
 # general
-# NOTE: os/sys must come first — --replot decides whether we grab a GPU via
-# autocvd or stay on the CPU, and both must happen before jax is imported.
+# NOTE: os/sys must come first: --replot decides whether a GPU is taken via
+# autocvd or the CPU is used, and both must happen before jax is imported.
+import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
-REPLOT = "--replot" in sys.argv
-# --approx-rsqrt: run the FD (Pallas) benchmark with the approximate-rsqrt fast
-# path (BackendConfig.use_approximate_rsqrt).  Results are stored under a
-# ``<node>_rsqrt`` tag so they sit alongside — never overwrite — the IEEE
-# baseline; the AthenaPK overlay still resolves from the base hardware node.
-APPROX_RSQRT = "--approx-rsqrt" in sys.argv
+PARSER = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+PARSER.add_argument("--replot", action="store_true", help="redraw the figures from stored data (CPU)")
+PARSER.add_argument("--single", action="store_true", help="single precision")
+PARSER.add_argument("--node", default=None, help="node tag to replot (default: every node on disk)")
+PARSER.add_argument("--resolutions", type=int, nargs="+", default=[8, 16, 32, 64, 128])
+PARSER.add_argument("--benchmarks", nargs="+", default=None, help="benchmark keys to run (default: all)")
+ARGUMENTS = PARSER.parse_args()
 
 # ==== GPU selection ====
-if REPLOT:
+if ARGUMENTS.replot:
     # Replotting touches no jax ops; keep jax off the GPUs entirely.
     os.environ["JAX_PLATFORMS"] = "cpu"
 elif os.environ.get("CUDA_VISIBLE_DEVICES"):
-    # A parent (generate_alfven_data.py) already picked the GPU via autocvd and
-    # exported it; inherit that choice so every sweep it drives is measured on
-    # the same device. Selection still goes through autocvd, just once.
+    # A parent (a Slurm runner or generate_alfven_data.py) already picked the
+    # GPU via autocvd; inherit that choice so every series is measured on it.
     pass
 else:
     from autocvd import autocvd
+
     autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
@@ -70,124 +85,80 @@ else:
 # numerics
 import numpy as np
 
+# plotting
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+
 # jax
 import jax
+import jax.numpy as jnp
 
-# Double precision: the paper's Alfvén-wave convergence figure is the x64 sweep.
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", not ARGUMENTS.single)
 
 # astronomix constants
-from astronomix import (
+from astronomix.option_classes.simulation_config import (
     FINITE_VOLUME,
-    NATIVE_JAX,
+    HLLD,
+    PALLAS,
+    VL2,
 )
 
 # astronomix containers
 from astronomix import (
-    SimulationConfig,
-    SnapshotSettings,
     BackendConfig,
+    SimulationConfig,
+    SimulationParams,
+    SnapshotSettings,
 )
-from astronomix.option_classes.simulation_config import StaticFloatVector
+from astronomix.test_setups.mhd.alfven_wave3D import CPAlfvenWave3DSettings
 
 # astronomix functions
+from astronomix import (
+    get_helper_data,
+    get_registered_variables,
+    time_integration,
+)
 from astronomix.test_setups.mhd.alfven_wave3D import (
-    setup_cp_alfven_wave,
+    _wave_primitive_state,
     cp_alfven_wave_solution,
+    setup_cp_alfven_wave,
 )
 
+# The shared benchmark helpers live under pytests/; put that directory on the
+# path so this script uses the same grid, naming and error conventions.
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[3]
+sys.path.insert(0, str(REPOSITORY / "pytests"))
 
-# The shared benchmark harness and the AthenaPK reference both live under
-# pytests/; put that directory on the path so this example reuses the exact
-# sweep driver the fast correctness test also builds on.
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parents[3]
-_PYTESTS_DIR = str(_REPO / "pytests")
-if _PYTESTS_DIR not in sys.path:
-    sys.path.insert(0, _PYTESTS_DIR)
-
+# benchmark helpers
 from _benchmark_utils import (  # noqa: E402
     BenchmarkSpec,
-    _slug,
+    _mean_l1_error,
+    grid_shape_3d,
     node_tag,
-    plot_convergence_and_runtime,
-    run_convergence_and_runtime,
 )
 
 # Everything is stored per GPU generation: runtimes measured on different
-# hardware must never share a file (or a figure) with each other.
-DATA_ROOT = _REPO / "pytests" / "mhd" / "data" / "astronomix"
-FIG_ROOT = _REPO / "pytests" / "mhd" / "figures"
-ATHENAPK_ROOT = _REPO / "pytests" / "mhd" / "data" / "athenapk"
+# hardware must never share a file (or a figure).
+DATA_ROOT = REPOSITORY / "pytests" / "mhd" / "data" / "astronomix"
+FIGURE_ROOT = REPOSITORY / "pytests" / "mhd" / "figures"
+ATHENAPK_ROOT = REPOSITORY / "pytests" / "mhd" / "data" / "athenapk"
 
-NAME = "alfven_wave3D_dp"
+PRECISION_TAG = "sp" if ARGUMENTS.single else "dp"
+PRECISION_NAME = "single precision" if ARGUMENTS.single else "double precision"
+NAME = f"alfven_wave3D_{PRECISION_TAG}"
+TITLE = f"3D CP Alfvén wave ({PRECISION_NAME})"
 
-# The convergence figure plots L1 error, which is a property of the scheme and
-# is bit-identical on every GPU — naming hardware there would imply it matters.
-# Only the runtime figure is hardware-dependent, so only it carries the node.
-TITLE = "3D CP Alfvén wave (double precision)"
+# Robust timing of the warm repetitions (see _benchmark_utils._run_simulation:
+# a sporadic ~0.1 s one-off cost hits roughly one run in three, so the fastest
+# of several repetitions is reported; runs above 10 s are measured once).
+MINIMUM_REPETITIONS = 3
+TARGET_TIMED_SECONDS = 1.0
+SINGLE_REPETITION_SECONDS = 10.0
+MAXIMUM_REPETITIONS = 25
 
-
-def _hw_node(tag: str) -> str:
-    """Base hardware node for a storage tag (``a100_rsqrt`` -> ``a100``)."""
-    return tag[: -len("_rsqrt")] if tag.endswith("_rsqrt") else tag
-
-
-def _runtime_title(tag: str) -> str:
-    # Title carries only the hardware node — not the rsqrt variant (the storage
-    # tag / folder already distinguishes rsqrt runs from the IEEE baseline).
-    return f"{TITLE} — {_hw_node(tag).upper()}"
-
-
-def _data_dir(node: str) -> str:
-    return str(DATA_ROOT / node)
-
-
-def _fig_dir(node: str) -> str:
-    return str(FIG_ROOT / node)
-
-
-def _reference_npzs(node: str):
-    """AthenaPK overlays measured on ``node``.
-
-    References by P. Grete, double precision, single meshblock per rank with
-    parthenon/mesh/minimum_number_of_teams_for_boundary_kernel=256 (without
-    which the ghost-cell communication is inefficient): the standard
-    configuration (VL2 + PLM + HLLD, CFL 0.3) and the higher-order variant
-    (RK3 + PPM + HLLD, CFL 0.4) that reaches L1 ~ 1e-5 at N=128.
-
-    Only same-node references are overlaid -- the runtime panel puts astronomix
-    and AthenaPK on shared time-to-error axes, so mixing hardware there would
-    invent a speed difference that is really a GPU difference.
-    """
-    node_dir = ATHENAPK_ROOT / _hw_node(node)
-    candidates = [
-        ("AthenaPK (VL2+PLM)", node_dir / "cfl03_teams256_singleblock" / "athenapk_alfven_convergence.npz"),
-        ("AthenaPK (RK3+PPM)", node_dir / "cfl04_teams256_singleblock_rk3_ppm" / "athenapk_alfven_convergence.npz"),
-    ]
-    present = [(label, str(p)) for label, p in candidates if p.exists()]
-    if not present:
-        print(f"[alfven] no AthenaPK reference for node {node!r} — plotting astronomix only")
-    return present
-
-
-def _nodes_on_disk() -> list:
-    """Node tags that already have a full set of NPZs under DATA_ROOT."""
-    if not DATA_ROOT.exists():
-        return []
-    nodes = []
-    for d in sorted(p for p in DATA_ROOT.iterdir() if p.is_dir()):
-        if all((d / f"{NAME}_convergence_{_slug(s.label)}.npz").exists() for s in BENCHMARKS):
-            nodes.append(d.name)
-    return nodes
-
-# The resolution sweep for the convergence figure.
-N_VALUES = [8, 16, 32, 64, 128]
-
-# Options shared by every benchmark configuration; only the backend, solver
-# mode and CFL number differ between them.
-_common_kwargs = dict(
-    box_size=StaticFloatVector(3.0, 1.5, 1.5),
+# Options shared by every configuration.
+COMMON_OPTIONS = dict(
     mhd=True,
     dimensionality=3,
     progress_bar=False,
@@ -197,38 +168,94 @@ _common_kwargs = dict(
     snapshot_settings=SnapshotSettings(return_final_state=True),
 )
 
-BENCHMARKS = [
-    BenchmarkSpec(
-        label="FV (JAX)",
+FV_LABEL = "FV (Pallas)"
+FD_LABEL = "FD (Pallas)"
+FD_PP_LABEL = "FD + PP (Pallas)"
+FD_TURBULENCE_LABEL = "FD + PP + upwind EMF (Pallas)"
+FD_CFL075_LABEL = "FD (Pallas), C_cfl 0.75"
+FD_RSQRT_LABEL = "FD (Pallas), approx. rsqrt"
+
+# The configurations, keyed by the name of their data files. The keys name the
+# scheme (not just the backend), so the files never mix with the earlier sweeps
+# (FV RK2, FD WENO-JS) stored for other nodes.
+BENCHMARKS = dict(
+    fv_vl2=BenchmarkSpec(
+        label=FV_LABEL,
         base_config=SimulationConfig(
-            backend_config=BackendConfig(backend=NATIVE_JAX),
             solver_mode=FINITE_VOLUME,
-            **_common_kwargs,
+            time_integrator=VL2,
+            riemann_solver=HLLD,
+            backend_config=BackendConfig(backend=PALLAS),
+            **COMMON_OPTIONS,
         ),
-        cfl=0.4,
+        cfl=0.3,
     ),
-    BenchmarkSpec(
-        label="FD (JAX)",
+    fd_wenoz=BenchmarkSpec(
+        label=FD_LABEL,
         base_config=SimulationConfig(
-            backend_config=BackendConfig(backend=NATIVE_JAX),
-            **_common_kwargs,
+            weno_z=True,
+            backend_config=BackendConfig(backend=PALLAS),
+            **COMMON_OPTIONS,
         ),
         cfl=1.5,
     ),
-    BenchmarkSpec(
-        label="FD (Pallas)",
+    fd_wenoz_pp=BenchmarkSpec(
+        label=FD_PP_LABEL,
         base_config=SimulationConfig(
-            # Only the Pallas MHD kernel honours use_approximate_rsqrt; it is a
-            # no-op for the two native benchmarks above, so it is set here only.
-            backend_config=BackendConfig(use_approximate_rsqrt=APPROX_RSQRT),
-            **_common_kwargs,
+            weno_z=True,
+            weno_positivity_preserving=True,
+            backend_config=BackendConfig(backend=PALLAS),
+            **COMMON_OPTIONS,
+        ),
+        cfl=0.75,
+    ),
+    fd_wenoz_pp_uct=BenchmarkSpec(
+        label=FD_TURBULENCE_LABEL,
+        base_config=SimulationConfig(
+            weno_z=True,
+            weno_positivity_preserving=True,
+            ct_upwind_dissipation=True,
+            backend_config=BackendConfig(backend=PALLAS),
+            **COMMON_OPTIONS,
+        ),
+        cfl=0.75,
+    ),
+    fd_wenoz_cfl075=BenchmarkSpec(
+        label=FD_CFL075_LABEL,
+        base_config=SimulationConfig(
+            weno_z=True,
+            backend_config=BackendConfig(backend=PALLAS),
+            **COMMON_OPTIONS,
+        ),
+        cfl=0.75,
+    ),
+    fd_wenoz_rsqrt=BenchmarkSpec(
+        label=FD_RSQRT_LABEL,
+        base_config=SimulationConfig(
+            weno_z=True,
+            backend_config=BackendConfig(backend=PALLAS, use_approximate_rsqrt=True),
+            **COMMON_OPTIONS,
         ),
         cfl=1.5,
     ),
-]
+)
+
+# The curves of the two paper figures; the remaining benchmarks are diagnostics.
+CONVERGENCE_FIGURE_KEYS = ("fv_vl2", "fd_wenoz", "fd_wenoz_pp_uct")
+RUNTIME_FIGURE_KEYS = ("fv_vl2", "fd_wenoz")
+
+# Fixed colours, so a scheme looks the same in both figures.
+COLORS = {
+    FV_LABEL: "tab:blue",
+    FD_LABEL: "tab:orange",
+    FD_PP_LABEL: "tab:green",
+    FD_TURBULENCE_LABEL: "tab:green",
+    "AthenaPK (VL2+PLM)": "tab:red",
+    "AthenaPK (RK3+PPM)": "tab:purple",
+}
 
 
-def _error_indices(registered_variables):
+def error_indices(registered_variables):
     """State-array indices entered into the L1 error norm (rho, v, p, B)."""
     return (
         registered_variables.density_index,
@@ -242,61 +269,356 @@ def _error_indices(registered_variables):
     )
 
 
-def _load_saved_results(node: str) -> dict:
-    """Load the per-benchmark sweep NPZs saved by a previous run on ``node``."""
-    results = {}
-    for spec in BENCHMARKS:
-        npz_path = Path(_data_dir(node)) / f"{NAME}_convergence_{_slug(spec.label)}.npz"
-        data = np.load(npz_path)
-        results[spec.label] = dict(
-            N=data["N_values"],
-            l1=data["l1_errors"],
-            runtime=data["runtimes"],
-            iterations=data["iterations"],
+def athenapk_l1_error(final_state, params, registered_variables, helper_data) -> float:
+    """
+    The L1 error as AthenaPK's ``cpaw.cpp`` defines it: the mean absolute
+    difference of the eight conserved variables (rho, rho v, E, B) to the point
+    values of the analytic wave, averaged over the variables.
+
+    Args:
+        final_state: The final primitive state.
+        params: The simulation parameters (``t_end``, ``gamma``).
+        registered_variables: The registered variables.
+        helper_data: The helper data (cell centres).
+
+    Returns:
+        The L1 error.
+    """
+    centers = helper_data.geometric_centers
+    analytic_primitives = _wave_primitive_state(
+        centers[..., 0],
+        centers[..., 1],
+        centers[..., 2],
+        params.t_end,
+        CPAlfvenWave3DSettings(),
+    )
+    final_primitives = tuple(final_state[index] for index in error_indices(registered_variables))
+
+    def conserved(density, velocity_x, velocity_y, velocity_z, pressure, field_x, field_y, field_z):
+        kinetic_energy = 0.5 * density * (velocity_x**2 + velocity_y**2 + velocity_z**2)
+        magnetic_energy = 0.5 * (field_x**2 + field_y**2 + field_z**2)
+        total_energy = pressure / (params.gamma - 1.0) + kinetic_energy + magnetic_energy
+        return (
+            density,
+            density * velocity_x,
+            density * velocity_y,
+            density * velocity_z,
+            total_energy,
+            field_x,
+            field_y,
+            field_z,
         )
+
+    differences = [
+        jnp.mean(jnp.abs(final - analytic))
+        for final, analytic in zip(conserved(*final_primitives), conserved(*analytic_primitives))
+    ]
+    return float(jnp.mean(jnp.stack(differences)))
+
+
+def run_resolution(spec: BenchmarkSpec, resolution: int) -> dict:
+    """
+    Run one configuration at one resolution to t = 5: once cold (compilation
+    and first run), then warm repetitions for the runtime.
+
+    Args:
+        spec: The benchmark configuration.
+        resolution: N (grid 2N x N x N).
+
+    Returns:
+        A dict with the L1 errors (astronomix and AthenaPK definition), the
+        runtime (fastest warm repetition), the slowest warm repetition and their
+        number, the cold runtime, the compile time, the iteration count and the
+        temporary device memory.
+    """
+    # A fresh compilation per resolution, so the cold run includes the full
+    # compile of this configuration.
+    jax.clear_caches()
+    config = spec.base_config._replace(num_cells=grid_shape_3d(resolution))
+    initial_state, config, params = setup_cp_alfven_wave(config, SimulationParams(C_cfl=spec.cfl))
+    registered_variables = get_registered_variables(config)
+    helper_data = get_helper_data(config)
+
+    def integrate():
+        result = time_integration(initial_state, config, params, registered_variables)
+        jax.block_until_ready(result.final_state)
+        return result
+
+    cold_start = time.perf_counter()
+    result = integrate()
+    cold_wall_seconds = time.perf_counter() - cold_start
+    cold_runtime = float(result.runtime)
+
+    warm_runtimes = []
+    while len(warm_runtimes) < MAXIMUM_REPETITIONS:
+        warm_runtimes.append(float(integrate().runtime))
+        if warm_runtimes[0] >= SINGLE_REPETITION_SECONDS:
+            break
+        if len(warm_runtimes) >= MINIMUM_REPETITIONS and sum(warm_runtimes) >= TARGET_TIMED_SECONDS:
+            break
+    runtime = min(warm_runtimes)
+
+    true_state = cp_alfven_wave_solution(config, registered_variables, params, helper_data)
+    return dict(
+        l1_error=_mean_l1_error(result.final_state, true_state, error_indices(registered_variables)),
+        l1_error_athenapk=athenapk_l1_error(result.final_state, params, registered_variables, helper_data),
+        runtime=runtime,
+        warm_runtime_max=max(warm_runtimes),
+        repetitions=len(warm_runtimes),
+        cold_runtime=cold_runtime,
+        compile_seconds=cold_wall_seconds - runtime,
+        iterations=int(result.num_iterations),
+        temporary_memory_bytes=int(result.temporary_memory_bytes or -1),
+    )
+
+
+def data_path(node: str, key: str) -> Path:
+    """The NPZ of one benchmark on one node."""
+    return DATA_ROOT / node / f"{NAME}_convergence_{key}.npz"
+
+
+def run_sweep(node: str, keys, resolutions) -> None:
+    """
+    Run every benchmark over the resolutions and store one NPZ per benchmark
+    (rewritten after every resolution, so an interrupted sweep keeps its data).
+
+    Args:
+        node: The storage tag of this GPU.
+        keys: The keys of the benchmarks to run.
+        resolutions: The values of N.
+    """
+    device = jax.devices()[0].device_kind
+    for key in keys:
+        spec = BENCHMARKS[key]
+        records = []
+        for resolution in resolutions:
+            record = run_resolution(spec, resolution)
+            records.append(record)
+            print(
+                f"[alfven] {spec.label:28s} N={resolution:4d}: L1={record['l1_error']:.6e} "
+                f"(AthenaPK def. {record['l1_error_athenapk']:.6e}), iterations={record['iterations']:5d}, "
+                f"runtime={record['runtime']:9.4f} s ({1e3 * record['runtime'] / record['iterations']:8.4f} ms/step, "
+                f"{record['repetitions']} warm runs, max {record['warm_runtime_max']:.4f} s), "
+                f"cold {record['cold_runtime']:.3f} s, compile {record['compile_seconds']:6.1f} s",
+                flush=True,
+            )
+            path = data_path(node, key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(
+                path,
+                N_values=np.array(resolutions[: len(records)]),
+                l1_errors=np.array([entry["l1_error"] for entry in records]),
+                l1_errors_athenapk=np.array([entry["l1_error_athenapk"] for entry in records]),
+                runtimes=np.array([entry["runtime"] for entry in records]),
+                warm_runtime_max=np.array([entry["warm_runtime_max"] for entry in records]),
+                repetitions=np.array([entry["repetitions"] for entry in records]),
+                cold_runtimes=np.array([entry["cold_runtime"] for entry in records]),
+                compile_seconds=np.array([entry["compile_seconds"] for entry in records]),
+                iterations=np.array([entry["iterations"] for entry in records]),
+                temporary_memory_bytes=np.array([entry["temporary_memory_bytes"] for entry in records]),
+                cfl=spec.cfl,
+                label=spec.label,
+                device=device,
+            )
+
+
+def load_results(node: str, keys) -> dict:
+    """The stored sweeps of ``keys`` on ``node`` by legend label (missing ones are skipped)."""
+    results = {}
+    for key in keys:
+        path = data_path(node, key)
+        if path.exists():
+            results[BENCHMARKS[key].label] = dict(np.load(path))
+        else:
+            print(f"[alfven] no data for {key!r} on {node}: {path}")
     return results
 
 
-def _replot(node: str) -> None:
-    plot_convergence_and_runtime(
-        _load_saved_results(node),
-        N_VALUES,
-        name=NAME,
-        title=TITLE,
-        runtime_title=_runtime_title(node),
-        figure_dir=_fig_dir(node),
-        reference_npzs=_reference_npzs(node),
+def athenapk_references(node: str) -> dict:
+    """
+    The AthenaPK references measured on ``node`` in this precision.
+
+    Only same-node references are overlaid: the runtime panels put astronomix
+    and AthenaPK on shared axes, so mixing hardware there would invent a speed
+    difference that is really a GPU difference.
+
+    The L1 error drawn is the one in astronomix's definition (primitive
+    variables against the discrete initial state, ``l1_errors_primitive``),
+    so that every curve of the figure uses the same norm; references without it
+    fall back to AthenaPK's own error.
+
+    Args:
+        node: The storage tag.
+
+    Returns:
+        A dict from legend label to the reference arrays, with the plotted error
+        in ``l1_errors_plotted``.
+    """
+    suffix = "_single" if ARGUMENTS.single else ""
+    candidates = {
+        "AthenaPK (VL2+PLM)": ATHENAPK_ROOT / node / f"cfl03_teams256_singleblock{suffix}",
+        "AthenaPK (RK3+PPM)": ATHENAPK_ROOT / node / f"cfl04_teams256_singleblock_rk3_ppm{suffix}",
+    }
+    references = {}
+    for label, directory in candidates.items():
+        path = directory / "athenapk_alfven_convergence.npz"
+        if not path.exists():
+            print(f"[alfven] no AthenaPK reference {label!r} on {node}: {path}")
+            continue
+        data = dict(np.load(path))
+        data["l1_errors_plotted"] = data.get("l1_errors_primitive", data["l1_errors"])
+        references[label] = data
+    return references
+
+
+def format_resolution_axis(axis, resolutions) -> None:
+    """Log scale with one labelled tick per resolution (as _benchmark_utils._format_xaxis)."""
+    axis.set_xscale("log")
+    axis.xaxis.set_major_locator(ticker.FixedLocator(resolutions))
+    axis.xaxis.set_major_formatter(ticker.FixedFormatter([str(value) for value in resolutions]))
+    axis.xaxis.set_minor_locator(ticker.NullLocator())
+
+
+def save_figure(figure, directory: Path, stem: str) -> None:
+    """Write a figure as SVG (paper), PDF and PNG."""
+    directory.mkdir(parents=True, exist_ok=True)
+    for extension in ("svg", "pdf", "png"):
+        figure.savefig(directory / f"{stem}.{extension}", dpi=200 if extension == "png" else None)
+
+
+def plot(node: str) -> None:
+    """
+    The convergence figure (L1 error against N) and the runtime figure (error
+    against runtime, runtime against N, time per iteration against N) of one
+    node, in the style of ``_benchmark_utils.plot_convergence_and_runtime``.
+    The AthenaPK curves are dashed with open markers so that the coinciding FV
+    (VL2) curve stays visible underneath.
+
+    Args:
+        node: The storage tag.
+    """
+    results = load_results(node, CONVERGENCE_FIGURE_KEYS)
+    references = athenapk_references(node)
+    if not results:
+        raise SystemExit(f"no data for node {node!r}")
+    resolutions = sorted({int(value) for data in results.values() for value in data["N_values"]})
+
+    astronomix_style = dict(marker="o", linewidth=2)
+    reference_markers = {"AthenaPK (VL2+PLM)": "s", "AthenaPK (RK3+PPM)": "D"}
+
+    def reference_style(label):
+        return dict(
+            marker=reference_markers[label],
+            markersize=10,
+            markerfacecolor="none",
+            markeredgewidth=1.5,
+            linestyle="--",
+            linewidth=2,
+            color=COLORS[label],
+            label=label,
+        )
+
+    # -------------------------------------------------------------
+    # =============== ↓ Convergence figure ↓ ======================
+    # -------------------------------------------------------------
+    figure_error, axis_error = plt.subplots(1, 1, figsize=(8, 6))
+    for label, data in results.items():
+        axis_error.loglog(data["N_values"], data["l1_errors"], color=COLORS[label], label=label, **astronomix_style)
+    for label, data in references.items():
+        axis_error.loglog(data["N_values"], data["l1_errors_plotted"], **reference_style(label))
+
+    # Guide slopes for second (FV) and fifth (FD) order, anchored at the
+    # coarsest-grid errors as in the earlier figure.
+    resolution_array = np.array(resolutions, dtype=float)
+    first_errors = [data["l1_errors"][0] for data in results.values()]
+    axis_error.loglog(
+        resolution_array,
+        max(first_errors) * (resolution_array / resolution_array[0]) ** -2.0,
+        "k--",
+        alpha=0.7,
+        label="$O(N^{-2})$ reference",
     )
-    print(f"[alfven] replotted {node} -> {_fig_dir(node)}")
+    axis_error.loglog(
+        resolution_array,
+        min(first_errors) * (resolution_array / resolution_array[0]) ** -5.0,
+        "k:",
+        alpha=0.7,
+        label="$O(N^{-5})$ reference",
+    )
+    axis_error.set_xlabel("N (grid size: 2N x N x N)", fontsize=12)
+    axis_error.set_ylabel("Average $L_1$ error", fontsize=12)
+    axis_error.set_title(f"{TITLE}: convergence", fontsize=14)
+    format_resolution_axis(axis_error, resolutions)
+    axis_error.legend(loc="lower left", fontsize=9)
+    axis_error.grid(True, which="major", ls="-", alpha=0.2)
+    figure_error.tight_layout()
+    save_figure(figure_error, FIGURE_ROOT / node, f"{NAME}_convergence")
+    # -------------------------------------------------------------
+    # =============== ↑ Convergence figure ↑ ======================
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # =============== ↓ Runtime figure ↓ ==========================
+    # -------------------------------------------------------------
+    figure_runtime, axes_runtime = plt.subplots(3, 1, figsize=(8, 12))
+    curves = []
+    for label in (BENCHMARKS[key].label for key in RUNTIME_FIGURE_KEYS):
+        if label in results:
+            curves.append((results[label], results[label]["l1_errors"], dict(color=COLORS[label], label=label, **astronomix_style)))
+    for label, data in references.items():
+        curves.append((data, data["l1_errors_plotted"], reference_style(label)))
+    for data, errors, style in curves:
+        time_per_iteration = np.asarray(data["runtimes"]) / np.asarray(data["iterations"])
+        axes_runtime[0].loglog(data["runtimes"], errors, **style)
+        axes_runtime[1].loglog(data["N_values"], data["runtimes"], **style)
+        axes_runtime[2].loglog(data["N_values"], time_per_iteration, **style)
+
+    axes_runtime[0].set_xlabel("Runtime (s)", fontsize=12)
+    axes_runtime[0].set_ylabel("Average $L_1$ error", fontsize=12)
+    axes_runtime[0].set_title(f"{TITLE} — {node.upper()}: error vs runtime", fontsize=13)
+    axes_runtime[1].set_xlabel("N (grid size: 2N x N x N)", fontsize=12)
+    axes_runtime[1].set_ylabel("Runtime (s)", fontsize=12)
+    axes_runtime[1].set_title("Runtime vs N", fontsize=13)
+    axes_runtime[2].set_xlabel("N (grid size: 2N x N x N)", fontsize=12)
+    axes_runtime[2].set_ylabel("Time per iteration (s)", fontsize=12)
+    axes_runtime[2].set_title("Time per iteration vs N", fontsize=13)
+    for axis in axes_runtime[1:]:
+        format_resolution_axis(axis, resolutions)
+    for axis in axes_runtime:
+        axis.legend(loc="best", fontsize=9)
+        axis.grid(True, which="major", ls="-", alpha=0.2)
+    figure_runtime.tight_layout()
+    save_figure(figure_runtime, FIGURE_ROOT / node, f"{NAME}_runtime")
+    # -------------------------------------------------------------
+    # =============== ↑ Runtime figure ↑ ==========================
+    # -------------------------------------------------------------
+    plt.close("all")
+    print(f"[alfven] wrote {FIGURE_ROOT / node}/{NAME}_{{convergence,runtime}}.{{svg,pdf,png}}")
+
+
+def nodes_on_disk() -> list:
+    """Node tags with at least one sweep of the figure benchmarks in this precision."""
+    if not DATA_ROOT.exists():
+        return []
+    return sorted(
+        directory.name
+        for directory in DATA_ROOT.iterdir()
+        if directory.is_dir()
+        and any(data_path(directory.name, key).exists() for key in CONVERGENCE_FIGURE_KEYS)
+    )
 
 
 if __name__ == "__main__":
-    if REPLOT:
-        # --node <tag> replots one node; otherwise every node found on disk, so
-        # a single --replot refreshes all hardware after e.g. a plotting tweak.
-        if "--node" in sys.argv:
-            nodes = [sys.argv[sys.argv.index("--node") + 1].lower()]
-        else:
-            nodes = _nodes_on_disk()
-        if not nodes:
-            raise SystemExit(f"no complete sweep data under {DATA_ROOT}; run the sweep on a GPU first")
-        for node in nodes:
-            _replot(node)
+    if ARGUMENTS.replot:
+        for node in [ARGUMENTS.node] if ARGUMENTS.node else nodes_on_disk():
+            plot(node)
     else:
-        node = node_tag() + ("_rsqrt" if APPROX_RSQRT else "")
-        print(f"[alfven] running on {jax.devices()[0].device_kind} -> storing under node {node!r}"
-              + (" (approximate rsqrt)" if APPROX_RSQRT else ""))
-        run_convergence_and_runtime(
-            BENCHMARKS,
-            N_values=N_VALUES,
-            setup_fn=setup_cp_alfven_wave,
-            analytic_fn=cp_alfven_wave_solution,
-            error_var_indices_fn=_error_indices,
-            name=NAME,
-            title=TITLE,
-            runtime_title=_runtime_title(node),
-            data_dir=_data_dir(node),
-            figure_dir=_fig_dir(node),
-            reference_npzs=_reference_npzs(node),
+        node = node_tag()
+        selected = list(BENCHMARKS) if ARGUMENTS.benchmarks is None else ARGUMENTS.benchmarks
+        print(
+            f"[alfven] {PRECISION_NAME} on {jax.devices()[0].device_kind} -> node {node!r}; "
+            f"benchmarks {selected}; N = {ARGUMENTS.resolutions}",
+            flush=True,
         )
-        print(f"[alfven] wrote {_data_dir(node)} and {_fig_dir(node)}")
+        run_sweep(node, selected, ARGUMENTS.resolutions)
+        plot(node)

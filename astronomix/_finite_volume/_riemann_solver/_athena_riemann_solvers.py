@@ -1201,16 +1201,29 @@ def hllc_hydro_flux(left: HydroFaceState, right: HydroFaceState, gamma) -> Hydro
     )
 
     # A shock (middle pressure above the outer one) moves faster than sound;
-    # these factors correct the outer wave speeds for its strength.
+    # these factors correct the outer wave speeds for its strength. The square
+    # root's argument is at least one wherever its branch is selected; the
+    # guard only keeps the discarded branch real in a strong rarefaction, whose
+    # NaN derivative would otherwise leak into reverse-mode gradients.
     shock_factor_left = jnp.where(
         middle_pressure <= left.pressure,
         1.0,
-        jnp.sqrt(1.0 + (gamma + 1) / (2 * gamma) * (middle_pressure / left.pressure - 1.0)),
+        jnp.sqrt(
+            jnp.maximum(
+                1.0 + (gamma + 1) / (2 * gamma) * (middle_pressure / left.pressure - 1.0),
+                1.0,
+            )
+        ),
     )
     shock_factor_right = jnp.where(
         middle_pressure <= right.pressure,
         1.0,
-        jnp.sqrt(1.0 + (gamma + 1) / (2 * gamma) * (middle_pressure / right.pressure - 1.0)),
+        jnp.sqrt(
+            jnp.maximum(
+                1.0 + (gamma + 1) / (2 * gamma) * (middle_pressure / right.pressure - 1.0),
+                1.0,
+            )
+        ),
     )
 
     speed_left = left.velocity_normal - sound_speed_left * shock_factor_left

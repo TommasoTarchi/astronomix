@@ -1,8 +1,15 @@
 """3D linear sound-wave convergence — paper figure (``sound_wave3D_convergence.svg``).
 
-Runs the L1-convergence + runtime sweep over N = 8..128 for the three pure-hydro
-methods-paper configurations — FV (JAX), FD (JAX) and FD (Pallas) — against the
-analytic linear sound-wave solution, and writes
+Runs the L1-convergence + runtime sweep over N = 8..128 for the pure-hydro
+methods-paper configurations against the analytic linear sound-wave solution:
+
+    FV (JAX), FV (Pallas)     the VL2 finite-volume scheme (AthenaPK's
+                              van Leer predictor-corrector, PLM with van Leer
+                              slopes, HLLC), C_cfl = 0.3 as AthenaPK in 3D
+    FD (JAX), FD (Pallas)     the finite-difference scheme with WENO-Z
+                              weights, C_cfl = 1.5
+
+and writes
 
     figures/sound_wave3D_convergence.svg   (average L1 error vs N, paper figure)
     figures/sound_wave3D_runtime.svg        (error/runtime diagnostics)
@@ -13,21 +20,28 @@ produces the paper figure. It reuses the shared benchmark harness in
 ``pytests/_benchmark_utils.py``.
 
     PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/hydro/sound_wave_convergence.py
+
+``--plot-only`` redraws the figures from the cached per-benchmark NPZs.
 """
 
 # ==== GPU selection ====
-from autocvd import autocvd
-autocvd(num_gpus=1)
+import sys as _sys
+if "--plot-only" not in _sys.argv:
+    from autocvd import autocvd
+    autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
 # general
-import os
+import math
 import sys
 from pathlib import Path
 
 # jax
 import jax
+
+# numerics
+import numpy as np
 
 # The tiny perturbation amplitudes of a linear sound wave need double precision
 # to stay above float rounding noise.
@@ -36,7 +50,10 @@ jax.config.update("jax_enable_x64", True)
 # astronomix constants
 from astronomix import (
     FINITE_VOLUME,
+    HLLC,
     NATIVE_JAX,
+    PALLAS,
+    VL2,
 )
 
 # astronomix containers
@@ -65,6 +82,8 @@ if _PYTESTS_DIR not in sys.path:
 
 from _benchmark_utils import (  # noqa: E402
     BenchmarkSpec,
+    _slug,
+    plot_convergence_and_runtime,
     run_convergence_and_runtime,
 )
 
@@ -87,28 +106,53 @@ _common_kwargs = dict(
     snapshot_settings=SnapshotSettings(return_final_state=True),
 )
 
+# The finite-volume scheme is AthenaPK's VL2 with its default hydrodynamics
+# Riemann solver; C_cfl = 0.3 is the value AthenaPK uses in 3D.
+_finite_volume_kwargs = dict(
+    solver_mode=FINITE_VOLUME,
+    time_integrator=VL2,
+    riemann_solver=HLLC,
+    **_common_kwargs,
+)
+
+# The finite-difference scheme with WENO-Z weights. The smooth wave needs no
+# positivity preservation; it runs at C_cfl = 1.5, well inside the linear
+# stability limit of SSPRK4.
+_finite_difference_kwargs = dict(
+    weno_z=True,
+    **_common_kwargs,
+)
+
 BENCHMARKS = [
     BenchmarkSpec(
         label="FV (JAX)",
         base_config=SimulationConfig(
             backend_config=BackendConfig(backend=NATIVE_JAX),
-            solver_mode=FINITE_VOLUME,
-            **_common_kwargs,
+            **_finite_volume_kwargs,
         ),
-        cfl=0.4,
+        cfl=0.3,
+    ),
+    BenchmarkSpec(
+        label="FV (Pallas)",
+        base_config=SimulationConfig(
+            backend_config=BackendConfig(backend=PALLAS),
+            **_finite_volume_kwargs,
+        ),
+        cfl=0.3,
     ),
     BenchmarkSpec(
         label="FD (JAX)",
         base_config=SimulationConfig(
             backend_config=BackendConfig(backend=NATIVE_JAX),
-            **_common_kwargs,
+            **_finite_difference_kwargs,
         ),
         cfl=1.5,
     ),
     BenchmarkSpec(
         label="FD (Pallas)",
         base_config=SimulationConfig(
-            **_common_kwargs,
+            backend_config=BackendConfig(backend=PALLAS),
+            **_finite_difference_kwargs,
         ),
         cfl=1.5,
     ),
@@ -126,8 +170,56 @@ def _error_indices(registered_variables):
     )
 
 
-if __name__ == "__main__":
-    run_convergence_and_runtime(
+def print_convergence_orders(results, N_values):
+    """
+    Print the measured convergence order of every benchmark between successive
+    resolutions, ``log(L1(N) / L1(2N)) / log 2``.
+
+    Args:
+        results: The sweep results keyed by benchmark label, as returned by
+            ``run_convergence_and_runtime``.
+        N_values: The swept resolutions.
+    """
+    for label, record in results.items():
+        errors = record["l1"]
+        orders = [
+            math.log(errors[index] / errors[index + 1])
+            / math.log(N_values[index + 1] / N_values[index])
+            for index in range(len(N_values) - 1)
+        ]
+        formatted_orders = ", ".join(f"{order:.2f}" for order in orders)
+        print(
+            f"[sound_wave3D] {label}: orders {formatted_orders}; "
+            f"L1(N={N_values[-1]}) = {errors[-1]:.3e}"
+        )
+
+
+def load_results():
+    """Return the cached sweep results of every benchmark, keyed by label."""
+    results = {}
+    for spec in BENCHMARKS:
+        cached = np.load(Path(DATA_DIR) / f"sound_wave3D_convergence_{_slug(spec.label)}.npz")
+        results[spec.label] = {
+            "N": list(cached["N_values"]),
+            "l1": list(cached["l1_errors"]),
+            "runtime": list(cached["runtimes"]),
+            "iterations": list(cached["iterations"]),
+        }
+    return results
+
+
+if __name__ == "__main__" and "--plot-only" in sys.argv:
+    results = load_results()
+    plot_convergence_and_runtime(
+        results,
+        N_VALUES,
+        name="sound_wave3D",
+        title="3D linear sound wave",
+        figure_dir=FIG_DIR,
+    )
+    print_convergence_orders(results, N_VALUES)
+elif __name__ == "__main__":
+    results = run_convergence_and_runtime(
         BENCHMARKS,
         N_values=N_VALUES,
         setup_fn=setup_sound_wave,
@@ -138,3 +230,4 @@ if __name__ == "__main__":
         data_dir=DATA_DIR,
         figure_dir=FIG_DIR,
     )
+    print_convergence_orders(results, N_VALUES)

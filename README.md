@@ -11,17 +11,16 @@ as surrogate / solver-in-the-loop training.
 
 ## Features
 
-- [x] 1D, 2D and 3D hydrodynamics and magnetohydrodynamics simulations scaling to multiple GPUs and nodes
-- [x] a 5th order finite difference constrained transport WENO MHD scheme following [HOW-MHD by Seo & Ryu 2023](https://arxiv.org/abs/2304.04360) (the WENO scheme is also available standalone for hydrodynamics), with an admissible characteristic face state and an optional positivity-preserving reconstruction (Zhang-Shu scaling of the split fluxes, with the paired admissibility of Wu (2018, SIAM J. Numer. Anal.) for ideal MHD) that keeps density and pressure positive for `C_cfl <= 0.75` without floors
-- [x] the provably divergence free and provably positivity preserving finite volume approach of [Pang and Wu (2024)](https://arxiv.org/abs/2410.05173)
-- [x] a re-implementation of [AthenaPK](https://github.com/parthenon-hpc-lab/athenapk)'s default second-order scheme (VL2 predictor-corrector, PLM, HLLD / HLLE / HLLC, GLM divergence cleaning, first-order flux correction), agreeing with AthenaPK to round-off ([validation](examples/scripts/validation/athenapk_vl2))
-- [x] isothermal hydrodynamics and magnetohydrodynamics are also supported (currently only in the finite difference scheme)
-- [x] for finite volume simulations the basic Lax-Friedrichs, HLL and HLLC Riemann solvers as well as the HLLC-LM ([Fleischmann et al., 2020](https://www.sciencedirect.com/science/article/pii/S0021999120305362)) and HYBRID-HLLC & AM-HLLC ([Hu et al., 2025](https://www.sciencedirect.com/science/article/pii/S1007570425005891)) (sequels to HLLC-LM) variants
-- [x] Pallas (Triton) GPU kernels for the finite difference and the VL2 finite volume schemes, multi-GPU via `shard_map` halo exchange
-- [x] novel semi-discretely energy conserving self-gravity scheme
+- [x] 1D, 2D and 3D hydrodynamics (HD) and magnetohydrodynamics (MHD) simulations scaling to multiple GPUs and nodes
+- [x] fifth order WENO-JS and WENO-Z finite difference schemes (FD) for both HD and MHD simulations (adiabtatic and isothermal)
+- [x] for the fifth order finite difference scheme a constrained transport MHD approach following [HOW-MHD by Seo & Ryu 2023](https://arxiv.org/abs/2304.04360)
+- [x] for the fifth order finite difference scheme a positivity-preserving reconstruction (based on [Zhang and Shu, 2012](https://www.sciencedirect.com/science/article/pii/S0021999111006759) and [Wu, 2018](https://arxiv.org/abs/1802.02278)) that keeps density and pressure positive for `C_cfl <= 0.75` without floors, additionally slight dissipation for the electric field can be activated for stability in extreme flows (where the cell-centered WENO dissipation does not translate into enough damping of the interface electric field at the Nyquist scale)
+- [x] for the finite difference scheme a novel semi-discretely energy conserving self-gravity scheme
+- [x] a re-implementation of [AthenaPK](https://github.com/parthenon-hpc-lab/athenapk)'s default second-order finite volume (FV) scheme (VL2 predictor-corrector, PLM, HLLD / HLLE / HLLC, GLM divergence cleaning, first-order flux correction), agreeing with AthenaPK to round-off ([validation](examples/scripts/validation/athenapk_vl2)), further supported Riemann solvers include Lax-Friedrichs, HLL, HLLC-LM ([Fleischmann et al., 2020](https://www.sciencedirect.com/science/article/pii/S0021999120305362)), HYBRID-HLLC & AM-HLLC ([Hu et al., 2025](https://www.sciencedirect.com/science/article/pii/S1007570425005891))
+- [x] backwards and forwards differentiable with adaptive timestepping
+- [x] physics modules: turbulent driving (white-in-time and Ornstein-Uhlenbeck, AthenaK / AthenaPK driving spectra), radiative cooling with an implicit solver, thermal conduction, viscosity and resistivity, passive scalars (e.g. composition tracers), dual energy, stellar winds
 - [x] spherically symmetric simulations such that mass and energy are conserved based on the scheme of [Crittenden and Balachandar (2018)](https://doi.org/10.1007/s00193-017-0784-y)
-- [x] backwards and forwards differentiable with adaptive timestepping, including rematerialisation options for memory-lean reverse mode
-- [x] physics modules: turbulent driving (white-in-time and Ornstein-Uhlenbeck, AthenaK / AthenaPK driving spectra), radiative cooling with an implicit solver, thermal conduction, viscosity and resistivity, cosmic rays with a shock finder, passive scalars (e.g. composition tracers), dual energy, stellar winds
+- [x] Pallas (Triton) GPU kernels for the finite difference and the VL2 finite volume schemes, multi-GPU via `shard_map` halo exchange
 - [x] easily extensible, all code is open source
 
 ## Contents
@@ -145,13 +144,7 @@ Runnable scripts live under `examples/scripts/`, notebooks under
   - [Positivity-preserving WENO](examples/scripts/validation/weno_stability)
 
 More involved, physics-module showcase scripts — turbulent radiative mixing
-layer, stellar wind, thermal instability, cooling and the calibrated
-Cassiopeia A supernova remnant reconstruction against Chandra data
-([`supernova_showcase`](examples/gallery/supernova_showcase)) — live in
-[`examples/gallery/`](examples/gallery). The faithful methods-paper figure
-generators live under [`examples/scripts/`](examples/scripts); regenerate every
-paper figure with `pytest pytests/test_reproduce_paper.py --reproduce-paper`.
-The fast correctness tests live under [`pytests/`](pytests).
+layer, stellar wind, cooling — live in [`examples/gallery/`](examples/gallery).
 
 ## Showcase
 
@@ -198,8 +191,7 @@ longer access the initial state after the simulation has started).
 First of all check if the initial conditions are valid. For the finite
 difference scheme, turn on the positivity-preserving WENO reconstruction
 (`weno_positivity_preserving=True` in the `SimulationConfig`), which keeps
-density and pressure positive for `C_cfl <= 0.75`. For the finite volume
-scheme, use a positivity-preserving limiter such as `VAN_ALBADA_PP`; the
+density and pressure positive for `C_cfl <= 0.75`. The
 `PositivityConfig` in the `SimulationConfig` additionally offers a per-step
 density / pressure floor.
 

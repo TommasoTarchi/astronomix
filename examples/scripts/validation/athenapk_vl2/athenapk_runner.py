@@ -1,16 +1,19 @@
 """
 Running AthenaPK and reading its output, for the VL2 validation.
 
-Small helpers to write an AthenaPK input file for a validation case, run the
-``athenaPK`` binary (located through the ``ATHENAPK_BIN`` / ``ATHENAPK_GPU_BIN``
-environment variables), read Parthenon's HDF5 outputs into astronomix's array
-layout, and start AthenaPK from an arbitrary initial condition by writing it into
-a Parthenon restart file.
+Small helpers to write an AthenaPK input file for a validation case or for the
+circularly polarized Alfvén wave benchmark, run the ``athenaPK`` binary (located
+through the ``ATHENAPK_BIN`` / ``ATHENAPK_GPU_BIN`` / ``ATHENAPK_GPU_SINGLE_BIN``
+environment variables), read its performance summary and Parthenon's HDF5
+outputs into astronomix's array layout, and start AthenaPK from an arbitrary
+initial condition by writing it into a Parthenon restart file.
 """
 
 # general
 import glob
+import math
 import os
+import re
 import shutil
 import subprocess
 
@@ -21,25 +24,191 @@ import numpy as np
 import h5py
 
 
-def athenapk_binary(gpu: bool = False) -> str:
+def athenapk_binary(gpu: bool = False, single_precision: bool = False) -> str:
     """
-    The AthenaPK executable to use (``ATHENAPK_GPU_BIN`` for the GPU build,
-    ``ATHENAPK_BIN`` otherwise).
+    The AthenaPK executable to use: ``ATHENAPK_GPU_BIN`` for the GPU build,
+    ``ATHENAPK_GPU_SINGLE_BIN`` for its single-precision variant
+    (``PARTHENON_SINGLE_PRECISION=ON``) and ``ATHENAPK_BIN`` (CPU) otherwise.
 
     Args:
-        gpu: Return the GPU build.
+        gpu: Return a GPU build.
+        single_precision: Return the single-precision GPU build.
 
     Returns:
         The path of the executable.
     """
-    variable = "ATHENAPK_GPU_BIN" if gpu else "ATHENAPK_BIN"
+    if gpu and single_precision:
+        variable = "ATHENAPK_GPU_SINGLE_BIN"
+    elif gpu:
+        variable = "ATHENAPK_GPU_BIN"
+    else:
+        variable = "ATHENAPK_BIN"
     path = os.environ.get(variable)
     if not path or not os.path.isfile(path):
         raise FileNotFoundError(
-            f"Set {variable} to an athenaPK executable (a double-precision build; "
-            "see this directory's README.md)."
+            f"Set {variable} to an athenaPK executable (see this directory's "
+            "README.md; on JUPITER jupiter_athenapk.sh sets all of them)."
         )
     return path
+
+
+def athenapk_environment(threads: int = 16) -> dict:
+    """
+    The environment AthenaPK runs in.
+
+    ``ATHENAPK_LIBRARY_PATH`` (optional) is prepended to ``LD_LIBRARY_PATH`` for
+    the AthenaPK process only: the builds link CUDA and HDF5 libraries of the
+    module system, which must not leak into the Python process whose JAX brings
+    its own CUDA libraries.
+
+    Args:
+        threads: OpenMP threads of a CPU build.
+
+    Returns:
+        The environment variables for ``subprocess``.
+    """
+    environment = dict(os.environ, OMP_NUM_THREADS=str(threads), OMP_PROC_BIND="false")
+    library_path = os.environ.get("ATHENAPK_LIBRARY_PATH")
+    if library_path:
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+            filter(None, [library_path, os.environ.get("LD_LIBRARY_PATH", "")])
+        )
+    return environment
+
+
+def cp_alfven_input(
+    resolution: int,
+    meshblock_cells=None,
+    integrator: str = "vl2",
+    reconstruction: str = "plm",
+    cfl: float = 0.3,
+    cycle_limit: int = -1,
+    compute_error: bool = False,
+    output_variables=None,
+) -> str:
+    """
+    The AthenaPK input file of the circularly polarized Alfvén wave benchmark.
+
+    Grid 2N x N x N on the box 3 x 1.5 x 1.5 (the wave travels along the box
+    diagonal (1, 2, 2)/3, one wavelength per period), HLLD with GLM cleaning,
+    run to t = 5 (five periods). The performance settings are P. Grete's tuned
+    ones for a single GPU: one meshblock holding the whole grid,
+    ``minimum_number_of_teams_for_boundary_kernel = 256`` (without it the ghost
+    exchange of a single large block is slow) and ``scratch_level = 1`` (the
+    pencils of a large block do not fit in shared memory). The first two cycles
+    are excluded from AthenaPK's zone-cycles/wallsecond (``perf_cycle_offset``).
+
+    Args:
+        resolution: N.
+        meshblock_cells: Optional meshblock size ``(nx1, nx2, nx3)``; default is
+            a single meshblock.
+        integrator: AthenaPK integrator (``vl2``, ``rk2``, ``rk3``).
+        reconstruction: AthenaPK reconstruction (``dc``, ``plm``, ``ppm``, ...).
+        cfl: The CFL number.
+        cycle_limit: Stop after this many cycles (-1: run to t = 5).
+        compute_error: Write ``cpaw-errors.dat`` (AthenaPK's L1 error at the end).
+        output_variables: Optional variables (e.g. ``"prim"``) written as HDF5
+            at t = 0 and at the end.
+
+    Returns:
+        The input file text.
+    """
+    num_cells = (2 * resolution, resolution, resolution)
+    meshblock_cells = num_cells if meshblock_cells is None else tuple(meshblock_cells)
+    upper_corner = (3.0, 1.5, 1.5)
+    # PPM needs a third ghost cell.
+    ghost_cells = 3 if reconstruction == "ppm" else 2
+
+    # The wave angles are given explicitly. cpaw.cpp derives them from the box
+    # only if they equal the sentinel -999.9, a comparison of the parsed Real
+    # with the double literal that fails in a single-precision build
+    # (-999.9f != -999.9): that build would run a wave along a wrong direction
+    # with a wrong wavelength. These are cpaw.cpp's own formulas, so the
+    # double-precision build computes the same values either way.
+    angle_3 = math.atan(upper_corner[0] / upper_corner[1])
+    angle_2 = math.atan(
+        0.5 * (upper_corner[0] * math.cos(angle_3) + upper_corner[1] * math.sin(angle_3)) / upper_corner[2]
+    )
+
+    mesh_lines = []
+    for axis in range(3):
+        mesh_lines += [
+            f"nx{axis + 1} = {num_cells[axis]}",
+            f"x{axis + 1}min = 0.0",
+            f"x{axis + 1}max = {upper_corner[axis]}",
+            f"ix{axis + 1}_bc = periodic",
+            f"ox{axis + 1}_bc = periodic",
+        ]
+    output_lines = []
+    if output_variables is not None:
+        output_lines = [
+            "<parthenon/output0>",
+            "file_type = hdf5",
+            "dt = 10.0",
+            f"variables = {output_variables}",
+        ]
+
+    text = "\n".join(
+        [
+            "<job>",
+            "problem_id = cpaw",
+            "<problem/cpaw>",
+            f"compute_error = {'true' if compute_error else 'false'}",
+            "b_par = 1.0",
+            "b_perp = 0.1",
+            "pres = 0.1",
+            "v_par = 0.0",
+            "dir = 1",
+            f"ang_2 = {angle_2!r}",
+            f"ang_3 = {angle_3!r}",
+            "<parthenon/mesh>",
+            "refinement = none",
+            f"nghost = {ghost_cells}",
+            *mesh_lines,
+            "minimum_number_of_teams_for_boundary_kernel = 256",
+            "<parthenon/meshblock>",
+            *[f"nx{axis + 1} = {meshblock_cells[axis]}" for axis in range(3)],
+            "<parthenon/time>",
+            f"integrator = {integrator}",
+            f"cfl = {cfl}",
+            "tlim = 5.0",
+            f"nlim = {cycle_limit}",
+            "perf_cycle_offset = 2",
+            "<hydro>",
+            "fluid = glmmhd",
+            "eos = adiabatic",
+            "riemann = hlld",
+            f"reconstruction = {reconstruction}",
+            "gamma = 1.666666666666667",
+            "scratch_level = 1",
+            *output_lines,
+            "",
+        ]
+    )
+    return text
+
+
+def performance_summary(standard_output: str):
+    """
+    AthenaPK's performance summary at the end of a run.
+
+    Parthenon resets its main timer after ``perf_cycle_offset`` cycles, so both
+    numbers exclude the initialisation and the first cycles (but include the
+    end-of-run work: the final output and ``compute_error``).
+
+    Args:
+        standard_output: AthenaPK's standard output.
+
+    Returns:
+        ``(zone_cycles_per_second, walltime_seconds, cycles)``, the cycles being
+        the last cycle number of the per-cycle diagnostics.
+    """
+    throughput = re.search(r"zone-cycles/wallsecond\s*=\s*([\d.eE+\-]+)", standard_output)
+    walltime = re.search(r"walltime used\s*=\s*([\d.eE+\-]+)", standard_output)
+    cycle_numbers = re.findall(r"cycle=(\d+)", standard_output)
+    if throughput is None or walltime is None or not cycle_numbers:
+        raise RuntimeError(f"No AthenaPK performance summary in:\n{standard_output[-3000:]}")
+    return float(throughput.group(1)), float(walltime.group(1)), int(cycle_numbers[-1])
 
 
 def write_input_file(case, path: str):
@@ -117,7 +286,13 @@ def write_input_file(case, path: str):
         file.write(text)
 
 
-def run_athenapk(arguments, run_directory: str, gpu: bool = False, threads: int = 16) -> str:
+def run_athenapk(
+    arguments,
+    run_directory: str,
+    gpu: bool = False,
+    threads: int = 16,
+    single_precision: bool = False,
+) -> str:
     """
     Run AthenaPK in ``run_directory`` (cleared of old outputs first).
 
@@ -126,6 +301,7 @@ def run_athenapk(arguments, run_directory: str, gpu: bool = False, threads: int 
         run_directory: The working directory.
         gpu: Use the GPU build.
         threads: OpenMP threads of the CPU build.
+        single_precision: Use the single-precision GPU build.
 
     Returns:
         AthenaPK's standard output.
@@ -133,13 +309,12 @@ def run_athenapk(arguments, run_directory: str, gpu: bool = False, threads: int 
     os.makedirs(run_directory, exist_ok=True)
     for old_output in glob.glob(os.path.join(run_directory, "parthenon.*")):
         os.remove(old_output)
-    environment = dict(os.environ, OMP_NUM_THREADS=str(threads), OMP_PROC_BIND="false")
     result = subprocess.run(
-        [athenapk_binary(gpu), *arguments],
+        [athenapk_binary(gpu, single_precision), *arguments],
         cwd=run_directory,
         capture_output=True,
         text=True,
-        env=environment,
+        env=athenapk_environment(threads),
     )
     if result.returncode != 0:
         raise RuntimeError(f"athenaPK failed:\n{result.stdout[-3000:]}\n{result.stderr[-3000:]}")

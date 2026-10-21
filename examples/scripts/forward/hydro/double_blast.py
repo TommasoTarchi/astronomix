@@ -3,14 +3,16 @@
 Generates ``figures/double_blast.pdf`` (and a ``.png`` copy): the gas density
 at t = 0.038 for four solver configurations,
 
-    - FV (HLL, minmod)   at   400 cells
-    - FV (HLLC, minmod)  at   400 cells
-    - FD (WENO)          at   400 cells
-    - FV (HLL, minmod)   at 10000 cells   (reference)
+    - FV (VL2, HLLE)       at   400 cells
+    - FV (VL2, HLLC)       at   400 cells
+    - FD (WENO-Z)          at   400 cells
+    - FV (VL2, HLLC)       at 10000 cells   (reference)
 
-The 10000-cell HLL run serves as a converged reference; the three 400-cell
-runs show how the different schemes resolve the colliding-blast structure at
-coarse resolution.
+The finite-volume runs use AthenaPK's VL2 scheme (van Leer predictor-corrector,
+PLM with van Leer slopes); the finite-difference runs use WENO-Z weights (the
+test needs no positivity-preserving WENO). The 10000-cell run serves as a
+converged reference; the three 400-cell runs show how the different schemes
+resolve the colliding-blast structure at coarse resolution.
 
 Run with the repo on PYTHONPATH (GPU picked via autocvd):
 
@@ -42,9 +44,7 @@ from astronomix import (
     FINITE_VOLUME,
     HLL,
     HLLC,
-    MINMOD,
-    NATIVE_JAX,
-    PALLAS,
+    VL2,
 )
 
 # astronomix containers
@@ -52,7 +52,6 @@ from astronomix import (
     SimulationConfig,
     SimulationParams,
     BoundarySettings1D,
-    BackendConfig,
 )
 
 # astronomix functions
@@ -79,15 +78,29 @@ BOX_SIZE = 1.0
 T_END = 0.038
 GAMMA = 1.4
 
+# The finite-volume runs use AthenaPK's one-dimensional CFL number, the
+# finite-difference runs the C_cfl = 0.4 this test always used.
+FINITE_VOLUME_CFL = 0.5
+FINITE_DIFFERENCE_CFL = 0.4
+
 CACHE = DATA_DIR / "double_blast.npz"
 
 # One entry per curve in the figure, as
 # (key, label, solver_mode, riemann_solver, num_cells, color, style).
+# (The Riemann solver entry of the finite-difference run is not read.)
 RUNS = [
-    ("fv_hll_400", "FV (HLL, minmod), 400", FINITE_VOLUME, HLL, 400, FV_HLL_COLOR, "marker"),
-    ("fv_hllc_400", "FV (HLLC, minmod), 400", FINITE_VOLUME, HLLC, 400, FV_HLLC_COLOR, "marker"),
-    ("fd_400", "FD, 400", FINITE_DIFFERENCE, HLL, 400, FD_COLOR, "marker"),
-    ("fv_hll_10000", "FV (HLL, minmod), 10000 (reference)", FINITE_VOLUME, HLL, 10000, "0.3", "line"),
+    ("fv_vl2_hlle_400", "FV (VL2, HLLE), 400", FINITE_VOLUME, HLL, 400, FV_HLL_COLOR, "marker"),
+    ("fv_vl2_hllc_400", "FV (VL2, HLLC), 400", FINITE_VOLUME, HLLC, 400, FV_HLLC_COLOR, "marker"),
+    ("fd_400", "FD (WENO-Z), 400", FINITE_DIFFERENCE, HLLC, 400, FD_COLOR, "marker"),
+    (
+        "fv_vl2_hllc_10000",
+        "FV (VL2, HLLC), 10000 (reference)",
+        FINITE_VOLUME,
+        HLLC,
+        10000,
+        "0.3",
+        "line",
+    ),
 ]
 
 
@@ -104,25 +117,31 @@ def simulate(solver_mode, riemann_solver, num_cells):
         positions and the final gas density at ``T_END``.
     """
     is_finite_difference = solver_mode == FINITE_DIFFERENCE
-    config = SimulationConfig(
+    common_settings = dict(
         geometry=CARTESIAN,
         solver_mode=solver_mode,
         boundary_settings=BoundarySettings1D(
-            left_boundary=REFLECTIVE_BOUNDARY, right_boundary=REFLECTIVE_BOUNDARY
+            left_boundary=REFLECTIVE_BOUNDARY,
+            right_boundary=REFLECTIVE_BOUNDARY,
         ),
-        first_order_fallback=False,
-        riemann_solver=riemann_solver,
-        limiter=MINMOD,
         box_size=BOX_SIZE,
         num_cells=num_cells,
         dimensionality=1,
         mhd=False,
-        # FD/WENO uses the Pallas backend (bit-compatible with native JAX).
-        backend_config=BackendConfig(
-            backend=PALLAS if is_finite_difference else NATIVE_JAX,
-            pallas_block_shape=(4, 1, 1),
-        ),
     )
+    if is_finite_difference:
+        config = SimulationConfig(
+            weno_z=True,
+            **common_settings,
+        )
+        cfl = FINITE_DIFFERENCE_CFL
+    else:
+        config = SimulationConfig(
+            time_integrator=VL2,
+            riemann_solver=riemann_solver,
+            **common_settings,
+        )
+        cfl = FINITE_VOLUME_CFL
 
     helper_data = get_helper_data(config)
     registered_variables = get_registered_variables(config)
@@ -145,10 +164,16 @@ def simulate(solver_mode, riemann_solver, num_cells):
     )
 
     config = finalize_config(config, initial_state.shape)
-    params = SimulationParams(t_end=T_END, gamma=GAMMA)
+    params = SimulationParams(t_end=T_END, gamma=GAMMA, C_cfl=cfl)
 
     final_state = time_integration(initial_state, config, params, registered_variables)
     final_density = final_state[registered_variables.density_index]
+    final_pressure = final_state[registered_variables.pressure_index]
+    print(
+        f"  min density {float(jnp.min(final_density)):.3e}, "
+        f"min pressure {float(jnp.min(final_pressure)):.3e}, "
+        f"finite: {bool(jnp.all(jnp.isfinite(final_state)))}"
+    )
     return np.asarray(positions), np.asarray(final_density)
 
 
@@ -168,6 +193,34 @@ def run_and_cache():
     np.savez(CACHE, **cached_profiles)
     print(f"cached -> {CACHE}")
     return cached_profiles
+
+
+def print_reference_errors(data):
+    """
+    Print, for every coarse run, its mean absolute density difference from the
+    reference run on the plotted interval 0.4 <= x <= 1 and its peak density
+    there against the reference peak.
+
+    Args:
+        data: The dict of cached profiles (see :func:`run_and_cache`).
+    """
+    reference_key = RUNS[-1][0]
+    reference_positions = data[f"{reference_key}_r"]
+    reference_density = data[f"{reference_key}_rho"]
+    in_window = reference_positions >= 0.4
+    print(f"reference peak density {reference_density[in_window].max():.3f}")
+    for key, label, _, _, _, _, style in RUNS:
+        if style != "marker":
+            continue
+        positions = data[f"{key}_r"]
+        density = data[f"{key}_rho"]
+        in_window = positions >= 0.4
+        reference_at_positions = np.interp(positions, reference_positions, reference_density)
+        mean_difference = np.mean(np.abs(density - reference_at_positions)[in_window])
+        print(
+            f"{label}: mean |rho - rho_ref| = {mean_difference:.4f}, "
+            f"peak density {density[in_window].max():.3f}"
+        )
 
 
 def plot(data):
@@ -215,4 +268,5 @@ if __name__ == "__main__":
         data = run_and_cache()
     else:
         data = dict(np.load(CACHE))
+    print_reference_errors(data)
     plot(data)

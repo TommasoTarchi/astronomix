@@ -7,7 +7,12 @@ half step and a piecewise-linear (harmonic van Leer slope) corrector step,
 AthenaPK's HLLD / HLLE / HLLC / LLF interface solvers, and — for MHD — the
 cell-centred GLM-MHD system of Dedner et al. (2002) with the cleaning scalar psi
 carried as a ninth variable. AthenaPK's first-order flux correction and its
-density / pressure floors are available as options.
+density / pressure floors are available as options. Self-gravity (and an
+external potential) couple as in Athena++, whose VL2 integrator this is: every
+stage adds the source of ``_add_athena_gravity_source`` built from the
+potential of the stage's initial state and the stage's Riemann mass fluxes,
+optionally with the time-centred energy source of Mullen, Hanawa & Gammie
+(2021). The gravity source runs on the native backend only.
 
 One step of size ``dt`` from the primitive state ``W^n`` (conserved form
 ``U^n``) reads, exactly as AthenaPK's task list::
@@ -18,7 +23,11 @@ One step of size ``dt`` from the primitive state ``W^n`` (conserved form
     U^{n+1}  = U^n - dt   L_PLM(W^{n+½})  then  psi *= exp(-α c_h dt / dx)
     W^{n+1}  = W(U^{n+1})
 
-with the flux divergence ``L(W)_i = (1/dx) Σ_d (F_{i+½} - F_{i-½})``.
+with the flux divergence ``L(W)_i = (1/dx) Σ_d (F_{i+½} - F_{i-½})``. With
+gravity each stage adds ``beta dt S(rho_stage, F_stage, phi_stage)`` to its
+update, where ``phi_stage`` is the potential of the stage's initial density
+(two Poisson solves per step, as in Athena++; three with the time-centred
+energy source).
 
 The per-face physics (reconstruction, Riemann solvers, conversions) is written as
 elementwise functions that the Pallas kernels in :mod:`._van_leer_pallas` call as
@@ -82,6 +91,10 @@ from astronomix._finite_volume._state_evolution._van_leer_pallas import (
     _vl2_stage_pallas,
 )
 from astronomix._geometry.boundaries import _boundary_handler
+from astronomix._modules._gravity._gravity import (
+    _add_athena_gravity_source,
+    _compute_total_potential,
+)
 
 
 # -------------------------------------------------------------
@@ -758,6 +771,35 @@ def _first_order_flux_correction(
 # -------------------------------------------------------------
 
 
+def _vl2_gravitational_potential(
+    density,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+):
+    """
+    The total gravitational potential (self-gravity and external) of a density
+    field of the VL2 scheme.
+
+    Args:
+        density: The density field.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The potential, shaped like the density.
+    """
+    return _compute_total_potential(
+        density,
+        config.grid_spacing,
+        config,
+        params,
+        registered_variables,
+        params.gravitational_constant,
+    )
+
+
 def _vl2_stage(
     stage_primitive_state: STATE_TYPE,
     base_conserved_state: STATE_TYPE,
@@ -769,11 +811,13 @@ def _vl2_stage(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
-) -> STATE_TYPE:
+    stage_potential=None,
+    initial_potential=None,
+):
     """
     One VL2 stage (native JAX): ``U = U_base - beta dt L(W_stage)``, the
-    Dedner source and the conversion back to primitives. Ghost cells are not
-    updated here.
+    gravity source, the Dedner source and the conversion back to primitives.
+    Ghost cells are not updated here.
 
     Args:
         stage_primitive_state: The primitive state the fluxes are computed from.
@@ -786,9 +830,15 @@ def _vl2_stage(
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
+        stage_potential: The potential of the stage's initial state (gravity
+            only).
+        initial_potential: The potential at the start of the step, ``t^n``
+            (gravity with the time-centred energy source only).
 
     Returns:
-        The primitive state after the stage.
+        The primitive state after the stage, and the potential of the stage's
+        new density if the time-centred energy source computed it (otherwise
+        ``None``).
     """
     fluxes_per_axis = [
         _interface_fluxes(
@@ -821,6 +871,32 @@ def _vl2_stage(
         config,
     )
 
+    end_potential = None
+    if config.gravity_config.gravity:
+        density_index = registered_variables.density_index
+        work_potential = stage_potential
+        if config.gravity_config.time_centred_energy_source:
+            # The density has no source term, so the stage's new density, and
+            # with it the potential at the end of the stage, is known before
+            # the gravity source is added.
+            end_potential = _vl2_gravitational_potential(
+                conserved_state[density_index],
+                config,
+                params,
+                registered_variables,
+            )
+            work_potential = 0.5 * (initial_potential + end_potential)
+        conserved_state = _add_athena_gravity_source(
+            conserved_state,
+            stage_primitive_state[density_index],
+            [fluxes[density_index] for fluxes in fluxes_per_axis],
+            stage_potential,
+            work_potential,
+            stage_time_step,
+            config,
+            registered_variables,
+        )
+
     if config.mhd:
         conserved_state = _dedner_source(
             conserved_state,
@@ -831,13 +907,14 @@ def _vl2_stage(
             registered_variables,
         )
 
-    return _primitive_from_conserved_vl2(
+    primitive_state = _primitive_from_conserved_vl2(
         conserved_state,
         gamma,
         config,
         params,
         registered_variables,
     )
+    return primitive_state, end_potential
 
 
 def _native_stage_from_primitive_base(
@@ -1018,7 +1095,7 @@ def _evolve_state_vl2(
     half step, then the corrector with the van Leer limited PLM, or with donor
     cell when ``config.first_order_fallback`` is set (``config.limiter`` is not
     read). Runs on the Pallas backend when it supports the configuration and
-    natively otherwise.
+    natively otherwise; with gravity always natively.
 
     Args:
         primitive_state: The primitive state ``W^n``.
@@ -1047,7 +1124,10 @@ def _evolve_state_vl2(
     )
     predictor_damping_factor, corrector_damping_factor = damping_factors
 
-    if _vl2_pallas_supported(primitive_state, config):
+    # The gravity source needs every face's mass flux, which the fused Pallas
+    # stage kernels never write out (they form the flux divergence in
+    # registers), so with gravity the stages run natively.
+    if not config.gravity_config.gravity and _vl2_pallas_supported(primitive_state, config):
 
         # --------------- ↓ Pallas stages ↓ ----------------
 
@@ -1091,13 +1171,25 @@ def _evolve_state_vl2(
 
     # --------------- ↓ Native stages ↓ ----------------
 
+    # The potential of each stage's initial state: Athena++ solves the
+    # Poisson equation after every stage, so the predictor sees phi(rho^n) and
+    # the corrector phi(rho^{n+1/2}).
+    initial_potential = None
+    if config.gravity_config.gravity:
+        initial_potential = _vl2_gravitational_potential(
+            primitive_state[registered_variables.density_index],
+            config,
+            params,
+            registered_variables,
+        )
+
     initial_conserved_state = _conserved_from_primitive_vl2(
         primitive_state,
         gamma,
         config,
         registered_variables,
     )
-    half_step_primitive_state = _vl2_stage(
+    half_step_primitive_state, half_step_end_potential = _vl2_stage(
         primitive_state,
         initial_conserved_state,
         stage_time_step=0.5 * dt,
@@ -1108,6 +1200,8 @@ def _evolve_state_vl2(
         config=config,
         params=params,
         registered_variables=registered_variables,
+        stage_potential=initial_potential,
+        initial_potential=initial_potential,
     )
     half_step_primitive_state = _update_ghost_cells(
         half_step_primitive_state,
@@ -1115,7 +1209,20 @@ def _evolve_state_vl2(
         params,
         registered_variables,
     )
-    new_primitive_state = _vl2_stage(
+
+    # The time-centred energy source has already solved for the potential of
+    # the half-step density (before the floors, which only matters where they
+    # act), so it is reused rather than solved again.
+    half_step_potential = half_step_end_potential
+    if config.gravity_config.gravity and half_step_potential is None:
+        half_step_potential = _vl2_gravitational_potential(
+            half_step_primitive_state[registered_variables.density_index],
+            config,
+            params,
+            registered_variables,
+        )
+
+    new_primitive_state, _ = _vl2_stage(
         half_step_primitive_state,
         initial_conserved_state,
         stage_time_step=dt,
@@ -1126,6 +1233,8 @@ def _evolve_state_vl2(
         config=config,
         params=params,
         registered_variables=registered_variables,
+        stage_potential=half_step_potential,
+        initial_potential=initial_potential,
     )
 
     # --------------- ↑ Native stages ↑ ----------------

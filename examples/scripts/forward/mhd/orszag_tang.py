@@ -1,13 +1,20 @@
 """Orszag-Tang vortex (2D MHD) — paper figure.
 
-Left panel:  finite-difference (WENO) density at t = 3.0 (shown as the example
-             field).
-Right panel: density profile along the cut y = 0.625 pi for both
-             FV (HLL, minmod) and FD (WENO), with the Pang & Wu (2024)
-             reference overlaid.
+Left panel:  finite-difference density at t = 3.0 on 1024^2 cells.
+Right panel: density profile along the cut y = 0.625 pi for the
+             finite-volume and finite-difference schemes at 200^2 against the
+             finite-difference 1024^2 result.
 
-Both solvers run at 200^2 in a periodic box of size 2 pi.  Final states are
-cached under ``data/`` so the figure can be re-styled without re-running.
+The finite-volume scheme is AthenaPK's VL2 (van Leer predictor-corrector, PLM
+with van Leer slopes, HLLD, GLM divergence cleaning); the finite-difference
+scheme uses WENO-Z weights (no positivity-preserving WENO). Both run at
+C_cfl = 0.4 in a periodic box of size 2 pi (Pang & Wu 2024, Example 5.2).
+The finite-difference scheme also runs in the setup of the supersonic
+turbulence (positivity-preserving WENO, upwind dissipation of the CT edge EMFs
+at the default strength, C_cfl = 0.75) at both resolutions; its 200^2 cut is
+drawn, and its deviations from the plain finite-difference runs are printed.
+Final states are cached under ``data/`` so the figure can be re-styled
+without re-running.
 
     PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/orszag_tang.py [--rerun]
 """
@@ -18,6 +25,11 @@ autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
+# jax
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
 # numerics
 import numpy as np
 
@@ -25,20 +37,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-# jax
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-
 # astronomix constants
 from astronomix import (
     FINITE_VOLUME,
     FINITE_DIFFERENCE,
-    HLL,
-    MINMOD,
-    NATIVE_JAX,
+    HLLD,
     PALLAS,
     PERIODIC_BOUNDARY,
+    VL2,
 )
 
 # astronomix containers
@@ -59,19 +65,12 @@ from astronomix import (
     construct_primitive_state,
 )
 
-
-# The dimensionality-aware interface-field initializer (the top-level one
-# assumes 3D, but this test is 2D).
-
 # shared figure helpers
 from _common import DATA_DIR
 from _common import FIG_DIR
 from _common import rerun_requested
-from _common import FD_LABEL
-from _common import FV_HLL_LABEL
 from _common import FD_COLOR
 from _common import FV_HLL_COLOR
-from _common import mhd_registered_variables
 
 
 GAMMA = 5.0 / 3.0
@@ -81,56 +80,83 @@ RES_HIGH = 1024
 T_END = 3.0
 Y_CUT = 0.625 * np.pi
 
+# Both schemes run at the C_cfl = 0.4 of this test (also AthenaPK's value for
+# its 2D Orszag-Tang problem).
+C_CFL = 0.4
+
+FD_LABEL = "FD (WENO-Z)"
+FD_TURBULENCE_LABEL = "FD (WENO-Z + PP + upwind EMF)"
+
+#: C_cfl of the turbulence setup, the bound of the positivity proof.
+C_CFL_TURBULENCE = 0.75
+FV_LABEL = "FV (VL2, HLLD)"
+
 PERIODIC_2D = BoundarySettings(
     BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
     BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
 )
 
 
-def simulate(solver_mode, num_cells):
-    """Run the Orszag-Tang vortex at ``num_cells``^2 with the given solver.
-
-    Sets up the standard Orszag-Tang initial condition in a periodic box of
-    size ``2*pi`` and evolves it to ``T_END``. The finite-difference solver runs
-    on the Pallas backend (bit-compatible with native JAX, ~10x faster), while
-    the finite-volume solver runs on native JAX.
+def make_config(solver_mode, num_cells, turbulence_setup=False):
+    """Build the Orszag-Tang configuration of one scheme.
 
     Args:
         solver_mode: The solver mode (FINITE_VOLUME or FINITE_DIFFERENCE).
         num_cells: The per-dimension resolution of the square grid.
+        turbulence_setup: Finite difference only: add the positivity-preserving
+            WENO and the upwind EMF dissipation (the supersonic turbulence
+            setup).
 
     Returns:
-        A tuple ``(final_state, x)`` of the final state array and the 1D cell-
-        centre coordinate array, both as numpy arrays.
+        The (not yet finalized) simulation configuration.
     """
-
-    # -------------------------------------------------------------
-    # =============== ↓ Solver configuration ↓ ===================
-    # -------------------------------------------------------------
-
-    is_fd = solver_mode == FINITE_DIFFERENCE
-    config = SimulationConfig(
+    # The Pallas block must divide the grid; (8, 8, 1) divides both 200 and
+    # 1024. The finite-difference MHD kernels are three-dimensional only, so
+    # the 2D finite-difference run computes its fluxes natively.
+    common_settings = dict(
         mhd=True,
         solver_mode=solver_mode,
         dimensionality=2,
         box_size=BOX_SIZE,
         num_cells=num_cells,
-        limiter=MINMOD,
-        riemann_solver=HLL,
         progress_bar=True,
         boundary_settings=PERIODIC_2D,
-        # FD/WENO runs ~10x faster through the Pallas backend (bit-compatible).
-        # The block must divide the grid; (8, 8, 1) divides both 200 and 400.
         backend_config=BackendConfig(
-            backend=PALLAS if is_fd else NATIVE_JAX,
+            backend=PALLAS,
             pallas_block_shape=(8, 8, 1),
         ),
     )
-    rv = get_registered_variables(config)
+    if solver_mode == FINITE_DIFFERENCE:
+        return SimulationConfig(
+            weno_z=True,
+            weno_positivity_preserving=turbulence_setup,
+            ct_upwind_dissipation=turbulence_setup,
+            **common_settings,
+        )
+    return SimulationConfig(
+        time_integrator=VL2,
+        riemann_solver=HLLD,
+        **common_settings,
+    )
 
-    # -------------------------------------------------------------
-    # =============== ↑ Solver configuration ↑ ===================
-    # -------------------------------------------------------------
+
+def simulate(solver_mode, num_cells, turbulence_setup=False):
+    """Run the Orszag-Tang vortex at ``num_cells``^2 with the given solver.
+
+    Sets up the standard Orszag-Tang initial condition in a periodic box of
+    size ``2*pi`` and evolves it to ``T_END``.
+
+    Args:
+        solver_mode: The solver mode (FINITE_VOLUME or FINITE_DIFFERENCE).
+        num_cells: The per-dimension resolution of the square grid.
+        turbulence_setup: See ``make_config``.
+
+    Returns:
+        A tuple ``(density, x)`` of the final density field and the 1D cell-
+        centre coordinate array, both as numpy arrays.
+    """
+    config = make_config(solver_mode, num_cells, turbulence_setup)
+    registered_variables = get_registered_variables(config)
 
     # -------------------------------------------------------------
     # ============= ↓ Orszag-Tang initial condition ↓ ============
@@ -149,7 +175,8 @@ def simulate(solver_mode, num_cells):
     B_z = jnp.zeros_like(X)
 
     # The finite-difference (constrained-transport) solver additionally needs
-    # the staggered interface magnetic fields; the finite-volume solver does not.
+    # the staggered interface magnetic fields; the finite-volume VL2 scheme
+    # keeps cell-centred fields and cleans their divergence (GLM).
     if solver_mode == FINITE_DIFFERENCE:
         bxb, byb, bzb = initialize_interface_fields(
             B_x,
@@ -162,7 +189,7 @@ def simulate(solver_mode, num_cells):
 
     initial_state = construct_primitive_state(
         config=config,
-        registered_variables=rv,
+        registered_variables=registered_variables,
         density=rho,
         velocity_x=V_x,
         velocity_y=V_y,
@@ -176,14 +203,24 @@ def simulate(solver_mode, num_cells):
     )
 
     config = finalize_config(config, initial_state.shape)
-    params = SimulationParams(t_end=T_END, C_cfl=0.4, gamma=GAMMA)
-
-    final_state = time_integration(initial_state, config, params, rv)
-    return np.asarray(final_state), np.asarray(x)
+    params = SimulationParams(
+        t_end=T_END,
+        C_cfl=C_CFL_TURBULENCE if turbulence_setup else C_CFL,
+        gamma=GAMMA,
+    )
 
     # -------------------------------------------------------------
     # ============= ↑ Orszag-Tang initial condition ↑ ============
     # -------------------------------------------------------------
+
+    final_state = time_integration(initial_state, config, params, registered_variables)
+    density = final_state[registered_variables.density_index]
+    print(
+        f"  min density {float(jnp.min(density)):.3e}, "
+        f"min pressure {float(jnp.min(final_state[registered_variables.pressure_index])):.3e}, "
+        f"finite: {bool(jnp.all(jnp.isfinite(final_state)))}"
+    )
+    return np.asarray(density), np.asarray(x)
 
 
 def cache_path(name, num_cells):
@@ -191,28 +228,29 @@ def cache_path(name, num_cells):
     return DATA_DIR / f"orszag_tang_{name}_{num_cells}.npz"
 
 
-def get_run(name, solver_mode, num_cells, rerun):
-    """Return an Orszag-Tang run's final state, from cache or by (re-)running.
+def get_run(name, solver_mode, num_cells, rerun, turbulence_setup=False):
+    """Return an Orszag-Tang run's final density, from cache or by (re-)running.
 
     Args:
-        name: The short cache label for this run (e.g. ``"fd"``, ``"fv_hll"``).
+        name: The short cache label for this run (e.g. ``"fd"``, ``"fv_vl2"``).
         solver_mode: The solver mode used for the run.
         num_cells: The per-dimension resolution of the run.
         rerun: When True, ignore any cache and re-run the simulation.
+        turbulence_setup: See ``make_config``.
 
     Returns:
-        A tuple ``(final_state, x)`` of the final state array and coordinate
+        A tuple ``(density, x)`` of the final density field and coordinate
         array.
     """
     path = cache_path(name, num_cells)
     if path.exists() and not rerun:
         cached = np.load(path)
-        return cached["final_state"], cached["x"]
+        return cached["density"], cached["x"]
     print(f"running Orszag-Tang {name} at {num_cells}^2 ...")
-    final_state, x = simulate(solver_mode, num_cells)
-    np.savez(path, final_state=final_state, x=x)
+    density, x = simulate(solver_mode, num_cells, turbulence_setup)
+    np.savez(path, density=density, x=x)
     print(f"  cached -> {path}")
-    return final_state, x
+    return density, x
 
 
 def plot(rerun):
@@ -220,8 +258,9 @@ def plot(rerun):
 
     The left panel shows the high-resolution finite-difference density field;
     the right panel compares the density profile along the cut ``Y_CUT`` for
-    FV (HLL, minmod) and FD at ``RES_LOW`` against the FD ``RES_HIGH``
-    reference. Saves ``orszag_tang.svg`` (and a ``.png`` copy).
+    the finite-volume and finite-difference schemes at ``RES_LOW`` against
+    the finite-difference ``RES_HIGH`` result. Saves ``orszag_tang.svg`` (and
+    a ``.png`` copy).
 
     Args:
         rerun: When True, force the underlying simulations to be re-run.
@@ -233,15 +272,30 @@ def plot(rerun):
 
     fd_hi, x_hi = get_run("fd", FINITE_DIFFERENCE, RES_HIGH, rerun)
     fd_lo, x_lo = get_run("fd", FINITE_DIFFERENCE, RES_LOW, rerun)
-    fv_lo, x_fv = get_run("fv_hll", FINITE_VOLUME, RES_LOW, rerun)
+    fv_lo, x_fv = get_run("fv_vl2", FINITE_VOLUME, RES_LOW, rerun)
+    turbulence_hi, _ = get_run("fd_turbulence", FINITE_DIFFERENCE, RES_HIGH, rerun, turbulence_setup=True)
+    turbulence_lo, _ = get_run("fd_turbulence", FINITE_DIFFERENCE, RES_LOW, rerun, turbulence_setup=True)
 
-    rv_fd = mhd_registered_variables(FINITE_DIFFERENCE, dimensionality=2)
-    rv_fv = mhd_registered_variables(FINITE_VOLUME, dimensionality=2)
-
-    def cut(state, registered_variables, x):
+    def cut(density, x):
         """Return the density profile along the horizontal cut ``Y_CUT``."""
         y_index = int(np.argmin(np.abs(x - Y_CUT)))
-        return state[registered_variables.density_index, :, y_index]
+        return density[:, y_index]
+
+    # The mean absolute difference of each 200^2 cut from the 1024^2 cut
+    # (interpolated to the coarse cell centres) quantifies which scheme is
+    # closer to the high-resolution solution.
+    reference_cut = np.interp(x_lo, x_hi, cut(fd_hi, x_hi))
+    for label, density, x in (
+        (FV_LABEL, fv_lo, x_fv),
+        (FD_LABEL, fd_lo, x_lo),
+        (FD_TURBULENCE_LABEL, turbulence_lo, x_lo),
+    ):
+        cut_difference = np.mean(np.abs(cut(density, x) - reference_cut))
+        print(f"{label}, {RES_LOW}: mean |cut - {RES_HIGH} cut| = {cut_difference:.4f}")
+    # How far the turbulence setup moves the whole density field.
+    for resolution, plain, turbulence in ((RES_LOW, fd_lo, turbulence_lo), (RES_HIGH, fd_hi, turbulence_hi)):
+        print(f"{FD_TURBULENCE_LABEL} vs {FD_LABEL}, {resolution}: mean |density difference| = "
+              f"{np.mean(np.abs(turbulence - plain)):.4f} (mean density {np.mean(plain):.3f})")
 
     # -------------------------------------------------------------
     # ================= ↑ Load / run the states ↑ ================
@@ -254,9 +308,8 @@ def plot(rerun):
     # -------------------------------------------------------------
 
     # Rasterize the image to keep the resulting SVG small.
-    density_fd = fd_hi[rv_fd.density_index]
     image = axs[0].imshow(
-        density_fd.T,
+        fd_hi.T,
         origin="lower",
         extent=(0, BOX_SIZE, 0, BOX_SIZE),
         cmap="viridis",
@@ -282,23 +335,31 @@ def plot(rerun):
     # FV 200 and FD 200 are compared against the FD 1024 reference.
     axs[1].plot(
         x_hi,
-        cut(fd_hi, rv_fd, x_hi),
+        cut(fd_hi, x_hi),
         color="black",
         lw=1.6,
         label=f"{FD_LABEL}, {RES_HIGH} (reference)",
     )
     axs[1].plot(
         x_fv,
-        cut(fv_lo, rv_fv, x_fv),
+        cut(fv_lo, x_fv),
         color=FV_HLL_COLOR,
-        label=f"{FV_HLL_LABEL}, {RES_LOW}",
+        label=f"{FV_LABEL}, {RES_LOW}",
     )
     axs[1].plot(
         x_lo,
-        cut(fd_lo, rv_fd, x_lo),
+        cut(fd_lo, x_lo),
         color=FD_COLOR,
         ls="--",
         label=f"{FD_LABEL}, {RES_LOW}",
+    )
+    axs[1].plot(
+        x_lo,
+        cut(turbulence_lo, x_lo),
+        color=FD_COLOR,
+        ls=":",
+        lw=1.6,
+        label=f"{FD_TURBULENCE_LABEL}, {RES_LOW}",
     )
 
     axs[1].set_xlabel("x")

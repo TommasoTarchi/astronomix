@@ -69,6 +69,7 @@ from astronomix._finite_difference._time_integrators._ssprk_pallas import (
 )
 from astronomix._finite_difference._magnetic_update._constrained_transport import (
     _constrained_transport_rhs_from_slices,
+    ct_upwind_dissipation_rhs,
     update_cell_center_fields,
 )
 from astronomix._finite_difference._magnetic_update._constrained_transport_pallas import (
@@ -441,6 +442,25 @@ def _ssprk4_with_ct(
             config,
             registered_variables,
         )
+        # Upwind dissipation of the edge EMFs on the interface fields, which
+        # the central CT interpolations leave undamped near the grid scale
+        # (see ct_upwind_dissipation_rhs); also a curl, so div(B) = 0 is kept.
+        if config.ct_upwind_dissipation:
+            upwind_rhs_bx, upwind_rhs_by, upwind_rhs_bz = ct_upwind_dissipation_rhs(
+                current_q,
+                bx,
+                by,
+                bz,
+                dt_tilde,
+                grid_spacing,
+                gamma,
+                params,
+                config,
+                registered_variables,
+            )
+            rhs_bx = rhs_bx + upwind_rhs_bx
+            rhs_by = rhs_by + upwind_rhs_by
+            rhs_bz = rhs_bz + upwind_rhs_bz
         # Explicit ohmic resistivity: a further curl of an edge EMF on the
         # interface fields, so div(B) = 0 is kept exactly (see _resistivity).
         if config.resistivity:
@@ -1466,6 +1486,24 @@ def _lsrk4_with_ct(
             )
         del flux_x_modified
 
+        # Upwind dissipation of the edge EMFs on the interface fields (see
+        # ct_upwind_dissipation_rhs); a curl, so div(B) = 0 is kept.
+        if config.ct_upwind_dissipation:
+            upwind_rhs_bx, upwind_rhs_by, upwind_rhs_bz = ct_upwind_dissipation_rhs(
+                current_q,
+                bx,
+                by,
+                bz,
+                dt,
+                grid_spacing,
+                gamma,
+                params,
+                config,
+                registered_variables,
+            )
+            rhs_bx = rhs_bx + upwind_rhs_bx
+            rhs_by = rhs_by + upwind_rhs_by
+            rhs_bz = rhs_bz + upwind_rhs_bz
         # Explicit ohmic resistivity: a further curl of an edge EMF on the
         # interface fields, so div(B) = 0 is kept exactly (see _resistivity).
         if config.resistivity:

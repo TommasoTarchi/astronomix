@@ -1,0 +1,116 @@
+{
+  "device": "cuda:0",
+  "cases": [
+    {
+      "case": "jeans_amplitude_1e-6",
+      "cycles": {
+        "athena": 73,
+        "astronomix_discrete": 73,
+        "astronomix_spectral": 73
+      },
+      "athena_seconds": 2.1644081519916654,
+      "discrete_kernel_vs_athena": {
+        "density": 1.0924126169020498e-09,
+        "velocity_x": 4.5835262588583794e-10,
+        "velocity_y": 2.622570007056268e-10,
+        "velocity_z": 2.6216932857044656e-10,
+        "pressure": 2.681272926511074e-09
+      },
+      "spectral_kernel_vs_athena": {
+        "density": 0.0002454419028530747,
+        "velocity_x": 0.00024477887758715883,
+        "velocity_y": 0.00024453107403312743,
+        "velocity_z": 0.00024453107387344385,
+        "pressure": 0.00024544191702402556
+      },
+      "discrete_kernel_truncation_error": {
+        "density": 0.038360256331080304,
+        "velocity_x": 0.037909780973609246,
+        "velocity_y": 0.03834287876181732,
+        "velocity_z": 0.03834287876172095,
+        "pressure": 0.038360256247641056
+      },
+      "athena_truncation_error": {
+        "density": 0.03836025625709873,
+        "velocity_x": 0.037909781054022956,
+        "velocity_y": 0.03834287879352618,
+        "velocity_z": 0.038342878792121345,
+        "pressure": 0.03836025627603085
+      }
+    },
+    {
+      "case": "jeans_amplitude_1e-2",
+      "cycles": {
+        "athena": 73,
+        "astronomix_discrete": 73,
+        "astronomix_spectral": 73
+      },
+      "athena_seconds": 2.08987586107105,
+      "discrete_kernel_vs_athena": {
+        "density": 9.480643529230364e-14,
+        "velocity_x": 4.7432398995033316e-14,
+        "velocity_y": 2.8190718188116266e-14,
+        "velocity_z": 2.843878475501702e-14,
+        "pressure": 2.8362238067592425e-13
+      },
+      "spectral_kernel_vs_athena": {
+        "density": 0.0002453303342407787,
+        "velocity_x": 0.0002444505538336154,
+        "velocity_y": 0.00024456627007903226,
+        "velocity_z": 0.0002445662700790588,
+        "pressure": 0.0002453243316188771
+      },
+      "discrete_kernel_truncation_error": {
+        "density": 0.05395767583048744,
+        "velocity_x": 0.05315949448278314,
+        "velocity_y": 0.053664235704127934,
+        "velocity_z": 0.053664235704127934,
+        "pressure": 0.053933428405774635
+      },
+      "athena_truncation_error": {
+        "density": 0.053957675830493206,
+        "velocity_x": 0.05315949448277312,
+        "velocity_y": 0.05366423570412001,
+        "velocity_z": 0.053664235704119975,
+        "pressure": 0.05393342840577651
+      }
+    },
+    {
+      "case": "slab_32",
+      "cycles": {
+        "athena": 250,
+        "astronomix_discrete": 250,
+        "astronomix_spectral": 251
+      },
+      "athena_seconds": 3.5679510390618816,
+      "discrete_kernel_vs_athena": {
+        "density": 3.578665670863306e-15,
+        "velocity_x": 8.723309979456289e-16,
+        "velocity_y": 8.649505175318865e-16,
+        "velocity_z": 8.574119243013233e-16,
+        "pressure": 1.972761425325838e-14
+      },
+      "spectral_kernel_vs_athena": {
+        "density": 6.135778515299534e-05,
+        "velocity_x": 4.471569865329425e-05,
+        "velocity_y": 4.471569865330163e-05,
+        "velocity_z": 4.471569865328975e-05,
+        "pressure": 0.0007896329730111086
+      },
+      "discrete_kernel_truncation_error": {
+        "density": 0.04327277952818744,
+        "velocity_x": 0.0001532863488897959,
+        "velocity_y": 0.00015328634888980028,
+        "velocity_z": 0.00015328634888979513,
+        "pressure": 0.017045304817579713
+      },
+      "athena_truncation_error": {
+        "density": 0.043272779528189066,
+        "velocity_x": 0.00015328634889008778,
+        "velocity_y": 0.00015328634889008673,
+        "velocity_z": 0.00015328634889008263,
+        "pressure": 0.01704530481758506
+      }
+    }
+  ]
+}

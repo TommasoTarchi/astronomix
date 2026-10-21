@@ -33,6 +33,8 @@ ap.add_argument("--budget", type=float, default=14400.0,
 ap.add_argument("--diag-every", type=int, default=1,
                 help="evaluate the fine-grid diagnostic loss every N steps during coarse stage.")
 ap.add_argument("--num-checkpoints", type=int, default=16)
+ap.add_argument("--ad-remat", type=str, default="stage",
+                help="reverse-mode rematerialisation of the Runge-Kutta stages (none/stage/axis).")
 ap.add_argument("--lr", type=float, default=3e-3)
 ap.add_argument("--save-every", type=int, default=2, help="save npz every N logged points.")
 ap.add_argument("--out", type=str, default="data/bench_money128.npz")
@@ -114,6 +116,7 @@ from PIL import Image
 
 # astronomix constants
 from astronomix import (
+    PALLAS,
     PERIODIC_BOUNDARY,
     BACKWARDS,
     FORWARDS,
@@ -121,6 +124,7 @@ from astronomix import (
 
 # astronomix containers
 from astronomix import (
+    BackendConfig,
     SimulationConfig,
     SimulationParams,
     CodeUnits,
@@ -154,12 +158,15 @@ NF, NC = args.fine_N, args.coarse_N
 
 def make_cfg(N, forcing, backward):
     return SimulationConfig(
+        weno_z=True,
         weno_positivity_preserving=True,
+        backend_config=BackendConfig(backend=PALLAS),
         mhd=True, progress_bar=False,
         donate_state=False, dimensionality=3,
         box_size=1.0, num_cells=N,
         differentiation_mode=BACKWARDS if backward else FORWARDS,
         num_checkpoints=args.num_checkpoints,
+        ad_remat=args.ad_remat,
         turbulent_forcing_config=TurbulentForcingConfig(turbulent_forcing=forcing),
         boundary_settings=BoundarySettings(
             *[BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY) for _ in range(3)]),
@@ -197,7 +204,8 @@ def lowpass(theta, mask):
 def main():
     os.makedirs("data", exist_ok=True)
     cfgg = make_cfg(NF, True, False); rv = get_registered_variables(cfgg)
-    params = SimulationParams(C_cfl=0.8, dt_max=0.1, gamma=5 / 3,
+    # C_cfl = 0.75: the positivity-preserving WENO's bound with SSPRK4.
+    params = SimulationParams(C_cfl=0.75, dt_max=0.1, gamma=5 / 3,
                               minimum_density=1e-2 * RHO0, minimum_pressure=1e-2 * P0,
                               turbulent_forcing_params=TurbulentForcingParams(energy_injection_rate=DEDT))
     sh = (NF,) * 3; z = jnp.zeros(sh)

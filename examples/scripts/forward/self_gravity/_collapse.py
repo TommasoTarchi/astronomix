@@ -1,11 +1,28 @@
-"""Shared Evrard-collapse simulation setup for the collapse figures.
+"""Shared Evrard-collapse setup for the self-gravity figures.
 
-Both ``energy_conservation_comparison.py`` and ``radial_profiles_comparison.py``
-drive the same finite-difference Evrard collapse, differing only in the end
-time and which diagnostics they keep. The FD configuration follows
-``tests/self_gravity_tests/simulate_collapse_fd.py`` and runs on the Pallas
-backend for speed.
+The energy budget (``energy_conservation_comparison.py``), the radial profiles
+(``radial_profiles_comparison.py``), the energy error against the resolution
+(``evrard_energy_convergence.py``) and against a fixed time step
+(``evrard_timestep_convergence.py``) all run the same finite-difference Evrard
+collapse: a sphere of radius 1 and mass 1 with ``rho ~ 1 / r`` at rest in a
+tenuous ambient medium, ``G = 1``, isolated (open-boundary) Poisson solve.
+They differ in the resolution, the end time, the initial thermal energy and the
+diagnostics they keep.
+
+The scheme is the finite-difference baseline: WENO-Z weights, the admissible
+face state and positivity-preserving WENO (Zhang & Shu 2012, inside the
+reconstruction and independent of the time step), with the gravitational work
+optionally flux-corrected (``GravityConfig.work_flux_correction``). The
+128^3 comparison adds the second-order finite-volume scheme (VL2, PLM, HLLC,
+C_cfl = 0.3) with Athena++'s coupling, optionally with the time-centred energy
+source of Mullen, Hanawa & Gammie (2021). The finite-volume runs need
+AthenaPK's density and pressure floors (``MINIMUM_DENSITY``,
+``MINIMUM_PRESSURE``): the gravitational work charged to the cold ambient
+cells at the sphere's edge exceeds their internal energy in the first steps.
 """
+
+# typing
+from typing import NamedTuple, Optional
 
 # jax
 import jax
@@ -13,22 +30,23 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix import (
-    FINITE_DIFFERENCE,
     FINITE_VOLUME,
     FORWARDS,
     HLLC,
-    MINMOD,
     NATIVE_JAX,
     PALLAS,
     PERIODIC_BOUNDARY,
+    VL2,
 )
 from astronomix.option_classes.simulation_config import (
-    RK2_SSP,
-    UNSPLIT,
+    ATHENA_SECOND_ORDER,
+    FOURTH_ORDER_CONSERVATIVE,
+    POSITIVITY_HARD_FLOOR,
 )
 
 # astronomix containers
 from astronomix import (
+    PositivityConfig,
     SimulationConfig,
     SimulationParams,
     BoundarySettings,
@@ -49,73 +67,117 @@ from astronomix import (
     finalize_state,
 )
 
+# figure helpers
+from _common import FINITE_VOLUME_COURANT_NUMBER
 
 
 GAMMA = 5 / 3
 BOX_SIZE = 4.0
-NUM_SNAPSHOTS = 60
+SPHERE_RADIUS = 1.0
+SPHERE_MASS = 1.0
+AMBIENT_DENSITY = 1e-4
+
+#: Initial thermal energy per unit mass of the standard (cold) Evrard collapse
+#: and of the warmer, milder variant used for the convergence figures.
+COLD_INITIAL_ENERGY = 0.05
+MILD_INITIAL_ENERGY = 0.20
+
+#: The floors of the setup. With positivity-preserving WENO they only enter
+#: the admissibility test of the reconstruction and the wave-speed estimates;
+#: the evolved state is never clamped. The finite-volume scheme applies them
+#: as AthenaPK's dfloor and pfloor.
+MINIMUM_DENSITY = 1e-5
+MINIMUM_PRESSURE = 3e-6
+
+#: The Courant number of the CFL-stepped runs: the bound up to which the
+#: positivity-preserving reconstruction is provable with SSPRK4.
+COURANT_NUMBER = 0.75
+
+DEFAULT_NUM_SNAPSHOTS = 60
 
 
-def _backend_kwargs(backend):
-    """Select the backend keyword arguments for the requested backend.
+class CollapseScheme(NamedTuple):
+    """The scheme options of one collapse run.
 
-    Pallas (~10x faster) is used for the default float32 runs; native JAX is
-    used for float64, where the Pallas/Triton kernel does some math in reduced
-    precision.
-
-    Args:
-        backend: The requested backend constant (``PALLAS`` or ``NATIVE_JAX``).
-
-    Returns:
-        A dictionary of ``SimulationConfig`` backend keyword arguments.
+    The defaults are the finite-difference baseline of the paper: WENO-Z,
+    positivity-preserving WENO, the fourth-order conservative (corrected
+    flux-based) coupling and no flux-corrected work. The
+    ``ATHENA_SECOND_ORDER`` coupling selects the finite-volume VL2 scheme
+    (the WENO options are then not read).
     """
-    if backend == PALLAS:
-        return {}
-    return dict(backend_config=BackendConfig(backend=NATIVE_JAX))
+
+    self_gravity_version: int = FOURTH_ORDER_CONSERVATIVE
+    weno_z: bool = True
+    positivity_preserving: bool = True
+    work_flux_correction: bool = False
+    time_centred_energy_source: bool = False
+
+    @property
+    def finite_volume(self) -> bool:
+        """Whether the run uses the finite-volume VL2 scheme."""
+        return self.self_gravity_version == ATHENA_SECOND_ORDER
 
 
 def collapse_config(
-    num_cells,
-    self_gravity_version,
-    want_states,
-    backend=PALLAS,
-    solver_mode=FINITE_DIFFERENCE,
-    sink_particles=False
-):
-    """Build the ``SimulationConfig`` for the Evrard collapse.
+    num_cells: int,
+    scheme: CollapseScheme,
+    backend: int = PALLAS,
+    num_snapshots: int = DEFAULT_NUM_SNAPSHOTS,
+    want_states: bool = False,
+    sink_particles: bool = False,
+    fixed_num_timesteps: Optional[int] = None,
+) -> SimulationConfig:
+    """Build the (not yet finalized) ``SimulationConfig`` of the collapse.
 
     Args:
         num_cells: Number of cells per dimension of the cubic grid.
-        self_gravity_version: The self-gravity source-term scheme to use.
-        want_states: Whether the snapshots should also retain the full states
-            (rather than only the energy diagnostics).
-        backend: The compute backend for the finite-difference path.
-        solver_mode: Either ``FINITE_DIFFERENCE`` (the paper default) or
-            ``FINITE_VOLUME`` for the MUSCL-Hancock baseline comparison.
+        scheme: The scheme options.
+        backend: The compute backend (``PALLAS`` or ``NATIVE_JAX``) of the
+            finite-difference scheme; the finite-volume gravity coupling runs
+            natively.
+        num_snapshots: Number of energy (and optionally state) snapshots.
+        want_states: Whether the snapshots also keep the full states.
         sink_particles: Whether sink particle formation should be enabled.
+        fixed_num_timesteps: If given, integrate with this many equal time
+            steps ``dt = t_end / fixed_num_timesteps`` instead of the CFL step.
 
     Returns:
-        The (not yet finalized) ``SimulationConfig`` for the collapse run.
+        The ``SimulationConfig`` of the collapse run.
     """
-    common = dict(
+    periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+    if scheme.finite_volume:
+        solver_options = dict(
+            backend_config=BackendConfig(backend=NATIVE_JAX),
+            solver_mode=FINITE_VOLUME,
+            time_integrator=VL2,
+            riemann_solver=HLLC,
+            positivity_config=PositivityConfig(per_step_mode=POSITIVITY_HARD_FLOOR),
+        )
+    else:
+        solver_options = dict(
+            backend_config=BackendConfig(backend=backend),
+            weno_z=scheme.weno_z,
+            weno_positivity_preserving=scheme.positivity_preserving,
+        )
+    config = SimulationConfig(
+        **solver_options,
         runtime_debugging=False,
         progress_bar=False,
         gravity_config=GravityConfig(
             self_gravity=True,
-            self_gravity_version=self_gravity_version,
+            self_gravity_version=scheme.self_gravity_version,
             poisson_manual_open_boundaries=True,
+            work_flux_correction=scheme.work_flux_correction,
+            time_centred_energy_source=scheme.time_centred_energy_source,
         ),
         mhd=False,
         dimensionality=3,
         box_size=BOX_SIZE,
         num_cells=num_cells,
         differentiation_mode=FORWARDS,
-        boundary_settings=BoundarySettings(
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-        ),
+        boundary_settings=BoundarySettings(periodic, periodic, periodic),
         return_snapshots=True,
+        num_snapshots=num_snapshots,
         snapshot_settings=SnapshotSettings(
             return_states=want_states,
             return_final_state=True,
@@ -124,105 +186,140 @@ def collapse_config(
             return_kinetic_energy=True,
             return_gravitational_energy=True,
         ),
-        num_snapshots=NUM_SNAPSHOTS,
         state_struct=sink_particles,
         sink_particle_config=SinkParticleConfig(sink_particles=sink_particles),
     )
-
-    if solver_mode == FINITE_VOLUME:
-        # Finite-volume MUSCL-Hancock-style scheme (follows the FV baseline in
-        # tests/self_gravity_tests/simulate_collapse_fd.py). The Pallas WENO
-        # kernel is finite-difference only, so FV always runs on native JAX.
-        return SimulationConfig(
-            solver_mode=FINITE_VOLUME,
-            first_order_fallback=False,
-            split=UNSPLIT,
-            limiter=MINMOD,
-            time_integrator=RK2_SSP,
-            riemann_solver=HLLC,
-            backend_config=BackendConfig(backend=NATIVE_JAX),
-            **common,
+    if fixed_num_timesteps is not None:
+        config = config._replace(
+            fixed_timestep=True,
+            num_timesteps=int(fixed_num_timesteps),
         )
+    return config
 
-    return SimulationConfig(
-        **_backend_kwargs(backend),
-        **common,
+
+def collapse_params(
+    t_end: float,
+    courant_number: float = COURANT_NUMBER,
+    minimum_density: float = MINIMUM_DENSITY,
+    minimum_pressure: float = MINIMUM_PRESSURE,
+) -> SimulationParams:
+    """The ``SimulationParams`` of the collapse.
+
+    Args:
+        t_end: The end time of the integration.
+        courant_number: The Courant number of the CFL step (unused by
+            fixed-step runs).
+        minimum_density: The density floor of the admissibility test and the
+            wave-speed estimates.
+        minimum_pressure: The pressure floor of the same.
+
+    Returns:
+        The simulation parameters.
+    """
+    return SimulationParams(
+        t_end=t_end,
+        C_cfl=courant_number,
+        dt_max=jnp.inf,
+        minimum_density=minimum_density,
+        minimum_pressure=minimum_pressure,
+    )
+
+
+def collapse_initial_state(config, params, initial_energy, helper_data, registered_variables):
+    """The Evrard initial condition: ``rho = M / (2 pi R^2 r)`` at rest.
+
+    Args:
+        config: The simulation configuration.
+        params: The simulation parameters (provide the pressure floor).
+        initial_energy: The initial thermal energy per unit mass of the
+            sphere (and of the ambient medium).
+        helper_data: The helper data (provides the cell-centre radius).
+        registered_variables: The registered variables.
+
+    Returns:
+        The primitive initial state.
+    """
+    radius = helper_data.r
+    density = jnp.where(
+        radius <= SPHERE_RADIUS,
+        SPHERE_MASS / (2 * jnp.pi * SPHERE_RADIUS**2 * radius),
+        AMBIENT_DENSITY,
+    )
+    pressure = jnp.maximum((GAMMA - 1) * density * initial_energy, params.minimum_pressure)
+    velocity = jnp.zeros_like(density)
+    return construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=density,
+        velocity_x=velocity,
+        velocity_y=velocity,
+        velocity_z=velocity,
+        gas_pressure=pressure,
     )
 
 
 def run_collapse(
-    num_cells,
-    self_gravity_version,
-    t_end,
-    want_states=False,
-    backend=PALLAS,
-    solver_mode=FINITE_DIFFERENCE,
-    initial_energy=0.05,
-    sink_particles=False,
+    num_cells: int,
+    scheme: CollapseScheme,
+    t_end: float,
+    initial_energy: float = COLD_INITIAL_ENERGY,
+    backend: int = PALLAS,
+    num_snapshots: int = DEFAULT_NUM_SNAPSHOTS,
+    want_states: bool = False,
+    fixed_num_timesteps: Optional[int] = None,
+    courant_number: Optional[float] = None,
+    minimum_density: float = MINIMUM_DENSITY,
+    minimum_pressure: float = MINIMUM_PRESSURE,
+    sink_particles: bool = False,
 ):
     """Run the Evrard collapse.
 
-    ``initial_energy`` is the initial thermal energy per unit mass; the standard
-    cold Evrard test uses 0.05. A warmer value (e.g. 0.20) gives a *milder*
-    collapse that stays finite for the conservative flux schemes down to 32^3.
-
     Args:
         num_cells: Number of cells per dimension of the cubic grid.
-        self_gravity_version: The self-gravity source-term scheme to use.
+        scheme: The scheme options.
         t_end: The end time of the integration.
-        want_states: Whether to retain the full snapshot states.
-        backend: The compute backend for the finite-difference path.
-        solver_mode: Either ``FINITE_DIFFERENCE`` or ``FINITE_VOLUME``.
-        initial_energy: Initial thermal energy per unit mass (0.05 = cold
-            Evrard, 0.20 = warm/mild collapse).
+        initial_energy: Initial thermal energy per unit mass (0.05 = the
+            standard cold Evrard collapse, 0.20 = the mild collapse).
+        backend: The compute backend.
+        num_snapshots: Number of energy (and optionally state) snapshots.
+        want_states: Whether the snapshots also keep the full states.
+        fixed_num_timesteps: If given, the number of equal time steps;
+            otherwise the CFL step with ``courant_number``.
+        courant_number: The Courant number of the CFL step (default:
+            ``COURANT_NUMBER``, or ``FINITE_VOLUME_COURANT_NUMBER`` for the
+            finite-volume scheme).
+        minimum_density: The density floor (see ``collapse_params``).
+        minimum_pressure: The pressure floor (see ``collapse_params``).
         sink_particles: Whether sink particle formation should be enabled.
 
     Returns:
-        ``(snapshots, helper_data, registered_variables)`` for the completed run.
+        ``(snapshots, helper_data, registered_variables)`` of the completed run.
     """
+    if courant_number is None:
+        courant_number = FINITE_VOLUME_COURANT_NUMBER if scheme.finite_volume else COURANT_NUMBER
     config = collapse_config(
         num_cells,
-        self_gravity_version,
-        want_states,
+        scheme,
         backend=backend,
-        solver_mode=solver_mode,
+        num_snapshots=num_snapshots,
+        want_states=want_states,
         sink_particles=sink_particles,
+        fixed_num_timesteps=fixed_num_timesteps,
     )
-
-    params = SimulationParams(
-        t_end=t_end,
-        C_cfl=0.4,
-        dt_max=jnp.inf,
-        minimum_density=1e-5,
-        minimum_pressure=3e-6,
+    params = collapse_params(
+        t_end,
+        courant_number,
+        minimum_density=minimum_density,
+        minimum_pressure=minimum_pressure,
     )
-
     helper_data = get_helper_data(config)
     registered_variables = get_registered_variables(config)
-
-    R = 1.0
-    M = 1.0
-    dx = config.box_size / (config.num_cells - 1)
-
-    rho = jnp.where(
-        helper_data.r <= R, M / (2 * jnp.pi * R**2 * helper_data.r), 1e-4
-    )
-    total_injected_mass = jnp.sum(jnp.where(helper_data.r <= R, rho, 0)) * dx**3
-    print(f"    injected mass: {float(total_injected_mass):.6f}", flush=True)
-
-    v = jnp.zeros_like(rho)
-    e = initial_energy  # initial thermal energy per unit mass (0.05 = cold Evrard)
-    p = (GAMMA - 1) * rho * e
-    p = jnp.where(p < params.minimum_pressure, params.minimum_pressure, p)
-
-    initial_state = construct_primitive_state(
-        config=config,
-        registered_variables=registered_variables,
-        density=rho,
-        velocity_x=v,
-        velocity_y=v,
-        velocity_z=v,
-        gas_pressure=p,
+    initial_state = collapse_initial_state(
+        config,
+        params,
+        initial_energy,
+        helper_data,
+        registered_variables,
     )
     config = finalize_config(config, initial_state.shape)
     initial_state = finalize_state(config, initial_state)
@@ -231,3 +328,16 @@ def run_collapse(
         time_integration(initial_state, config, params, registered_variables)
     )
     return snapshots, helper_data, registered_variables
+
+
+def relative_energy_error(snapshots):
+    """The relative total-energy error ``|E - E_0| / |E_0|`` at every snapshot.
+
+    Args:
+        snapshots: The snapshot data of a collapse run.
+
+    Returns:
+        The relative error per snapshot.
+    """
+    total_energy = snapshots.total_energy
+    return jnp.abs(total_energy - total_energy[0]) / jnp.abs(total_energy[0])

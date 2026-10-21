@@ -81,9 +81,18 @@ instead — see interactive jobs below. Real runs never belong on the login node
 
 ### Batch job template
 
-Adapted from `examples/scripts/multi_gpu/multi_node.sh` — the launch model is
-**one process per GPU**, and the `srun --gpu-bind=none` line is load-bearing
-(see gotcha list below):
+Adapted from `examples/scripts/multi_gpu/multi_node.sh`. The `srun
+--gpu-bind=none` line is load-bearing (see gotcha list below).
+
+**Prefer one process per node driving its four GPUs** over one process per
+GPU for multi-node runs: measured on JUPITER (October 2026), the multi-node
+weak-scaling rungs of both the finite difference and the finite volume solver
+are ~30 % faster per step that way (FD MHD, 8 GPUs: 14.4 s vs 21.1 s), because
+the halo exchange between the GPUs of a node stays inside one process. The
+scaling runners select it with `PROCESS_LAYOUT=node` (the default of
+`sharded_layout` in `pytests/runners/_env.sh`): one task per node, and
+`jax.distributed.initialize(local_device_ids=[0, 1, 2, 3])`. The template
+below shows the older one-process-per-GPU layout, which still works:
 
 ```bash
 #!/bin/bash
@@ -141,7 +150,8 @@ written on HoreKa, but the launch model and every JAX-side fix transfer
 directly; only the site specifics change:
 
 - partition/account: `booster` / `astronomix` (not `accelerated-h100`)
-- GPUs per node: 4 (GH200), so `--ntasks-per-node=4`
+- GPUs per node: 4 (GH200); prefer `--ntasks-per-node=1` with all four
+  GPUs per process (see above), `--ntasks-per-node=4` for one process per GPU
 - there is no separate dev queue — validate with a short-walltime (≤1 h)
   1-node job on `booster` before scaling out
 - architecture: aarch64 — rebuild any env rather than copying one over

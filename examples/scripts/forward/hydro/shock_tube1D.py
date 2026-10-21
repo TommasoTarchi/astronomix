@@ -1,12 +1,22 @@
 """1D Sod shock-tube — paper figure (``shock_tube1D_test.svg``).
 
-Runs the classic Sod shock tube on three solver configurations (finite-volume
-HLLC with the Minmod / Superbee limiters and the finite-difference solver) at
-200 cells, overlays each on a high-resolution analytic reference, and writes
-``figures/shock_tube1D_test.svg`` (density / velocity / pressure with a zoomed
-inset around the contact discontinuity).
+Runs the Sod shock tube at 200 cells with three solver configurations,
 
-The same simulation runs as a fast correctness check in
+    FV (VL2, HLLC)       the finite-volume VL2 scheme (AthenaPK's van Leer
+                         predictor-corrector with PLM and van Leer slopes),
+                         HLLC Riemann solver, C_cfl = 0.5 as AthenaPK's Sod
+    FV (VL2, HLLE)       the same with the HLLE Riemann solver
+    FD (WENO-Z)          the finite-difference scheme with WENO-Z weights at
+                         C_cfl = 0.75 (Sod needs no positivity-preserving WENO)
+
+overlays each on the analytic Riemann solution and writes
+``figures/shock_tube1D_test.svg`` (density / velocity / pressure with a zoomed
+inset around the contact discontinuity). The exact density decreases
+monotonically from left to right, so every rise of the numerical density
+between neighbouring cells is a spurious oscillation; for every configuration
+the script prints the largest such rise and their sum.
+
+The same problem runs as a fast correctness check in
 ``pytests/hydrodynamics/shock_tube1D.py``; this script is the figure generator.
 
     PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/hydro/shock_tube1D.py
@@ -21,20 +31,19 @@ autocvd(num_gpus=1)
 # general
 from pathlib import Path
 
-# jax
-import jax.numpy as jnp
+# numerics
+import numpy as np
 
 # plotting
 import matplotlib.pyplot as plt
 
 # astronomix constants
 from astronomix import (
-    FINITE_DIFFERENCE,
     FINITE_VOLUME,
+    HLL,
     HLLC,
-    MINMOD,
+    VL2,
 )
-from astronomix.option_classes.simulation_config import SUPERBEE
 
 # astronomix containers
 from astronomix import (
@@ -48,7 +57,6 @@ from astronomix import (
     time_integration,
     get_registered_variables,
 )
-from astronomix.option_classes.simulation_config import config_to_string
 from astronomix.plotting_helpers.inset_box import add_inset_box
 from astronomix.test_setups.hydrodynamics.shock_tube1D import (
     setup_sod_shock_tube,
@@ -62,25 +70,57 @@ FIG_DIR.mkdir(exist_ok=True)
 
 NUM_CELLS = 200
 
-# The configurations shown: two finite-volume HLLC runs differing only in their
-# slope limiter, plus the finite-difference solver.
-CONFIG_LIST = [
-    SimulationConfig(
-        solver_mode=FINITE_VOLUME,
-        riemann_solver=HLLC,
-        limiter=MINMOD,
-        num_cells=NUM_CELLS,
+# The configurations shown, as (legend label, configuration, CFL number): the
+# two Riemann solvers of the finite-volume VL2 scheme and the
+# finite-difference scheme. VL2 always reconstructs with the van Leer slope,
+# so the solvers are the finite-volume variants worth comparing.
+RUNS = [
+    (
+        "FV (VL2, HLLC)",
+        SimulationConfig(
+            solver_mode=FINITE_VOLUME,
+            time_integrator=VL2,
+            riemann_solver=HLLC,
+            num_cells=NUM_CELLS,
+        ),
+        0.5,
     ),
-    SimulationConfig(
-        solver_mode=FINITE_VOLUME,
-        riemann_solver=HLLC,
-        limiter=SUPERBEE,
-        num_cells=NUM_CELLS,
+    (
+        "FV (VL2, HLLE)",
+        SimulationConfig(
+            solver_mode=FINITE_VOLUME,
+            time_integrator=VL2,
+            riemann_solver=HLL,
+            num_cells=NUM_CELLS,
+        ),
+        0.5,
     ),
-    SimulationConfig(
-        num_cells=NUM_CELLS,
+    (
+        "FD (WENO-Z)",
+        SimulationConfig(
+            weno_z=True,
+            num_cells=NUM_CELLS,
+        ),
+        0.75,
     ),
 ]
+
+
+def density_rises(density):
+    """
+    Rises of the density between neighbouring cells, which the monotonically
+    decreasing exact Sod density does not have.
+
+    Args:
+        density: The numerical density on the cell centres.
+
+    Returns:
+        A tuple ``(largest_rise, total_rise)``: the largest increase of the
+        density from one cell to its right neighbour and the sum of all
+        increases (both >= 0).
+    """
+    rises = np.maximum(np.diff(density), 0.0)
+    return rises.max(), rises.sum()
 
 
 def run_shock_tube1D():
@@ -150,18 +190,14 @@ def run_shock_tube1D():
     # ============ ↓ Per-configuration run and plot ↓ =============
     # -------------------------------------------------------------
 
-    for config in CONFIG_LIST:
+    for label, config, cfl in RUNS:
         registered_variables = get_registered_variables(config)
         helper_data = get_helper_data(config)
 
-        # Build the initial state. The finite-difference solver tolerates a
-        # larger CFL number than the finite-volume solver here.
         initial_state, config, params = setup_sod_shock_tube(
             config,
             registered_variables,
-            SimulationParams(
-                C_cfl=1.5 if config.solver_mode == FINITE_DIFFERENCE else 0.8,
-            ),
+            SimulationParams(C_cfl=cfl),
             helper_data,
         )
 
@@ -172,20 +208,28 @@ def run_shock_tube1D():
             registered_variables,
         )
 
+        largest_rise, total_rise = density_rises(
+            np.asarray(final_state[registered_variables.density_index])
+        )
+        print(
+            f"{label}: largest density rise between neighbouring cells "
+            f"{largest_rise:.3e}, sum of the rises {total_rise:.3e}"
+        )
+
         ax_density.plot(
             helper_data.geometric_centers,
             final_state[registered_variables.density_index],
-            label=config_to_string(config),
+            label=label,
         )
         ax_velocity.plot(
             helper_data.geometric_centers,
             final_state[registered_variables.velocity_index],
-            label=config_to_string(config),
+            label=label,
         )
         ax_pressure.plot(
             helper_data.geometric_centers,
             final_state[registered_variables.pressure_index],
-            label=config_to_string(config),
+            label=label,
         )
 
     # -------------------------------------------------------------
@@ -193,7 +237,7 @@ def run_shock_tube1D():
     # -------------------------------------------------------------
 
     # A zoomed inset around the contact discontinuity highlights how the
-    # limiters differ where the solutions are hardest to resolve.
+    # schemes differ where the solutions are hardest to resolve.
     add_inset_box(ax_density, x1=0.62, x2=0.72, y1=0.20, y2=0.30, connect_loc1=1)
 
     handles, labels = ax_density.get_legend_handles_labels()

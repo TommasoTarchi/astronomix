@@ -15,7 +15,7 @@
 # (sharded state restore across 8 GPUs; one field gathers to 34 GB of the
 # 480 GB host memory for each spectrum).
 
-source /e/home/jusers/storcks1/jupiter/astronomix/pytests/runners/_env.sh
+source "${ASTRONOMIX_REPO:-/e/home/jusers/storcks1/jupiter/astronomix}/pytests/runners/_env.sh"
 
 N="${N:?set N}"
 CKPT="${CKPT:?set CKPT}"

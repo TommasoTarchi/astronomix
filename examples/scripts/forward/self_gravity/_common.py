@@ -1,36 +1,46 @@
 """Shared helpers for the self-gravity methods-paper figures.
 
-Every script in ``examples/scripts/forward/self_gravity`` imports the scheme definitions,
-consistent labels/styles, the Pallas backend configuration and a couple of
-plotting utilities from here, so the four figures stay visually and
-terminologically consistent.
+Every script in ``examples/scripts/forward/self_gravity`` imports the scheme
+definitions, consistent labels and styles and a couple of plotting utilities
+from here, so the figures stay visually and terminologically consistent.
 
-``astronomix`` is installed non-editably in site-packages, so run the scripts
-with the repo on ``PYTHONPATH`` to pick up this worktree, e.g.
+Run the scripts with the repository on ``PYTHONPATH`` to pick up this checkout,
+e.g.
 
     PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/self_gravity/jeans_convergence.py
 
-Each script caches its simulation output under ``data/`` (``jnp.savez``) and
-regenerates the figure from that cache unless ``--rerun`` is passed, so plots
-can be re-styled without re-running any simulation.
+Each script caches its simulation output under ``data/`` and regenerates the
+figure from that cache unless ``--rerun`` is passed, so plots can be re-styled
+without re-running any simulation.
 """
 
 # general
 from pathlib import Path
 
 # typing
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 # numerics
 import numpy as np
 
 # astronomix constants
-from astronomix import FINITE_DIFFERENCE
+from astronomix import (
+    FINITE_DIFFERENCE,
+    FINITE_VOLUME,
+    HLLC,
+    NATIVE_JAX,
+    PALLAS,
+    VL2,
+)
 from astronomix.option_classes.simulation_config import (
+    ATHENA_SECOND_ORDER,
     FOURTH_ORDER_CONSERVATIVE,
     SECOND_ORDER_CONSERVATIVE,
     SIMPLE_SOURCE,
 )
+
+# astronomix containers
+from astronomix import BackendConfig
 
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
@@ -38,23 +48,27 @@ FIG_DIR = HERE / "figures"
 DATA_DIR.mkdir(exist_ok=True)
 FIG_DIR.mkdir(exist_ok=True)
 
-# --- consistent scheme naming across all gravity figures -------------------
-# These are the three finite-difference self-gravity source-term schemes
-# compared throughout the self-gravity section of the methods paper.
+# These are the three finite-difference self-gravity couplings compared
+# throughout the self-gravity section of the methods paper, named as there,
+# and the second-order finite-volume scheme (VL2) with Athena++'s coupling.
 SCHEME_LABELS = {
-    SIMPLE_SOURCE: "FD, simple source",
-    SECOND_ORDER_CONSERVATIVE: "FD, flux-based source",
-    FOURTH_ORDER_CONSERVATIVE: "FD, corrected flux-based source",
+    SIMPLE_SOURCE: "simple source",
+    SECOND_ORDER_CONSERVATIVE: "flux-based",
+    FOURTH_ORDER_CONSERVATIVE: "flux-based corrected",
+    ATHENA_SECOND_ORDER: "FV (VL2): Athena++ coupling",
 }
 
 
 class Scheme(NamedTuple):
-    """A self-gravity source-term scheme with its consistent plot styling.
+    """A self-gravity coupling with its consistent plot styling.
 
-    ``solver_mode`` defaults to finite difference (the three FD source-term
-    schemes shared by every figure). ``label_override`` lets a figure add a
-    differently-named scheme (e.g. the finite-volume comparison in the Evrard
-    energy plot) without disturbing the shared FD ``SCHEME_LABELS``.
+    ``work_flux_correction`` adds the flux-corrected gravitational work
+    (``GravityConfig.work_flux_correction``) to a conservative coupling.
+    ``positivity_preserving`` marks the "+ PP-WENO" line of the smooth tests,
+    which otherwise run without positivity-preserving WENO; the collapse runs
+    always use it. The ``ATHENA_SECOND_ORDER`` coupling selects the
+    finite-volume VL2 scheme, optionally with the time-centred energy source
+    of Mullen, Hanawa & Gammie (2021) (``time_centred_energy_source``).
     """
 
     self_gravity_version: int
@@ -62,50 +76,153 @@ class Scheme(NamedTuple):
     linestyle: str
     color: str
     linewidth: float = 2.0
-    solver_mode: int = FINITE_DIFFERENCE
-    label_override: Optional[str] = None
+    work_flux_correction: bool = False
+    positivity_preserving: bool = False
+    time_centred_energy_source: bool = False
+
+    @property
+    def finite_volume(self) -> bool:
+        """Whether the scheme is the finite-volume VL2 scheme."""
+        return self.self_gravity_version == ATHENA_SECOND_ORDER
 
     @property
     def label(self) -> str:
-        """The legend label, honouring ``label_override`` when set."""
-        return self.label_override or SCHEME_LABELS[self.self_gravity_version]
+        """The legend label."""
+        label = SCHEME_LABELS[self.self_gravity_version]
+        if self.work_flux_correction:
+            label += " + flux-corrected work"
+        if self.positivity_preserving:
+            label += " + PP-WENO"
+        if self.time_centred_energy_source:
+            label += " + time-centred work"
+        return label
+
+    @property
+    def key(self) -> str:
+        """A unique key of the scheme for the cached data."""
+        key = str(self.self_gravity_version)
+        if self.work_flux_correction:
+            key += "_fct"
+        if self.positivity_preserving:
+            key += "_pp"
+        if self.time_centred_energy_source:
+            key += "_tc"
+        return key
 
 
-# Order and styling shared by all figures. Colours/markers are fixed per
-# scheme so a reader can match curves across the four panels.
-SCHEMES = [
-    Scheme(SIMPLE_SOURCE, marker="o", linestyle=":", color="C0", linewidth=2.5),
-    Scheme(SECOND_ORDER_CONSERVATIVE, marker="s", linestyle="-.", color="C1", linewidth=2.0),
-    Scheme(FOURTH_ORDER_CONSERVATIVE, marker="^", linestyle="--", color="C2", linewidth=2.0),
-]
+# Order and styling shared by all figures. Colours and markers are fixed per
+# scheme so a reader can match curves across the panels.
+SIMPLE_SCHEME = Scheme(SIMPLE_SOURCE, marker="o", linestyle=":", color="C0", linewidth=2.5)
+FLUX_SCHEME = Scheme(SECOND_ORDER_CONSERVATIVE, marker="s", linestyle="-.", color="C1")
+CORRECTED_SCHEME = Scheme(FOURTH_ORDER_CONSERVATIVE, marker="^", linestyle="--", color="C2")
+CORRECTED_FCT_SCHEME = Scheme(
+    FOURTH_ORDER_CONSERVATIVE,
+    marker="v",
+    linestyle="-",
+    color="C3",
+    linewidth=1.5,
+    work_flux_correction=True,
+)
 
-# The scheme the convergence-order fit is reported for.
-FIT_SCHEME_VERSION = FOURTH_ORDER_CONSERVATIVE
+#: The second-order finite-volume scheme (VL2, PLM, HLLC) with Athena++'s
+#: coupling, and with the time-centred energy source of Mullen et al. (2021).
+FINITE_VOLUME_SCHEME = Scheme(
+    ATHENA_SECOND_ORDER,
+    marker="D",
+    linestyle=(0, (3, 1, 1, 1, 1, 1)),
+    color="C4",
+    linewidth=1.8,
+)
+FINITE_VOLUME_TIME_CENTRED_SCHEME = Scheme(
+    ATHENA_SECOND_ORDER,
+    marker="P",
+    linestyle=(0, (8, 3)),
+    color="C5",
+    linewidth=1.8,
+    time_centred_energy_source=True,
+)
+
+#: The three couplings of the smooth tests (Jeans waves, slab advection).
+SCHEMES = [SIMPLE_SCHEME, FLUX_SCHEME, CORRECTED_SCHEME]
+
+#: The smooth tests add the finite-volume scheme.
+SMOOTH_TEST_SCHEMES = SCHEMES + [FINITE_VOLUME_SCHEME]
+
+#: The Courant numbers of the smooth tests: the WENO-Z scheme alone runs at
+#: 1.5; with positivity-preserving WENO the bound of its proof, 0.75.
+SMOOTH_TEST_COURANT_NUMBER = 1.5
+POSITIVITY_PRESERVING_COURANT_NUMBER = 0.75
+
+#: The Courant number of the finite-volume VL2 scheme in 3D, AthenaPK's (and
+#: Athena++'s) value for its 3D tests.
+FINITE_VOLUME_COURANT_NUMBER = 0.3
+
+#: The collapse figures add the flux-corrected work to the corrected coupling.
+COLLAPSE_SCHEMES = [SIMPLE_SCHEME, FLUX_SCHEME, CORRECTED_SCHEME, CORRECTED_FCT_SCHEME]
+CONSERVATIVE_SCHEMES = [FLUX_SCHEME, CORRECTED_SCHEME, CORRECTED_FCT_SCHEME]
+
+#: The 128^3 collapse (energy budget and radial profiles) adds the
+#: finite-volume scheme with both energy sources.
+FINITE_VOLUME_SCHEMES = [FINITE_VOLUME_SCHEME, FINITE_VOLUME_TIME_CENTRED_SCHEME]
+COLLAPSE_COMPARISON_SCHEMES = COLLAPSE_SCHEMES + FINITE_VOLUME_SCHEMES
 
 
-# --- Pallas backend --------------------------------------------------------
-def block_shape_for(dims, cap=8) -> tuple:
-    """Largest power-of-two block (per axis, capped) that divides ``dims``.
-
-    A robust fallback when resolutions are not all multiples of 16 — keeps the
-    Pallas WENO kernel engaged for any grid.
+def solver_options(scheme: Scheme) -> dict:
+    """
+    The ``SimulationConfig`` options that select a scheme's solver: the
+    finite-difference baseline (WENO-Z, Pallas, positivity-preserving WENO as
+    the scheme says) or the finite-volume VL2 scheme (PLM, HLLC; native, as
+    its gravity coupling runs on the native backend only).
 
     Args:
-        dims: The per-axis cell counts of the grid.
-        cap: The maximum block size per axis.
+        scheme: The self-gravity scheme.
 
     Returns:
-        A tuple of per-axis block sizes, each the largest capped power of two
-        that evenly divides the corresponding entry of ``dims``.
+        The keyword arguments for ``SimulationConfig``.
     """
+    if scheme.finite_volume:
+        return dict(
+            backend_config=BackendConfig(backend=NATIVE_JAX),
+            solver_mode=FINITE_VOLUME,
+            time_integrator=VL2,
+            riemann_solver=HLLC,
+        )
+    return dict(
+        backend_config=BackendConfig(backend=PALLAS),
+        solver_mode=FINITE_DIFFERENCE,
+        weno_z=True,
+        weno_positivity_preserving=scheme.positivity_preserving,
+    )
 
-    def largest_power_of_two_divisor(cells):
-        block = 1
-        while block * 2 <= cap and cells % (block * 2) == 0:
-            block *= 2
-        return block
 
-    return tuple(largest_power_of_two_divisor(int(cells)) for cells in dims)
+def gravity_options(scheme: Scheme) -> dict:
+    """
+    The ``GravityConfig`` options of a scheme's coupling. The finite-volume
+    scheme uses Athena++'s Poisson kernel, the discrete Laplacian (it only
+    acts on periodic solves).
+
+    Args:
+        scheme: The self-gravity scheme.
+
+    Returns:
+        The keyword arguments for ``GravityConfig`` (without ``self_gravity``
+        and the boundary options).
+    """
+    return dict(
+        self_gravity_version=scheme.self_gravity_version,
+        work_flux_correction=scheme.work_flux_correction,
+        poisson_discrete_laplacian=scheme.finite_volume,
+        time_centred_energy_source=scheme.time_centred_energy_source,
+    )
+
+
+def smooth_test_courant_number(scheme: Scheme) -> float:
+    """The Courant number of a scheme in the smooth tests."""
+    if scheme.finite_volume:
+        return FINITE_VOLUME_COURANT_NUMBER
+    if scheme.positivity_preserving:
+        return POSITIVITY_PRESERVING_COURANT_NUMBER
+    return SMOOTH_TEST_COURANT_NUMBER
 
 
 # --- analysis helpers ------------------------------------------------------
@@ -140,6 +257,24 @@ def fit_power_law(n, error, floor_factor=3.0):
     n_fit, error_fit = n[mask], error[mask]
     p, log_a = np.polyfit(np.log(n_fit), np.log(error_fit), 1)
     return float(p), float(np.exp(log_a)), n_fit, error_fit
+
+
+def observed_orders(step_sizes, errors):
+    """Observed convergence orders between successive refinements.
+
+    Args:
+        step_sizes: The step sizes (time steps or cell sizes), any order.
+        errors: The error per step size.
+
+    Returns:
+        ``log(e_k / e_{k+1}) / log(h_k / h_{k+1})`` from the coarsest to the
+        finest pair.
+    """
+    step_sizes = np.asarray(step_sizes, dtype=float)
+    errors = np.asarray(errors, dtype=float)
+    order = np.argsort(step_sizes)[::-1]
+    step_sizes, errors = step_sizes[order], errors[order]
+    return np.log(errors[:-1] / errors[1:]) / np.log(step_sizes[:-1] / step_sizes[1:])
 
 
 def apply_paper_style():
@@ -183,3 +318,21 @@ def integer_log_ticks(ax, resolutions, axis="x"):
     else:
         ax.set_yticks(resolutions)
         ax.set_yticklabels([str(r) for r in resolutions])
+
+
+def save_figure(fig, stem, dpi=200, extensions=("svg",)):
+    """Save a figure under ``figures/`` (svg, the format the paper includes,
+    unless more formats are requested).
+
+    Args:
+        fig: The matplotlib figure.
+        stem: The file name without extension.
+        dpi: The resolution of a png and of rasterized layers.
+        extensions: The file formats to write.
+
+    Returns:
+        The path of the svg file.
+    """
+    for extension in extensions:
+        fig.savefig(FIG_DIR / f"{stem}.{extension}", dpi=dpi)
+    return FIG_DIR / f"{stem}.svg"

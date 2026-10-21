@@ -23,7 +23,7 @@ set -euo pipefail
 
 REPO=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 HERE="$REPO/examples/scripts/forward/mhd/turbulence"
-RUN="$REPO/examples/gallery/supernova_showcase/run.sh"
+RUN="$REPO/examples/scripts/run.sh"
 PYTHON=/export/home/lstorcks/.local/share/mamba/envs/astx/bin/python
 TRACK="${1:-all}"
 

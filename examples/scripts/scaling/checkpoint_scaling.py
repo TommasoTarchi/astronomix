@@ -1,23 +1,33 @@
 """
 Checkpoint scaling benchmark.
 
-Sweeps ``num_checkpoints`` for the backwards-differentiable time integration
-and records, for each solver configuration (FV and FD by default):
+Sweeps ``num_checkpoints`` of the reverse-mode (BACKWARDS) time integration
+with adaptive time steps and records, for each solver configuration:
 
-  1. Gradient-pass runtime
-  2. Gradient-pass compiled memory (XLA ``memory_analysis``)
-  3. Theoretical extra forward evaluations from binomial checkpointing,
-     using the actual number of timesteps ``N`` from the simulation.
+  1. the runtime of one gradient evaluation (forward + backward),
+  2. its compiled memory (XLA ``memory_analysis``),
+  3. the theoretical number of recomputed forward steps of optimal binomial
+     checkpointing, for the actual number of time steps N of the run.
 
-The differentiable testbed is the 1D linear acoustic wave from
-``tests/sensitivity/sensitivity.py`` (sine wave initial condition,
-periodic box, gradient of ``J = 0.5 * sum(rho_P^2 + v^2) * dV`` with
-respect to the initial primitive perturbations). The setup is mirrored
-here so the script doesn't depend on the ``tests/sensitivity`` package
-being importable.
+The configurations are the finite-difference WENO-Z solver and the
+finite-volume VL2 scheme (AthenaPK's van Leer integrator, PLM, HLLC), each on
+the native-JAX and the Pallas backend. On the Pallas backend the forward
+steps run the Pallas kernels while the derivatives go through the native-JAX
+tangent (``diffable_pallas_call``), so the backward pass is a native-JAX one.
+
+The differentiable testbed is the 1D linear acoustic wave of
+``examples/scripts/differentiability/sensitivity.py`` (sine-wave density
+perturbation in a periodic box, gradient of
+``J = 0.5 * sum(rho_P^2 + v^2) * dV`` with respect to the initial
+perturbations), mirrored here so the benchmark is self-contained.
+
+Run with ``--plot-only`` to redraw the figure from ``data/astronomix/
+checkpoint_scaling.json``.
 """
 
 # general
+import argparse
+import json
 import math
 import os
 from timeit import default_timer as timer
@@ -48,38 +58,42 @@ import matplotlib.pyplot as plt
 
 # astronomix constants
 from astronomix import (
-    CARTESIAN,
     BACKWARDS,
+    CARTESIAN,
     FINITE_DIFFERENCE,
     FINITE_VOLUME,
     FORWARDS,
+    HLLC,
     NATIVE_JAX,
     PALLAS,
     PERIODIC_BOUNDARY,
+    VL2,
 )
 from astronomix.option_classes.simulation_config import PERIODIC_ROLL
 
 # astronomix containers
 from astronomix import (
+    BackendConfig,
     BoundarySettings1D,
     SimulationConfig,
     SimulationParams,
-    BackendConfig,
 )
 
 # astronomix functions
 from astronomix import (
+    construct_primitive_state,
+    finalize_config,
     get_helper_data,
     get_registered_variables,
     time_integration,
-    construct_primitive_state,
-    finalize_config,
 )
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_HERE, "data", "astronomix")
 FIG_DIR = os.path.join(_HERE, "figures")
+RESULTS_JSON = os.path.join(DATA_DIR, "checkpoint_scaling.json")
+DEFAULT_CHECKPOINT_COUNTS = (2, 4, 8, 14, 22, 32, 50, 80)
 
 
 # -----------------------------------------------------------------------------
@@ -147,19 +161,44 @@ class _Problem(NamedTuple):
         return (self.c_s**2) * self.rho_B / self.gamma
 
 
-def _base_config(problem: _Problem, solver_mode: int, backend: int = NATIVE_JAX):
+class CheckpointSpec(NamedTuple):
+    """A single solver configuration in the checkpoint sweep.
+
+    Attributes:
+        label: The human-readable label used in prints and plot legends.
+        solver_mode: The solver mode (finite-volume or finite-difference).
+        backend: The compute backend (native JAX or Pallas).
+    """
+    label: str
+    solver_mode: int
+    backend: int = NATIVE_JAX
+
+
+DEFAULT_CONFIGURATIONS = (
+    CheckpointSpec("FD WENO-Z (JAX)", FINITE_DIFFERENCE, NATIVE_JAX),
+    CheckpointSpec("FD WENO-Z (Pallas)", FINITE_DIFFERENCE, PALLAS),
+    CheckpointSpec("FV VL2 (JAX)", FINITE_VOLUME, NATIVE_JAX),
+    CheckpointSpec("FV VL2 (Pallas)", FINITE_VOLUME, PALLAS),
+)
+
+
+def _base_config(problem: _Problem, spec: CheckpointSpec):
     """Build the simulation config and params for the linear-wave testbed.
 
     Args:
         problem: The linear acoustic eigenmode specification.
-        solver_mode: The solver mode (finite-volume or finite-difference).
-        backend: The compute backend (native JAX or Pallas).
+        spec: The solver configuration (solver mode and backend).
 
     Returns:
         A ``(config, params)`` tuple for the periodic 1D acoustic problem.
     """
+    if spec.solver_mode == FINITE_VOLUME:
+        scheme_options = dict(time_integrator=VL2, riemann_solver=HLLC)
+    else:
+        scheme_options = dict(weno_z=True)
+
     config = SimulationConfig(
-        solver_mode=solver_mode,
+        solver_mode=spec.solver_mode,
         geometry=CARTESIAN,
         progress_bar=False,
         boundary_handling=PERIODIC_ROLL,
@@ -173,8 +212,12 @@ def _base_config(problem: _Problem, solver_mode: int, backend: int = NATIVE_JAX)
             right_boundary=PERIODIC_BOUNDARY,
         ),
         return_snapshots=False,
-        backend_config=BackendConfig(backend=backend),
+        backend_config=BackendConfig(backend=spec.backend),
+        **scheme_options,
     )
+    # In 1D the finite-difference and the VL2 time steps are both
+    # C_cfl * dx / max(|v| + c_s), so the two solvers take the same number of
+    # adaptive steps and share one recomputation curve.
     params = SimulationParams(
         C_cfl=0.4,
         t_end=problem.t_end,
@@ -201,6 +244,30 @@ def _wave_ic(helper_data, problem: _Problem):
     return rho_P0, v_P0
 
 
+def _initial_state(rho_P0, v_P0, config, registered_variables, problem: _Problem):
+    """Superimpose the perturbations on the uniform background state.
+
+    The pressure perturbation follows the acoustic relation p' = c_s^2 rho'.
+
+    Args:
+        rho_P0: The initial density perturbation.
+        v_P0: The initial velocity perturbation.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+        problem: The linear acoustic eigenmode specification.
+
+    Returns:
+        The primitive initial state.
+    """
+    return construct_primitive_state(
+        config,
+        registered_variables,
+        density=problem.rho_B + rho_P0,
+        velocity_x=v_P0,
+        gas_pressure=problem.P_B + (problem.c_s**2) * rho_P0,
+    )
+
+
 def _forward_and_cost(rho_P0, v_P0, config, params, problem: _Problem):
     """Integrate the wave forward and return the scalar cost ``J``.
 
@@ -216,19 +283,7 @@ def _forward_and_cost(rho_P0, v_P0, config, params, problem: _Problem):
     """
     registered_variables = get_registered_variables(config)
     dV = problem.L / problem.N
-
-    # Superimpose the perturbations on the uniform background state; the
-    # pressure perturbation follows the isothermal-like relation p' = c_s^2 rho'.
-    rho = problem.rho_B + rho_P0
-    p = problem.P_B + (problem.c_s**2) * rho_P0
-
-    initial_state = construct_primitive_state(
-        config,
-        registered_variables,
-        density=rho,
-        velocity_x=v_P0,
-        gas_pressure=p,
-    )
+    initial_state = _initial_state(rho_P0, v_P0, config, registered_variables, problem)
     config_final = finalize_config(config, initial_state.shape)
     final = time_integration(initial_state, config_final, params, registered_variables)
 
@@ -237,22 +292,43 @@ def _forward_and_cost(rho_P0, v_P0, config, params, problem: _Problem):
     return 0.5 * jnp.sum(final_rho_P**2 + final_v**2) * dV
 
 
-# -----------------------------------------------------------------------------
-# Single forward run to discover N (the actual number of timesteps).
-# -----------------------------------------------------------------------------
-def _measure_num_iterations(solver_mode: int, problem: _Problem,
-                            backend: int = NATIVE_JAX) -> int:
-    """Run a single forward integration and return its number of timesteps.
+def _time_call(function, arguments, repeats: int) -> float:
+    """Mean wall time of ``function(*arguments)`` after one warm-up call.
 
     Args:
-        solver_mode: The solver mode (finite-volume or finite-difference).
-        problem: The linear acoustic eigenmode specification.
-        backend: The compute backend (native JAX or Pallas).
+        function: The compiled function.
+        arguments: The tuple of its arguments.
+        repeats: The number of timed calls.
 
     Returns:
-        The number of adaptive timesteps ``N`` taken by the forward run.
+        The mean runtime in seconds.
     """
-    config, params = _base_config(problem, solver_mode, backend)
+    jax.block_until_ready(function(*arguments))
+    times = []
+    for _ in range(repeats):
+        start_time = timer()
+        jax.block_until_ready(function(*arguments))
+        times.append(timer() - start_time)
+    return float(np.mean(times))
+
+
+# -----------------------------------------------------------------------------
+# Single forward run: the actual number of timesteps N and the forward runtime.
+# -----------------------------------------------------------------------------
+def _measure_forward(spec: CheckpointSpec, problem: _Problem, repeats: int):
+    """Run the forward integration, return its step count and runtime.
+
+    Args:
+        spec: The solver configuration.
+        problem: The linear acoustic eigenmode specification.
+        repeats: The number of timed forward runs to average over.
+
+    Returns:
+        A ``(num_iterations, mean_runtime_s)`` tuple of the plain
+        (non-differentiated, FORWARDS-mode) forward run.
+    """
+    jax.clear_caches()
+    config, params = _base_config(problem, spec)
     config = config._replace(
         differentiation_mode=FORWARDS,
         return_snapshots=True,
@@ -261,46 +337,35 @@ def _measure_num_iterations(solver_mode: int, problem: _Problem,
     helper_data = get_helper_data(config)
     registered_variables = get_registered_variables(config)
     rho_P0, v_P0 = _wave_ic(helper_data, problem)
-
-    rho = problem.rho_B + rho_P0
-    p = problem.P_B + (problem.c_s**2) * rho_P0
-    initial_state = construct_primitive_state(
-        config,
-        registered_variables,
-        density=rho,
-        velocity_x=v_P0,
-        gas_pressure=p,
-    )
+    initial_state = _initial_state(rho_P0, v_P0, config, registered_variables, problem)
     config = finalize_config(config, initial_state.shape)
-    result = time_integration(initial_state, config, params, registered_variables)
-    return int(result.num_iterations)
+
+    forward = jax.jit(lambda state: time_integration(state, config, params, registered_variables))
+    num_iterations = int(forward(initial_state).num_iterations)
+    runtime = _time_call(forward, (initial_state,), repeats)
+    return num_iterations, runtime
 
 
 # -----------------------------------------------------------------------------
 # Per-(config, c) gradient measurement.
 # -----------------------------------------------------------------------------
-def _measure_grad(
-    solver_mode: int, problem: _Problem, num_checkpoints: int, repeats: int,
-    backend: int = NATIVE_JAX,
-):
+def _measure_grad(spec: CheckpointSpec, problem: _Problem, num_checkpoints: int, repeats: int):
     """Measure the compiled memory and runtime of one gradient pass.
 
     Args:
-        solver_mode: The solver mode (finite-volume or finite-difference).
+        spec: The solver configuration.
         problem: The linear acoustic eigenmode specification.
         num_checkpoints: The number of binomial checkpoints for the backward
             pass.
         repeats: The number of timed gradient evaluations to average over.
-        backend: The compute backend (native JAX or Pallas).
 
     Returns:
         A ``(memory_MB, mean_runtime_s)`` tuple for the gradient pass.
     """
-    # Alternating sharded/unsharded JIT calls across the sweep can leave stale
-    # cached lowerings behind, so clear the caches at the start of every
-    # measurement to keep each configuration independent.
+    # Clear the caches so that every configuration is compiled and measured
+    # independently of the previous ones.
     jax.clear_caches()
-    config, params = _base_config(problem, solver_mode, backend)
+    config, params = _base_config(problem, spec)
     config = config._replace(
         differentiation_mode=BACKWARDS,
         num_checkpoints=num_checkpoints,
@@ -315,8 +380,7 @@ def _measure_grad(
 
     # Compile first and read the compiled memory footprint before timing, so the
     # reported memory reflects the same executable that the timed runs use.
-    lowered = grad_fn.lower(rho_P0, v_P0)
-    compiled = lowered.compile()
+    compiled = grad_fn.lower(rho_P0, v_P0).compile()
     stats = compiled.memory_analysis()
     if stats is not None:
         total_bytes = (
@@ -329,48 +393,13 @@ def _measure_grad(
         total_bytes = 0
     memory_MB = total_bytes / (1024**2)
 
-    # One warm-up call to exclude dispatch/allocation overhead from the timings.
-    out = grad_fn(rho_P0, v_P0)
-    jax.block_until_ready(out)
-
-    times = []
-    for _ in range(repeats):
-        start_time = timer()
-        out = grad_fn(rho_P0, v_P0)
-        jax.block_until_ready(out)
-        end_time = timer()
-        times.append(end_time - start_time)
-    return memory_MB, float(np.mean(times))
+    runtime = _time_call(compiled, (rho_P0, v_P0), repeats)
+    return memory_MB, runtime
 
 
 # -----------------------------------------------------------------------------
 # Sweep + plotting.
 # -----------------------------------------------------------------------------
-class CheckpointSpec(NamedTuple):
-    """A single solver configuration in the checkpoint sweep.
-
-    Attributes:
-        label: The human-readable label used in prints and plot legends.
-        solver_mode: The solver mode (finite-volume or finite-difference).
-        backend: The compute backend (native JAX or Pallas).
-    """
-    label: str
-    solver_mode: int
-    backend: int = NATIVE_JAX
-
-
-# Compare backends on the backward (reverse-mode AD) pass.  In BACKWARDS mode
-# the FD hydro WENO flux routes its backward through the native Pallas adjoint
-# kernel (see astronomix/_pallas_helpers.pallas_vjp_call), so FD (Pallas) runs
-# the whole reverse pass on the GPU instead of the slow native VJP.  FV (Pallas)
-# is left out of the comparison (the FV evolve backward is not the focus here).
-DEFAULT_CONFIGURATIONS = (
-    CheckpointSpec("FD (JAX)", FINITE_DIFFERENCE, NATIVE_JAX),
-    CheckpointSpec("FD (Pallas)", FINITE_DIFFERENCE, PALLAS),
-    CheckpointSpec("FV (JAX)", FINITE_VOLUME, NATIVE_JAX),
-)
-
-
 def run_sweep(
     checkpoint_counts,
     problem: _Problem = _Problem(),
@@ -383,37 +412,49 @@ def run_sweep(
         checkpoint_counts: The checkpoint counts ``c`` to sweep over.
         problem: The linear acoustic eigenmode specification.
         configurations: The solver configurations to benchmark.
-        repeats: The number of timed gradient evaluations to average over.
+        repeats: The number of timed evaluations to average over.
 
     Returns:
         A dict mapping each configuration label to its recorded forward step
-        count, checkpoint counts, runtimes and memory footprints.
+        count, forward runtime, checkpoint counts, gradient runtimes and
+        memory footprints.
     """
     results = {}
     for spec in configurations:
-        print(f"\n=== {spec.label} (solver_mode={spec.solver_mode}, "
-              f"backend={spec.backend}) ===")
-        N_iters = _measure_num_iterations(spec.solver_mode, problem, spec.backend)
-        print(f"[{spec.label}] forward N = {N_iters} timesteps")
+        print(f"\n=== {spec.label} (solver_mode={spec.solver_mode}, backend={spec.backend}) ===")
+        N_iters, forward_runtime = _measure_forward(spec, problem, repeats)
+        print(f"[{spec.label}] forward N = {N_iters} timesteps, forward runtime = {forward_runtime:.4f}s")
         runtime_list, memory_list = [], []
         for c in checkpoint_counts:
-            memory, runtime = _measure_grad(
-                spec.solver_mode,
-                problem,
-                int(c),
-                repeats=repeats,
-                backend=spec.backend,
-            )
+            memory, runtime = _measure_grad(spec, problem, int(c), repeats)
             print(f"[{spec.label}] c={int(c):3d}: memory={memory:8.2f} MB, runtime={runtime:6.3f}s")
             runtime_list.append(runtime)
             memory_list.append(memory)
         results[spec.label] = dict(
             N_iters=N_iters,
+            forward_runtime_s=forward_runtime,
             checkpoints=list(map(int, checkpoint_counts)),
             runtime_s=runtime_list,
             memory_MB=memory_list,
         )
     return results
+
+
+def _curve_style(label):
+    """Backend colours shared with the other paper figures.
+
+    FD (JAX) light blue, FD (Pallas) violet, FV (JAX) orange, FV (Pallas)
+    brown; the JAX variants thick solid with dots, the Pallas variants thinner
+    dashed with crosses on top, so that both stay visible where they overlap.
+    """
+    is_pallas = "Pallas" in label
+    if label.startswith("FD"):
+        color = "darkviolet" if is_pallas else "cornflowerblue"
+    else:
+        color = "saddlebrown" if is_pallas else "tab:orange"
+    if is_pallas:
+        return dict(color=color, linestyle="--", linewidth=1.8, marker="x", markersize=7, zorder=3)
+    return dict(color=color, linestyle="-", linewidth=3.0, marker="o", markersize=6, zorder=2)
 
 
 def plot_results(results, figure_path):
@@ -429,38 +470,6 @@ def plot_results(results, figure_path):
     # -------------------------------------------------------------
     # ============== ↓ Measured runtime and memory ↓ ==============
     # -------------------------------------------------------------
-
-    # Consistent backend colours across all figures: FD (JAX) light blue,
-    # FD (Pallas) violet, FV (JAX) orange.  FD (JAX) is a thick solid line / 'o',
-    # FD (Pallas) a thinner dashed line / 'x' drawn on top, so the two FD curves
-    # stay clearly distinguishable where they overlap.
-    def _curve_style(label):
-        if label.startswith("FD"):
-            if "Pallas" in label:
-                return dict(
-                    color="darkviolet",
-                    linestyle="--",
-                    linewidth=1.8,
-                    marker="x",
-                    markersize=7,
-                    zorder=3,
-                )
-            return dict(
-                color="cornflowerblue",
-                linestyle="-",
-                linewidth=3.0,
-                marker="o",
-                markersize=6,
-                zorder=2,
-            )
-        return dict(
-            color="tab:orange",
-            linestyle="-",
-            linewidth=2.2,
-            marker="o",
-            markersize=6,
-            zorder=2,
-        )
 
     c_max_global = 0
     for label, data in results.items():
@@ -478,29 +487,24 @@ def plot_results(results, figure_path):
     # =========== ↓ Theoretical recomputation curve ↓ =============
     # -------------------------------------------------------------
 
-    # The theoretical recomputation curve assumes a single forward length N;
-    # every configuration must therefore agree on the number of forward steps.
-    N_values = {data["N_iters"] for data in results.values()}
-    if len(N_values) != 1:
-        raise ValueError(
-            f"Expected a single forward N across configurations, got {N_values}. "
-            "The theoretical recomputation curve assumes one N."
-        )
-    N = N_values.pop()
-
+    # One recomputation curve per distinct forward length N (the solvers
+    # normally share one; a differing N gets its own, labelled curve).
+    N_values = sorted({data["N_iters"] for data in results.values()})
     c_grid = np.arange(1, c_max_global + 1)
-    recomp = np.array([recomputations(int(c), N) for c in c_grid])
-    ax_recomp.plot(
-        c_grid,
-        recomp,
-        marker="o",
-        markersize=3,
-        linewidth=1.5,
-        label="minimal recomputations",
-    )
+    for N in N_values:
+        recomp = np.array([recomputations(int(c), N) for c in c_grid])
+        ax_recomp.plot(
+            c_grid,
+            recomp,
+            marker="o",
+            markersize=3,
+            linewidth=1.5,
+            label="minimal recomputations" + (f" (N = {N})" if len(N_values) > 1 else ""),
+        )
 
     # Mark where the repetition number drops to r <= 3 and r <= 2, the regimes
     # where binomial checkpointing becomes cheap.
+    N = N_values[0]
     c_r3 = _repetition_threshold(N, 3, c_max_global)
     c_r2 = _repetition_threshold(N, 2, c_max_global)
     if c_r3 is not None:
@@ -536,7 +540,9 @@ def plot_results(results, figure_path):
     ax_recomp.set_yscale("log")
     ax_recomp.set_xlabel("number of checkpoints c")
     ax_recomp.set_ylabel("extra forward steps / recomputations")
-    ax_recomp.set_title(f"Checkpointing recomputation cost for N = {N}")
+    ax_recomp.set_title(
+        f"Checkpointing recomputation cost for N = {', '.join(str(value) for value in N_values)}"
+    )
     ax_recomp.grid(True, which="both", linewidth=0.5, alpha=0.5)
     ax_recomp.legend()
 
@@ -565,19 +571,58 @@ def _flatten_for_npz(results):
     return flat
 
 
-def run_checkpoint_scaling():
-    """Run the checkpoint sweep, plot the results and save the raw data."""
+def _print_backend_ratios(results):
+    """Print the Pallas-over-JAX ratios of runtime and memory per solver.
+
+    Args:
+        results: The per-configuration results dict from :func:`run_sweep`.
+    """
+    for solver_prefix in ("FD WENO-Z", "FV VL2"):
+        jax_label, pallas_label = f"{solver_prefix} (JAX)", f"{solver_prefix} (Pallas)"
+        if jax_label not in results or pallas_label not in results:
+            continue
+        runtime_ratio = np.array(results[jax_label]["runtime_s"]) / np.array(results[pallas_label]["runtime_s"])
+        memory_ratio = np.array(results[jax_label]["memory_MB"]) / np.array(results[pallas_label]["memory_MB"])
+        forward_ratio = results[jax_label]["forward_runtime_s"] / results[pallas_label]["forward_runtime_s"]
+        print(
+            f"{solver_prefix}: JAX / Pallas gradient runtime {runtime_ratio.min():.2f} - {runtime_ratio.max():.2f}, "
+            f"memory {memory_ratio.min():.2f} - {memory_ratio.max():.2f}, forward runtime {forward_ratio:.2f}"
+        )
+    for label, data in results.items():
+        gradient_over_forward = np.array(data["runtime_s"]) / data["forward_runtime_s"]
+        print(
+            f"{label}: gradient / forward runtime {gradient_over_forward.min():.1f} - "
+            f"{gradient_over_forward.max():.1f}"
+        )
+
+
+def run_checkpoint_scaling(checkpoint_counts=DEFAULT_CHECKPOINT_COUNTS, plot_only=False):
+    """Run the checkpoint sweep, plot the results and save the raw data.
+
+    Args:
+        checkpoint_counts: The checkpoint counts ``c`` to sweep over.
+        plot_only: Redraw the figure from the saved JSON instead of measuring.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(FIG_DIR, exist_ok=True)
-    problem = _Problem()
-    checkpoint_counts = (2, 4, 8, 14, 22, 32, 50, 80)
-    results = run_sweep(checkpoint_counts, problem=problem)
+    if plot_only:
+        with open(RESULTS_JSON) as results_file:
+            results = json.load(results_file)
+    else:
+        results = run_sweep(checkpoint_counts, problem=_Problem())
+        with open(RESULTS_JSON, "w") as results_file:
+            json.dump(results, results_file, indent=1)
+        np.savez(
+            os.path.join(DATA_DIR, "checkpoint_scaling.npz"),
+            **_flatten_for_npz(results),
+        )
+    _print_backend_ratios(results)
     plot_results(results, os.path.join(FIG_DIR, "checkpoint_scaling.svg"))
-    np.savez(
-        os.path.join(DATA_DIR, "checkpoint_scaling.npz"),
-        **_flatten_for_npz(results),
-    )
 
 
 if __name__ == "__main__":
-    run_checkpoint_scaling()
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--checkpoints", type=int, nargs="+", default=list(DEFAULT_CHECKPOINT_COUNTS))
+    parser.add_argument("--plot-only", action="store_true", help="redraw the figure from the saved JSON")
+    args = parser.parse_args()
+    run_checkpoint_scaling(tuple(args.checkpoints), plot_only=args.plot_only)

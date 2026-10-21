@@ -1,7 +1,8 @@
 """Numerical diffusivities, Prandtl and Reynolds numbers, per scheme and resolution.
 
-One table, one definition, every scheme in the ladder. Everything comes from the
-spectral energy budget of the saturated state, shell by shell,
+One table, one definition, every scheme in the ladder -- AthenaPK's GLM schemes
+and astronomix's finite-difference (WENO + CT) and finite-volume (VL2 + GLM)
+schemes alike. Everything comes from the spectral energy budget, shell by shell,
 
     dE(n)/dt = T(n) - D(n)
 
@@ -24,8 +25,16 @@ implied by the measured ``nu`` lies beyond the grid, a Laplacian reading of that
 fits measured against imposed: the estimator is only worth its numbers if that
 line has slope one.
 
+A GLM run of astronomix's VL2 scheme also carries the cleaning transfer
+``T_psi`` (``_mhd_spectral.glm_cleaning_transfer``); the tables then report
+``eta_psi``, the part of the measured ``eta_eff`` that is the divergence
+cleaning, so the budget's attribution of the cleaning sink to the numerical
+resistivity is measured rather than assumed.
+
     python make_mechanism_table.py --audit
     python make_mechanism_table.py --calibration
+    python make_mechanism_table.py --data data/fd_fv --summary \
+        --reference "astronomix FD WENO-Z+CT"     # astronomix FD against FV
 """
 
 # general
@@ -38,7 +47,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _mhd_metrics import N_INJECTION, dissipation_shell, load_runs
-from make_dissipation_figure import dissipation_series
+from make_dissipation_figure import T_PSI, dissipation_series
 
 HERE = Path(__file__).resolve().parent
 
@@ -128,6 +137,7 @@ def measure(run, band=BAND, sat_start=SAT_START, snapshots=None):
     E_v, E_B = ser["E_v"][sel].mean(0), ser["E_B"][sel].mean(0)
     nu = float(np.mean(D_v[inband] / (2.0 * k[inband] ** 2 * E_v[inband])))
     eta = float(np.mean(D_B[inband] / (2.0 * k[inband] ** 2 * E_B[inband])))
+    eta_psi = cleaning_resistivity(ser, sel, k, inband)
 
     v_rms = float(np.asarray(run["v_rms"])[sel].mean())
     # Longitudinal integral scale of isotropic turbulence, (3 pi / 4) times the
@@ -144,7 +154,7 @@ def measure(run, band=BAND, sat_start=SAT_START, snapshots=None):
         **dissipation_shells(n, D_v, D_B),
         N=N, label=str(run["label"]), code=str(run["code"]),
         scheme=str(run.get("scheme_key", "-")),
-        nu=nu, eta=eta, Pm=nu / eta,
+        nu=nu, eta=eta, Pm=nu / eta, eta_psi=eta_psi,
         Re=v_rms * L_INJ / nu, Rm=v_rms * L_INJ / eta,
         L_spec=L_spec,
         Re_L=v_rms * L_spec / nu, Rm_L=v_rms * L_spec / eta,
@@ -179,7 +189,33 @@ def measure(run, band=BAND, sat_start=SAT_START, snapshots=None):
                        / (0.5 * float(np.mean(np.asarray(run["v_rms"])[sel] ** 2)))),
         ohm_diff=float(run["ohm_diff"]) if "ohm_diff" in run else 0.0,
         mom_diff=float(run["mom_diff"]) if "mom_diff" in run else 0.0,
+        path=str(run["path"]),
     )
+
+
+def cleaning_resistivity(series, snapshots, wavenumber, inband):
+    """The part of ``eta_eff`` that is the GLM divergence cleaning.
+
+    ``D_B`` of a GLM run is everything its induction discretisation removes,
+    the cleaning sink ``-T_psi`` included. Read through the same Laplacian band
+    mean as ``eta_eff``, that sink is ``eta_psi = <-T_psi / (2 k^2 E_B)>``.
+
+    Args:
+        series: The output of ``dissipation_series``.
+        snapshots: Indices of the snapshots to average over.
+        wavenumber: ``k = 2 pi n`` per shell.
+        inband: Mask of the shells in the band.
+
+    Returns:
+        ``eta_psi``, or NaN for a run without the cleaning transfer (CT, or a
+        GLM run of AthenaPK, which does not record it).
+    """
+    if series.get("T_psi") is None:
+        return np.nan
+    cleaning_sink = -series["T_psi"][snapshots].mean(0)
+    magnetic_spectrum = series["E_B"][snapshots].mean(0)
+    return float(np.mean(cleaning_sink[inband]
+                         / (2.0 * wavenumber[inband] ** 2 * magnetic_spectrum[inband])))
 
 
 def measure_in_window(run, window=FIXED_WINDOW, band=BAND):
@@ -194,27 +230,48 @@ def measure_in_window(run, window=FIXED_WINDOW, band=BAND):
     return measure(run, band=band, snapshots=sel)
 
 
+def matched_snapshots(series, ratio=MATCH_RATIO, window=MATCH_WINDOW, t_min=2.0):
+    """Indices of the ``window`` snapshots centred where ``E_B/E_K`` first
+    reaches ``ratio`` (after ``t_min`` crossing times), or ``None``.
+
+    Symmetric about the crossing, so the window mean is not biased upward by
+    the growth and does not depend on which side the snapshot cadence lands.
+
+    Args:
+        series: The output of ``dissipation_series``.
+        ratio: The matched magnetic energy fraction.
+        window: Number of snapshots averaged.
+        t_min: Earliest admitted crossing time, so the window cannot land in
+            the spin-up.
+
+    Returns:
+        The snapshot indices, or ``None`` when the run never gets there or the
+        window would leave the run.
+    """
+    tc, r = series["t_over_tc"], series["ratio"]
+    hits = np.where((tc >= t_min) & (r >= ratio))[0]
+    if len(hits) == 0:
+        return None
+    lo = hits[0] - window // 2
+    if lo < 1 or lo + window > len(tc):
+        return None
+    return np.arange(lo, lo + window)
+
+
 def measure_at_ratio(run, ratio=MATCH_RATIO, window=MATCH_WINDOW,
                      t_min=2.0, band=BAND):
     """The diffusivities where ``E_B/E_K`` first reaches ``ratio``.
 
     The comparison point every scheme can be brought to, unlike the saturated
-    state. Snapshots before ``t_min`` crossing times are excluded so the
-    measurement cannot land in the spin-up.
+    state (see :func:`matched_snapshots` for the window).
     """
     ser = dissipation_series(run, deconvolve=False)
     if ser is None:
         return None
     tc, r = ser["t_over_tc"], ser["ratio"]
-    hits = np.where((tc >= t_min) & (r >= ratio))[0]
-    if len(hits) == 0:
+    sel = matched_snapshots(ser, ratio=ratio, window=window, t_min=t_min)
+    if sel is None:
         return None
-    # Symmetric about the crossing, so the window mean is not biased upward by
-    # the growth and does not depend on which side the snapshot cadence lands.
-    lo = hits[0] - window // 2
-    if lo < 1 or lo + window > len(tc):
-        return None
-    sel = np.arange(lo, lo + window)
 
     N = int(run["N"])
     n = ser["n"]
@@ -228,7 +285,9 @@ def measure_at_ratio(run, ratio=MATCH_RATIO, window=MATCH_WINDOW,
     keep = n >= 1
     L_spec = float((3.0 * np.pi / 4.0) * np.sum(E_v[keep] / k[keep])
                    / np.sum(E_v[keep]))
-    return dict(nu=nu, eta=eta, Pm=nu / eta, Re=v_rms * L_INJ / nu,
+    return dict(nu=nu, eta=eta, Pm=nu / eta,
+                eta_psi=cleaning_resistivity(ser, sel, k, b),
+                Re=v_rms * L_INJ / nu,
                 Rm=v_rms * L_INJ / eta, L_spec=L_spec,
                 Re_L=v_rms * L_spec / nu, Rm_L=v_rms * L_spec / eta,
                 t_over_tc=float(tc[sel].mean()), ratio=float(r[sel].mean()),
@@ -265,19 +324,52 @@ def bootstrap(run, n_resample=400, seed=0, block=BLOCK, **kw):
 BAND_VARIANTS = ((0.1, 0.3), (0.2, 0.4), (0.3, 0.6), (0.15, 0.6), (0.2, 0.7))
 
 
-def systematic(run, **kw):
-    """Spread of ``Pm`` over the defensible band and window choices."""
+def systematic(run, quantity="Pm", **kw):
+    """Spread of ``Pm`` (or ``quantity``) over the defensible band and window
+    choices: half the range of the values they give."""
     variants = [dict(band=b) for b in BAND_VARIANTS] + [dict(sat_start=24.0),
                                                         dict(sat_start=32.0)]
-    vals = [measure(run, **{**kw, **v})["Pm"] for v in variants]
+    vals = [measure(run, **{**kw, **v})[quantity] for v in variants]
     return float(np.max(vals) - np.min(vals)) / 2.0
+
+
+def total_errors(run, sat_start=SAT_START):
+    """Absolute uncertainties of ``(nu, eta, Pm)``: the moving-block bootstrap
+    and the band-and-window systematic, added in quadrature.
+
+    The convention of the ``Pm`` error bars of the earlier study, extended to
+    the two diffusivities so ``Re`` and ``Rm`` can carry error bars too.
+
+    Args:
+        run: A run file (as loaded by ``load_runs``).
+        sat_start: Start of the saturated window the bootstrap resamples.
+
+    Returns:
+        ``{"nu": ..., "eta": ..., "Pm": ...}``.
+    """
+    statistical = bootstrap(run, sat_start=sat_start)
+    return {quantity: float(np.hypot(statistical[quantity],
+                                     systematic(run, quantity, sat_start=sat_start)))
+            for quantity in ("nu", "eta", "Pm")}
 # -------------------------------------------------------------
 # ================== ↑ The measurement ↑ ======================
 # -------------------------------------------------------------
 
 
-ORDER = {"astronomix": 5, "plm": 2, "ppm": 3, "limo3": 3, "wenoz": 5}
-DIVB = {"astronomix": "CT"}
+#: Formal order of the reconstruction per AthenaPK scheme key.
+ATHENAPK_ORDER = {"plm": 2, "ppm": 3, "limo3": 3, "wenoz": 5}
+
+
+def order_and_divergence_treatment(code, scheme_key):
+    """``(order, div B treatment)`` of a scheme, for the table rows.
+
+    astronomix has two MHD schemes: the 5th-order finite-difference WENO with
+    constrained transport (every FD key) and the 2nd-order VL2 finite-volume
+    scheme with GLM cleaning (``vl2``). Every AthenaPK scheme cleans with GLM.
+    """
+    if code == "astronomix":
+        return (2, "GLM") if scheme_key == "vl2" else (5, "CT")
+    return ATHENAPK_ORDER.get(scheme_key, 0), "GLM"
 
 
 def collect(dirs, sat_start=SAT_START):
@@ -288,9 +380,7 @@ def collect(dirs, sat_start=SAT_START):
             m = measure(run, sat_start=sat_start)
             if m is None:
                 continue
-            m["order"] = ORDER.get(m["scheme"] if m["code"] == "athenapk"
-                                   else "astronomix", 0)
-            m["divb"] = DIVB.get(m["code"], "GLM")
+            m["order"], m["divb"] = order_and_divergence_treatment(m["code"], m["scheme"])
             rows.append(m)
     return sorted(rows, key=lambda r: (r["order"], r["divb"], r["N"]))
 
@@ -322,8 +412,15 @@ def main():
     p.add_argument("--ratios", nargs="*", type=float,
                    default=(0.003, 0.01, 0.03, 0.06, 0.10),
                    help="the E_B/E_K values --matched reports at")
-    p.add_argument("--out", default=str(HERE / "data" / "mechanism.md"))
+    p.add_argument("--reference", default=REFERENCE,
+                   help="label of the scheme --accounting compares the others "
+                        "against")
+    p.add_argument("--out", default=None,
+                   help="markdown table to write; default mechanism.md in the "
+                        "first --data directory")
     args = p.parse_args()
+    if args.out is None:
+        args.out = str(Path(args.data[0]) / "mechanism.md")
 
     if args.calibration:
         return calibration(HERE / "data" / "calibration", args.sat_start)
@@ -335,7 +432,7 @@ def main():
     if args.summary:
         return summary(rows, args)
     if args.accounting:
-        return accounting(rows)
+        return accounting(rows, args.reference)
     if args.collapse:
         return collapse(rows)
     if args.matched:
@@ -373,19 +470,21 @@ _CACHE = {}
 
 
 def _index(dirs):
-    """Index every run in ``dirs`` by ``(code, scheme, N)`` for :func:`_reload`."""
+    """Index every run in ``dirs`` by its file path for :func:`_reload`.
+
+    The path, not ``(code, scheme, N)``: two runs of one scheme at one
+    resolution (a control next to the production run) must stay apart.
+    """
     for d in dirs:
         for run in load_runs(d, skip=("smoke", "calib")):
-            _CACHE[(str(run["code"]), str(run.get("scheme_key", "-")),
-                    int(run["N"]))] = run
+            _CACHE[str(run["path"])] = run
 
 
 def _reload(r):
     """Re-open the run file a row came from (rows carry no arrays)."""
-    key = (r["code"], r["scheme"], r["N"])
-    if key not in _CACHE:
-        _index([HERE / "data" / "dissipation", HERE / "data" / "dissipation_mech"])
-    return _CACHE[key]
+    if r["path"] not in _CACHE:
+        _index([Path(r["path"]).parent])
+    return _CACHE[r["path"]]
 
 
 def matched(rows, args):
@@ -442,7 +541,53 @@ def growth(run, band=COLLAPSE_BAND, t_min=2.0, with_count=False):
 #: cadence was too coarse to fit.
 COLLAPSE_C = 0.0198
 
-REFERENCE = "astronomix WENO5+CT"
+#: Default reference scheme of ``--accounting``: astronomix's FD scheme.
+REFERENCE = "astronomix FD WENO-Z+CT"
+
+
+def summary_rows(rows, sat_start=SAT_START):
+    """The numbers of the ``--summary`` table, one dict per run.
+
+    Shared with the figure scripts, so the table and the figures cannot drift
+    apart. Everything is measured at matched ``E_B/E_K`` (see
+    :data:`MATCH_RATIO`); the errors are :func:`total_errors`, propagated to
+    ``Re`` and ``Rm`` through their relative size; the growth rate is fitted
+    over :data:`COLLAPSE_BAND`, on the dense scalar history where a run has one
+    (``.hst`` for AthenaPK, the scalar snapshots of ``dynamo_convergence.py``)
+    and on the spectral snapshots otherwise.
+
+    Args:
+        rows: The rows of :func:`collect`.
+        sat_start: Start of the saturated window the errors are estimated in.
+
+    Returns:
+        A list of dicts, in the order of ``rows``; runs that never reach the
+        matched state are left out.
+    """
+    table = []
+    for r in rows:
+        run = _reload(r)
+        m = measure_at_ratio(run)
+        if m is None:
+            continue
+        errors = total_errors(run, sat_start=sat_start)
+        gamma_history, points_history = growth_from_history(run)
+        gamma_snapshots, points_snapshots = growth(run, with_count=True)
+        table.append(dict(
+            label=r["label"], scheme=r["scheme"], order=r["order"], divb=r["divb"],
+            N=r["N"], path=r["path"],
+            nu=m["nu"], eta=m["eta"], Pm=m["Pm"], Re=m["Re"], Rm=m["Rm"],
+            nu_err=errors["nu"], eta_err=errors["eta"], Pm_err=errors["Pm"],
+            Re_err=m["Re"] * errors["nu"] / r["nu"],
+            Rm_err=m["Rm"] * errors["eta"] / r["eta"],
+            L_spec=m["L_spec"], Re_L=m["Re_L"], Rm_L=m["Rm_L"],
+            eta_psi=m["eta_psi"], mach=m["mach"], t_over_tc=m["t_over_tc"],
+            resolvedness=r["n_kolmogorov"] / r["n_nyquist"],
+            gamma=gamma_history if np.isfinite(gamma_history) else gamma_snapshots,
+            gamma_points=points_history if np.isfinite(gamma_history) else points_snapshots,
+            gamma_snapshots=gamma_snapshots,
+        ))
+    return table
 
 
 def summary(rows, args):
@@ -455,45 +600,61 @@ def summary(rows, args):
     over every defensible band and window. ``Re_L``/``Rm_L`` repeat the two
     Reynolds numbers with each run's own measured integral scale in place of the
     fixed driving wavelength, which is the only part of the convention that does
-    not cancel between codes.
+    not cancel between codes. ``Gamma t_cross`` is the kinematic growth rate
+    over ``E_B/E_K`` = 3e-3 - 3e-2, and ``eta_psi / eta`` the share of a GLM
+    scheme's measured resistivity that is the divergence cleaning.
     """
     print(f"\nAt matched E_B/E_K = {MATCH_RATIO:g}. L = {L_INJ} (driving "
           f"wavelength) for Re/Rm; L_spec is each run's measured integral "
           f"scale, used for Re_L/Rm_L.")
-    print(f"\n{'scheme':22s} {'ord':>3s} {'divB':>4s} {'N':>4s} {'nu_eff':>9s} "
-          f"{'eta_eff':>9s} {'Re':>6s} {'Rm':>6s} {'Pm':>15s} {'L_spec':>7s} "
-          f"{'Re_L':>6s} {'Rm_L':>6s} {'ok?':>4s}")
+    print(f"\n{'scheme':26s} {'ord':>3s} {'divB':>4s} {'N':>4s} {'nu_eff':>9s} "
+          f"{'eta_eff':>9s} {'Re':>12s} {'Rm':>12s} {'Pm':>15s} {'L_spec':>7s} "
+          f"{'Re_L':>6s} {'Rm_L':>6s} {'Mach':>5s} {'G*tc':>6s} {'pts':>4s} "
+          f"{'eta_psi/eta':>11s} {'ok?':>4s}")
     lines = ["| scheme | order | div.B | N | `nu_eff` | `eta_eff` | `Re` | `Rm` "
-             "| `Pm` | `Rm_L` |", "|---|---|---|---|---|---|---|---|---|---|"]
-    for r in rows:
-        run = _reload(r)
-        m = measure_at_ratio(run)
-        if m is None:
-            continue
-        err = float(np.hypot(bootstrap(run, sat_start=args.sat_start)["Pm"],
-                             systematic(run, sat_start=args.sat_start)))
-        ok = "" if r["n_kolmogorov"] / r["n_nyquist"] <= RESOLVED_MAX else "n_K!"
-        print(f"{r['label'][:22]:22s} {r['order']:3d} {r['divb']:>4s} {r['N']:4d} "
-              f"{m['nu']:9.2e} {m['eta']:9.2e} {m['Re']:6.0f} {m['Rm']:6.0f} "
-              f"{m['Pm']:7.3f}+-{err:6.3f} {m['L_spec']:7.3f} {m['Re_L']:6.0f} "
-              f"{m['Rm_L']:6.0f} {ok:>4s}")
-        lines.append(f"| {r['label']} | {r['order']} | {r['divb']} | {r['N']} | "
-                     f"{m['nu']:.2e} | {m['eta']:.2e} | {m['Re']:.0f} | "
-                     f"{m['Rm']:.0f} | **{m['Pm']:.2f} ± {err:.2f}** | "
-                     f"{m['Rm_L']:.0f} |")
+             "| `Pm` | `Rm_L` | Mach | `Gamma t_cross` |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    table = summary_rows(rows, sat_start=args.sat_start)
+    for t in table:
+        ok = "" if t["resolvedness"] <= RESOLVED_MAX else "n_K!"
+        psi_share = (f"{t['eta_psi'] / t['eta']:11.4f}" if np.isfinite(t["eta_psi"])
+                     else f"{'--':>11s}")
+        print(f"{t['label'][:26]:26s} {t['order']:3d} {t['divb']:>4s} {t['N']:4d} "
+              f"{t['nu']:9.2e} {t['eta']:9.2e} {t['Re']:6.0f}+-{t['Re_err']:4.0f} "
+              f"{t['Rm']:6.0f}+-{t['Rm_err']:4.0f} {t['Pm']:7.3f}+-{t['Pm_err']:6.3f} "
+              f"{t['L_spec']:7.3f} {t['Re_L']:6.0f} {t['Rm_L']:6.0f} {t['mach']:5.3f} "
+              f"{t['gamma']:6.3f} {t['gamma_points']:4d} {psi_share} {ok:>4s}")
+        lines.append(f"| {t['label']} | {t['order']} | {t['divb']} | {t['N']} | "
+                     f"{t['nu']:.2e} | {t['eta']:.2e} | {t['Re']:.0f} ± {t['Re_err']:.0f} | "
+                     f"{t['Rm']:.0f} ± {t['Rm_err']:.0f} | "
+                     f"**{t['Pm']:.2f} ± {t['Pm_err']:.2f}** | "
+                     f"{t['Rm_L']:.0f} | {t['mach']:.2f} | {t['gamma']:.3f} |")
     print(f"\n'n_K!' marks a run whose implied Kolmogorov scale lies beyond "
-          f"Nyquist, where the Laplacian reading of nu is an extrapolation.")
+          f"{RESOLVED_MAX:g} of Nyquist, where the Laplacian reading of nu is an "
+          f"extrapolation. 'pts' is the number of points of the growth-rate fit.")
     out = Path(args.out).with_name("mechanism_summary.md")
     out.write_text("\n".join(lines) + "\n")
     print(f"wrote {out}")
+    # The same numbers machine-readable, for the paper figure and for anyone
+    # quoting them.
+    numeric_fields = [key for key in table[0] if key not in ("label", "scheme", "divb", "path")]
+    archive = out.with_suffix(".npz")
+    np.savez(archive,
+             label=np.array([t["label"] for t in table]),
+             scheme=np.array([t["scheme"] for t in table]),
+             divb=np.array([t["divb"] for t in table]),
+             match_ratio=MATCH_RATIO, L_inj=L_INJ, band=np.array(BAND),
+             **{key: np.array([t[key] for t in table]) for key in numeric_fields})
+    print(f"wrote {archive}")
 
 
-def accounting(rows):
-    """What the CT scheme's advantage is made of, and what it is worth in cells.
+def accounting(rows, reference=REFERENCE):
+    """What the reference scheme's advantage is made of, and what it is worth
+    in cells.
 
     Three questions, in order: which diffusivity actually differs, how the
     growth-rate ratio splits between ``Rm`` and ``Pm``, and what grid each
-    AthenaPK scheme would need to reach the same dynamo.
+    other scheme would need to reach the same dynamo.
     """
     d = {}
     for r in rows:
@@ -501,17 +662,17 @@ def accounting(rows):
         m = measure_at_ratio(run)
         if m:
             d[(r["label"], r["N"])] = dict(m, gamma=growth(run))
-    ref = {n: v for (l, n), v in d.items() if l == REFERENCE}
+    ref = {n: v for (l, n), v in d.items() if l == reference}
     if not ref:
-        raise SystemExit(f"no {REFERENCE} run to compare against")
+        raise SystemExit(f"no {reference} run to compare against")
 
-    print(f"\nRatios {REFERENCE} / AthenaPK, at matched E_B/E_K = "
-          f"{MATCH_RATIO:g}. A ratio below 1 means astronomix is the less "
+    print(f"\nRatios {reference} / other scheme, at matched E_B/E_K = "
+          f"{MATCH_RATIO:g}. A ratio below 1 means the reference is the less "
           f"dissipative of the two.")
     print(f"{'':30s} {'N':>4s} {'nu':>6s} {'eta':>6s} {'Rm':>6s} {'Pm':>6s} "
           f"{'Gamma':>6s} {'sqrt(Rm Pm)':>12s}")
     for (l, n), v in sorted(d.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-        if l == REFERENCE or n not in ref:
+        if l == reference or n not in ref:
             continue
         a = ref[n]
         g = a["gamma"] / v["gamma"] if np.isfinite(a["gamma"]) else np.nan
@@ -531,10 +692,10 @@ def accounting(rows):
             print(f"  {l[:28]:28s} Rm = {np.exp(fit[l][1]):5.2f} N^{fit[l][0]:.2f}"
                   f"   (N = " + ", ".join(str(q[0]) for q in pts) + ")")
 
-    print(f"\nGrid each GLM scheme needs for astronomix's dynamo, from "
+    print(f"\nGrid each other scheme needs for the reference's dynamo, from "
           f"Gamma = {COLLAPSE_C:g} sqrt(Rm Pm) and the fits above.")
     for l, a in sorted(fit.items()):
-        if l == REFERENCE:
+        if l == reference:
             continue
         Pm = float(np.mean([d[(ll, n)]["Pm"] for (ll, n) in d if ll == l]))
         for n in sorted(ref):
@@ -544,7 +705,7 @@ def accounting(rows):
                 g = COLLAPSE_C * np.sqrt(ref[n]["Rm"] * ref[n]["Pm"])
             need = np.exp((np.log((g / (COLLAPSE_C * np.sqrt(Pm))) ** 2)
                            - a[1]) / a[0])
-            print(f"  astronomix {n:3d}^3 (Gamma = {g:.3f}"
+            print(f"  reference {n:3d}^3 (Gamma = {g:.3f}"
                   f"{', predicted' if predicted else ', measured'})  ->  "
                   f"{l[:24]:24s} {need:5.0f}^3  "
                   f"({need / n:4.1f}x linear, {(need / n) ** 3:4.0f}x cells)")

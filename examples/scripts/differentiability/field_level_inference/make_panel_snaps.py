@@ -1,236 +1,159 @@
-#!/usr/bin/env python
-"""Generate the 4 density cubes for the field-level-inference panel figure.
-
-Loads the optimized 64^3 MHD state and evolves it (turbulence OFF) to four
-times:
-
-    t = 0  (initial optimized state)
-    t = f_pre  * t_end   (shortly before the loss time)
-    t = t_end            (the target / loss time)
-    t = f_post * t_end   (shortly after)
-
-The loss time t_end is recovered WITHOUT the expensive forced-turbulence run:
-we scan evolution times and pick the one whose z-projection best *correlates*
-with the target logo (the velocity was optimized so the logo appears exactly at
-t_end).  Correlation -- not MSE -- is used because the logo's contrast is only
-~1%, so an MSE of the projection is dominated by the overall mean amplitude and
-mis-detects the (narrow) logo peak.  The scan is two-stage (coarse bracket then
-fine refine) since the peak is only ~1-2% of t_end wide.
-
-Default device is GPU via autocvd (CPU compute is against cluster rules here).
-Saves a single npz (4 density cubes [N,N,N] + times + target image).
-Intended env: astx (jax 0.10.2 + astronomix) or jf1uids.
 """
+The four density cubes of the field-level-inference panel figure.
+
+Evolves the optimised initial state (turbulent driving off, the same scheme as
+the optimisation, from ``_problem.py``) to
+
+    t = 0                 (the optimised initial state)
+    t = f_pre  * t_end    (shortly before the loss time)
+    t = t_end             (the loss time)
+    t = f_post * t_end    (shortly after)
+
+and saves them with the times and the target image in one npz. The loss time
+comes from the optimisation's ``run_summary.json`` (``--summary``) or
+``--t-end``; without either it is recovered by a correlation scan: the evolution
+time whose z-projection correlates best with the logo. Correlation, not MSE,
+because the logo's contrast is only ~1 %, so an MSE of the projection is
+dominated by the overall amplitude and misses the narrow logo peak.
+"""
+
+# general
 import argparse
-import os
+import json
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--resolution", type=int, default=64)
-ap.add_argument("--state", type=str, default="best_state.npy")
-ap.add_argument("--out", type=str, default="panel_snaps.npz")
-ap.add_argument("--f-pre", type=float, default=0.995)
-ap.add_argument("--f-post", type=float, default=1.005)
-ap.add_argument("--device", type=str, default="gpu", choices=["cpu", "gpu"],
-                help="cpu is against cluster rules on this box; use gpu (autocvd).")
-ap.add_argument("--backend", type=str, default="pallas", choices=["pallas", "native"])
-ap.add_argument("--scan-lo", type=float, default=0.4)
-ap.add_argument("--scan-hi", type=float, default=1.8)
-ap.add_argument("--scan-n", type=int, default=15)
-ap.add_argument("--refine-n", type=int, default=41,
-                help="fine-scan samples spanning +/- one coarse step around the peak.")
-ap.add_argument("--t-end", type=float, default=0.0,
-                help="if >0, skip the correlation scan and use this loss time directly "
-                     "(needed at 256³ where each evolution is minutes).")
-args = ap.parse_args()
+# gpu selection
+from autocvd import autocvd
 
-if args.device == "cpu":
-    os.environ["JAX_PLATFORMS"] = "cpu"
-else:
-    from autocvd import autocvd
-    autocvd(num_gpus=1)
+autocvd(num_gpus=1)
 
-# ruff: noqa: E402
-import numpy as np
-import jax
-import jax.numpy as jnp
-from PIL import Image
+# jax
+import jax.numpy as jnp  # noqa: E402
 
-# astronomix constants
-from astronomix import (
-    PERIODIC_BOUNDARY,
-    PALLAS,
+# numerics
+import numpy as np  # noqa: E402
+
+# field-level inference problem
+from _problem import (  # noqa: E402
+    finalized,
+    logo_target,
+    make_config,
+    make_params,
+    rms_velocity,
 )
-
-# astronomix containers
-from astronomix import (
-    SimulationConfig,
-    SimulationParams,
-    CodeUnits,
-    BoundarySettings,
-    BoundarySettings1D,
-    BackendConfig,
-)
-from astronomix._modules._turbulent_forcing._turbulent_forcing_options import TurbulentForcingConfig
 
 # astronomix functions
-from astronomix import (
-    get_registered_variables,
-    construct_primitive_state,
-    time_integration,
-    finalize_config,
-    initialize_interface_fields,
-)
-from astropy import units as u
-import astropy.constants as c
+from astronomix import time_integration  # noqa: E402
 
 
-def load_image(path, height, width):
-    img = jnp.array(Image.open(path).convert("L"))
-    img = 1.0 - img / 255.0
-    h, w = img.shape
-    pad_h = (-h) % height
-    pad_w = (-w) % width
-    pad = ((pad_h // 2, pad_h - pad_h // 2), (pad_w // 2, pad_w - pad_w // 2))
-    img = jnp.pad(img, pad)
-    hp, wp = img.shape
-    result = img.reshape(height, hp // height, width, wp // width).mean(axis=(1, 3))
-    return 1.0 + (result - 0.01) / (1.0 - 0.01) * 0.01
+def parse_arguments():
+    """
+    Parse the command line.
+
+    Returns:
+        The argparse namespace.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--resolution", type=int, default=128)
+    parser.add_argument("--state", type=str, default="best_state.npy")
+    parser.add_argument("--summary", type=str, default="", help="run_summary.json of the optimisation")
+    parser.add_argument("--out", type=str, default="panel_snaps.npz")
+    parser.add_argument("--f-pre", type=float, default=0.995)
+    parser.add_argument("--f-post", type=float, default=1.005)
+    parser.add_argument("--t-end", type=float, default=0.0, help="loss time; > 0 skips the scan")
+    parser.add_argument("--scan-lo", type=float, default=0.4)
+    parser.add_argument("--scan-hi", type=float, default=1.8)
+    parser.add_argument("--scan-n", type=int, default=15)
+    parser.add_argument(
+        "--refine-n",
+        type=int,
+        default=41,
+        help="fine-scan samples spanning +/- one coarse step around the peak",
+    )
+    return parser.parse_args()
 
 
 def main():
+    """Evolve the optimised state to the four panel times and save the cubes."""
+    args = parse_arguments()
+    t_end = args.t_end
     resolution = args.resolution
-    gamma = 5 / 3
-    box_size = 1.0
-    print(f"device={args.device} backend={args.backend} jax={jax.__version__} "
-          f"platform={jax.default_backend()}")
+    if args.summary:
+        with open(args.summary) as summary_file:
+            summary = json.load(summary_file)
+        t_end = summary["t_end"]
+        resolution = summary["resolution"]
 
-    backend_kw = {}
-    if args.backend == "pallas":
-        backend_kw = dict(backend_config=BackendConfig(backend=PALLAS))
-
-    config = SimulationConfig(
-        weno_positivity_preserving=True,
-        mhd=True, progress_bar=False,
-        donate_state=False, dimensionality=3,
-        box_size=box_size, num_cells=resolution,
-        turbulent_forcing_config=TurbulentForcingConfig(turbulent_forcing=False),
-        boundary_settings=BoundarySettings(
-            *[BoundarySettings1D(left_boundary=PERIODIC_BOUNDARY,
-                                 right_boundary=PERIODIC_BOUNDARY) for _ in range(3)]),
-        **backend_kw,
-    )
-    rv = get_registered_variables(config)
-
-    code_length = 3 * u.parsec
-    code_mass = 100 * u.M_sun
-    code_velocity = 100 * u.km / u.s
-    code_units = CodeUnits(code_length, code_mass, code_velocity)
-
-    n_h = 2
-    rho_0 = n_h * c.m_p / u.cm**3
-    p_0 = 3e4 * u.K / u.cm**3 * c.k_B
-
-    params = SimulationParams(
-        C_cfl=0.8, dt_max=0.1, gamma=gamma,
-        minimum_density=(1e-2 * rho_0).to(code_units.code_density).value,
-        minimum_pressure=(1e-2 * p_0).to(code_units.code_pressure).value,
-    )
-
-    # a config.finalize needs a representative state shape
-    sh = (resolution,) * 3
-    zero = jnp.zeros(sh)
-    B_0 = (13.5 * u.microgauss / c.mu0**0.5).to(code_units.code_magnetic_field).value
-    bxb, byb, bzb = initialize_interface_fields(jnp.ones(sh) * B_0, zero, zero)
-    probe = construct_primitive_state(
-        config=config, registered_variables=rv, density=jnp.ones(sh),
-        velocity_x=zero, velocity_y=zero, velocity_z=zero, gas_pressure=jnp.ones(sh),
-        magnetic_field_x=jnp.ones(sh) * B_0, magnetic_field_y=zero, magnetic_field_z=zero,
-        interface_magnetic_field_x=bxb, interface_magnetic_field_y=byb,
-        interface_magnetic_field_z=bzb)
-    config = finalize_config(config, probe.shape)
-
+    registered_variables, config = finalized(make_config(resolution))
+    density_index = registered_variables.density_index
     best_state = jnp.asarray(np.load(args.state))
-    di = rv.density_index
-    vi = rv.velocity_index
+    target = logo_target(resolution, float(best_state[density_index].sum()))
+    target_anomaly = target - jnp.mean(target)
 
-    target = load_image("logo.png", resolution, resolution)
-    target = target / jnp.sum(target) * jnp.sum(best_state[di])
-    tgt_zm = target - jnp.mean(target)
+    def evolve(time):
+        if time <= 0.0:
+            return best_state[density_index]
+        final_state = time_integration(best_state, config, make_params(float(time)), registered_variables)
+        return final_state[density_index]
 
-    # crude crossing-time estimate from the optimized velocity to centre the scan
-    rms_v = float(jnp.sqrt(jnp.mean(best_state[vi.x]**2 + best_state[vi.y]**2 + best_state[vi.z]**2)))
-    t_cross = box_size / max(rms_v, 1e-12)
-    t_center = 0.5 * t_cross
-    print(f"rms_v(best)={rms_v:.4f}  t_cross~{t_cross:.4f}  t_center~{t_center:.4f}")
+    def logo_correlation(density):
+        projection = jnp.sum(density, axis=2)
+        projection_anomaly = projection - jnp.mean(projection)
+        return float(
+            jnp.sum(projection_anomaly * target_anomaly)
+            / jnp.sqrt(jnp.sum(projection_anomaly**2) * jnp.sum(target_anomaly**2))
+        )
 
-    def evolve(t):
-        if t <= 0.0:
-            return best_state[di]
-        fin = time_integration(best_state, config, params._replace(t_end=float(t)), rv)
-        return fin[di]
+    # -------------------------------------------------------------
+    # =============== ↓ Loss time (given or scanned) ↓ ============
+    # -------------------------------------------------------------
+    if t_end <= 0.0:
+        # The logo peak is narrow (~1-2 % of t_end), so a coarse scan brackets
+        # it and a fine scan of +/- one coarse step around it refines it.
+        t_center = 0.5 / max(rms_velocity(best_state, registered_variables), 1e-12)
+        coarse_times = np.linspace(args.scan_lo * t_center, args.scan_hi * t_center, args.scan_n)
+        coarse_correlations = [logo_correlation(evolve(time)) for time in coarse_times]
+        coarse_peak = float(coarse_times[int(np.argmax(coarse_correlations))])
+        coarse_step = float(coarse_times[1] - coarse_times[0])
+        fine_times = np.linspace(coarse_peak - coarse_step, coarse_peak + coarse_step, args.refine_n)
+        fine_correlations = [logo_correlation(evolve(time)) for time in fine_times]
+        t_end = float(fine_times[int(np.argmax(fine_correlations))])
+        print(f"recovered t_end = {t_end:.4f} (correlation {max(fine_correlations):.4f})", flush=True)
+    # -------------------------------------------------------------
+    # =============== ↑ Loss time (given or scanned) ↑ ============
+    # -------------------------------------------------------------
 
-    def logo_corr(t):
-        # Normalised correlation of the z-projection with the (mean-subtracted)
-        # logo.  The logo's contrast is only ~1%, so a plain MSE of the
-        # projection is dominated by the overall mean amplitude and is a poor
-        # detector (it picks coarse-grid artefacts, not the logo).  The
-        # optimised velocity makes the projection *correlate* sharply with the
-        # logo at exactly the loss time, so we detect that peak instead.
-        proj = jnp.sum(evolve(t), axis=2)
-        pz = proj - jnp.mean(proj)
-        return float(jnp.sum(pz * tgt_zm)
-                     / jnp.sqrt(jnp.sum(pz * pz) * jnp.sum(tgt_zm * tgt_zm)))
-
-    # Fixed t_end bypasses the (expensive) scan — essential at high resolution
-    # (256³) where each evolution is minutes, so a ~56-point scan is infeasible.
-    # The loss time is crossing_time/2 ≈ 0.5/rms_v, which the inverse run already
-    # reports; pass it with --t-end.
-    if args.t_end > 0.0:
-        t_end = args.t_end
-        print(f"==> using fixed t_end={t_end:.4f} (scan skipped)")
-        times = {"init": 0.0, "pre": args.f_pre * t_end, "target": t_end, "post": args.f_post * t_end}
-        cubes = {}
-        for name, t in times.items():
-            cubes[name] = np.asarray(evolve(t), dtype=np.float32)
-            print(f"  {name}: t={t:.4f}  rho[{cubes[name].min():.4g},{cubes[name].max():.4g}]")
-        np.savez(args.out,
-                 init=cubes["init"], pre=cubes["pre"], target=cubes["target"], post=cubes["post"],
-                 t_init=0.0, t_pre=times["pre"], t_target=t_end, t_post=times["post"],
-                 f_pre=args.f_pre, f_post=args.f_post,
-                 target_image=np.asarray(target, dtype=np.float32), N=resolution)
-        print(f"wrote {args.out}")
-        return
-
-    # Two-stage scan for the loss time.  The logo peak is narrow (FWHM ~1-2% of
-    # t_end), so a single coarse grid can step right over it: first a coarse
-    # correlation scan to bracket the peak, then a fine refine spanning +/- one
-    # coarse step around it.
-    coarse_ts = np.linspace(args.scan_lo * t_center, args.scan_hi * t_center, args.scan_n)
-    coarse_c = [logo_corr(t) for t in coarse_ts]
-    for t, cval in zip(coarse_ts, coarse_c):
-        print(f"  coarse t={t:.4f}  corr={cval:+.4f}")
-    t0 = float(coarse_ts[int(np.argmax(coarse_c))])
-    dt = float(coarse_ts[1] - coarse_ts[0])
-    fine_ts = np.linspace(t0 - dt, t0 + dt, args.refine_n)
-    fine_c = [logo_corr(t) for t in fine_ts]
-    for t, cval in zip(fine_ts, fine_c):
-        print(f"  fine   t={t:.4f}  corr={cval:+.4f}")
-    t_end = float(fine_ts[int(np.argmax(fine_c))])
-    print(f"==> recovered t_end={t_end:.4f}  (corr={max(fine_c):.4f})")
-
-    times = {"init": 0.0, "pre": args.f_pre * t_end, "target": t_end, "post": args.f_post * t_end}
+    times = {
+        "init": 0.0,
+        "pre": args.f_pre * t_end,
+        "target": t_end,
+        "post": args.f_post * t_end,
+    }
     cubes = {}
-    for name, t in times.items():
-        dens = evolve(t)
-        cubes[name] = np.asarray(dens, dtype=np.float32)
-        print(f"  {name}: t={t:.4f}  rho[{cubes[name].min():.4g},{cubes[name].max():.4g}]")
-
-    np.savez(args.out,
-             init=cubes["init"], pre=cubes["pre"], target=cubes["target"], post=cubes["post"],
-             t_init=0.0, t_pre=times["pre"], t_target=t_end, t_post=times["post"],
-             f_pre=args.f_pre, f_post=args.f_post,
-             target_image=np.asarray(target, dtype=np.float32), N=resolution)
-    print(f"wrote {args.out}")
+    for name, time in times.items():
+        density = evolve(time)
+        cubes[name] = np.asarray(density, dtype=np.float32)
+        mse = float(jnp.mean((jnp.sum(density, axis=2) - target) ** 2))
+        print(
+            f"{name:6s}: t = {time:.4f}, logo correlation {logo_correlation(density):+.4f}, "
+            f"projection MSE {mse:.4e}",
+            flush=True,
+        )
+    np.savez(
+        args.out,
+        init=cubes["init"],
+        pre=cubes["pre"],
+        target=cubes["target"],
+        post=cubes["post"],
+        t_init=0.0,
+        t_pre=times["pre"],
+        t_target=t_end,
+        t_post=times["post"],
+        f_pre=args.f_pre,
+        f_post=args.f_post,
+        target_image=np.asarray(target, dtype=np.float32),
+        N=resolution,
+    )
+    print(f"wrote {args.out}", flush=True)
 
 
 if __name__ == "__main__":

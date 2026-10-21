@@ -1,84 +1,125 @@
-"""Generate ALL astronomix Alfvén benchmark data for this GPU, in one command.
+"""
+Generate all CP Alfvén-wave benchmark data of astronomix and AthenaPK on this
+GPU (paper convergence figure, single-GPU runtime figure and the finite-volume
+single-precision comparison) with one command:
 
-    PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/mhd/generate_alfven_data.py
+    PYTHONPATH=<repo> python examples/scripts/forward/mhd/generate_alfven_data.py [--steps ...]
 
-Runs, in order:
+Steps (all by default, in this order; ``--steps`` selects a subset by name):
 
-1. ``alfven_convergence.py``       — the dp convergence + runtime sweep for all
-                                     three backends (FV JAX, FD JAX, FD Pallas)
-2. ``alfven_spdp_runtime.py --dp`` — per-iteration cost, double precision
-3. ``alfven_spdp_runtime.py --sp`` — per-iteration cost, single precision
-4. ``alfven_spdp_runtime.py --plot`` — the sp/dp panel across every node found
+* ``athenapk_double``: AthenaPK references VL2+PLM (cfl 0.3) and RK3+PPM
+  (cfl 0.4), double precision, N = 8 ... 128
+  (``validation/athenapk_vl2/athenapk_alfven_reference.py``),
+* ``astronomix_double``: the double-precision convergence and runtime sweep
+  (``alfven_convergence.py``: FV VL2, FD WENO-Z, FD WENO-Z + PP and two
+  diagnostics), which also draws the two figures,
+* ``athenapk_single`` and ``astronomix_single``: the same in single precision
+  (AthenaPK's ``PARTHENON_SINGLE_PRECISION`` build; astronomix FV and FD only),
+* ``benchmark_double`` and ``benchmark_single``: time per step of the FV scheme
+  against AthenaPK VL2 for N = 16 ... 512 (``validation/athenapk_vl2/benchmark.py``),
+* ``figure_single_precision``: the FV-against-AthenaPK figure from the two
+  benchmark files.
 
-Steps 2 and 3 must be separate processes because ``jax_enable_x64`` is global
-and has to be set before the first array is built -- which is exactly why this
-driver exists rather than a single in-process loop.
-
-Storage is automatic and node-derived. The GPU is picked **once** here via
-autocvd and exported to every child, so (a) all series are measured on the same
-device and are therefore comparable, and (b) each child files its results under
-``pytests/mhd/data/astronomix/<node>/`` where ``<node>`` comes from the live
-device (a100 / h100 / h200 / ...). Running this on new hardware creates a new
-folder; it can never overwrite another GPU's numbers.
+The precisions run in separate processes because ``jax_enable_x64`` is global.
+The GPU is picked once (autocvd, unless a queue already set
+``CUDA_VISIBLE_DEVICES``) and inherited by every child, so all series are
+measured on the same device. The AthenaPK steps need ``ATHENAPK_GPU_BIN`` /
+``ATHENAPK_GPU_SINGLE_BIN`` (on JUPITER run this script through
+``validation/athenapk_vl2/jupiter_athenapk.sh``). Data and figures are filed
+under the node tag of the live device (``pytests/mhd/{data,figures}/.../<node>/``).
 
 Options:
-    --dry-run   print the plan (and the resolved GPU) without running anything
+    --steps NAME ...  run only these steps
+    --node TAG        node tag of the benchmark files (default: gh200)
+    --dry-run         print the plan without running anything
 """
 
-# NOTE: autocvd must run before any child is spawned -- it is what sets
-# CUDA_VISIBLE_DEVICES, which the children inherit instead of each grabbing
-# (possibly different) GPUs of their own.
-from autocvd import autocvd
+# general
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-import os  # noqa: E402
-import subprocess  # noqa: E402
-import sys  # noqa: E402
-import time  # noqa: E402
-from pathlib import Path  # noqa: E402
+HERE = Path(__file__).resolve().parent
+REPOSITORY = HERE.parents[3]
+VALIDATION = REPOSITORY / "examples" / "scripts" / "validation" / "athenapk_vl2"
 
-DRY_RUN = "--dry-run" in sys.argv
+REFERENCE_RESOLUTIONS = ["8", "16", "32", "64", "128"]
+BENCHMARK_RESOLUTIONS = ["16", "32", "64", "128", "256", "384", "512"]
 
-_HERE = Path(__file__).resolve().parent
-_REPO = _HERE.parents[3]
 
-if not DRY_RUN:
-    # One selection for the whole run; children see it via the environment.
-    autocvd(num_gpus=1)
-
-STEPS = [
-    ("dp convergence sweep (FV JAX / FD JAX / FD Pallas)", [str(_HERE / "alfven_convergence.py")]),
-    ("per-iteration runtime, double precision", [str(_HERE / "alfven_spdp_runtime.py"), "--dp"]),
-    ("per-iteration runtime, single precision", [str(_HERE / "alfven_spdp_runtime.py"), "--sp"]),
-    ("sp/dp panel (all nodes on disk)", [str(_HERE / "alfven_spdp_runtime.py"), "--plot"]),
-]
+def plan(node: str) -> dict:
+    """The steps by name: a list of ``(title, command)`` each."""
+    reference = str(VALIDATION / "athenapk_alfven_reference.py")
+    convergence = str(HERE / "alfven_convergence.py")
+    benchmark = str(VALIDATION / "benchmark.py")
+    results = VALIDATION / "results"
+    return dict(
+        athenapk_double=[
+            (f"AthenaPK {setup}, double", [reference, "--setup", setup, "--precision", "double",
+                                           "--resolutions", *REFERENCE_RESOLUTIONS])
+            for setup in ("vl2_plm", "rk3_ppm")
+        ],
+        astronomix_double=[("astronomix sweep, double", [convergence])],
+        athenapk_single=[
+            (f"AthenaPK {setup}, single", [reference, "--setup", setup, "--precision", "single",
+                                           "--resolutions", *REFERENCE_RESOLUTIONS])
+            for setup in ("vl2_plm", "rk3_ppm")
+        ],
+        astronomix_single=[("astronomix sweep, single", [convergence, "--single", "--benchmarks", "fv_vl2", "fd_wenoz"])],
+        benchmark_double=[
+            ("FV against AthenaPK, double", [benchmark, "--precision", "double", "--resolutions",
+                                             *BENCHMARK_RESOLUTIONS, "--output",
+                                             str(results / f"benchmark_{node}_double.json")])
+        ],
+        benchmark_single=[
+            ("FV against AthenaPK, single", [benchmark, "--precision", "single", "--resolutions",
+                                             *BENCHMARK_RESOLUTIONS, "--output",
+                                             str(results / f"benchmark_{node}_single.json")])
+        ],
+        figure_single_precision=[
+            ("FV against AthenaPK figure", [str(VALIDATION / "fv_athenapk_single_precision.py"), "--node", node])
+        ],
+    )
 
 
 def main() -> None:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_REPO), env.get("PYTHONPATH", "")]))
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--steps", nargs="+", default=None)
+    parser.add_argument("--node", default="gh200")
+    parser.add_argument("--dry-run", action="store_true")
+    arguments = parser.parse_args()
 
-    gpu = env.get("CUDA_VISIBLE_DEVICES", "<none>")
-    print(f"[generate] GPU (via autocvd): CUDA_VISIBLE_DEVICES={gpu}")
-    print(f"[generate] {len(STEPS)} steps; every child inherits this GPU\n")
+    steps = plan(arguments.node)
+    selected = list(steps) if arguments.steps is None else arguments.steps
+    unknown = set(selected) - set(steps)
+    if unknown:
+        raise SystemExit(f"unknown steps {sorted(unknown)}; known: {list(steps)}")
 
-    if DRY_RUN:
-        for i, (title, cmd) in enumerate(STEPS, 1):
-            print(f"  {i}. {title}\n     python -u {' '.join(cmd)}")
-        print("\n[generate] --dry-run: nothing executed")
-        return
+    # One GPU selection for the whole run; the children inherit it through the
+    # environment instead of each grabbing (possibly different) GPUs.
+    if not arguments.dry_run and os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+        from autocvd import autocvd
 
-    t_all = time.perf_counter()
-    for i, (title, cmd) in enumerate(STEPS, 1):
-        print(f"\n{'=' * 70}\n[generate] step {i}/{len(STEPS)}: {title}\n{'=' * 70}", flush=True)
-        t0 = time.perf_counter()
-        # check=True: a failed sweep must not be papered over by later steps
-        # appearing to succeed -- the data would silently be incomplete.
-        subprocess.run([sys.executable, "-u", *cmd], check=True, env=env, cwd=str(_REPO))
-        print(f"[generate] step {i} done in {time.perf_counter() - t0:.1f}s", flush=True)
+        autocvd(num_gpus=1)
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, [str(REPOSITORY), environment.get("PYTHONPATH", "")]))
+    print(f"[generate] CUDA_VISIBLE_DEVICES={environment.get('CUDA_VISIBLE_DEVICES', '<none>')}, steps {selected}")
 
-    print(f"\n[generate] ALL DONE in {(time.perf_counter() - t_all) / 60:.1f} min")
-    print(f"[generate] data:    {_REPO / 'pytests' / 'mhd' / 'data' / 'astronomix'}/<node>/")
-    print(f"[generate] figures: {_REPO / 'pytests' / 'mhd' / 'figures'}/<node>/")
+    start_all = time.perf_counter()
+    for name in selected:
+        for title, command in steps[name]:
+            print(f"\n{'=' * 70}\n[generate] {name}: {title}\n   python -u {' '.join(command)}\n{'=' * 70}", flush=True)
+            if arguments.dry_run:
+                continue
+            start = time.perf_counter()
+            # check=True: a failed step must not be papered over by later steps
+            # appearing to succeed; the data would silently be incomplete.
+            subprocess.run([sys.executable, "-u", *command], check=True, env=environment, cwd=str(REPOSITORY))
+            print(f"[generate] {title} done in {time.perf_counter() - start:.1f} s", flush=True)
+    print(f"\n[generate] all done in {(time.perf_counter() - start_all) / 60:.1f} min")
 
 
 if __name__ == "__main__":

@@ -1,18 +1,28 @@
-"""Sedov-Taylor blast wave — paper figure (4x3 layout at 128^3).
+"""Sedov-Taylor blast wave — paper figure (3x3 layout at 256^3).
 
 Generates ``figures/sedov_blast_<N>.png`` (and a ``.pdf`` copy): radial
 profiles (density, |v|, pressure) of the spherical Sedov-Taylor blast at
-t = 0.1 compared with the exact self-similar solution, for four solvers, one
+t = 0.1 compared with the exact self-similar solution, for three solvers, one
 per row, all at the same resolution:
 
-    row 0:  FV (HLL, minmod)
-    row 1:  FV (HLLC, minmod)
-    row 2:  FV (AM-HLLC, minmod)
-    row 3:  FD (WENO)
+    row 0:  FV (VL2, HLLE)
+    row 1:  FV (VL2, HLLC)
+    row 2:  FD (WENO-Z)
+
+The finite-volume rows use AthenaPK's VL2 scheme with the safeguards AthenaPK
+uses for strong shocks: the first-order flux correction and the density and
+pressure floors. The finite-difference row uses WENO-Z weights alone (the
+test needs no positivity-preserving WENO). ``--without-fofc`` runs the
+finite-volume rows without these safeguards (cached and plotted separately, as
+``sedov_blast_<N>_without_fofc``) to show whether they are needed.
 
 Each run is cached separately under ``data/sedov_<key>_<N>.npz`` (binned radial
-profiles + a scatter subsample), so the figure can be re-styled without
-re-running any simulation. Pass ``--rerun`` to recompute.
+profiles and their spread, a scatter subsample and a central density slice),
+so the figure can be re-styled without re-running any simulation. Pass
+``--rerun`` to recompute. Besides the figure, the script prints per run the
+extrema of the final state and the largest spread of |v| within a radial bin
+around the shock front, which measures the carbuncle instability of the HLLC
+solver.
 
 Resolution can be overridden for a quick smoke test:
 
@@ -21,6 +31,8 @@ Resolution can be overridden for a quick smoke test:
 Default run (the paper figure):
 
     PYTHONPATH=$(git rev-parse --show-toplevel) python examples/scripts/forward/hydro/sedov_blast.py --rerun
+
+ExactPack (https://github.com/lanl/ExactPack) provides the exact solution.
 """
 
 # ==== GPU selection ====
@@ -33,7 +45,6 @@ autocvd(num_gpus=1)
 import sys
 
 # jax
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -53,13 +64,10 @@ from astronomix import (
     FINITE_VOLUME,
     HLL,
     HLLC,
-    MINMOD,
     PERIODIC_BOUNDARY,
+    VL2,
 )
-from astronomix.option_classes.simulation_config import (
-    AM_HLLC,
-    HYBRID_HLLC,
-)
+from astronomix.option_classes.simulation_config import POSITIVITY_HARD_FLOOR
 
 # astronomix containers
 from astronomix import (
@@ -67,6 +75,7 @@ from astronomix import (
     SimulationParams,
     BoundarySettings,
     BoundarySettings1D,
+    PositivityConfig,
 )
 
 # astronomix functions
@@ -84,7 +93,6 @@ from _common import (
     DATA_DIR,
     FIG_DIR,
     FD_COLOR,
-    FV_AM_HLLC_COLOR,
     FV_HLLC_COLOR,
     FV_HLL_COLOR,
     rerun_requested,
@@ -106,13 +114,28 @@ SMOOTH_CELLS = 2.0
 NUM_BINS = 200
 NUM_SCATTER = 80_000
 
+# CFL numbers: AthenaPK's 3D value for the finite-volume VL2 scheme; the
+# finite-difference run keeps the C_cfl = 0.4 this test always used.
+FINITE_VOLUME_CFL = 0.3
+FINITE_DIFFERENCE_CFL = 0.4
+
+# AthenaPK's density and pressure floors (dfloor / pfloor) for the
+# finite-volume runs, as in its Sedov validation case; far below the smallest
+# density (~1e-5 at the centre) and pressure (1e-4) of the exact solution.
+DENSITY_FLOOR = 1e-8
+PRESSURE_FLOOR = 1e-8
+
+# The radial shell around the exact shock radius (in units of it) in which
+# the spread of |v| within a radial bin measures the carbuncle instability.
+SHOCK_SHELL = (0.85, 1.05)
+
 # One entry per solver row in the figure, as
-# (key, label, color, solver_mode, riemann_solver).
+# (key, label, color, solver_mode, riemann_solver). The finite-difference
+# scheme has no Riemann solver.
 RUNS = [
-    ("fv_hll", "FV (HLL, minmod)", FV_HLL_COLOR, FINITE_VOLUME, HLL),
-    ("fv_hllc", "FV (HLLC, minmod)", FV_HLLC_COLOR, FINITE_VOLUME, HLLC),
-    ("fv_amhllc", "FV (AM-HLLC, minmod)", FV_AM_HLLC_COLOR, FINITE_VOLUME, AM_HLLC),
-    ("fd", "FD", FD_COLOR, FINITE_DIFFERENCE, HYBRID_HLLC),
+    ("fv_vl2_hlle", "FV (VL2, HLLE)", FV_HLL_COLOR, FINITE_VOLUME, HLL),
+    ("fv_vl2_hllc", "FV (VL2, HLLC)", FV_HLLC_COLOR, FINITE_VOLUME, HLLC),
+    ("fd", "FD (WENO-Z)", FD_COLOR, FINITE_DIFFERENCE, None),
 ]
 
 
@@ -128,63 +151,85 @@ def _resolution_from_argv():
     return 256
 
 
-def make_config(solver_mode, riemann_solver, num_cells):
+def _strong_shock_safeguards_from_argv():
+    """Return whether the finite-volume runs use AthenaPK's safeguards.
+
+    Returns:
+        False when ``--without-fofc`` was passed (no first-order flux
+        correction and no floors), True otherwise.
+    """
+    return "--without-fofc" not in sys.argv
+
+
+def make_config(solver_mode, riemann_solver, num_cells, strong_shock_safeguards):
     """Build the simulation configuration for one Sedov solver row.
 
     Args:
         solver_mode: The solver family, FINITE_VOLUME or FINITE_DIFFERENCE.
-        riemann_solver: The Riemann solver to use (e.g. HLL, HLLC).
+        riemann_solver: The Riemann solver of the finite-volume scheme (HLL
+            or HLLC); not read for the finite-difference scheme.
         num_cells: The number of cells per dimension (cubic domain).
+        strong_shock_safeguards: Whether the finite-volume scheme uses
+            AthenaPK's first-order flux correction and its density and
+            pressure floors.
 
     Returns:
         The assembled :class:`SimulationConfig`.
     """
-    is_finite_difference = solver_mode == FINITE_DIFFERENCE
-    kwargs = dict(
+    # The blast stays inside the unit box until t = 0.1, so the boundaries do
+    # not matter; periodic ones are the cheapest for both schemes.
+    periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+    common_settings = dict(
         geometry=CARTESIAN,
         solver_mode=solver_mode,
-        riemann_solver=riemann_solver,
-        limiter=MINMOD,
         dimensionality=3,
         num_cells=num_cells,
         exact_end_time=True,
         progress_bar=True,
-        mhd=is_finite_difference,  # the FD/WENO backend runs in MHD mode (B = 0 here)
+        mhd=False,
+        boundary_settings=BoundarySettings(periodic, periodic, periodic),
     )
-    if is_finite_difference:
-        # Periodic box + positivity-preserving WENO for the strong point
-        # explosion. The FD/WENO backend runs ~10x faster through the Pallas
-        # (Triton) backend; results are bit-compatible with native JAX.
-        kwargs.update(
-            weno_positivity_preserving=True,
-            boundary_settings=BoundarySettings(
-                BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-                BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-                BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            ),
+    if solver_mode == FINITE_DIFFERENCE:
+        return SimulationConfig(
+            weno_z=True,
+            **common_settings,
         )
-    return SimulationConfig(**kwargs)
+    if strong_shock_safeguards:
+        positivity_config = PositivityConfig(per_step_mode=POSITIVITY_HARD_FLOOR)
+    else:
+        positivity_config = PositivityConfig()
+    return SimulationConfig(
+        time_integrator=VL2,
+        riemann_solver=riemann_solver,
+        first_order_flux_correction=strong_shock_safeguards,
+        positivity_config=positivity_config,
+        **common_settings,
+    )
 
 
-def simulate(solver_mode, riemann_solver, num_cells):
+def simulate(solver_mode, riemann_solver, num_cells, strong_shock_safeguards):
     """Run one 3D Sedov simulation and reduce it to radial diagnostics.
 
     Args:
         solver_mode: The solver family, FINITE_VOLUME or FINITE_DIFFERENCE.
-        riemann_solver: The Riemann solver to use (e.g. HLL, HLLC).
+        riemann_solver: The Riemann solver of the finite-volume scheme.
         num_cells: The number of cells per dimension (cubic domain).
+        strong_shock_safeguards: Whether the finite-volume scheme uses the
+            first-order flux correction and the floors.
 
     Returns:
-        A dict of numpy arrays holding the binned radial means (density,
-        |v|, pressure), a reproducible scatter subsample of the raw cells, and
-        the maximum domain radius — everything the figure needs, cached to disk.
+        A dict of numpy arrays holding the binned radial means and standard
+        deviations (density, |v|, pressure), a reproducible scatter subsample
+        of the raw cells, the central density slice, the extrema of the final
+        state and the maximum domain radius — everything the figure and the
+        printed diagnostics need, cached to disk.
     """
 
     # -------------------------------------------------------------
     # ============ ↓ Initial condition (energy injection) ↓ =======
     # -------------------------------------------------------------
 
-    config = make_config(solver_mode, riemann_solver, num_cells)
+    config = make_config(solver_mode, riemann_solver, num_cells, strong_shock_safeguards)
     helper_data = get_helper_data(config)
     registered_variables = get_registered_variables(config)
 
@@ -205,26 +250,27 @@ def simulate(solver_mode, riemann_solver, num_cells):
     delta_p = E_EXPLOSION * (GAMMA - 1.0) / (jnp.sum(weight) * cell_volume)
     gas_pressure = P_AMBIENT + delta_p * weight
 
-    fields = dict(
+    initial_state = construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
         density=density,
         velocity_x=zeros,
         velocity_y=zeros,
         velocity_z=zeros,
         gas_pressure=gas_pressure,
     )
-    if config.mhd:
-        fields.update(
-            magnetic_field_x=zeros, magnetic_field_y=zeros, magnetic_field_z=zeros
-        )
-
-    initial_state = construct_primitive_state(
-        config=config, registered_variables=registered_variables, **fields
-    )
     config = finalize_config(config, initial_state.shape)
 
-    params = SimulationParams(t_end=T_END, gamma=GAMMA)
-    if config.mhd:
-        params = params._replace(minimum_density=1e-6, minimum_pressure=1e-6)
+    if solver_mode == FINITE_DIFFERENCE:
+        params = SimulationParams(t_end=T_END, gamma=GAMMA, C_cfl=FINITE_DIFFERENCE_CFL)
+    else:
+        params = SimulationParams(
+            t_end=T_END,
+            gamma=GAMMA,
+            C_cfl=FINITE_VOLUME_CFL,
+            minimum_density=DENSITY_FLOOR,
+            minimum_pressure=PRESSURE_FLOOR,
+        )
 
     # -------------------------------------------------------------
     # ============ ↑ Initial condition (energy injection) ↑ =======
@@ -257,9 +303,17 @@ def simulate(solver_mode, riemann_solver, num_cells):
 
     counts = jnp.zeros(NUM_BINS).at[bin_index].add(1.0)
     counts = jnp.where(counts == 0, 1.0, counts)
-    mean_rho = jnp.zeros(NUM_BINS).at[bin_index].add(density_flat) / counts
-    mean_v = jnp.zeros(NUM_BINS).at[bin_index].add(velocity_magnitude) / counts
-    mean_p = jnp.zeros(NUM_BINS).at[bin_index].add(pressure_flat) / counts
+
+    def binned_mean_and_spread(field):
+        """Return the per-bin mean and standard deviation of ``field``."""
+        mean = jnp.zeros(NUM_BINS).at[bin_index].add(field) / counts
+        mean_of_square = jnp.zeros(NUM_BINS).at[bin_index].add(field**2) / counts
+        spread = jnp.sqrt(jnp.maximum(mean_of_square - mean**2, 0.0))
+        return mean, spread
+
+    mean_rho, spread_rho = binned_mean_and_spread(density_flat)
+    mean_v, spread_v = binned_mean_and_spread(velocity_magnitude)
+    mean_p, spread_p = binned_mean_and_spread(pressure_flat)
 
     # Reproducible scatter subsample of the raw cells for the background cloud.
     perm = jr.permutation(jr.PRNGKey(42), radius_flat.shape[0])[:NUM_SCATTER]
@@ -273,12 +327,28 @@ def simulate(solver_mode, riemann_solver, num_cells):
         mean_rho=np.asarray(mean_rho),
         mean_v=np.asarray(mean_v),
         mean_p=np.asarray(mean_p),
+        spread_rho=np.asarray(spread_rho),
+        spread_v=np.asarray(spread_v),
+        spread_p=np.asarray(spread_p),
         r_scatter=np.asarray(radius_flat[perm]),
         rho_scatter=np.asarray(density_flat[perm]),
         v_scatter=np.asarray(velocity_magnitude[perm]),
         p_scatter=np.asarray(pressure_flat[perm]),
+        density_slice=np.asarray(result[registered_variables.density_index, :, :, num_cells // 2]),
+        min_density=np.asarray(jnp.min(density_flat)),
+        max_velocity=np.asarray(jnp.max(velocity_magnitude)),
+        min_pressure=np.asarray(jnp.min(pressure_flat)),
+        all_finite=np.asarray(jnp.all(jnp.isfinite(result))),
         domain_max_r=np.asarray(domain_max_r),
     )
+
+
+def run_key(key, solver_mode, strong_shock_safeguards):
+    """Return the cache key of a run, marking finite-volume runs without the
+    strong-shock safeguards."""
+    if solver_mode == FINITE_VOLUME and not strong_shock_safeguards:
+        return f"{key}_without_fofc"
+    return key
 
 
 def cache_path(key, num_cells):
@@ -286,24 +356,26 @@ def cache_path(key, num_cells):
     return DATA_DIR / f"sedov_{key}_{num_cells}.npz"
 
 
-def get_run(key, solver_mode, riemann_solver, num_cells, rerun):
+def get_run(key, solver_mode, riemann_solver, num_cells, strong_shock_safeguards, rerun):
     """Load the cached diagnostics for one run, computing them if needed.
 
     Args:
         key: The short run identifier used in the cache filename.
         solver_mode: The solver family, FINITE_VOLUME or FINITE_DIFFERENCE.
-        riemann_solver: The Riemann solver to use (e.g. HLL, HLLC).
+        riemann_solver: The Riemann solver of the finite-volume scheme.
         num_cells: The number of cells per dimension (cubic domain).
+        strong_shock_safeguards: Whether the finite-volume scheme uses the
+            first-order flux correction and the floors.
         rerun: When True, recompute and overwrite the cache instead of reusing it.
 
     Returns:
         The dict of radial diagnostics produced by :func:`simulate`.
     """
-    path = cache_path(key, num_cells)
+    path = cache_path(run_key(key, solver_mode, strong_shock_safeguards), num_cells)
     if path.exists() and not rerun:
         return dict(np.load(path))
     print(f"running Sedov {key} at {num_cells}^3 ...")
-    data = simulate(solver_mode, riemann_solver, num_cells)
+    data = simulate(solver_mode, riemann_solver, num_cells, strong_shock_safeguards)
     np.savez(path, **data)
     print(f"  cached -> {path}")
     return data
@@ -325,11 +397,43 @@ def exact_solution(domain_max_r):
     return r_exact, sol
 
 
-def plot(num_cells, rerun):
-    """Draw the 4x3 Sedov figure (one solver per row, three fields per column).
+def print_diagnostics(label, run_data, r_exact, sol):
+    """
+    Print the extrema of a run's final state and the carbuncle measures: the
+    largest |v| of any cell and the largest standard deviation of |v| within
+    a radial bin around the shock front (``SHOCK_SHELL``), both relative to
+    the exact post-shock velocity.
+
+    Args:
+        label: The run's label.
+        run_data: The run's cached diagnostics.
+        r_exact: The radii of the exact solution.
+        sol: The exact solution.
+    """
+    exact_velocity = np.asarray(sol["velocity"])
+    post_shock_velocity = exact_velocity.max()
+    shock_radius = r_exact[np.argmax(exact_velocity)]
+    bin_centers = run_data["bin_centers"]
+    in_shell = (bin_centers > SHOCK_SHELL[0] * shock_radius) & (
+        bin_centers < SHOCK_SHELL[1] * shock_radius
+    )
+    shell_velocity_spread = run_data["spread_v"][in_shell].max() / post_shock_velocity
+    print(
+        f"{label}: min density {float(run_data['min_density']):.3e}, "
+        f"min pressure {float(run_data['min_pressure']):.3e}, "
+        f"finite {bool(run_data['all_finite'])}, "
+        f"max |v| {float(run_data['max_velocity']) / post_shock_velocity:.3f} and largest "
+        f"|v| spread at the shock front {shell_velocity_spread:.3f} of the post-shock velocity"
+    )
+
+
+def plot(num_cells, strong_shock_safeguards, rerun):
+    """Draw the Sedov figure (one solver per row, three fields per column).
 
     Args:
         num_cells: The number of cells per dimension (cubic domain).
+        strong_shock_safeguards: Whether the finite-volume rows use the
+            first-order flux correction and the floors.
         rerun: When True, recompute each run's cache before plotting.
     """
     fig, axes = plt.subplots(
@@ -339,9 +443,17 @@ def plot(num_cells, rerun):
     col_labels = ["density", r"$|v|$", "pressure"]
 
     for row_index, (key, label, color, solver_mode, riemann_solver) in enumerate(RUNS):
-        run_data = get_run(key, solver_mode, riemann_solver, num_cells, rerun)
+        run_data = get_run(
+            key,
+            solver_mode,
+            riemann_solver,
+            num_cells,
+            strong_shock_safeguards,
+            rerun,
+        )
         domain_max_r = float(run_data["domain_max_r"])
         r_exact, sol = exact_solution(domain_max_r)
+        print_diagnostics(label, run_data, r_exact, sol)
 
         # Per column: the scatter cloud, the binned mean, the exact profile, and
         # whether the y-axis is logarithmic (pressure spans several decades).
@@ -396,8 +508,11 @@ def plot(num_cells, rerun):
         handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, 0.005)
     )
 
-    plt.tight_layout(rect=[0.04, 0.03, 1, 1])
-    out = FIG_DIR / f"sedov_blast_{num_cells}.png"
+    plt.tight_layout(rect=[0.04, 0.04, 1, 1])
+    figure_name = f"sedov_blast_{num_cells}"
+    if not strong_shock_safeguards:
+        figure_name += "_without_fofc"
+    out = FIG_DIR / f"{figure_name}.png"
     fig.savefig(out, dpi=200)
     fig.savefig(out.with_suffix(".pdf"))
     plt.close(fig)
@@ -405,5 +520,8 @@ def plot(num_cells, rerun):
 
 
 if __name__ == "__main__":
-    num_cells = _resolution_from_argv()
-    plot(num_cells, rerun_requested())
+    plot(
+        _resolution_from_argv(),
+        _strong_shock_safeguards_from_argv(),
+        rerun_requested(),
+    )

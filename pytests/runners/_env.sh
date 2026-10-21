@@ -11,7 +11,10 @@
 # no `set -e`: module/micromamba shell functions misbehave under it
 set -u
 
-export ASTRONOMIX_REPO="/e/home/jusers/storcks1/jupiter/astronomix"
+# A worktree of the repository is selected by exporting ASTRONOMIX_REPO before
+# sbatch (with --export=ALL); its checkout is then imported, not the editable
+# install's.
+export ASTRONOMIX_REPO="${ASTRONOMIX_REPO:-/e/home/jusers/storcks1/jupiter/astronomix}"
 export RUN_LOG_DIR="/e/project1/astronomix/storcks1/runs"
 mkdir -p "$RUN_LOG_DIR"
 
@@ -33,7 +36,7 @@ export JAX_USE_SHARDY_PARTITIONER=false
 # and made a 43 GB compiled temp buffer fail on a 96 GB GH200 with plenty of
 # total memory free.  0.92 leaves ~8 GB for the CUDA context and NCCL.
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.92
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.92}"
 
 # --- optional communication optimizations (gated so existing runners are
 # --- unaffected; Slurm --export eats commas, hence one variable per knob) ---
@@ -53,4 +56,37 @@ if [ "${OPT_NCCL_DEBUG:-0}" = "1" ]; then
     export NCCL_DEBUG_SUBSYS=INIT
 fi
 
+export PYTHONPATH="$ASTRONOMIX_REPO${PYTHONPATH:+:$PYTHONPATH}"
+
+# --- process layout of the sharded scaling drivers (weak_*.sh,
+# --- strong_scaling.sh, validate_sharded.sh) ---
+# The job shape is --nodes=N --ntasks-per-node=T, T the GPUs used per node.
+# PROCESS_LAYOUT=node (default) launches one process per node driving all GPUs
+# of its node (on a single node: one process claiming T GPUs via autocvd);
+# intra-node halo exchanges then stay inside one process, which makes the
+# multi-node rungs ~30% faster on JUPITER.  PROCESS_LAYOUT=gpu launches one
+# process per GPU.  Sets SRUN_LAYOUT (srun options) and DRIVER_GPU_ARGS.
+sharded_layout() {
+    # NCCL needs more than the 8% of device memory that the default XLA pool
+    # leaves free once the pairwise halo exchange adds its per-pair
+    # communicators on many nodes; NVLS buffers are not needed for halo
+    # exchanges.
+    export XLA_PYTHON_CLIENT_MEM_FRACTION="${SHARDED_MEM_FRACTION:-0.90}"
+    export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+    export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-1048576}"
+    local gpus_per_node="${SLURM_NTASKS_PER_NODE:-4}"
+    local nodes="${SLURM_JOB_NUM_NODES:-1}"
+    DRIVER_GPU_ARGS=""
+    if [ "${PROCESS_LAYOUT:-node}" = "node" ]; then
+        SRUN_LAYOUT="--ntasks=$nodes --ntasks-per-node=1 --gres=gpu:4 --gpu-bind=none"
+        if [ "$nodes" = "1" ]; then
+            DRIVER_GPU_ARGS="--gpus $gpus_per_node"
+        fi
+    else
+        SRUN_LAYOUT="--gpu-bind=none"
+        if [ "${SLURM_NTASKS:-1}" = "1" ]; then
+            DRIVER_GPU_ARGS="--gpus 1"
+        fi
+    fi
+}
 cd "$ASTRONOMIX_REPO"

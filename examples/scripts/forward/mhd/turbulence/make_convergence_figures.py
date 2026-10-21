@@ -1,7 +1,8 @@
-"""Figures and convergence metrics for the astronomix / AthenaPK dynamo study.
+"""Figures and convergence metrics for the dynamo study.
 
-Reads every reduced run in ``data/`` (written by ``dynamo_convergence.py`` and
-``athenapk_turb.py``) and produces
+Reads every reduced run in ``data/`` (written by ``dynamo_convergence.py`` for
+astronomix's FD and FV schemes and by ``athenapk_turb.py`` for AthenaPK) and
+produces
 
     figures/dynamo_time_series.png   E_B(t), E_B/E_K(t), <|B|>(t), Mach(t)
     figures/dynamo_spectra_saturated.png       saturated state, all resolutions
@@ -60,8 +61,11 @@ FIG_DIR = HERE / "figures"
 #: One colour per scheme, one line style per resolution — so a figure reads as
 #: "scheme = colour, resolution = dash", the same convention as the hydro study.
 SERIES = {
-    "astronomix": ("#1f77b4", "astronomix WENO5+CT (5th)"),
-    "astronomix_wenoz": ("#17becf", "astronomix WENO-Z+CT (5th)"),
+    "astronomix": ("#1f77b4", "astronomix FD WENO5+CT (5th)"),
+    "astronomix_wenoz": ("#17becf", "astronomix FD WENO-Z+CT (5th)"),
+    "astronomix_wenoz_pp": ("#8c564b", "astronomix FD WENO-Z+CT+PP (5th)"),
+    "astronomix_weno5_pp": ("#7f7f7f", "astronomix FD WENO5+CT+PP (5th)"),
+    "astronomix_vl2":  ("#e377c2", "astronomix FV VL2+GLM (2nd)"),
     "plm":        ("#d62728", "AthenaPK PLM+VL2 (2nd)"),
     "ppm":        ("#ff9e4a", "AthenaPK PPM+RK3 (3rd)"),
     "limo3":      ("#9467bd", "AthenaPK LimO3+RK3 (3rd)"),
@@ -74,10 +78,24 @@ STYLE = {32: dict(ls=(0, (1, 3)), lw=1.3, alpha=0.65),
          512: dict(ls="-", lw=2.9, alpha=1.0)}
 
 
+#: astronomix scheme keys (``scheme_key`` in a run file) that have their own
+#: series; the FD runs written before the key existed fall back to the weights.
+ASTRONOMIX_SERIES = {
+    "weno5": "astronomix",
+    "wenoz": "astronomix_wenoz",
+    "wenoz_pp": "astronomix_wenoz_pp",
+    "weno5_pp": "astronomix_weno5_pp",
+    "vl2": "astronomix_vl2",
+}
+
+
 def series_of(run):
-    """Series key of a run: the code for astronomix (split by WENO weights),
-    the scheme for AthenaPK."""
+    """Series key of a run: the scheme within astronomix (FD by WENO weights
+    and positivity limiter, FV), the scheme for AthenaPK."""
     if str(run["code"]) == "astronomix":
+        scheme_key = str(run.get("scheme_key", ""))
+        if scheme_key in ASTRONOMIX_SERIES:
+            return ASTRONOMIX_SERIES[scheme_key]
         return "astronomix_wenoz" if bool(run.get("weno_z", False)) \
             else "astronomix"
     return str(run["scheme_key"])
@@ -320,8 +338,10 @@ def figure_convergence(summaries, out):
     print(f"wrote {out}")
 
 
-def figure_runtime(summaries, out, tcross):
+def figure_runtime(summaries, out, tcross, precision_note):
     """Wall clock at fixed N, throughput, and wall clock at fixed dynamo quality.
+
+    ``precision_note`` names the floating-point precision of the runs shown.
 
     Raw wall clock as configured, i.e. including each code's diagnostic output
     (82 in-flight spectral reductions for astronomix, 41 HDF5 dumps for
@@ -361,10 +381,10 @@ def figure_runtime(summaries, out, tcross):
     for ax in axes:
         ax.grid(alpha=0.25, which="both")
         ax.legend(fontsize=7)
-    fig.suptitle(f"Runtime: RAW wall clock on a single A100 for {tcross:g} crossing "
-                 "times, diagnostic output included, astronomix x32 vs AthenaPK "
-                 "x64.\nNot a like-for-like speed comparison — see the "
-                 "precision-matched timing grid in the README.", fontsize=9)
+    fig.suptitle(f"Runtime: RAW wall clock for {tcross:g} crossing times, "
+                 "diagnostic output included, each run in its own precision "
+                 f"({precision_note}).\nNot a like-for-like speed comparison "
+                 "unless the precisions match -- see the README.", fontsize=9)
     for ax in axes:
         ax.grid(alpha=0.25, which="both")
     fig.tight_layout()
@@ -440,7 +460,7 @@ def main():
     growth = {}
     if Path(args.growth_from).is_dir():
         for g in load_runs(args.growth_from):
-            growth[(str(g["code"]), int(g["N"]))] = g
+            growth[(series_of(g), int(g["N"]))] = g
         if growth:
             print(f"growth rates from the high-cadence repeats in "
                   f"{args.growth_from}: {sorted(growth)}")
@@ -448,7 +468,7 @@ def main():
     for run in runs:
         s = summarize(run, sat_start=args.sat_start, kin_band=tuple(args.band),
                       frac=args.frac, deconvolve=deconvolve,
-                      growth_run=growth.get((str(run["code"]), int(run["N"]))))
+                      growth_run=growth.get((series_of(run), int(run["N"]))))
         s["series"] = series_of(run)
         summaries.append(s)
 
@@ -477,7 +497,13 @@ def main():
                    f"$t/t_{{\\rm cross}} \\geq {args.sat_start:g}$")
     figure_convergence(summaries, fig_dir / "dynamo_convergence.png")
     tcross = max(float(np.asarray(r["t_over_tc"]).max()) for r in runs)
-    figure_runtime(summaries, fig_dir / "dynamo_runtime.png", tcross)
+    # AthenaPK's run files carry no precision flag; its science runs used the
+    # double-precision build.
+    precisions = sorted({f"{SERIES[series_of(r)][1]}: "
+                         + ("x64" if bool(r.get("x64", str(r["code"]) == "athenapk"))
+                            else "x32") for r in runs})
+    figure_runtime(summaries, fig_dir / "dynamo_runtime.png", tcross,
+                   "; ".join(precisions))
 
     table = metric_table(summaries)
     print()
@@ -490,10 +516,10 @@ def main():
         + ("Finite-volume spectra are deconvolved for cell averaging.\n\n"
            if deconvolve else "Raw (un-deconvolved) spectra.\n\n")
         + table + "\n\n"
-        "`wall [s]` is the raw wall clock of each production run as configured "
-        "-- astronomix in x32, AthenaPK in x64, each with its own diagnostic "
-        "output. It is NOT a like-for-like speed comparison; see the Runtime "
-        "section of README.md for the precision-matched timing grid.\n")
+        "`wall [s]` is the raw wall clock of each production run as configured, "
+        f"each with its own diagnostic output ({'; '.join(precisions)}). It is "
+        "NOT a like-for-like speed comparison unless the precisions match; see "
+        "the Runtime section of README.md.\n")
     print(f"\nwrote {Path(args.data) / 'metrics.md'}")
 
 

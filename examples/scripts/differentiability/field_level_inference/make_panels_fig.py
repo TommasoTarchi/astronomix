@@ -8,7 +8,13 @@ plane brought to the FRONT of the cube (toward the viewer) so it is clearly
 visible, with faint rays cube -> screen.  Volume and screen share one modern
 white-background -> blue colormap that prints cleanly.
 
-Run in the jf1uids env (pyvista + vtk).  Reads panel_snaps.npz.
+Run in an env with pyvista + vtk (on JUPITER:
+/e/project1/astronomix/storcks1/revision_tools/pyvista).  Reads panel_snaps.npz.
+Off-screen rendering needs an OpenGL context: on JUPITER the login nodes have
+none (the panels come out black), so render on a GPU node with the NVIDIA EGL::
+
+    sbatch --export=ALL,RUN_DIR=<this directory>,VTK_DEFAULT_OPENGL_WINDOW=vtkEGLRenderWindow \
+        pytests/runners/gpu1.sh <pyvista env>/bin/python make_panels_fig.py --snaps ... --out ...
 """
 import argparse
 import numpy as np

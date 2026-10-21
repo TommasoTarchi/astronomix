@@ -38,9 +38,12 @@ from astronomix.option_classes.simulation_config import (
     FINITE_VOLUME,
     FORWARDS,
     GHOST_CELLS,
+    IDEAL_GAS,
+    MAXIMUM_STEP_RETRIES,
     ON_DEVICE,
     PALLAS,
     PERIODIC_ROLL,
+    POSITIVITY_HARD_FLOOR,
     RK4_LSRK,
     STATE_TYPE,
     TO_DISK,
@@ -66,7 +69,10 @@ from astronomix._finite_difference._timestep_estimation._timestep_estimator impo
     _cfl_time_step_fd_hydro,
 )
 from astronomix._fluid_equations._passive_scalars import _fill_scalar_ghost_cells
-from astronomix._modules._iteration_level_updates import _iteration_level_updates
+from astronomix._modules._iteration_level_updates import (
+    _apply_density_floor,
+    _iteration_level_updates,
+)
 from astronomix._modules._turbulent_forcing._turbulent_forcing import _init_ou_forcing_state
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
@@ -416,7 +422,11 @@ def time_integration(
         pallas_mesh = sharding.mesh if sharding is not None else None
         pallas_spec = sharding.spec if sharding is not None else None
         if config.memory_analysis:
-            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
+            with mesh_ctx, pallas_mesh_context(
+                pallas_mesh,
+                pallas_spec,
+                config.backend_config.halo_exchange,
+            ):
                 compiled_step = time_integration_jit.lower(
                     primitive_state,
                     config,
@@ -454,7 +464,11 @@ def time_integration(
         if config.print_elapsed_time:
             if not config.memory_analysis:
                 # compile the time integration function
-                with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
+                with mesh_ctx, pallas_mesh_context(
+                    pallas_mesh,
+                    pallas_spec,
+                    config.backend_config.halo_exchange,
+                ):
                     time_integration_jit.lower(
                         primitive_state,
                         config,
@@ -468,7 +482,11 @@ def time_integration(
             print("🚀 Starting simulation...")
 
         try:
-            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
+            with mesh_ctx, pallas_mesh_context(
+                pallas_mesh,
+                pallas_spec,
+                config.backend_config.halo_exchange,
+            ):
                 final_state = time_integration_jit(
                     primitive_state,
                     config,
@@ -885,39 +903,86 @@ def _integrate_core(
         if config.exact_end_time and not config.use_specific_snapshot_timepoints:
             dt = jnp.minimum(dt, params.t_end - time)
 
-        # modules that run every time step
-        key, forcing, primitive_state = _iteration_level_updates(
-            primitive_state,
-            key,
-            forcing,
-            dt,
-            config,
-            params,
-            helper_data_pad,
-            registered_variables,
-            time + dt,
-        )
-
-        # evolve the state
-        if config.solver_mode == FINITE_VOLUME:
-            primitive_state = _evolve_state_fv(
+        def advance(step_size):
+            """The per-step modules and the evolve over ``step_size``, from the
+            state, PRNG key and forcing at the start of the step."""
+            new_key, new_forcing, new_state = _iteration_level_updates(
                 primitive_state,
-                dt,
-                params.gamma,
+                key,
+                forcing,
+                step_size,
                 config,
                 params,
                 helper_data_pad,
                 registered_variables,
+                time + step_size,
             )
-        elif config.solver_mode == FINITE_DIFFERENCE:
-            primitive_state = _evolve_state_fd(
+            if config.solver_mode == FINITE_VOLUME:
+                new_state = _evolve_state_fv(
+                    new_state,
+                    step_size,
+                    params.gamma,
+                    config,
+                    params,
+                    helper_data_pad,
+                    registered_variables,
+                )
+            elif config.solver_mode == FINITE_DIFFERENCE:
+                new_state = _evolve_state_fd(
+                    new_state,
+                    step_size,
+                    params.gamma,
+                    config,
+                    params,
+                    helper_data_pad,
+                    registered_variables,
+                )
+            return new_key, new_forcing, new_state
+
+        if config.positivity_config.step_retry:
+            # Repeat a step that left a non-finite value or a non-positive
+            # density / pressure at half the step size (see
+            # ``PositivityConfig.step_retry``). One loop body, so the evolve is
+            # traced once.
+            def admissible(state):
+                admissible_state = jnp.all(jnp.isfinite(state)) & (
+                    jnp.min(state[registered_variables.density_index]) > 0.0
+                )
+                if config.equation_of_state == IDEAL_GAS:
+                    admissible_state = admissible_state & (
+                        jnp.min(state[registered_variables.pressure_index]) > 0.0
+                    )
+                return admissible_state
+
+            def retry_pending(carry):
+                attempt, _, _, _, _, accepted = carry
+                return jnp.logical_not(accepted) & (attempt <= MAXIMUM_STEP_RETRIES)
+
+            def attempt_step(carry):
+                attempt, step_size, _, _, _, _ = carry
+                step_size = jnp.where(attempt == 0, step_size, 0.5 * step_size)
+                new_key, new_forcing, new_state = advance(step_size)
+                return attempt + 1, step_size, new_key, new_forcing, new_state, admissible(new_state)
+
+            _, dt, key, forcing, primitive_state, _ = jax.lax.while_loop(
+                retry_pending,
+                attempt_step,
+                (jnp.asarray(0), dt, key, forcing, primitive_state, jnp.asarray(False)),
+            )
+        else:
+            key, forcing, primitive_state = advance(dt)
+
+        # AthenaPK floors the density in every stage's conversion to
+        # primitives, so its time step and output see the floored state; the
+        # per-step hard floor does the same at the end of the step.
+        if config.positivity_config.per_step_mode == POSITIVITY_HARD_FLOOR:
+            primitive_state = _apply_density_floor(
                 primitive_state,
-                dt,
+                params.minimum_density,
                 params.gamma,
                 config,
-                params,
-                helper_data_pad,
                 registered_variables,
+                params.maximum_alfven_speed,
             )
 
         # Sink particle formation and accretion act on the updated state, so
@@ -1363,7 +1428,11 @@ def _time_integration_to_disk(
                     segment_params,
                 )
 
-            with mesh_ctx, pallas_mesh_context(pallas_mesh, pallas_spec):
+            with mesh_ctx, pallas_mesh_context(
+                pallas_mesh,
+                pallas_spec,
+                config.backend_config.halo_exchange,
+            ):
                 (
                     t_final,
                     primitive_state,

@@ -727,12 +727,12 @@ def _local_gas_pressure(state, gamma_minus_one, magnetic_slots=()):
     Returns:
         The gas pressure.
     """
-    density = jnp.maximum(state[DENSITY_SLOT], DIVISION_FLOOR)
     momentum_slots = [slot for slot in range(1, len(state) - 1) if slot not in magnetic_slots]
     momentum_squared = state[momentum_slots[0]] * state[momentum_slots[0]]
     for slot in momentum_slots[1:]:
         momentum_squared = momentum_squared + state[slot] * state[slot]
-    internal_energy = state[-1] - 0.5 * momentum_squared / density
+    # the guarded division with the float32-safe derivative, as the array form
+    internal_energy = state[-1] - _floored_ratio(0.5 * momentum_squared, state[DENSITY_SLOT])
     for slot in magnetic_slots:
         internal_energy = internal_energy - 0.5 * state[slot] * state[slot]
     return gamma_minus_one * internal_energy
@@ -769,7 +769,7 @@ def _local_admissible_fraction(
     density_floor = jnp.minimum(minimum_density, 0.5 * base_density)
     fraction = jnp.where(
         density_step < 0.0,
-        (base_density - density_floor) / jnp.maximum(-density_step, DIVISION_FLOOR),
+        _floored_ratio(base_density - density_floor, -density_step),
         1.0,
     )
     fraction = jnp.clip(jnp.where(base_density > 0.0, fraction, 0.0), 0.0, 1.0)
@@ -781,7 +781,7 @@ def _local_admissible_fraction(
     base_margin = base_pressure - pressure_floor
     end_state = tuple(base[slot] + fraction * step[slot] for slot in range(len(step)))
     end_margin = _local_gas_pressure(end_state, gamma_minus_one, magnetic_slots) - pressure_floor
-    chord_root = fraction * base_margin / jnp.maximum(base_margin - end_margin, DIVISION_FLOOR)
+    chord_root = _floored_ratio(fraction * base_margin, base_margin - end_margin)
     fraction = jnp.where(end_margin >= 0.0, fraction, chord_root)
     return jnp.where(base_margin > 0.0, fraction, 0.0)
 
@@ -825,6 +825,7 @@ def positivity_preserving_flux_local(
     minimum_pressure,
     ideal_gas=True,
     magnetic_slots=(),
+    frozen_theta=False,
 ):
     """
     ``positivity_preserving_interface_flux`` for one interface of a
@@ -850,6 +851,9 @@ def positivity_preserving_flux_local(
             the kinetic energy in the pressure. The normal-field component
             keeps its Lax-Friedrichs diffusion (see
             ``positivity_preserving_interface_flux``).
+        frozen_theta: Freeze the admissibility scalings for differentiation,
+            as ``weno_ad_frozen_weights`` does in the array form (the adjoint
+            kernels); the value is unchanged.
 
     Returns:
         The interface flux as a list of local components.
@@ -893,6 +897,9 @@ def positivity_preserving_flux_local(
 
     plus_theta = face_scaling(plus_owner, plus_unshifted, plus_step)
     minus_theta = face_scaling(minus_owner, minus_unshifted, minus_step)
+    if frozen_theta:
+        plus_theta = jax.lax.stop_gradient(plus_theta)
+        minus_theta = jax.lax.stop_gradient(minus_theta)
     # The normal-field component stays, as in positivity_preserving_interface_flux.
     interface_flux = [
         0.5 * alpha * (plus_owner[slot] + plus_theta * plus_step[slot])

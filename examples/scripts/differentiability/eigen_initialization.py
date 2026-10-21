@@ -1,333 +1,155 @@
 """
-# Kelvin-Helmholtz instability in 2D
-
-We analyze the Kelvin-Helmholtz instability across 
-Mach and Reynolds numbers.
-
-## Setup
-
-Where not indicated differently, 
-our general setup follows Mandelker et al, 2016,
-https://arxiv.org/pdf/1606.06289. Note that they
-use different coordinate conventions, 
-
-- their x-axis (transverse) is our y-axis
-- their z-axis (flow direction) is our x-axis
-
-### Baseline setup
-
-Consider a dense slab with radius R_s flowing 
-through a dilute background medium along the x-axis. 
-
-- the simulation domain is [0, 1] x [0, 1] with periodic boundaries at x = 0 and x = 1
-  and periodic (open in Mandelker et al.) boundaries at y = 0 and y = 1
-- R_s = 1/160 in Mandelker et al.
-- the slab is centered at y_c = 0.5
-- slab and background are ideal gases with γ = 5/3 and P = 1 everywhere
-- the background has density ρ_b = 1 and velocity v_b = 0
-- the slab has density ρ_s = χ and velocity v_s = M_b * c_b * x̂, 
-  where c_b = sqrt(γ * P / ρ_b) = sqrt(5/3) and M_b is the Mach 
-  number of the hot dilute background flow relative to the slab
-- diffusion can be included, the kinematic viscosity ν is set
-
-Truly discontinuous density and velocity 
-profiles lead to numerical noise at the grid-scale,
-such that we use a smoothed transition
-
-f(y) = f_b + 0.25 * (f_s - f_b) * (1 + tanh((R_s - (y - y_c)) / σ)) * (1 + tanh((R_s + (y - y_c)) / σ))
-
-with smoothing length σ, e.g. σ = λ / 102, 
-where λ is the wavelength of the perturbation.
-
-Roediger et al. 2013 only use smoothing for the highest
-Re run, they then smooth with σ being 1 to 2% of λ.
-
-### Perturbation
-
-There are multiple ways to perturb this system.
-
-#### Velocity only perturbation
-
-Following Sec. 3.1 in Roediger et al. 2013, we can perturb
-
-v_y = v_0 sin(k * x) * [exp(-((y - y_c) - R_s)^2 / (σ_y^2)) + exp(-((y - y_c) + R_s)^2 / (σ_y^2))]
-
-with 
-
-- k = 2 * π / λ
-- σ_y^2 = 0.3 * λ
-- v_0 = 0.1 * v_s (the slab and also the shear velocity)
-
-#### Pressure only perturbation (Sec. 3.3 in Mandelker et al.)
-
-We can perturb the pressure with
-
-P_1 = A * cos(k * x) * [exp(-((y - y_c) - R_s)^2 / (2 Σ^2)) + exp(-((y - y_c) + R_s)^2 / (2 Σ^2))]
-
-e.g. with the same A and k as above and e.g. Σ = 5 * σ or
-
-- A = 0.05
-- Σ = 5 * σ
-- k = 2 * π / λ, e.g. λ = R_s or λ = 2 * R_s
-
-#### Eigenmode perturbations
-
-##### Mandelker et al. analytical approach
-
-Following Sec. 2.1 and 2.3 in Mandelker et al., by inserting
-small perturbations into the Euler equations, one can relate
-the perturbations in velocity, density, and pressure
-to each other.
-
-Denote \partial_y f as f' and k_x = k * cos(θ).
-
-Given a pressure perturbation P_1(x, y),
-
-ρ_1 = -1 / (k^2 (v_k - ω / k)^2) * [P_1'' - 2v_k' / (v_k - ω / k) * P_1' - k^2 P_1]
-v_{1x} = -cos(θ) / (ρ_0 (v_k - ω / k)) * [v_k' / (k^2 cos^2(θ) (v_k - ω / k)) * P_1' + P_1]
-v_{1y} = i / (ρ_0 k (v_k - ω / k)) * P_1'
-
-where 
-
-- k is the wavenumber of the perturbation
-- θ is the angle of the perturbation wavevector with respect to the flow direction (x-axis)
-- v_k = v_0 \cdot k = v_0 * cos(θ) is the component of the background 
-  velocity in the direction of the perturbation wavevector
-- ω is the complex frequency of the perturbation
-
-In our case of the slab flowing along the x-axis, we have
-
-- subscript s denotes the slab and subscript b denotes the background
-- θ = 0 (perturbation aligned with the flow)
-- v_k = v_0 = const. -> v_k' = 0
-
-so
-
-ρ_1 = -1 / (k^2 (v_0 - ω / k)^2) * [P_1'' - k^2 P_1]
-v_{1x} = -1 / (ρ_0 (v_0 - ω / k)) * P_1
-v_{1y} = i / (ρ_0 k (v_0 - ω / k)) * P_1'
-
-For the slab, one finds the pressure perturbation P_1(y)
-to be
-
-         { A * exp(-q_b * (y - y_c - R_s)) for y > y_c + R_s
-P_1(y) = | A * S(q_s * (y - y_c)) / S(q_s * R_s) for y_c - R_s <= y <= y_c + R_s
-         { ±A * exp(q_b * (y - y_c + R_s)) for y < y_c - R_s
-
-where
-
-- S = cosh for pinch modes (plus sign in the bottom line)
-- S = sinh for sinusoidal modes (minus sign in the bottom line)
-
-where
-
-- q_b = k * sqrt(1 - (Δv_b / c_b)^2)
-- q_s = k * sqrt(1 - (Δv_s / c_s)^2)
-
-where
-
-- Δv_b = v_b - ω/k
-- Δv_s = v_s - ω/k
-
-Now we are still missing the complex frequency ω.
-It follows from solving Eq. 25 in Mandelker et al.
-
-(ω - k * v_b)^2 / (ω - k * v_s)^2 = -ρ_s / ρ_b * q_b / q_s * T(q_s * R_s)
-
-where
-
-- T = tanh for sinusoidal modes
-- T = coth for pinch modes
-
-This is solved by numerical root finding, under 
-the constraint that Re(q_b) > 0 and 
-Re(q_s) > 0 (wave decays towards
-the edge).
-
-The characteristic time of perturbation growth in 
-the linear regime is the Kelvin-Helmholtz time 
-k_KH = 1 / Im(ω).
-
-Smoothing is applied to all initial perturbations 
-(not fully consistent, but sufficient).
-
-For more details, see the Mandelker et al. paper.
-
-##### Purely numerical eigenmodes (optional)
-
-One might alternatively directly linearize the Euler equations
-around the background flow and numerically solve the resulting
-eigenvalues problem. We might use JAX autodiff to linearize
-the RHS of our fluid solver directly and solve for the eigenmodes
-of the resulting linear operator, this allows us to allows us
-to find the eigenmodes of our numerical scheme with the smoothed
-initial conditions, and is flexible regarding the inclusion of 
-additional physics like viscosity.
-
-Ideally, one would implement both approaches 
-and check for consistency.
-
-## Criticality
-
-### Critical Mach number
-
-The critical Mach number is given by
-
-M_crit = (1 + χ^{-1/3})^{3/2}  (Eq. 22 in Mandelker et al.)
-
-where χ = ρ_s / ρ_b is the density contrast 
-between the slab and the background.
-
-- M_b < M_crit: surface modes grow rapidly, stream disrupts
-- M_b > M_crit: surface modes suppressed, stream remains stable
-
-### Critical Reynolds number
-
-Roediger et al. 2013 (https://arxiv.org/pdf/1309.2635) empirically found
-
-  Re_crit = 880 / Δ       (Eq. 22, for constant kinematic viscosity)
-  Re_0 = 1320 / sqrt(Δ)   (Eq. 23)
-  Δ = (ρ_cold + ρ_hot)² / (ρ_cold ρ_hot)
-
-with the viscous growth time (Eq. 21):
-
-  τ_KH,visc = τ_KH,inv × [1 + Re₀ / (Re − Re_crit)]
-
-while the non-viscous growth time is
-
-	t_kh = jnp.sqrt(Delta) / (2 * jnp.pi) * wavelength / v_slab
-
-where approximately for
-
-- Re >> Re_crit: viscosity negligible, usual KHI growth
-- Re <  Re_crit:  viscosity dominates, KHI suppressed
-
-However, suppresion by viscosity is a gradual effect and
-it is hard to define what "suppressed" means in practice.
-
-## Experimental diagnostics
-
-### Growth time
-Consider the maximum (or minimum) v_y, v_ymax as a function of time.
-
-- until ~ 1 t_kh, v_ymax reflects sound waves from the initialization and we ignore it
-- from ~ 1 t_kh to ~ 5 t_kh, we measure the growth time t_kh_measured by fitting
-    v_ymax(t) = v_ymax(t=0) * exp(t / t_kh_measured)
-
+Eigen-initialization of the Kelvin-Helmholtz instability with the AD Jacobian.
+
+The semi-discrete finite-difference right-hand side dq/dt = R(q) is linearized
+by forward-mode AD about a base state that depends on y only. Since the x axis
+is periodic and the base state streamwise homogeneous, a single x Fourier mode
+q_hat(y) exp(i k_x x) decouples, and the reduced Jacobian of that mode
+(n_var N_y x n_var N_y) is small enough to be diagonalized densely
+(``single_xmode_rhs_jacobian2D``). Its eigenpairs are exact eigenpairs of the
+discrete operator: growth rate Re(lambda), frequency Im(lambda).
+
+Setup (paper Sec. "Sensitivity analysis and eigen-initialization"): pure
+hydrodynamics on [0, 1]^2 at 300^2 cells, periodic in x and open in y, in single
+precision, WENO-Z. A single tanh transition across y_c = 1/2 in density (chi = 10
+below, 1 above) and streamwise velocity (-/+ v_shear / 2, v_shear = M_b c_b with
+M_b = 0.5, c_b = sqrt(gamma P / rho_b)), uniform pressure P = 1, gamma = 5/3,
+smoothing length sigma = lambda_x / 10 with lambda_x = L_x / 2; the sharp
+reference interface is the sigma -> 0 limit. The KH time is
+tau_KH = sqrt(Delta) lambda_x / v_shear with Delta = (rho_1 + rho_2)^2 /
+(rho_1 rho_2).
+
+The script
+
+1. computes the eigenspectra of the dilute upper and the dense lower state in
+   isolation and of the sharp and the smoothed interface, coloured by the
+   effective transverse wavenumber, and selects the KH eigenmode (growing,
+   interface-localized, transversely smooth): ``figures/eigenvalue_spectrum.png``
+   (paper: eigenvalue_spectrum_final.png);
+2. evolves the eigenmode and the usual ad-hoc velocity perturbation
+   v_y = A sin(k_x x) exp(-((y - y_c) / (0.2 lambda_x))^2) of the same peak
+   amplitude A = M_b c_b / 20 to t = 1.5 tau_KH and compares the growth of the
+   k_x Fourier amplitude of v_y, ``figures/eigenmode_transient_test.png``, and the
+   final states, ``figures/eigenmode_final_states.png``.
+
+The spectra, the selected eigenvalue and the amplitude curves are written to
+``data/eigen_initialization.npz``.
+
+The slab geometry (a dense stream of half-width R_s, two interfaces, Mandelker
+et al. 2016) and a pressure perturbation are available through
+``interface_mode = SLAB`` and ``PRESSURE_PERTURBATION``; the paper uses the
+single interface.
 """
 
 # ==== GPU selection ====
 from autocvd import autocvd
+
 autocvd(num_gpus=1)
 # ruff: noqa: E402
 # =======================
 
-from functools import partial
+# general
+from dataclasses import dataclass
+from pathlib import Path
 
 # typing
-from dataclasses import dataclass
 from typing import NamedTuple
 
-# numerics
-import jax
+# jax
 import jax.numpy as jnp
+
+# numerics
 import numpy as np
-from scipy.sparse.linalg import LinearOperator, eigs, ArpackNoConvergence
-import scipy.sparse as sp
-import scipy.linalg as la
 
 # plotting
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-import matplotlib.animation as animation
 from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
-import matplotlib.colors as mcolors
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
-import matplotlib as mpl
 
 # astronomix constants
 from astronomix import (
-    OPEN_BOUNDARY,
     FINITE_DIFFERENCE,
+    OPEN_BOUNDARY,
+    PALLAS,
     PERIODIC_BOUNDARY,
 )
 from astronomix.option_classes.simulation_config import DYNAMIC_VISCOSITY
 
 # astronomix containers
 from astronomix import (
+    BackendConfig,
+    BoundarySettings,
+    BoundarySettings1D,
     SimulationConfig,
     SimulationParams,
     SnapshotSettings,
-    BoundarySettings,
-    BoundarySettings1D,
 )
 
 # astronomix functions
 from astronomix import (
-    get_helper_data,
-    time_integration,
     construct_primitive_state,
-    get_registered_variables,
     finalize_config,
+    get_helper_data,
+    get_registered_variables,
+    time_integration,
 )
 from astronomix._fluid_equations._equations import (
     conserved_state_from_primitive,
     primitive_state_from_conserved,
 )
-from astronomix.analysis_helpers.jacobians import (
-    single_xmode_jacobian2Dt,
-    single_xmode_rhs_jacobian2D,
-)
+from astronomix.analysis_helpers.jacobians import single_xmode_rhs_jacobian2D
 from astronomix.plotting_helpers.inset_box import add_inset_box
 
-# figures are written to the local figures/ directory
-from pathlib import Path
-figures_dir = Path(__file__).resolve().parent / "figures"
-figures_dir.mkdir(exist_ok=True)
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+FIGURES_DIRECTORY = SCRIPT_DIRECTORY / "figures"
+DATA_DIRECTORY = SCRIPT_DIRECTORY / "data"
+
+# Geometry of the base state.
 SINGLE_INTERFACE = 0
 SLAB = 1
 interface_mode = SINGLE_INTERFACE
 
-ROEDIGER = 0
-TIRSO = 1
-paper_mode = TIRSO
-
+# Perturbation types.
 VELOCITY_PERTURBATION = 0
 PRESSURE_PERTURBATION = 1
 EIGENMODE_PERTURBATION = 2
 
-# global parameters
+# Global parameters of the base state.
 y_center = 0.5
 background_density = 1.0
-pressure = 1.0 # uniform pressure everywhere
+pressure = 1.0
 background_velocity = 0.0
-# box_size = 1.0
 box_size = 1.0
-gamma = 5/3
+gamma = 5 / 3
 
-# paper resolution: the smooth KH eigenmode (effective transverse wavenumber
-# k_y^eff/k_Nyq ~ 0.05) is only cleanly separated from the grid-scale modes once
-# the smoothed interface (sigma = lambda_x/10) is well resolved; at much lower
-# resolution the physical growing mode is not captured and the selection fails
+# The smooth KH eigenmode (k_y^eff / k_Nyq ~ 0.05) separates cleanly from the
+# grid-scale modes only once the smoothed interface (sigma = lambda_x / 10) is
+# well resolved; at much lower resolution the selection fails.
 num_cells = 300
+
 
 @dataclass
 class PerturbationSetup:
+    """Amplitude and wavelength of the perturbation."""
 
-	#: The amplitude of the perturbation.
-	amplitude: float
+    #: The amplitude of the perturbation (peak transverse velocity).
+    amplitude: float
 
-	#: The wavelength of the perturbation.
-	wavelength: float
+    #: The wavelength of the perturbation.
+    wavelength: float
+
 
 @dataclass
 class PressurePerturbationSetup(PerturbationSetup):
+    """A perturbation setup with the Gaussian width of a pressure perturbation."""
 
-	#: The width of the Gaussian envelope for the pressure perturbation.
-	gaussian_width: float # Σ
+    #: The width of the Gaussian envelope of a pressure perturbation.
+    gaussian_width: float
+
 
 class KHISetup(NamedTuple):
+    """The Kelvin-Helmholtz setup."""
 
     #: The number of cells in the x and y directions.
     num_cells: int
@@ -344,278 +166,260 @@ class KHISetup(NamedTuple):
     #: Switch for whether to include diffusion (viscosity) or not.
     diffusion: bool
 
-    #: The kinematic viscosity of the fluid, if diffusion is included.
+    #: The viscosity of the fluid, if diffusion is included.
     viscosity: float
 
-    #: The Mach number of the slab relative to the background.
-    mach_number: float # M_b
+    #: The Mach number of the shear flow, M_b = v_shear / c_b.
+    mach_number: float
 
-    #: The density contrast between the slab and the background.
-    density_contrast: float # χ
+    #: The density contrast chi between the dense and the dilute fluid.
+    density_contrast: float
 
-    #: The radius (half-width) of the slab.
-    slab_radius: float # R_s
+    #: The radius (half-width) of the slab (slab mode only).
+    slab_radius: float
 
-    #: The smoothing length for the initial conditions.
-    smoothing_length: float # σ
-        
-    #: Whether to use smooth profiles for the initial conditions or not.
+    #: The smoothing length sigma of the tanh profiles.
+    smoothing_length: float
+
+    #: Smooth tanh profiles (True) or sharp jumps (False).
     smooth_profiles: bool = True
 
-def slab_profile(f_b, f_s, Y, y_center, slab_radius, smoothing_length):
-    """Tanh transition from f_b (background) to f_s (stream)."""
 
-	# f(y) = f_b + 0.25 * (f_s - f_b) * (1 + tanh((R_s - (y - y_c)) / σ)) * (1 + tanh((R_s + (y - y_c)) / σ))
+# -------------------------------------------------------------
+# ================ ↓ Base state and perturbations ↓ ===========
+# -------------------------------------------------------------
+
+
+def slab_profile(f_b, f_s, Y, y_center, slab_radius, smoothing_length):
+    """
+    Tanh transition from f_b (background) to f_s (stream) on both sides of a
+    slab: f = f_b + (f_s - f_b) / 4 (1 + tanh((R_s - (y - y_c)) / sigma))
+    (1 + tanh((R_s + (y - y_c)) / sigma)).
+    """
     return f_b + 0.25 * (f_s - f_b) * (
-		(1 + jnp.tanh((slab_radius - (Y - y_center)) / smoothing_length)) *
-		(1 + jnp.tanh((slab_radius + (Y - y_center)) / smoothing_length))
-	)
+        (1 + jnp.tanh((slab_radius - (Y - y_center)) / smoothing_length))
+        * (1 + jnp.tanh((slab_radius + (Y - y_center)) / smoothing_length))
+    )
+
 
 def single_interface(f_l, f_u, Y, y_center, smoothing_length):
-	return 0.5 * (f_l * (1 - jnp.tanh((Y - y_center) / smoothing_length)) + f_u * (1 + jnp.tanh((Y - y_center) / smoothing_length)))
+    """Tanh transition from f_l (below y_c) to f_u (above y_c)."""
+    transition = jnp.tanh((Y - y_center) / smoothing_length)
+    return 0.5 * (f_l * (1 - transition) + f_u * (1 + transition))
+
 
 def velocity_perturbation(cell_centers, slab_radius, perturbation_setup):
-	# NOTE: here without smoothing
-	k = 2 * jnp.pi / perturbation_setup.wavelength
-	X = cell_centers[:, :, 0] # x-coordinates of cell centers
-	Y = cell_centers[:, :, 1] # y-coordinates of cell centers
-	sigma_y = 0.3 * perturbation_setup.wavelength
-	vy_pert = perturbation_setup.amplitude * jnp.sin(k * X) * (
-		jnp.exp(-((Y - y_center) - slab_radius)**2 / (sigma_y**2)) + 
-		jnp.exp(-((Y - y_center) + slab_radius)**2 / (sigma_y**2))
-	)
-	return vy_pert
+    """
+    The transverse-velocity perturbation of a slab (Roediger et al. 2013, Sec.
+    3.1): v_y = A sin(k x) [exp(-((y - y_c) - R_s)^2 / sigma_y^2) +
+    exp(-((y - y_c) + R_s)^2 / sigma_y^2)] with sigma_y = 0.3 lambda.
+    """
+    wavenumber = 2 * jnp.pi / perturbation_setup.wavelength
+    X = cell_centers[:, :, 0]
+    Y = cell_centers[:, :, 1]
+    width = 0.3 * perturbation_setup.wavelength
+    return perturbation_setup.amplitude * jnp.sin(wavenumber * X) * (
+        jnp.exp(-(((Y - y_center) - slab_radius) ** 2) / width**2)
+        + jnp.exp(-(((Y - y_center) + slab_radius) ** 2) / width**2)
+    )
+
 
 def single_interface_velocity_perturbation(cell_centers, perturbation_setup):
-	# v_y = A * sin(k * x) * exp(-((y - y_c) / σ)^2)
-	k = 2 * jnp.pi / perturbation_setup.wavelength
-	X = cell_centers[:, :, 0] # x-coordinates of cell centers
-	Y = cell_centers[:, :, 1] # y-coordinates of cell centers
-	sigma = 0.2 * perturbation_setup.wavelength
-	vy_pert = perturbation_setup.amplitude * jnp.sin(k * X) * jnp.exp(-((Y - y_center) / sigma)**2)
-	return vy_pert
+    """
+    The ad-hoc transverse-velocity perturbation of the single interface:
+    v_y = A sin(k x) exp(-((y - y_c) / sigma_v)^2) with sigma_v = 0.2 lambda.
+    """
+    wavenumber = 2 * jnp.pi / perturbation_setup.wavelength
+    X = cell_centers[:, :, 0]
+    Y = cell_centers[:, :, 1]
+    width = 0.2 * perturbation_setup.wavelength
+    return perturbation_setup.amplitude * jnp.sin(wavenumber * X) * jnp.exp(-(((Y - y_center) / width) ** 2))
+
 
 def pressure_perturbation(cell_centers, slab_radius, y_center, perturbation_setup):
-	# P_1 = A * cos(k * x) * [exp(-((y - y_c) - R_s)^2 / (2 Σ^2)) + exp(-((y - y_c) + R_s)^2 / (2 Σ^2))]
-	k = 2 * jnp.pi / perturbation_setup.wavelength
-	X = cell_centers[:, :, 0] # x-coordinates of cell centers
-	Y = cell_centers[:, :, 1] # y-coordinates of cell centers
-	P_1 = perturbation_setup.amplitude * jnp.cos(k * X) * (
-		jnp.exp(-((Y - y_center) - slab_radius)**2 / (2 * perturbation_setup.gaussian_width**2)) + 
-		jnp.exp(-((Y - y_center) + slab_radius)**2 / (2 * perturbation_setup.gaussian_width**2))
-	)
-	return P_1
+    """
+    The pressure perturbation of a slab (Mandelker et al. 2016, Sec. 3.3):
+    P_1 = A cos(k x) [exp(-((y - y_c) - R_s)^2 / (2 Sigma^2)) +
+    exp(-((y - y_c) + R_s)^2 / (2 Sigma^2))].
+    """
+    wavenumber = 2 * jnp.pi / perturbation_setup.wavelength
+    X = cell_centers[:, :, 0]
+    Y = cell_centers[:, :, 1]
+    width = perturbation_setup.gaussian_width
+    return perturbation_setup.amplitude * jnp.cos(wavenumber * X) * (
+        jnp.exp(-(((Y - y_center) - slab_radius) ** 2) / (2 * width**2))
+        + jnp.exp(-(((Y - y_center) + slab_radius) ** 2) / (2 * width**2))
+    )
 
-def setup_khi_unperturbed_base(setup: KHISetup, return_snapshots = False):
-	
-    # set up the simulation configuration
+
+def setup_khi_unperturbed_base(setup: KHISetup, return_snapshots=False):
+    """
+    The configuration, parameters and the unperturbed (y-dependent) base state.
+
+    Args:
+        setup: The KH setup.
+        return_snapshots: Return 300 snapshots of the states.
+
+    Returns:
+        The tuple ``(base_state, config, params, registered_variables,
+        helper_data)``.
+    """
+    # The padded grid is 300 + 2 x 4 = 308 cells per axis; a Pallas block has
+    # to divide it and be a power of two, so it is (4, 4).
     config = SimulationConfig(
-        progress_bar = True,
-        dimensionality = 2,
-        box_size = box_size,
-        num_cells = setup.num_cells,
-        diffusion = setup.diffusion,
-        viscosity_type = DYNAMIC_VISCOSITY, # KINEMATIC_VISCOSITY,
-        boundary_settings = BoundarySettings(
-            x = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),   # flow dir
-            y = BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY),           # transverse
+        backend_config=BackendConfig(backend=PALLAS, pallas_block_shape=(4, 4, 1)),
+        weno_z=True,
+        progress_bar=True,
+        dimensionality=2,
+        box_size=box_size,
+        num_cells=setup.num_cells,
+        diffusion=setup.diffusion,
+        viscosity_type=DYNAMIC_VISCOSITY,
+        boundary_settings=BoundarySettings(
+            x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+            y=BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY),
         ),
-        return_snapshots = return_snapshots,
-        num_snapshots = 300,
-        snapshot_settings = SnapshotSettings(
-            return_states = True,
-        )
+        return_snapshots=return_snapshots,
+        num_snapshots=300,
+        snapshot_settings=SnapshotSettings(return_states=True),
     )
 
-    # set up the simulation parameters
+    # The finite-difference CFL number counts the sum of the axis signal
+    # speeds; 1.5 is close to the SSP limit of the five-stage SSPRK4 and
+    # stable for this smooth, subsonic flow.
     params = SimulationParams(
-        viscosity = setup.viscosity,
-        t_end = setup.simulation_time,
-        C_cfl = 1.5 if config.solver_mode == FINITE_DIFFERENCE else 0.4, 
-        gamma = gamma,
+        viscosity=setup.viscosity,
+        t_end=setup.simulation_time,
+        C_cfl=1.5 if config.solver_mode == FINITE_DIFFERENCE else 0.4,
+        gamma=gamma,
     )
 
-    # helper data
     helper_data = get_helper_data(config)
     registered_variables = get_registered_variables(config)
 
-    # construct the unperturbed initial conditions
-    cell_centers = helper_data.geometric_centers
-    Y = cell_centers[:, :, 1] # y-coordinates of cell centers
+    Y = helper_data.geometric_centers[:, :, 1]
     stream_density = setup.density_contrast * background_density
+    background_sound_speed = jnp.sqrt(params.gamma * pressure / background_density)
+    shear_velocity = setup.mach_number * background_sound_speed
 
-    c_background = jnp.sqrt(params.gamma * pressure / background_density)
-
-    smooth_profiles = setup.smooth_profiles
-
-    if smooth_profiles:
-        if interface_mode == SINGLE_INTERFACE:
-
-            density = single_interface(
-                f_l = stream_density,
-                f_u = background_density,
-                Y = Y,
-                y_center = y_center,
-                smoothing_length = setup.smoothing_length,
-            )
-
-            v_mach = setup.mach_number * c_background
-            v_x = single_interface(
-                f_l = -v_mach / 2,
-                f_u = v_mach / 2,
-                Y = Y,
-                y_center = y_center,
-                smoothing_length = setup.smoothing_length,
-            )
-        
-        elif interface_mode == SLAB:
+    if interface_mode == SINGLE_INTERFACE:
+        if setup.smooth_profiles:
+            density = single_interface(stream_density, background_density, Y, y_center, setup.smoothing_length)
+            velocity_x = single_interface(-shear_velocity / 2, shear_velocity / 2, Y, y_center, setup.smoothing_length)
+        else:
+            density = jnp.where(Y < y_center, stream_density, background_density)
+            velocity_x = jnp.where(Y < y_center, -shear_velocity / 2, shear_velocity / 2)
+    elif interface_mode == SLAB:
+        if setup.smooth_profiles:
             density = slab_profile(
-                f_b = background_density,
-                f_s = stream_density,
-                Y = Y,
-                y_center = y_center,
-                slab_radius = setup.slab_radius,
-                smoothing_length = setup.smoothing_length,
-            )
-
-            v_x = slab_profile(
-                f_b = background_velocity,
-                f_s = setup.mach_number * c_background,
-                Y = Y,
-                y_center = y_center,
-                slab_radius = setup.slab_radius,
-                smoothing_length = setup.smoothing_length,
-            )
-    else:
-        if interface_mode == SLAB:
-            density = jnp.where(
-                jnp.abs(Y - y_center) <= setup.slab_radius,
+                background_density,
                 stream_density,
-                background_density
+                Y,
+                y_center,
+                setup.slab_radius,
+                setup.smoothing_length,
             )
-
-            v_x = jnp.where(
-                jnp.abs(Y - y_center) <= setup.slab_radius,
-                setup.mach_number * c_background,
-                background_velocity
+            velocity_x = slab_profile(
+                background_velocity,
+                shear_velocity,
+                Y,
+                y_center,
+                setup.slab_radius,
+                setup.smoothing_length,
             )
         else:
-            density = jnp.where(
-                Y < y_center,
-                stream_density,
-                background_density
-            )
-            v_mach = setup.mach_number * c_background
-            v_x = jnp.where(
-                Y < y_center,
-                -v_mach / 2,
-                v_mach / 2
-            )
+            inside_slab = jnp.abs(Y - y_center) <= setup.slab_radius
+            density = jnp.where(inside_slab, stream_density, background_density)
+            velocity_x = jnp.where(inside_slab, shear_velocity, background_velocity)
+    else:
+        raise ValueError(f"Unknown interface_mode {interface_mode}.")
 
-    v_y = jnp.zeros_like(v_x)
-
-    P = jnp.full_like(v_x, pressure)
-
-    primitive_state_unperturbed = construct_primitive_state(
-        config = config,
-        registered_variables = registered_variables,
-        density = density,
-        velocity_x = v_x,
-        velocity_y = v_y,
-        gas_pressure = P,
+    base_state = construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=density,
+        velocity_x=velocity_x,
+        velocity_y=jnp.zeros_like(velocity_x),
+        gas_pressure=jnp.full_like(velocity_x, pressure),
     )
+    config = finalize_config(config, base_state.shape)
+    return base_state, config, params, registered_variables, helper_data
 
-    config = finalize_config(config, primitive_state_unperturbed.shape)
 
-    return primitive_state_unperturbed, config, params, registered_variables, helper_data
+def perturb_khi(base_state, setup, helper_data, registered_variables, eigenmode_state=None):
+    """
+    Add the configured perturbation to the base state.
 
-def perturb_khi(primitive_state_unperturbed, setup, config, params, helper_data, registered_variables):
-	
+    Args:
+        base_state: The unperturbed primitive state.
+        setup: The KH setup (its ``perturbation_type`` selects the perturbation).
+        helper_data: The helper data (cell centres).
+        registered_variables: The registered variables.
+        eigenmode_state: For ``EIGENMODE_PERTURBATION`` the eigenmode-perturbed
+            state from :func:`find_numerical_eigenmode`.
+
+    Returns:
+        The perturbed primitive state.
+    """
     cell_centers = helper_data.geometric_centers
-
-    # add perturbation
     if setup.perturbation_type == VELOCITY_PERTURBATION:
         if interface_mode == SLAB:
-            vy_pert = velocity_perturbation(
-                cell_centers = cell_centers,
-                slab_radius = setup.slab_radius,
-                perturbation_setup = setup.perturbation_setup,
-            )
-            primitive_state = primitive_state_unperturbed.at[
-                registered_variables.velocity_index.y
-            ].add(vy_pert)
+            transverse_velocity = velocity_perturbation(cell_centers, setup.slab_radius, setup.perturbation_setup)
+        else:
+            transverse_velocity = single_interface_velocity_perturbation(cell_centers, setup.perturbation_setup)
+        return base_state.at[registered_variables.velocity_index.y].add(transverse_velocity)
 
-        elif interface_mode == SINGLE_INTERFACE:
-            vy_pert = single_interface_velocity_perturbation(
-                cell_centers = cell_centers,
-                perturbation_setup = setup.perturbation_setup
-            )
-            primitive_state = primitive_state_unperturbed.at[
-                registered_variables.velocity_index.y
-            ].add(vy_pert)
+    if setup.perturbation_type == PRESSURE_PERTURBATION:
+        if interface_mode != SLAB:
+            raise NotImplementedError("The pressure perturbation is implemented for the slab only.")
+        pressure_change = pressure_perturbation(cell_centers, setup.slab_radius, y_center, setup.perturbation_setup)
+        return base_state.at[registered_variables.pressure_index].add(pressure_change)
 
-    elif setup.perturbation_type == PRESSURE_PERTURBATION:
-        if interface_mode == SLAB:
-            P_pert = pressure_perturbation(
-                cell_centers = cell_centers,
-                slab_radius = setup.slab_radius,
-                y_center = y_center,
-                perturbation_setup = setup.perturbation_setup,
-            )
-            primitive_state = primitive_state_unperturbed.at[
-                registered_variables.pressure_index
-            ].add(P_pert)
-        elif interface_mode == SINGLE_INTERFACE:
-            raise NotImplementedError("Single interface with pressure perturbation not implemented yet.")
-        
-    elif setup.perturbation_type == EIGENMODE_PERTURBATION:
-        primitive_state, dom_eval = find_numerical_eigenmode(
-        	primitive_state_unperturbed,
-        	config,
-        	params,
-        	registered_variables,
-        	helper_data,
-        	setup
-        )
-        growth_rate = float(jnp.real(dom_eval))
-        phase_freq = float(jnp.imag(dom_eval))
-        print(f"🎯 Exact Complex Eigenmode | Growth Rate σ: {growth_rate:.4e} | Phase ω_R: {phase_freq:.4e}")
-    else:
-        raise NotImplementedError("Only velocity and pressure perturbations are implemented so far.")
-    
-    return primitive_state
+    if setup.perturbation_type == EIGENMODE_PERTURBATION:
+        if eigenmode_state is None:
+            raise ValueError("EIGENMODE_PERTURBATION needs the eigenmode state of find_numerical_eigenmode.")
+        return eigenmode_state
 
-def simulate_khi(setup: KHISetup, return_snapshots = False):
+    raise NotImplementedError(f"Unknown perturbation type {setup.perturbation_type}.")
 
-    (
-        primitive_state_unperturbed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
-    ) = setup_khi_unperturbed_base(setup, return_snapshots)
-	
-    primitive_state = perturb_khi(primitive_state_unperturbed, setup, config, params, helper_data, registered_variables)
 
-    # finalize the simulation configuration
-    config = finalize_config(config, primitive_state.shape)
-
-    # run the simulation
-    result = time_integration(
-        primitive_state,
-        config, 
-        params,
-        registered_variables
-    )
-
-    return result, helper_data, registered_variables
+# -------------------------------------------------------------
+# ================ ↑ Base state and perturbations ↑ ===========
+# -------------------------------------------------------------
 
 
 # -------------------------------------------------------------
 # ================ ↓ Eigenmode initialization ↓ ===============
 # -------------------------------------------------------------
+
+
+def effective_transverse_wavenumber(modes, transverse_spacing):
+    """
+    The effective transverse wavenumber k_y^eff / k_y^Nyq of each eigenvector:
+    the spectral centroid sqrt(sum k_y^2 |q_hat(k_y)|^2 / sum |q_hat(k_y)|^2)
+    of its y Fourier spectrum (all conserved variables), normalized to the
+    Nyquist wavenumber. Unlike a centred-gradient estimate it detects
+    Nyquist (checkerboard) modes correctly.
+
+    Args:
+        modes: The eigenvectors as an array (num_modes, n_var, N_y).
+        transverse_spacing: The cell size in y.
+
+    Returns:
+        The array of k_y^eff / k_y^Nyq.
+    """
+    num_transverse_cells = modes.shape[-1]
+    spectrum = jnp.fft.fft(modes, axis=-1)
+    transverse_wavenumbers = 2.0 * jnp.pi * jnp.fft.fftfreq(num_transverse_cells, d=transverse_spacing)
+    power = jnp.sum(jnp.abs(spectrum) ** 2, axis=1)
+    effective_wavenumber = jnp.sqrt(
+        jnp.sum(power * (transverse_wavenumbers**2)[None, :], axis=1) / (jnp.sum(power, axis=1) + 1e-30)
+    )
+    return effective_wavenumber / (jnp.pi / transverse_spacing)
+
+
 def find_numerical_eigenmode(
-    primitive_state_unperturbed,
+    base_state,
     config,
     params,
     registered_variables,
@@ -623,72 +427,71 @@ def find_numerical_eigenmode(
     setup: KHISetup,
     assembly_batch_size=4,
     require_growth=True,
-    loc_threshold=0.20,
-    ky_eff_threshold=0.25,
-    print_candidates=12,
+    localization_threshold=0.20,
+    wavenumber_threshold=0.25,
+    num_printed_candidates=12,
 ):
     """
-    Compute a numerical KH eigenmode from the full AD Fourier-block Jacobian.
+    Select the KH eigenmode of the AD Fourier-block Jacobian and return the
+    eigenmode-perturbed state.
 
-    Uses:
-      - single_xmode_rhs_jacobian2D(...) for the raw +kx simulator Jacobian,
-      - jnp.linalg.eig(...) for the full dense eigensystem,
-      - a minimal physical selection: among growing modes, keep those that are
-        localized at the interface and smooth in the transverse direction (low
-        effective transverse wavenumber), then take the fastest growing one.
+    Among the growing modes (Re(lambda) > 0) those localized at the interface
+    (L > ``localization_threshold``) and smooth in y (k_y^eff / k_y^Nyq <
+    ``wavenumber_threshold``) are accepted, and the fastest growing one is
+    taken. The spurious fast-growing modes of the discretization are
+    grid-scale in y (k_y^eff / k_y^Nyq ~ 0.6), the physical KH mode is smooth
+    (~ 0.05), so one cutoff separates them. The mode is phase-aligned and
+    scaled to the peak transverse velocity ``setup.perturbation_setup.amplitude``.
+
+    Args:
+        base_state: The unperturbed primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+        helper_data: The helper data (cell centres).
+        setup: The KH setup.
+        assembly_batch_size: Jacobian columns per JVP batch.
+        require_growth: Accept growing modes only.
+        localization_threshold: The minimum interface localization L.
+        wavenumber_threshold: The maximum k_y^eff / k_y^Nyq.
+        num_printed_candidates: The number of best candidates printed.
+
+    Returns:
+        The tuple ``(perturbed_state, eigenvalue)``.
     """
+    print(f"Extracting the AD KH eigenmode at lambda_x = {setup.perturbation_setup.wavelength} ...")
 
-    print(
-        f"⏳ Extracting raw-AD KH eigenmode at "
-        f"λx={setup.perturbation_setup.wavelength} ..."
-    )
+    config = finalize_config(config, base_state.shape)
+    density_index = registered_variables.density_index
+    momentum_y_index = registered_variables.velocity_index.y
 
-    config = finalize_config(config, primitive_state_unperturbed.shape)
-    gamma = params.gamma
+    conserved_base_state = conserved_state_from_primitive(base_state, params.gamma, config, registered_variables)
+    num_variables, _, num_transverse_cells = conserved_base_state.shape
 
-    rho_i = registered_variables.density_index
-    momx_i = registered_variables.velocity_index.x
-    momy_i = registered_variables.velocity_index.y
-    energy_i = registered_variables.pressure_index
-
-    cons0 = conserved_state_from_primitive(
-        primitive_state_unperturbed,
-        gamma,
-        config,
-        registered_variables,
-    )
-
-    nvar, Nx, Ny = cons0.shape
-
-    Lx = float(config.box_size.x)
-    Ly = float(config.box_size.y) if hasattr(config.box_size, "y") else Lx
-
-    m_float = Lx / float(setup.perturbation_setup.wavelength)
-    m = int(round(m_float))
-
-    if abs(m_float - m) > 1e-12:
+    box_length_x = float(config.box_size.x)
+    wavelength_ratio = box_length_x / float(setup.perturbation_setup.wavelength)
+    mode_number = int(round(wavelength_ratio))
+    if abs(wavelength_ratio - mode_number) > 1e-12:
         raise ValueError(
-            f"wavelength={setup.perturbation_setup.wavelength} is not "
-            f"commensurate with Lx={Lx}. Got Lx / wavelength = {m_float}."
+            f"wavelength={setup.perturbation_setup.wavelength} is not commensurate with "
+            f"L_x={box_length_x} (L_x / wavelength = {wavelength_ratio})."
         )
-
-    kx = 2.0 * jnp.pi * m / Lx
+    streamwise_wavenumber = 2.0 * jnp.pi * mode_number / box_length_x
 
     X = helper_data.geometric_centers[:, :, 0]
-    Y = helper_data.geometric_centers[:, :, 1]
-    y = Y[0, :]
-    dy = y[1] - y[0]
+    y = helper_data.geometric_centers[0, :, 1]
+    transverse_spacing = y[1] - y[0]
 
-    rho0 = primitive_state_unperturbed[rho_i, 0, :]
-    u0 = primitive_state_unperturbed[momx_i, 0, :]
-    v0 = primitive_state_unperturbed[momy_i, 0, :]
+    base_density = base_state[density_index, 0, :]
+    base_velocity_y = base_state[momentum_y_index, 0, :]
 
-    # ------------------------------------------------------------------
-    # Full AD Fourier-block Jacobian and eigensystem.
-    # ------------------------------------------------------------------
-    print("  Building full AD Fourier-block Jacobian ...")
-    J = single_xmode_rhs_jacobian2D(
-        primitive_state_unperturbed,
+    # -------------------------------------------------------------
+    # ========== ↓ Fourier-block Jacobian and eigensystem ↓ =======
+    # -------------------------------------------------------------
+
+    print("  Building the AD Fourier-block Jacobian ...")
+    jacobian = single_xmode_rhs_jacobian2D(
+        base_state,
         config,
         params,
         registered_variables,
@@ -696,197 +499,135 @@ def find_numerical_eigenmode(
         wavelength=setup.perturbation_setup.wavelength,
         assembly_batch_size=assembly_batch_size,
     )
+    print("  Solving the dense eigenproblem ...")
+    eigenvalues, eigenvectors = jnp.linalg.eig(jacobian)
 
-    print("  Solving dense JAX eigenproblem ...")
-    eigvals, eigvecs = jnp.linalg.eig(J)
+    # eigenvectors[:, i] is eigenvector i; reshape to modes[i, variable, y].
+    modes = eigenvectors.T.reshape((-1, num_variables, num_transverse_cells))
 
-    # eigvecs[:, i] is eigenvector i. Convert to modes[i, var, y].
-    modes = eigvecs.T.reshape((-1, nvar, Ny))
+    # The linearized conserved-to-primitive map gives the transverse-velocity
+    # perturbation of every mode.
+    density_perturbation = modes[:, density_index, :]
+    transverse_velocity_perturbation = (
+        modes[:, momentum_y_index, :] / base_density[None, :]
+        - base_velocity_y[None, :] * density_perturbation / base_density[None, :]
+    )
 
-    # ------------------------------------------------------------------
-    # Conserved -> primitive perturbations.
-    # ------------------------------------------------------------------
-    def conserved_to_primitive_hat(qhat):
-        drho = qhat[:, rho_i, :]
-        dmx = qhat[:, momx_i, :]
-        dmy = qhat[:, momy_i, :]
-        dE = qhat[:, energy_i, :]
+    # -------------------------------------------------------------
+    # ========== ↑ Fourier-block Jacobian and eigensystem ↑ =======
+    # -------------------------------------------------------------
 
-        du = dmx / rho0[None, :] - u0[None, :] * drho / rho0[None, :]
-        dv = dmy / rho0[None, :] - v0[None, :] * drho / rho0[None, :]
+    # -------------------------------------------------------------
+    # ======================= ↓ Mode selection ↓ ==================
+    # -------------------------------------------------------------
 
-        dp = (gamma - 1.0) * (
-            dE
-            - 0.5 * drho * (u0[None, :] ** 2 + v0[None, :] ** 2)
-            - rho0[None, :] * (u0[None, :] * du + v0[None, :] * dv)
-        )
-
-        return drho, du, dv, dp
-
-    drho, du, dv, dp = conserved_to_primitive_hat(modes)
-
-    # ------------------------------------------------------------------
-    # Mode selection.
-    #
-    # Among the growing modes (Re(lambda) > 0) we keep those that are
-    # (i) localized at the shear interface and (ii) smooth in the transverse
-    # direction, then pick the fastest growing one. Only two diagnostics are
-    # needed:
-    #   - the interface localization L of the transverse-velocity profile,
-    #   - the effective transverse wavenumber k_y^eff / k_y^Nyq, the same
-    #     quantity used to color the eigenvalue spectrum.
-    # The spurious fast-growing modes of the discretization are grid-scale in y
-    # (k_y^eff/k_y^Nyq ~ 0.6), so a single cutoff on k_y^eff cleanly separates
-    # them from the physical KH mode (k_y^eff/k_y^Nyq ~ 0.05). This subsumes the
-    # roughness / high-k_y diagnostics; localization subsumes the edge-power one.
-    # ------------------------------------------------------------------
     if interface_mode == SLAB:
-        envelope = (
-            jnp.exp(-kx * jnp.abs(y - (y_center - setup.slab_radius)))
-            + jnp.exp(-kx * jnp.abs(y - (y_center + setup.slab_radius)))
+        envelope = jnp.exp(-streamwise_wavenumber * jnp.abs(y - (y_center - setup.slab_radius))) + jnp.exp(
+            -streamwise_wavenumber * jnp.abs(y - (y_center + setup.slab_radius))
         )
     else:
-        envelope = jnp.exp(-kx * jnp.abs(y - y_center))
-
+        envelope = jnp.exp(-streamwise_wavenumber * jnp.abs(y - y_center))
     envelope = envelope / jnp.max(envelope)
 
-    dv_power = jnp.sum(jnp.abs(dv) ** 2, axis=1) + 1e-30
-    localization = jnp.sum(jnp.abs(dv) ** 2 * envelope[None, :], axis=1) / dv_power
-
-    # Effective transverse wavenumber from the conserved eigenvector spectrum,
-    # normalized to the Nyquist wavenumber (identical to the spectrum color).
-    q_fft = jnp.fft.fft(modes, axis=-1)
-    ky = 2.0 * jnp.pi * jnp.fft.fftfreq(Ny, d=dy)
-    ky_power = jnp.sum(jnp.abs(q_fft) ** 2, axis=1)
-    ky_eff = jnp.sqrt(
-        jnp.sum(ky_power * (ky ** 2)[None, :], axis=1)
-        / (jnp.sum(ky_power, axis=1) + 1e-30)
+    transverse_velocity_power = jnp.sum(jnp.abs(transverse_velocity_perturbation) ** 2, axis=1) + 1e-30
+    localization = (
+        jnp.sum(jnp.abs(transverse_velocity_perturbation) ** 2 * envelope[None, :], axis=1)
+        / transverse_velocity_power
     )
-    ky_eff_norm = ky_eff / (jnp.pi / dy)
+    wavenumber_ratio = effective_transverse_wavenumber(modes, transverse_spacing)
 
     finite = (
-        jnp.isfinite(jnp.real(eigvals))
-        & jnp.isfinite(jnp.imag(eigvals))
+        jnp.isfinite(jnp.real(eigenvalues))
+        & jnp.isfinite(jnp.imag(eigenvalues))
         & jnp.isfinite(localization)
-        & jnp.isfinite(ky_eff_norm)
+        & jnp.isfinite(wavenumber_ratio)
     )
-
-    growth_ok = jnp.real(eigvals) > 0.0 if require_growth else jnp.ones_like(finite)
-
+    growing = jnp.real(eigenvalues) > 0.0 if require_growth else jnp.ones_like(finite)
     is_kh_like = (
         finite
-        & growth_ok
-        & (localization > loc_threshold)
-        & (ky_eff_norm < ky_eff_threshold)
+        & growing
+        & (localization > localization_threshold)
+        & (wavenumber_ratio < wavenumber_threshold)
     )
 
-    # Among the accepted modes, take the fastest growing one.
-    score = jnp.where(is_kh_like, jnp.real(eigvals), -1e30)
-
-    use_strict = bool(jnp.any(is_kh_like))
-    if not use_strict:
+    # Among the accepted modes, the fastest growing one.
+    score = jnp.where(is_kh_like, jnp.real(eigenvalues), -1e30)
+    if not bool(jnp.any(is_kh_like)):
         print(
-            "  Warning: no mode passed the KH filters. Falling back to the "
-            "growing mode that is most localized and smoothest in y."
+            "  Warning: no mode passed the KH filters; falling back to the growing "
+            "mode that is most localized and smoothest in y."
         )
-        score = jnp.where(finite & growth_ok, localization - ky_eff_norm, -1e30)
+        score = jnp.where(finite & growing, localization - wavenumber_ratio, -1e30)
 
-    best_idx = int(jnp.argmax(score))
-    lam = eigvals[best_idx]
-    qhat = modes[best_idx]
+    selected_index = int(jnp.argmax(score))
+    eigenvalue = eigenvalues[selected_index]
+    selected_mode = modes[selected_index]
 
-    # ------------------------------------------------------------------
-    # Print candidates.
-    # ------------------------------------------------------------------
-    order = jnp.argsort(score)[::-1]
-
-    print("  Top raw-AD eigenmode candidates:")
-    for rank in range(min(print_candidates, eigvals.shape[0])):
-        i = int(order[rank])
-        marker = " <--- selected" if i == best_idx else ""
+    print("  Best eigenmode candidates:")
+    for rank, mode_index in enumerate(np.asarray(jnp.argsort(score)[::-1][:num_printed_candidates])):
+        marker = " <--- selected" if mode_index == selected_index else ""
         print(
-            f"    {rank:02d}: idx={i:04d}, "
-            f"lambda={float(jnp.real(eigvals[i])):+.6e} "
-            f"{float(jnp.imag(eigvals[i])):+.6e}i, "
-            f"loc={float(localization[i]):.3f}, "
-            f"ky_eff/ky_Nyq={float(ky_eff_norm[i]):.3f}, "
-            f"score={float(score[i]):+.6e}"
-            f"{marker}"
+            f"    {rank:02d}: index {int(mode_index):04d}, "
+            f"lambda = {float(jnp.real(eigenvalues[mode_index])):+.6e} "
+            f"{float(jnp.imag(eigenvalues[mode_index])):+.6e} i, "
+            f"L = {float(localization[mode_index]):.3f}, "
+            f"k_y^eff/k_Nyq = {float(wavenumber_ratio[mode_index]):.3f}{marker}"
         )
 
-    # ------------------------------------------------------------------
-    # Phase-align and scale eigenmode.
-    # ------------------------------------------------------------------
-    drho_b = qhat[rho_i]
-    dmy_b = qhat[momy_i]
-    dv_b = dmy_b / rho0 - v0 * drho_b / rho0
+    # -------------------------------------------------------------
+    # ======================= ↑ Mode selection ↑ ==================
+    # -------------------------------------------------------------
 
-    anchor = int(jnp.argmax(jnp.abs(dv_b) * envelope))
-    qhat = qhat * jnp.exp(-1j * jnp.angle(dv_b[anchor]))
+    # -------------------------------------------------------------
+    # =============== ↓ Phase alignment and scaling ↓ =============
+    # -------------------------------------------------------------
 
-    drho_b = qhat[rho_i]
-    dmy_b = qhat[momy_i]
-    dv_b = dmy_b / rho0 - v0 * drho_b / rho0
+    def transverse_velocity_profile(mode):
+        """The transverse-velocity perturbation profile of one mode."""
+        return mode[momentum_y_index] / base_density - base_velocity_y * mode[density_index] / base_density
 
-    phase = jnp.exp(1j * kx * X).astype(qhat.dtype)
-    dv_real_space = jnp.real(dv_b[None, :] * phase)
+    # Rotate the phase so that v_y is real at its interface peak.
+    anchor = int(jnp.argmax(jnp.abs(transverse_velocity_profile(selected_mode)) * envelope))
+    selected_mode = selected_mode * jnp.exp(-1j * jnp.angle(transverse_velocity_profile(selected_mode)[anchor]))
 
-    max_vy = jnp.max(jnp.abs(dv_real_space))
+    phase = jnp.exp(1j * streamwise_wavenumber * X).astype(selected_mode.dtype)
+    transverse_velocity_field = jnp.real(transverse_velocity_profile(selected_mode)[None, :] * phase)
+    peak_transverse_velocity = jnp.max(jnp.abs(transverse_velocity_field))
+    if float(peak_transverse_velocity) <= 0.0 or not bool(jnp.isfinite(peak_transverse_velocity)):
+        raise RuntimeError("The selected eigenmode has an invalid transverse-velocity amplitude.")
+    scale = setup.perturbation_setup.amplitude / peak_transverse_velocity
 
-    if float(max_vy) <= 0.0 or not bool(jnp.isfinite(max_vy)):
-        raise RuntimeError("Selected AD eigenmode has invalid transverse velocity amplitude.")
-
-    eps = setup.perturbation_setup.amplitude / max_vy
-
-    delta_cons = eps * jnp.real(qhat[:, None, :] * phase[None, :, :])
-    cons_perturbed = cons0 + delta_cons.astype(cons0.dtype)
-
-    primitive_state_perturbed = primitive_state_from_conserved(
-        cons_perturbed,
-        gamma,
+    conserved_perturbation = scale * jnp.real(selected_mode[:, None, :] * phase[None, :, :])
+    perturbed_state = primitive_state_from_conserved(
+        conserved_base_state + conserved_perturbation.astype(conserved_base_state.dtype),
+        params.gamma,
         config,
         registered_variables,
     )
-
-    min_rho = float(jnp.min(primitive_state_perturbed[rho_i]))
-    min_p = float(jnp.min(primitive_state_perturbed[registered_variables.pressure_index]))
-
-    if min_rho <= 0.0 or min_p <= 0.0:
+    minimum_density = float(jnp.min(perturbed_state[density_index]))
+    minimum_pressure = float(jnp.min(perturbed_state[registered_variables.pressure_index]))
+    if minimum_density <= 0.0 or minimum_pressure <= 0.0:
         raise RuntimeError(
-            f"Eigenmode amplitude too large: min rho={min_rho:.3e}, "
-            f"min p={min_p:.3e}. Reduce perturbation_setup.amplitude."
+            f"Eigenmode amplitude too large: min rho = {minimum_density:.3e}, "
+            f"min p = {minimum_pressure:.3e}. Reduce perturbation_setup.amplitude."
         )
 
-    # Residual diagnostic using the dense JAX Jacobian.
-    q_flat = qhat.reshape(-1)
-    Lq = J @ q_flat
-    residual = jnp.linalg.norm(Lq - lam * q_flat) / (
-        jnp.linalg.norm(Lq) + jnp.abs(lam) * jnp.linalg.norm(q_flat) + 1e-30
+    # -------------------------------------------------------------
+    # =============== ↑ Phase alignment and scaling ↑ =============
+    # -------------------------------------------------------------
+
+    mode_vector = selected_mode.reshape(-1)
+    jacobian_action = jacobian @ mode_vector
+    residual = jnp.linalg.norm(jacobian_action - eigenvalue * mode_vector) / (
+        jnp.linalg.norm(jacobian_action) + jnp.abs(eigenvalue) * jnp.linalg.norm(mode_vector) + 1e-30
     )
-
-    growth_time = jnp.where(jnp.real(lam) > 0.0, 1.0 / jnp.real(lam), jnp.inf)
-
-    slab_density = setup.density_contrast * background_density
-    delta = (slab_density + background_density) ** 2 / (
-        slab_density * background_density
-    )
-    c_background = jnp.sqrt(gamma * pressure / background_density)
-    v_shear = setup.mach_number * c_background
-    t_kh = jnp.sqrt(delta) * setup.perturbation_setup.wavelength / v_shear
-
     print(
-        "🎯 Raw-AD KH eigenmode selected: "
-        f"lambda = {float(jnp.real(lam)):.6e} "
-        f"+ {float(jnp.imag(lam)):.6e} i, "
-        f"growth time = {float(growth_time):.6e}"
+        f"Selected KH eigenmode: lambda = {float(jnp.real(eigenvalue)):.6e} + "
+        f"{float(jnp.imag(eigenvalue)):.6e} i, growth time {1.0 / float(jnp.real(eigenvalue)):.6e}, "
+        f"eigen residual {float(residual):.3e}"
     )
-    print(f"  Eigen residual: {float(residual):.3e}")
-    print(
-        "  Expected slope in ln(A/A0) vs t/t_KH: "
-        f"{float(jnp.real(lam) * t_kh):.6e}"
-    )
+    return perturbed_state, eigenvalue
 
-    return primitive_state_perturbed, lam
 
 # -------------------------------------------------------------
 # ================ ↑ Eigenmode initialization ↑ ===============
@@ -894,165 +635,109 @@ def find_numerical_eigenmode(
 
 
 # -------------------------------------------------------------
-# ===================== ↓ Eigenmode test ↓ ====================
+# ===================== ↓ Paper figures ↓ =====================
 # -------------------------------------------------------------
 
-def eigenvalue_plot():
 
+def paper_setup():
+    """
+    The setup of the paper: chi = 10, M_b = 0.5, lambda_x = L_x / 2,
+    sigma = lambda_x / 10, A = M_b c_b / 20, no viscosity, evolved to
+    1.5 tau_KH.
+
+    Returns:
+        The tuple ``(setup, kh_time)``.
+    """
     density_contrast = 10.0
     mach_number = 0.5
-    diffusion = False
-    kinematic_viscosity = 0.0
-
-    c_background = float(jnp.sqrt(gamma * pressure / background_density))
+    background_sound_speed = float(jnp.sqrt(gamma * pressure / background_density))
     wavelength = box_size / 2
-    amplitude = mach_number * c_background / 20
     smoothing_length = wavelength / 10
-    slab_radius = 0.1
 
-    # KHI timescale for reference
-    slab_density = density_contrast * background_density
-    Delta = float((slab_density + background_density)**2 / (slab_density * background_density))
-    v_slab = mach_number * c_background
-    t_kh = float(jnp.sqrt(Delta) * wavelength / v_slab)
-
-    # Simulate up to 1.5 tau_KH to stay in the clean linear regime
-    simulation_time = 1.5 * t_kh
-
-    # either simulation or RHS jacobian
-    simulation_jacobian = False
-    # t end simulation jacobian
-    t_end_jac = 0.1 * t_kh
+    dense_density = density_contrast * background_density
+    density_factor = (dense_density + background_density) ** 2 / (dense_density * background_density)
+    shear_velocity = mach_number * background_sound_speed
+    kh_time = float(np.sqrt(density_factor) * wavelength / shear_velocity)
 
     setup = KHISetup(
         num_cells=num_cells,
-        simulation_time=simulation_time,
+        simulation_time=1.5 * kh_time,
         perturbation_type=VELOCITY_PERTURBATION,
         perturbation_setup=PressurePerturbationSetup(
-            amplitude=amplitude,
+            amplitude=shear_velocity / 20,
             wavelength=wavelength,
             gaussian_width=5 * smoothing_length,
         ),
-        diffusion=diffusion,
-        viscosity=kinematic_viscosity,
+        diffusion=False,
+        viscosity=0.0,
         mach_number=mach_number,
         density_contrast=density_contrast,
-        slab_radius=slab_radius,
+        slab_radius=0.1,
         smoothing_length=smoothing_length,
-        smooth_profiles=False
     )
+    return setup, kh_time
 
-    # set up the unperturbed base state and config
-    (
-        khi_unperturbed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
-    ) = setup_khi_unperturbed_base(setup)
 
-    setup = setup._replace(smooth_profiles=True)
-    (
-        khi_unperturbed_smoothed,
-        _,
-        _,
-        _,
-        _,
-    ) = setup_khi_unperturbed_base(setup)
+def eigenvalue_plot(setup: KHISetup):
+    """
+    The eigenspectra of the upper and the lower state, the sharp and the
+    smoothed interface, and the selected KH eigenmode (Fig. kh-spectrum).
+    Writes ``figures/eigenvalue_spectrum.png``.
 
-    # for testing set the whole state to be the upper
-    # or lower state, assumes single interface mode
-    upper_state = jnp.repeat(khi_unperturbed[:, :, -1][:, :, None], khi_unperturbed.shape[2], axis=2)
-    lower_state = jnp.repeat(khi_unperturbed[:, :, 0][:, :, None], khi_unperturbed.shape[2], axis=2)
-    # make plots
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+    Args:
+        setup: The KH setup (smooth profiles).
 
+    Returns:
+        The tuple ``(eigenmode_state, eigenvalue, spectra)`` with the
+        eigenmode-perturbed smoothed state, the selected eigenvalue and a dict
+        of the spectra and their k_y^eff / k_Nyq.
+    """
+    sharp_state, config, params, registered_variables, helper_data = setup_khi_unperturbed_base(
+        setup._replace(smooth_profiles=False)
+    )
+    smoothed_state, _, _, _, _ = setup_khi_unperturbed_base(setup._replace(smooth_profiles=True))
+
+    # The upper and the lower fluid in isolation (single-interface mode).
+    num_transverse_cells = sharp_state.shape[2]
+    upper_state = jnp.repeat(sharp_state[:, :, -1:], num_transverse_cells, axis=2)
+    lower_state = jnp.repeat(sharp_state[:, :, :1], num_transverse_cells, axis=2)
+    transverse_spacing = float(helper_data.geometric_centers[0, 1, 1] - helper_data.geometric_centers[0, 0, 1])
+
+    figure, axes = plt.subplots(2, 2, figsize=(12, 10))
     imaginary_range = (-650, 650)
     real_range = (-450, 50)
-
-    def effective_ky_from_eigenvectors(eigenvectors, state):
-        """
-        eigenvectors[:, i] is one qhat_i(y).
-
-        Returns k_y^eff / k_y^Nyquist for each eigenvector, estimated from the
-        FFT power spectrum in y. This detects Nyquist/checkerboard modes correctly,
-        unlike a centered-gradient estimate.
-        """
-        nvar, Nx, Ny = state.shape
-
-        Y = helper_data.geometric_centers[:, :, 1]
-        y = Y[0, :]
-        dy = y[1] - y[0]
-
-        modes = eigenvectors.T.reshape((-1, nvar, Ny))
-
-        # Option A: use full conserved eigenvector.
-        q_for_spectrum = modes
-
-        # Option B, often cleaner for KH/acoustic interpretation:
-        # use primitive transverse velocity only.
-        # rho_i = registered_variables.density_index
-        # momy_i = registered_variables.velocity_index.y
-        # rho0 = state[rho_i, 0, :]
-        # v0 = state[momy_i, 0, :]
-        # drho = modes[:, rho_i, :]
-        # dmy = modes[:, momy_i, :]
-        # dvy = dmy / rho0[None, :] - v0[None, :] * drho / rho0[None, :]
-        # q_for_spectrum = dvy[:, None, :]
-
-        q_fft = jnp.fft.fft(q_for_spectrum, axis=-1)
-
-        ky = 2.0 * jnp.pi * jnp.fft.fftfreq(Ny, d=dy)
-        ky2 = ky**2
-
-        power = jnp.sum(jnp.abs(q_fft) ** 2, axis=1)  # shape: (num_modes, Ny)
-
-        ky_eff = jnp.sqrt(
-            jnp.sum(power * ky2[None, :], axis=1)
-            / (jnp.sum(power, axis=1) + 1e-30)
+    spectra = {}
+    last_scatter = None
+    states = (
+        ("upper state", upper_state),
+        ("lower state", lower_state),
+        ("khi unperturbed", sharp_state),
+        ("khi unperturbed smoothed", smoothed_state),
+    )
+    for panel_index, (label, state) in enumerate(states):
+        jacobian = single_xmode_rhs_jacobian2D(
+            state,
+            config,
+            params,
+            registered_variables,
+            helper_data,
+            wavelength=setup.perturbation_setup.wavelength,
+        )
+        eigenvalues, eigenvectors = jnp.linalg.eig(jacobian)
+        modes = eigenvectors.T.reshape((-1, state.shape[0], num_transverse_cells))
+        wavenumber_ratio = effective_transverse_wavenumber(modes, transverse_spacing)
+        spectra[label] = (np.asarray(eigenvalues), np.asarray(wavenumber_ratio))
+        print(
+            f"{label}: max Re(lambda) = {float(jnp.max(jnp.real(eigenvalues))):.4e}, "
+            f"min Re(lambda) = {float(jnp.min(jnp.real(eigenvalues))):.4e}, "
+            f"max |Im(lambda)| = {float(jnp.max(jnp.abs(jnp.imag(eigenvalues)))):.4e}"
         )
 
-        ky_nyquist = jnp.pi / dy
-
-        return ky_eff / ky_nyquist
-
-    last_scatter = None
-
-    for i, label, state in zip(
-        range(4),
-        ["upper state", "lower state", "khi unperturbed", "khi unperturbed smoothed"],
-        [upper_state, lower_state, khi_unperturbed, khi_unperturbed_smoothed]
-    ):
-        
-        if not simulation_jacobian:
-            J = single_xmode_rhs_jacobian2D(
-                state,
-                config,
-                params,
-                registered_variables,
-                helper_data,
-                wavelength=wavelength,
-            )
-        else:
-            J = single_xmode_jacobian2Dt(
-                state,
-                config,
-                params._replace(t_end=t_end_jac),
-                registered_variables,
-                helper_data,
-                wavelength=wavelength,
-            )
-
-        eigenvalues, eigenvectors = jnp.linalg.eig(J)
-
-        ky_eff_norm = effective_ky_from_eigenvectors(eigenvectors, state)
-
-        ax = axs[i // 2, i % 2]
-
-        last_scatter = ax.scatter(
+        axis = axes[panel_index // 2, panel_index % 2]
+        last_scatter = axis.scatter(
             jnp.real(eigenvalues),
             jnp.imag(eigenvalues),
-            c=ky_eff_norm,
+            c=wavenumber_ratio,
             s=10,
             cmap="plasma",
             vmin=0.0,
@@ -1060,406 +745,236 @@ def eigenvalue_plot():
             alpha=0.8,
             linewidths=0,
         )
+        axis.set_title(label)
+        axis.set_xlim(real_range)
+        axis.set_ylim(imaginary_range)
+        axis.set_xlabel(r"$\operatorname{Re}(\lambda)$")
+        axis.set_ylabel(r"$\operatorname{Im}(\lambda)$")
+        axis.grid(True)
 
-        ax.set_title(label)
-        ax.set_xlim(real_range)
-        ax.set_ylim(imaginary_range)
-        ax.set_xlabel(r"$\operatorname{Re}(\lambda)$")
-        ax.set_ylabel(r"$\operatorname{Im}(\lambda)$")
-        ax.grid(True)
-
-    # find the khi-eigenmode, mark it in the ax[1, 1] plot
-    # and make an inset plot to zoom in on it
-    _, lambda_khi = find_numerical_eigenmode(
-        khi_unperturbed_smoothed,
+    # Select the KH eigenmode of the smoothed interface, mark it and zoom in.
+    eigenmode_state, eigenvalue = find_numerical_eigenmode(
+        smoothed_state,
         config,
         params,
         registered_variables,
         helper_data,
         setup,
     )
-    ax = axs[1, 1]
-    # mark the khi mode with a star
-    ax.scatter(
-        jnp.real(lambda_khi),
-        jnp.imag(lambda_khi),
+    axis = axes[1, 1]
+    axis.scatter(
+        jnp.real(eigenvalue),
+        jnp.imag(eigenvalue),
         marker="*",
         s=100,
         facecolors="none",
         edgecolors="black",
         linewidths=1.5,
-        label=f"Selected KH eigenmode, λ={jnp.real(lambda_khi):.1f} + {jnp.imag(lambda_khi):.1f}i",
+        label=f"selected KH eigenmode, λ = {float(jnp.real(eigenvalue)):.2f} + {float(jnp.imag(eigenvalue)):.2f}i",
         zorder=10,
     )
-    ax.legend(loc="upper left")
+    axis.legend(loc="upper left")
+    add_inset_box(axis, x1=-2.0, x2=2.0, y1=0.0, y2=3.0, loc="lower left", connect_loc1=2, connect_loc2=4)
 
-    # inset axes
-    add_inset_box(ax, x1=-2.0, x2=2.0, y1=0.0, y2=3.0, loc='lower left', connect_loc1=2, connect_loc2=4)
-
-    cbar = fig.colorbar(last_scatter, ax=axs.ravel().tolist(), fraction=0.046, pad=0.04)
-    cbar.set_label(r"$k_y^\mathrm{eff}/k_{y,\mathrm{Nyq}}$")
-
-    fig.savefig(figures_dir / "eigenvalue_spectrum.png", dpi=600, bbox_inches="tight")
-    print("Saved figures/eigenvalue_spectrum.png")
-
-
-def eigenvalue_plot_simulation():
-
-    density_contrast = 10.0
-    mach_number = 0.5
-    diffusion = False
-    kinematic_viscosity = 0.0
-
-    c_background = float(jnp.sqrt(gamma * pressure / background_density))
-    wavelength = box_size / 2
-    amplitude = mach_number * c_background / 20
-    smoothing_length = wavelength / 10
-    slab_radius = 0.1
-
-    # KHI timescale for reference
-    slab_density = density_contrast * background_density
-    Delta = float((slab_density + background_density)**2 / (slab_density * background_density))
-    v_slab = mach_number * c_background
-    t_kh = float(jnp.sqrt(Delta) * wavelength / v_slab)
-
-    # t end simulation jacobian
-    t_end_jac = 0.1 * t_kh
-    print(f"KH timescale: {t_kh:.3e}, t_end for jacobian: {t_end_jac:.3e}")
-
-    setup = KHISetup(
-        num_cells=num_cells,
-        simulation_time=t_end_jac,
-        perturbation_type=VELOCITY_PERTURBATION,
-        perturbation_setup=PressurePerturbationSetup(
-            amplitude=amplitude,
-            wavelength=wavelength,
-            gaussian_width=5 * smoothing_length,
-        ),
-        diffusion=diffusion,
-        viscosity=kinematic_viscosity,
-        mach_number=mach_number,
-        density_contrast=density_contrast,
-        slab_radius=slab_radius,
-        smoothing_length=smoothing_length,
-        smooth_profiles=False
-    )
-
-    # set up the unperturbed base state and config
-    (
-        khi_unperturbed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
-    ) = setup_khi_unperturbed_base(setup)
-
-    setup = setup._replace(smooth_profiles=True)
-    (
-        khi_unperturbed_smoothed,
-        _,
-        _,
-        _,
-        _,
-    ) = setup_khi_unperturbed_base(setup)
+    colorbar = figure.colorbar(last_scatter, ax=axes.ravel().tolist(), fraction=0.046, pad=0.04)
+    colorbar.set_label(r"$k_y^\mathrm{eff}/k_{y,\mathrm{Nyq}}$")
+    figure_path = FIGURES_DIRECTORY / "eigenvalue_spectrum.png"
+    figure.savefig(figure_path, dpi=600, bbox_inches="tight")
+    plt.close(figure)
+    print(f"saved {figure_path}")
+    return eigenmode_state, eigenvalue, spectra
 
 
-    # make plots
-    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+def mode_amplitude(states, velocity_y_index, wavenumber, X):
+    """
+    A(t) = max_y sqrt(a_s^2 + a_c^2), the transverse peak of the modulus of
+    the k_x Fourier pair of v_y, a_s = 2/N_x sum_x v_y sin(k_x x) and
+    a_c = 2/N_x sum_x v_y cos(k_x x); insensitive to the x phase of the
+    travelling wave.
 
-    # imaginary_range = (-650, 650)
-    # real_range = (-450, 50)
+    Args:
+        states: The snapshot states (num_snapshots, n_var, N_x, N_y).
+        velocity_y_index: The index of v_y.
+        wavenumber: The streamwise wavenumber k_x.
+        X: The x coordinates of the cell centres.
 
-    def effective_ky_from_eigenvectors(eigenvectors, state):
-        """
-        eigenvectors[:, i] is one qhat_i(y).
+    Returns:
+        The array of A(t).
+    """
+    sine = jnp.sin(wavenumber * X)
+    cosine = jnp.cos(wavenumber * X)
+    amplitudes = []
+    for state in states:
+        transverse_velocity = state[velocity_y_index]
+        sine_coefficient = 2 * jnp.mean(transverse_velocity * sine, axis=0)
+        cosine_coefficient = 2 * jnp.mean(transverse_velocity * cosine, axis=0)
+        amplitudes.append(float(jnp.max(jnp.sqrt(sine_coefficient**2 + cosine_coefficient**2))))
+    return np.array(amplitudes)
 
-        Returns k_y^eff / k_y^Nyquist for each eigenvector, estimated from the
-        FFT power spectrum in y. This detects Nyquist/checkerboard modes correctly,
-        unlike a centered-gradient estimate.
-        """
-        nvar, Nx, Ny = state.shape
 
-        Y = helper_data.geometric_centers[:, :, 1]
-        y = Y[0, :]
-        dy = y[1] - y[0]
+def eigenmode_growth_test(setup: KHISetup, kh_time, eigenmode_state, eigenvalue, spectra):
+    """
+    Evolve the ad-hoc velocity perturbation and the eigenmode to 1.5 tau_KH,
+    compare the growth of the mode amplitude (Fig. kh-transient) and the final
+    states (Fig. kh-final). Writes ``figures/eigenmode_transient_test.png``,
+    ``figures/eigenmode_final_states.png`` and ``data/eigen_initialization.npz``.
 
-        modes = eigenvectors.T.reshape((-1, nvar, Ny))
-
-        # Option A: use full conserved eigenvector.
-        q_for_spectrum = modes
-
-        # Option B, often cleaner for KH/acoustic interpretation:
-        # use primitive transverse velocity only.
-        # rho_i = registered_variables.density_index
-        # momy_i = registered_variables.velocity_index.y
-        # rho0 = state[rho_i, 0, :]
-        # v0 = state[momy_i, 0, :]
-        # drho = modes[:, rho_i, :]
-        # dmy = modes[:, momy_i, :]
-        # dvy = dmy / rho0[None, :] - v0[None, :] * drho / rho0[None, :]
-        # q_for_spectrum = dvy[:, None, :]
-
-        q_fft = jnp.fft.fft(q_for_spectrum, axis=-1)
-
-        ky = 2.0 * jnp.pi * jnp.fft.fftfreq(Ny, d=dy)
-        ky2 = ky**2
-
-        power = jnp.sum(jnp.abs(q_fft) ** 2, axis=1)  # shape: (num_modes, Ny)
-
-        ky_eff = jnp.sqrt(
-            jnp.sum(power * ky2[None, :], axis=1)
-            / (jnp.sum(power, axis=1) + 1e-30)
-        )
-
-        ky_nyquist = jnp.pi / dy
-
-        return ky_eff / ky_nyquist
-
-    last_scatter = None
-
-    state = khi_unperturbed_smoothed
-
-    # J = single_xmode_jacobian2Dt(
-    #     state,
-    #     config,
-    #     params._replace(t_end=t_end_jac),
-    #     registered_variables,
-    #     helper_data,
-    #     wavelength=wavelength,
-    # )
-
-    # save J
-    # jnp.save("simulation_jacobian.npy", J)
-
-    J = jnp.load("simulation_jacobian.npy")
-
-    eigenvalues, eigenvectors = jnp.linalg.eig(J)
-
-    ky_eff_norm = effective_ky_from_eigenvectors(eigenvectors, state)
-
-    last_scatter = ax.scatter(
-        jnp.real(eigenvalues),
-        jnp.imag(eigenvalues),
-        c=ky_eff_norm,
-        s=10,
-        cmap="plasma",
-        vmin=0.0,
-        vmax=1.0,
-        alpha=0.8,
-        linewidths=0,
-    )
-
-    ax.set_xlabel(r"$\operatorname{Re}(\mu)$")
-    ax.set_ylabel(r"$\operatorname{Im}(\mu)$")
-    ax.grid(True)
-
-    # rhs eigenmode, not simulation jacobian
-    _, lambda_khi = find_numerical_eigenmode(
-        khi_unperturbed_smoothed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
+    Args:
+        setup: The KH setup (smooth profiles, velocity perturbation).
+        kh_time: tau_KH.
+        eigenmode_state: The eigenmode-perturbed state.
+        eigenvalue: The selected eigenvalue.
+        spectra: The spectra of :func:`eigenvalue_plot`, stored with the data.
+    """
+    print("\nEvolving the velocity perturbation and the eigenmode ...")
+    base_state, config, params, registered_variables, helper_data = setup_khi_unperturbed_base(
         setup,
+        return_snapshots=True,
     )
+    velocity_state = perturb_khi(base_state, setup, helper_data, registered_variables)
+    result_velocity = time_integration(velocity_state, config, params, registered_variables)
+    result_eigenmode = time_integration(eigenmode_state, config, params, registered_variables)
 
-    # Convert generator eigenvalue to finite-time amplification factor.
-    mu_khi = jnp.exp(lambda_khi * t_end_jac)
-
-    lambda_khi_re = float(jnp.real(lambda_khi))
-    lambda_khi_im = float(jnp.imag(lambda_khi))
-    mu_khi_re = float(jnp.real(mu_khi))
-    mu_khi_im = float(jnp.imag(mu_khi))
-    mu_khi_abs = float(jnp.abs(mu_khi))
-
-    ax.scatter(
-        mu_khi_re,
-        mu_khi_im,
-        marker="*",
-        s=140,
-        facecolors="none",
-        edgecolors="black",
-        linewidths=1.6,
-        label=(
-            rf"KH mode: $|\mu|={mu_khi_abs:.3f}$"
-            "\n"
-            rf"$\lambda={lambda_khi_re:.2f}{lambda_khi_im:+.2f}i$"
-        ),
-        zorder=10,
-    )
-
-    ax.set_ylim(-2.0, 2.0)
-    ax.set_xlim(0.5, 5.0)
-
-    # inset axes
-    # add_inset_box(ax, x1=-2.0, x2=2.0, y1=0.0, y2=3.0, loc='lower left', connect_loc1=2, connect_loc2=4)
-
-    cbar = fig.colorbar(last_scatter, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(r"$k_y^\mathrm{eff}/k_{y,\mathrm{Nyq}}$")
-
-    fig.savefig("figures/eigenvalue_spectrum_t.png", dpi=600, bbox_inches="tight")
-    print("Saved figures/eigenvalue_spectrum_t.png")
-
-def eigenmode_growth_test():
-    
-    print("\n🚀 Starting Eigenmode Transient Test...")
-
-    density_contrast = 10.0
-    mach_number = 0.5
-    diffusion = False
-    kinematic_viscosity = 0.0
-
-    c_background = float(jnp.sqrt(gamma * pressure / background_density))
-    wavelength = box_size / 2
-    amplitude = mach_number * c_background / 20
-    smoothing_length = wavelength / 10
-    slab_radius = 0.1
-
-    # KHI timescale for reference
-    slab_density = density_contrast * background_density
-    Delta = float((slab_density + background_density)**2 / (slab_density * background_density))
-    v_slab = mach_number * c_background
-    t_kh = float(jnp.sqrt(Delta) * wavelength / v_slab)
-
-    # Simulate up to 1.5 tau_KH to stay in the clean linear regime
-    simulation_time = 1.5 * t_kh
-
-    setup_vel = KHISetup(
-        num_cells=num_cells,
-        simulation_time=simulation_time,
-        perturbation_type=VELOCITY_PERTURBATION,
-        perturbation_setup=PressurePerturbationSetup(
-            amplitude=amplitude,
-            wavelength=wavelength,
-            gaussian_width=5 * smoothing_length,
-        ),
-        diffusion=diffusion,
-        viscosity=kinematic_viscosity,
-        mach_number=mach_number,
-        density_contrast=density_contrast,
-        slab_radius=slab_radius,
-        smoothing_length=smoothing_length,
-    )
-
-    setup_eig = setup_vel._replace(perturbation_type=EIGENMODE_PERTURBATION)
-
-    print("\n--- Running Standard Velocity Initialization ---")
-    result_vel, helper_data, reg_vars = simulate_khi(setup_vel, return_snapshots=True)
-
-    print("\n--- Running Pure JAX Eigenmode Initialization ---")
-    result_eig, _, _ = simulate_khi(setup_eig, return_snapshots=True)
-
-    # get the eigenmode growth rate for reference
-    # set up the unperturbed base state and config
-    (
-        khi_unperturbed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
-    ) = setup_khi_unperturbed_base(setup_eig)
-    _, lambda_khi = find_numerical_eigenmode(
-        khi_unperturbed,
-        config,
-        params,
-        registered_variables,
-        helper_data,
-        setup_eig,
-    )
-    growth_rate_khi = float(jnp.real(lambda_khi))
-    print(f"Reference KH eigenmode growth rate: {growth_rate_khi:.6e}")
-
-    # --- Analysis: Measure Mode Amplitude ---
-    # We project v_y onto the spatial Fourier basis to extract the envelope amplitude,
-    # avoiding phase oscillations as the wave travels.
+    growth_rate = float(jnp.real(eigenvalue))
     X = helper_data.geometric_centers[:, :, 0]
-    k = 2 * jnp.pi / wavelength
-    sin_kx = jnp.sin(k * X)
-    cos_kx = jnp.cos(k * X)
+    wavenumber = 2 * jnp.pi / setup.perturbation_setup.wavelength
+    velocity_y_index = registered_variables.velocity_index.y
+    amplitude_velocity = mode_amplitude(result_velocity.states, velocity_y_index, wavenumber, X)
+    amplitude_eigenmode = mode_amplitude(result_eigenmode.states, velocity_y_index, wavenumber, X)
+    time_velocity = np.asarray(result_velocity.time_points)
+    time_eigenmode = np.asarray(result_eigenmode.time_points)
+    log_growth_velocity = np.log(amplitude_velocity / amplitude_velocity[0])
+    log_growth_eigenmode = np.log(amplitude_eigenmode / amplitude_eigenmode[0])
 
-    def get_mode_amplitude(result_obj):
-        amplitudes = []
-        for state in result_obj.states:
-            vy_field = state[reg_vars.velocity_index.y]
-            
-            # Project onto sin and cos to capture any phase
-            proj_sin = jnp.mean(vy_field * sin_kx, axis=0) * 2  
-            proj_cos = jnp.mean(vy_field * cos_kx, axis=0) * 2  
-            
-            # Magnitude of the Fourier coefficient envelope, take peak across y
-            amp_envelope = jnp.sqrt(proj_sin**2 + proj_cos**2)
-            amplitudes.append(float(jnp.max(amp_envelope)))
-            
-        return jnp.array(amplitudes), jnp.array(result_obj.time_points)
+    # The measured growth rate of the eigenmode run over its first 0.6 tau_KH
+    # (linear fit of ln A), to compare with Re(lambda).
+    early = time_eigenmode <= 0.6 * kh_time
+    measured_rate = float(np.polyfit(time_eigenmode[early], log_growth_eigenmode[early], 1)[0])
+    print(f"Re(lambda) = {growth_rate:.4f}, measured eigenmode growth rate over t < 0.6 tau_KH = {measured_rate:.4f}")
+    minimum_index = int(np.argmin(log_growth_velocity))
+    print(
+        f"velocity perturbation: minimum ln(A/A0) = {log_growth_velocity[minimum_index]:.3f} "
+        f"at t / tau_KH = {time_velocity[minimum_index] / kh_time:.3f}; final ln(A/A0): velocity "
+        f"{log_growth_velocity[-1]:.3f}, eigenmode {log_growth_eigenmode[-1]:.3f}"
+    )
 
-    amp_vel, t_vel = get_mode_amplitude(result_vel)
-    amp_eig, t_eig = get_mode_amplitude(result_eig)
+    DATA_DIRECTORY.mkdir(exist_ok=True)
+    np.savez(
+        DATA_DIRECTORY / "eigen_initialization.npz",
+        eigenvalue=np.asarray(eigenvalue),
+        kh_time=kh_time,
+        time_velocity=time_velocity,
+        amplitude_velocity=amplitude_velocity,
+        time_eigenmode=time_eigenmode,
+        amplitude_eigenmode=amplitude_eigenmode,
+        **{f"spectrum_{label.replace(' ', '_')}": values[0] for label, values in spectra.items()},
+        **{f"wavenumber_ratio_{label.replace(' ', '_')}": values[1] for label, values in spectra.items()},
+    )
 
-    # Normalize to t=0 amplitude and convert to log scale for exponential plot
-    ln_vel = jnp.log(amp_vel / amp_vel[0])
-    ln_eig = jnp.log(amp_eig / amp_eig[0])
+    # -------------------------------------------------------------
+    # ==================== ↓ Growth transient ↓ ===================
+    # -------------------------------------------------------------
 
-    # --- Plot 1: Transient Analysis ---
-    fig_line, ax_line = plt.subplots(figsize=(8, 6))
-    ax_line.plot(t_vel / t_kh, ln_vel, label="ad-hoc velocity perturbation", linestyle="--", color="red", linewidth=2)
-    ax_line.plot(t_eig / t_kh, ln_eig, label="selected eigenmode", linestyle="-", color="blue", linewidth=2)
+    figure, axis = plt.subplots(figsize=(8, 6))
+    axis.plot(
+        time_velocity / kh_time,
+        log_growth_velocity,
+        label="ad-hoc velocity perturbation",
+        linestyle="--",
+        color="red",
+        linewidth=2,
+    )
+    axis.plot(
+        time_eigenmode / kh_time,
+        log_growth_eigenmode,
+        label="selected eigenmode",
+        linestyle="-",
+        color="blue",
+        linewidth=2,
+    )
+    reference_time = np.linspace(0, setup.simulation_time, 100)
+    axis.plot(
+        reference_time / kh_time,
+        growth_rate * reference_time,
+        label=f"expected growth, Re[λ] = {growth_rate:.2e}",
+        linestyle=":",
+        color="black",
+        linewidth=1.5,
+    )
+    axis.set_ylim(top=2.0)
+    axis.set_xlabel(r"Time ($t / \tau_{KH}$)", fontsize=14)
+    axis.set_ylabel(r"$\ln(A(t) / A_0)$", fontsize=14)
+    axis.set_title("KHI growth: elimination of initialization transients", fontsize=14, fontweight="bold")
+    axis.legend(fontsize=12)
+    axis.grid(True, alpha=0.3)
+    figure.tight_layout()
+    figure_path = FIGURES_DIRECTORY / "eigenmode_transient_test.png"
+    figure.savefig(figure_path, dpi=150)
+    plt.close(figure)
+    print(f"saved {figure_path}")
 
-    # Reference line for expected growth rate
-    t_ref = jnp.linspace(0, simulation_time, 100)
-    ax_line.plot(t_ref / t_kh, growth_rate_khi * t_ref, label=f"expected growth, Re[λ] = {growth_rate_khi:.2e}", linestyle=":", color="black", linewidth=1.5)
-    ax_line.set_ylim(top = 2.0)
+    # -------------------------------------------------------------
+    # ==================== ↑ Growth transient ↑ ===================
+    # -------------------------------------------------------------
 
-    ax_line.set_xlabel(r"Time ($t / \tau_{KH}$)", fontsize=14)
-    ax_line.set_ylabel(r"$\ln(A(t) / A_0)$", fontsize=14)
-    ax_line.set_title("KHI growth: elimination of initialization transients", fontsize=14, fontweight="bold")
-    ax_line.legend(fontsize=12)
-    ax_line.grid(True, alpha=0.3)
-    fig_line.tight_layout()
-    fig_line.savefig(figures_dir / "eigenmode_transient_test.png", dpi=150)
-    print("Saved figures/eigenmode_transient_test.png")
+    # -------------------------------------------------------------
+    # ====================== ↓ Final states ↓ =====================
+    # -------------------------------------------------------------
 
-    # --- Plot 2: Visual comparison of the final states ---
-    fig_state, axs = plt.subplots(2, 3, figsize=(15, 9))
+    figure, axes = plt.subplots(2, 3, figsize=(15, 9))
     extent = [0, box_size, 0, box_size]
+    panels = (
+        (registered_variables.density_index, "viridis", LogNorm()),
+        (registered_variables.velocity_index.y, "RdBu_r", None),
+        (registered_variables.pressure_index, "magma", None),
+    )
+    for row, result in enumerate((result_velocity, result_eigenmode)):
+        final_state = result.states[-1]
+        for column, (variable_index, colormap, norm) in enumerate(panels):
+            image = axes[row, column].imshow(
+                final_state[variable_index].T,
+                cmap=colormap,
+                origin="lower",
+                extent=extent,
+                norm=norm,
+            )
+            axes[row, column].set_xticks([])
+            axes[row, column].set_yticks([])
+            colorbar_axis = make_axes_locatable(axes[row, column]).append_axes("right", size="5%", pad=0.1)
+            figure.colorbar(image, cax=colorbar_axis)
+    axes[0, 0].set_ylabel("ad-hoc velocity", fontsize=12, fontweight="bold")
+    axes[1, 0].set_ylabel("eigenmode", fontsize=12, fontweight="bold")
+    for column, title in enumerate(["Density (log)", r"Transverse Velocity ($v_y$)", "Pressure"]):
+        axes[0, column].set_title(title, fontsize=13)
+    figure.suptitle(f"Final State Comparison at $t = {setup.simulation_time:.2f}$", fontsize=16, fontweight="bold")
+    figure.tight_layout()
+    figure_path = FIGURES_DIRECTORY / "eigenmode_final_states.png"
+    figure.savefig(figure_path, dpi=150)
+    plt.close(figure)
+    print(f"saved {figure_path}")
 
-    final_state_vel = result_vel.states[-1]
-    final_state_eig = result_eig.states[-1]
+    # -------------------------------------------------------------
+    # ====================== ↑ Final states ↑ =====================
+    # -------------------------------------------------------------
 
-    # Setup A (Velocity)
-    im0 = axs[0, 0].imshow(final_state_vel[reg_vars.density_index].T, cmap='viridis', origin='lower', extent=extent, norm=LogNorm())
-    im1 = axs[0, 1].imshow(final_state_vel[reg_vars.velocity_index.y].T, cmap='RdBu_r', origin='lower', extent=extent)
-    im2 = axs[0, 2].imshow(final_state_vel[reg_vars.pressure_index].T, cmap='magma', origin='lower', extent=extent)
-
-    # Setup B (Eigenmode)
-    im3 = axs[1, 0].imshow(final_state_eig[reg_vars.density_index].T, cmap='viridis', origin='lower', extent=extent, norm=LogNorm())
-    im4 = axs[1, 1].imshow(final_state_eig[reg_vars.velocity_index.y].T, cmap='RdBu_r', origin='lower', extent=extent)
-    im5 = axs[1, 2].imshow(final_state_eig[reg_vars.pressure_index].T, cmap='magma', origin='lower', extent=extent)
-
-    axs[0, 0].set_ylabel("ad-hoc velocity", fontsize=12, fontweight='bold')
-    axs[1, 0].set_ylabel("eigenmode", fontsize=12, fontweight='bold')
-
-    titles = ['Density (log)', r'Transverse Velocity ($v_y$)', 'Pressure']
-    for col in range(3):
-        axs[0, col].set_title(titles[col], fontsize=13)
-
-    for i, ax in enumerate(axs.flat):
-        ax.set_xticks([])
-        ax.set_yticks([])
-        cax = make_axes_locatable(ax).append_axes("right", size="5%", pad=0.1)
-        fig_state.colorbar([im0, im1, im2, im3, im4, im5][i], cax=cax)
-
-    fig_state.suptitle(f"Final State Comparison at $t = {simulation_time:.2f}$", fontsize=16, fontweight='bold')
-    fig_state.tight_layout()
-    fig_state.savefig(figures_dir / "eigenmode_final_states.png", dpi=150)
-    print("Saved figures/eigenmode_final_states.png")
 
 # -------------------------------------------------------------
-# ===================== ↑ Eigenmode test ↑ ====================
+# ===================== ↑ Paper figures ↑ =====================
 # -------------------------------------------------------------
 
 
 if __name__ == "__main__":
-    # Figure 1: eigenvalue spectrum coloured by effective transverse wavenumber
-    eigenvalue_plot()
-    # Figures 2 and 3: growth transient + developed final-state comparison
-    eigenmode_growth_test()
+    FIGURES_DIRECTORY.mkdir(exist_ok=True)
+    paper_khi_setup, paper_kh_time = paper_setup()
+
+    # Fig. kh-spectrum: the eigenspectra and the selected KH eigenmode.
+    paper_eigenmode_state, paper_eigenvalue, paper_spectra = eigenvalue_plot(paper_khi_setup)
+
+    # Figs. kh-transient and kh-final: growth transient and final states.
+    eigenmode_growth_test(
+        paper_khi_setup,
+        paper_kh_time,
+        paper_eigenmode_state,
+        paper_eigenvalue,
+        paper_spectra,
+    )

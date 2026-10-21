@@ -98,6 +98,12 @@ class SimulationParams(NamedTuple):
     #: Minimum pressure, in the same roles as ``minimum_density``.
     minimum_pressure: float = 1e-14
 
+    #: Alfven-speed ceiling of the per-step HARD_FLOOR (MHD only): where the
+    #: Alfven speed |B| / sqrt(rho) would exceed it, the density is raised to
+    #: |B|^2 / maximum_alfven_speed^2, momentum and total energy kept (see
+    #: ``_apply_density_floor``). ``inf`` (the default) switches it off.
+    maximum_alfven_speed: float = float("inf")
+
     #: Temperature-floor scale ``p/rho`` (``= k_B T_floor / (mu m_p)`` in code
     #: units). It defines the radiatively crushed interfaces that
     #: ``PositivityConfig.coldcrush_blend`` blends towards first order and,

@@ -20,14 +20,31 @@ Hardware-gated cases are intentionally excluded from the automated set because
 they need resources beyond a single node (run them by hand — see each module's
 docstring):
 
-* ``differentiability/kh_recon.py`` — heavy reconstruction optimisation campaign.
+* ``differentiability/kh_recon.py`` — heavy reconstruction optimisation campaign
+  (with the diagnostics ``kh_reversal_error.py``, ``kh_node_refinement.py`` and
+  ``kh_coarse_target.py``); its figures (``kh_horizon.svg``,
+  ``kh_example_T120.svg``) are drawn from the stored results by
+  ``kh_paper_figures.py``.
 * ``scaling/strong_scaling_speedup.py`` — the combined hydro+MHD speedup figure
   is measured across separate 4-/8-GPU H100/H200 machines, then assembled with
   ``--plot``.
 * ``scaling/scaling_campaign.py`` — single-GPU / block-shape / strong-scaling
   measurement driver (writes NPZ+JSON caches, not a single figure).
-* ``scaling/weak_scaling_hydro.py`` — multi-node weak scaling launched under
-  Slurm (up to 2048^3 on 16 GPUs / 4 nodes).
+* ``scaling/weak_scaling_hydro.py`` / ``weak_scaling_mhd.py`` — multi-node
+  weak scaling of both schemes launched under Slurm (up to 128 GPUs on 32
+  nodes; ``pytests/runners/weak_{hydro,mhd}.sh``, tables and figure by
+  ``scaling/make_weak_tables.py``).
+* ``scaling/strong_scaling_speedup.py`` on GH200 nodes
+  (``pytests/runners/strong_scaling.sh``).
+* ``scaling/pallas_speedup.py --measure`` — single-GPU sweeps of both schemes
+  and backends to the memory limit (hours per sweep).
+* ``forward/mhd/mhd_jet.py --res 1024`` — 1024^3 on 16 GPUs
+  (``pytests/runners/mhd_jet.sh``).
+* the paper's turbulence runs at 256^3 and 512^3 (``pytests/runners/turb_paper.sh``;
+  the 512^3 runs take 10-20 h and resume across jobs). The automated set below
+  runs the same setups at 128^3 and 256^3.
+* ``forward/mhd/turbulence/dynamo_convergence.py`` — the FD vs FV Reynolds and
+  Prandtl number study (``run_dynamo_ladder.sh``; the 256^3 runs take hours).
 
 The single-node ``checkpoint_scaling`` and 2-GPU ``extended_strong_scaling``
 figures ARE included above.
@@ -73,12 +90,13 @@ _TURB = "forward/mhd/turbulence"
 _TURB_STEPS = [
     Step(f"{_TURB}/paper_turbulence.py",
          ("--mturb", "10", "--beta", "0.1", "--eos", "iso", "--tcross", "5",
+          "--cfl", "0.75", "--rhomin", "1e-3", "--floor", "1", "--alfven-ceiling", "10",
           "--N", str(N), "--tag", f"ISM_N{N}"))
     for N in (128, 256)
 ] + [
     Step(f"{_TURB}/paper_turbulence.py",
          ("--mturb", "0.5", "--beta", "1e6", "--eos", "iso", "--tcross", "30",
-          "--N", str(N), "--tag", f"ICM_N{N}"))
+          "--F0", "2.4", "--N", str(N), "--tag", f"ICM_N{N}"))
     for N in (128, 256)
 ] + [
     Step(f"{_TURB}/make_fig14.py"),
@@ -106,17 +124,20 @@ PAPER_FIGURES = [
         ["figures/shock_tube_sensitivity.svg",
          "figures/shock_tube_sensitivity_step_sweep.svg"],
     ),
-    # The paper ran this at --fine-N 128, whose naive full-resolution
-    # value-and-grad needs ~181 GiB; --fine-N 64 reproduces the same 3-method
-    # comparison within ~10 GiB (A100-40GB). Three steps: optimise, render the
-    # panel snapshots, then assemble the figure.
+    # Plain Adam on the 3 x 128^3 initial velocity with the Pallas adjoint of the
+    # WENO flux (~7 min per step, 9.9 GiB, one GH200; the paper's run took 119
+    # steps / 15.4 h to the 600x loss reduction; optimize_velocity.py resumes, so
+    # run it as a chain of jobs), then the panel snapshots and the rendering
+    # (pyvista + vtk; needs an OpenGL context, see make_panels_fig.py).
     PaperFigure(
         "field_level_inference",
-        [Step("differentiability/field_level_inference/run_inference.py",
-              ("--fine-N", "64", "--coarse-N", "32")),
+        [Step("differentiability/field_level_inference/optimize_velocity.py",
+              ("--resolution", "128", "--num-steps", "300", "--learning-rate", "3e-3",
+               "--target-reduction", "600", "--flux-adjoint", "pallas",
+               "--run-directory", "adam_N128")),
          Step("differentiability/field_level_inference/make_panel_snaps.py",
-              ("--state", "data/best_state_full128.npy", "--resolution", "64",
-               "--out", "panel_snaps.npz")),
+              ("--resolution", "128", "--state", "adam_N128/best_state.npy",
+               "--summary", "adam_N128/run_summary.json", "--out", "panel_snaps.npz")),
          Step("differentiability/field_level_inference/make_panels_fig.py",
               ("--snaps", "panel_snaps.npz", "--out", "field_level_inference.png"))],
         ["field_level_inference.png"],
@@ -129,7 +150,7 @@ PAPER_FIGURES = [
     ),
     PaperFigure(
         "sedov_blast",
-        [Step("forward/hydro/sedov_blast.py", ("--rerun",))],
+        [Step("forward/hydro/sedov_blast.py", ("--rerun", "--res", "256"))],
         ["figures/sedov_blast_256.png"],
     ),
     PaperFigure(
@@ -145,14 +166,9 @@ PAPER_FIGURES = [
     # --- forward mhd ------------------------------------------------------
     PaperFigure(
         "mhd_blast",
-        [Step("forward/mhd/mhd_blast.py", ("--rerun",))],
+        [Step("forward/mhd/mhd_blast.py", ("--rerun", "--res", "128", "256"))],
         ["figures/mhd_blast_test1_256cells.png",
          "figures/mhd_blast_oscillations_comparison.png"],
-    ),
-    PaperFigure(
-        "mhd_jet",
-        [Step("forward/mhd/mhd_jet.py", ("--rerun",))],
-        ["figures/mhd_jet_fd_256.png"],
     ),
     PaperFigure(
         "orszag_tang",
@@ -161,23 +177,24 @@ PAPER_FIGURES = [
     ),
     PaperFigure(
         "alfven_convergence",
-        [Step("forward/mhd/alfven_convergence.py")],
-        ["figures/alfven_wave3D_dp_convergence.svg"],
+        [Step("forward/mhd/alfven_convergence.py", ("--node", "gh200"))],
+        ["../../../../pytests/mhd/figures/gh200/alfven_wave3D_dp_convergence.svg",
+         "../../../../pytests/mhd/figures/gh200/alfven_wave3D_dp_runtime.svg"],
     ),
     PaperFigure(
         "turbulence",
         _TURB_STEPS,
-        ["figures/turbulence_slices.pdf", "figures/turbulence_spectra.svg"],
+        ["figures/turbulence_slices.svg", "figures/turbulence_spectra_smooth.svg"],
     ),
     # --- forward self-gravity --------------------------------------------
     PaperFigure(
         "jeans_convergence",
-        [Step("forward/self_gravity/jeans_convergence.py")],
+        [Step("forward/self_gravity/jeans_convergence.py", ("--rerun",))],
         ["figures/jeans_waves_error_convergence.svg"],
     ),
     PaperFigure(
         "slab_convergence",
-        [Step("forward/self_gravity/slab_convergence.py")],
+        [Step("forward/self_gravity/slab_convergence.py", ("--rerun",))],
         ["figures/slab_error_convergence.svg"],
     ),
     PaperFigure(
