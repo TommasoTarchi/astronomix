@@ -194,6 +194,37 @@ def _sound_speed_squared(
     return jnp.full_like(density, params.isothermal_sound_speed**2)
 
 
+def _density_threshold(
+    sound_speed_squared: FIELD_TYPE,
+    config: SimulationConfig,
+    params: SimulationParams,
+) -> FIELD_TYPE:
+    """
+    The density threshold in every cell, used for creation and accretion.
+
+    Without the factor, it is the density at which the Jeans length equals
+    2 r_acc, the smallest Jeans length the grid resolves (Federrath et al.
+    2010, Eq. 32), ρ_thr = π c_s² / (4 G r_acc²). It is multiplied by
+    ``density_threshold_factor``.
+
+    Args:
+        sound_speed_squared: The squared sound speed in every cell.
+        config: The simulation configuration.
+        params: The simulation parameters.
+
+    Returns:
+        The density threshold, with the shape of ``sound_speed_squared``.
+    """
+    sink_particle_config = config.sink_particle_config
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
+    return (
+        sink_particle_config.density_threshold_factor
+        * jnp.pi
+        * sound_speed_squared
+        / (4.0 * params.gravitational_constant * accretion_radius**2)
+    )
+
+
 def _interior_mask(
     density: FIELD_TYPE,
     config: SimulationConfig,
@@ -521,21 +552,15 @@ def _form_sink_particles(
         axis=-1,
     )
 
-    # The density threshold is the density at which the Jeans length equals
-    # 2 r_acc, the smallest Jeans length the grid resolves (Federrath et al.
-    # 2010, Eq. 32). It depends on the local sound speed, so it is evaluated
-    # in every cell.
+    # The density threshold (Eq. 32, times density_threshold_factor) depends
+    # on the local sound speed, so it is evaluated in every cell.
     sound_speed_squared = _sound_speed_squared(
         primitive_state,
         config,
         params,
         registered_variables,
     )
-    density_threshold = (
-        jnp.pi
-        * sound_speed_squared
-        / (4.0 * params.gravitational_constant * accretion_radius**2)
-    )
+    density_threshold = _density_threshold(sound_speed_squared, config, params)
 
     # The gravitational potential of the gas (plus any external potential),
     # from a Poisson solve on the updated density. The hydro update computes it
@@ -554,16 +579,17 @@ def _form_sink_particles(
     # =============== ↓ Stage 1: grid-wide checks ↓ ===============
     # -------------------------------------------------------------
 
-    # Density threshold check (Section 2.2.1), converging flow check
-    # (Section 2.2.3) and gravitational potential minimum check (Section
-    # 2.2.4). Ghost cells are excluded, as they only mirror physical cells or
-    # hold boundary values.
+    # Density threshold check (Section 2.2.1), gravitational potential
+    # minimum check (Section 2.2.4) and, if converging_flow_check is set,
+    # converging flow check (Section 2.2.3). Ghost cells are excluded, as they
+    # only mirror physical cells or hold boundary values.
     candidate_mask = (
         (density > density_threshold)
-        & _converging_flow_mask(velocity)
         & _potential_minimum_mask(gravitational_potential, offsets)
         & _interior_mask(density, config)
     )
+    if sink_particle_config.converging_flow_check:
+        candidate_mask = candidate_mask & _converging_flow_mask(velocity)
 
     # -------------------------------------------------------------
     # =============== ↑ Stage 1: grid-wide checks ↑ ===============
@@ -631,8 +657,9 @@ def _form_sink_particles(
     )
 
     # Jeans instability check (Section 2.2.5): the gravitational energy of the
-    # gas in the control volume must exceed twice its thermal energy plus its
-    # magnetic energy, |E_grav| > 2 E_th + E_mag.
+    # gas in the control volume must exceed f times its thermal energy plus
+    # its magnetic energy, |E_grav| > f E_th + E_mag, with
+    # f = jeans_thermal_energy_factor (2 in the paper).
     #   - E_th = ½ Σ M c_s² (Eq. 5).
     #   - E_grav = −Σ M (φ_max − φ), with φ_max the largest potential in the
     #     control volume, as in Federrath's FLASH code. Measuring φ from its
@@ -667,28 +694,33 @@ def _form_sink_particles(
         magnetic_energy = jnp.zeros_like(thermal_energy)
 
     jeans_unstable = (
-        gravitational_energy_magnitude > 2.0 * thermal_energy + magnetic_energy
+        gravitational_energy_magnitude
+        > sink_particle_config.jeans_thermal_energy_factor * thermal_energy
+        + magnetic_energy
     )
 
-    # Bound state check (Section 2.2.6): the total energy of the gas in the
-    # control volume must be negative, E_grav + E_th + E_kin + E_mag < 0, with
-    # E_kin = ½ Σ M |v − v_cm|² the kinetic energy relative to the
-    # centre-of-mass motion (Eq. 11).
-    velocity_relative_to_center_of_mass = (
-        velocity_in_volume - center_of_mass_velocity[:, None, :]
-    )
-    kinetic_energy = 0.5 * jnp.sum(
-        cell_mass_in_volume
-        * jnp.sum(velocity_relative_to_center_of_mass**2, axis=-1),
-        axis=-1,
-    )
-    bound = (
-        -gravitational_energy_magnitude
-        + thermal_energy
-        + kinetic_energy
-        + magnetic_energy
-        < 0.0
-    )
+    # Bound state check (Section 2.2.6), if formation_bound_check is set: the
+    # total energy of the gas in the control volume must be negative,
+    # E_grav + E_th + E_kin + E_mag < 0, with E_kin = ½ Σ M |v − v_cm|² the
+    # kinetic energy relative to the centre-of-mass motion (Eq. 11).
+    if sink_particle_config.formation_bound_check:
+        velocity_relative_to_center_of_mass = (
+            velocity_in_volume - center_of_mass_velocity[:, None, :]
+        )
+        kinetic_energy = 0.5 * jnp.sum(
+            cell_mass_in_volume
+            * jnp.sum(velocity_relative_to_center_of_mass**2, axis=-1),
+            axis=-1,
+        )
+        bound = (
+            -gravitational_energy_magnitude
+            + thermal_energy
+            + kinetic_energy
+            + magnetic_energy
+            < 0.0
+        )
+    else:
+        bound = jnp.ones_like(jeans_unstable)
 
     candidate_passes = (
         candidate_is_valid

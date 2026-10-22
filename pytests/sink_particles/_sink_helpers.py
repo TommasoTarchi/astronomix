@@ -86,12 +86,15 @@ def _setup(
 
 
 def _density_threshold(config, params):
-    """The density threshold of Eq. 32 for the setup's uniform c_s² = 1."""
-    accretion_radius = (
-        config.sink_particle_config.accretion_radius_in_cells * config.grid_spacing
-    )
-    return jnp.pi * SETTINGS.sound_speed_squared / (
-        4.0 * params.gravitational_constant * accretion_radius**2
+    """The density threshold of Eq. 32, times ``density_threshold_factor``, for
+    the setup's uniform c_s² = 1."""
+    sink_particle_config = config.sink_particle_config
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
+    return (
+        sink_particle_config.density_threshold_factor
+        * jnp.pi
+        * SETTINGS.sound_speed_squared
+        / (4.0 * params.gravitational_constant * accretion_radius**2)
     )
 
 

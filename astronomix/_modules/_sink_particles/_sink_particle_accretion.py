@@ -2,9 +2,10 @@
 Gas accretion onto sink particles following Federrath et al. (2010), ApJ 713, 269.
 
 Once per time step, after sink creation, every sink takes the gas above the
-density threshold from the cells within its accretion radius (Section 2.3):
-from a cell with ρ > ρ_res, the mass increment ΔM = (ρ − ρ_res) ΔV (Eq. 13)
-moves to the sink and the cell is left at ρ_res. Mass and linear momentum are
+density threshold from the cells within its accretion sphere, of radius
+r_cut = accretion_distance_cutoff_factor × r_acc (Section 2.3): from a cell
+with ρ > ρ_res, the mass increment ΔM = (ρ − ρ_res) ΔV (Eq. 13) moves to the
+sink and the cell is left at ρ_res. Mass and linear momentum are
 conserved (Appendix B); the sink moves to the centre of mass of itself and the
 accreted gas. New sinks, created with zero mass, get their mass here too.
 
@@ -36,19 +37,38 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_formation import (
+    _density_threshold,
     _periodic_box,
     _sound_speed_squared,
 )
 
 
+def _accretion_cutoff_radius_in_cells(config: SimulationConfig) -> float:
+    """
+    The radius r_cut of the accretion sphere in units of the grid spacing,
+    r_acc times ``accretion_distance_cutoff_factor``.
+
+    Args:
+        config: The simulation configuration.
+
+    Returns:
+        r_cut / Δx.
+    """
+    sink_particle_config = config.sink_particle_config
+    return (
+        sink_particle_config.accretion_distance_cutoff_factor
+        * sink_particle_config.accretion_radius_in_cells
+    )
+
+
 def _accretion_offsets(config: SimulationConfig) -> np.ndarray:
     """
     Integer cell offsets (i, j, k), from the cell containing a sink, of every
-    cell that can lie within the accretion radius of that sink.
+    cell that can lie within the accretion sphere of that sink.
 
     A sink can sit anywhere inside its cell, at most √3/2 cells from the cell
-    centre, so the offsets are those with i² + j² + k² ≤ (r_acc/Δx + √3/2)².
-    Whether a cell is actually within r_acc is checked per sink. The offsets
+    centre, so the offsets are those with i² + j² + k² ≤ (r_cut/Δx + √3/2)².
+    Whether a cell is actually within r_cut is checked per sink. The offsets
     are computed with NumPy at trace time, since they only depend on the
     static configuration.
 
@@ -58,9 +78,7 @@ def _accretion_offsets(config: SimulationConfig) -> np.ndarray:
     Returns:
         The offsets, shape (num_offsets, 3), with (0, 0, 0) among them.
     """
-    reach_in_cells = (
-        config.sink_particle_config.accretion_radius_in_cells + 0.5 * np.sqrt(3.0)
-    )
+    reach_in_cells = _accretion_cutoff_radius_in_cells(config) + 0.5 * np.sqrt(3.0)
     max_offset = int(np.floor(reach_in_cells))
     offset_range = np.arange(-max_offset, max_offset + 1)
     offsets = np.stack(
@@ -82,7 +100,7 @@ def _accrete_gas(
 ) -> tuple[STATE_TYPE, SinkParticles]:
     """
     Move the gas above the density threshold within each sink's accretion
-    radius onto that sink.
+    sphere onto that sink.
 
     Args:
         primitive_state: The (padded) primitive state.
@@ -99,7 +117,7 @@ def _accrete_gas(
     sink_particle_config = config.sink_particle_config
     grid_spacing = config.grid_spacing
     cell_volume = grid_spacing**3
-    accretion_radius = sink_particle_config.accretion_radius_in_cells * grid_spacing
+    cutoff_radius = _accretion_cutoff_radius_in_cells(config) * grid_spacing
     num_ghost_cells = config.num_ghost_cells
 
     density = primitive_state[registered_variables.density_index]
@@ -112,18 +130,17 @@ def _accrete_gas(
         axis=-1,
     )
 
-    # The density threshold of Eq. 32, per cell, as in the creation step.
+    # The density threshold, per cell, as in the creation step. Both steps
+    # must use the same threshold: a sink created where the gas is below the
+    # accretion threshold would stay massless, and a massless slot counts as
+    # empty.
     sound_speed_squared = _sound_speed_squared(
         primitive_state,
         config,
         params,
         registered_variables,
     )
-    density_threshold = (
-        jnp.pi
-        * sound_speed_squared
-        / (4.0 * params.gravitational_constant * accretion_radius**2)
-    )
+    density_threshold = _density_threshold(sound_speed_squared, config, params)
 
     # -------------------------------------------------------------
     # ================ ↓ Cells around each sink ↓ =================
@@ -179,13 +196,19 @@ def _accrete_gas(
     velocity_in_reach = velocity[cell_indices]
     mass_increment = (density_in_reach - density_threshold_in_reach) * cell_volume
 
+    # The cell containing the sink (the inner cell) is accreted from whenever
+    # it is above the density threshold (Section 2.3): it skips the distance
+    # cutoff, which it can fail for r_cut below √3/2 cells, and the checks
+    # below, which also avoids r = 0 there.
+    is_inner_cell = jnp.all(offsets == 0, axis=-1)[None, :]
+
     # A (sink, cell) pair is a possible accretion if the sink is active, the
-    # cell is a real cell within r_acc of the sink, and the cell is above the
+    # cell is a real cell within r_cut of the sink, and the cell is above the
     # density threshold (Section 2.3).
     possible_accretion = (
         sink_is_active[:, None]
         & is_real_cell
-        & (distance <= accretion_radius)
+        & (is_inner_cell | (distance <= cutoff_radius))
         & (density_in_reach > density_threshold_in_reach)
     )
 
@@ -193,44 +216,49 @@ def _accrete_gas(
     # ================= ↓ Accretion checks ↓ ======================
     # -------------------------------------------------------------
 
-    # The gas in the cell containing the sink is always accreted, with no
-    # further check (Section 2.3); this also avoids r = 0 below.
-    is_inner_cell = jnp.all(offsets == 0, axis=-1)[None, :]
-
-    # Bound check (Section 2.3): ΔM must be bound to the sink and the gas
-    # around it, E_grav + E_kin < 0, with E_kin = ½ ΔM |v − v_n|² in the sink's
-    # frame. The paper gives no formula for E_grav; as in Federrath's FLASH
-    # code, the gas within r_acc is a uniform sphere of density ρ_res and the
-    # sink a point mass M_n, both measured from the edge of the accretion
-    # sphere:
-    #   E_grav = −G (2π/3) ρ_res (r_acc² − r²) ΔM − G M_n ΔM (1/r − 1/r_acc).
+    # Bound check (Section 2.3), if accretion_bound_check is set: ΔM must be
+    # bound to the sink and the gas around it, E_grav + E_kin < 0, with
+    # E_kin = ½ ΔM |v − v_n|² in the sink's frame. The paper gives no formula
+    # for E_grav; as in Federrath's FLASH code, the gas within the accretion
+    # sphere is a uniform sphere of density ρ_res and the sink a point mass
+    # M_n, both measured from the edge of the accretion sphere:
+    #   E_grav = −G (2π/3) ρ_res (r_cut² − r²) ΔM − G M_n ΔM (1/r − 1/r_cut).
+    # The total energy is computed either way, since it also decides which
+    # sink accretes a cell within reach of several sinks.
     gravitational_constant = params.gravitational_constant
-    safe_distance = jnp.where(distance > 0.0, distance, accretion_radius)
+    safe_distance = jnp.where(distance > 0.0, distance, cutoff_radius)
     gravitational_energy = (
         -gravitational_constant
         * (2.0 * jnp.pi / 3.0)
         * density_threshold_in_reach
-        * (accretion_radius**2 - distance**2)
+        * (cutoff_radius**2 - distance**2)
         * mass_increment
         - gravitational_constant
         * sink_particles.mass[:, None]
         * mass_increment
-        * (1.0 / safe_distance - 1.0 / accretion_radius)
+        * (1.0 / safe_distance - 1.0 / cutoff_radius)
     )
     relative_velocity = velocity_in_reach - sink_particles.velocity[:, None, :]
     kinetic_energy = 0.5 * mass_increment * jnp.sum(relative_velocity**2, axis=-1)
     total_energy = gravitational_energy + kinetic_energy
-    bound = total_energy < 0.0
+    if sink_particle_config.accretion_bound_check:
+        bound = total_energy < 0.0
+    else:
+        bound = jnp.ones_like(total_energy, dtype=bool)
 
     # Radial velocity check (Section 2.3): ΔM must move toward the sink,
     # v_r = r · (v − v_n) / r, with r pointing from the sink to the cell. The
-    # paper asks for a negative v_r; as in Federrath's FLASH code, v_r up to
-    # 10⁻⁵ c_s is accepted. Gas moving with the sink has v_r = 0 only up to
-    # rounding (the sink velocity is a mass-weighted average of gas
-    # velocities), so a bound of exactly 0 would accept or reject it at
-    # random.
+    # paper asks for a negative v_r; v_r up to
+    # radial_velocity_tolerance_in_sound_speeds × c_s is accepted (10⁻⁵ by
+    # default, as in Federrath's FLASH code). Gas moving with the sink has
+    # v_r = 0 only up to rounding (the sink velocity is a mass-weighted
+    # average of gas velocities), so a bound of exactly 0 would accept or
+    # reject it at random.
     radial_velocity = jnp.sum(separation * relative_velocity, axis=-1) / safe_distance
-    radial_velocity_tolerance = 1e-5 * jnp.sqrt(sound_speed_squared[cell_indices])
+    radial_velocity_tolerance = (
+        sink_particle_config.radial_velocity_tolerance_in_sound_speeds
+        * jnp.sqrt(sound_speed_squared[cell_indices])
+    )
     moving_toward_sink = radial_velocity <= radial_velocity_tolerance
 
     eligible_accretion = possible_accretion & (

@@ -1698,6 +1698,20 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 "Sink particles require state_struct = True; the sinks are "
                 "passed in and returned in the StateStruct."
             )
+        sink_particle_config = config.sink_particle_config
+        if sink_particle_config.density_threshold_factor <= 0.0:
+            raise ValueError(
+                "density_threshold_factor must be positive; accretion leaves "
+                "cells at the density threshold."
+            )
+        if sink_particle_config.jeans_thermal_energy_factor < 0.0:
+            raise ValueError("jeans_thermal_energy_factor must not be negative.")
+        if sink_particle_config.accretion_distance_cutoff_factor <= 0.0:
+            raise ValueError("accretion_distance_cutoff_factor must be positive.")
+        if sink_particle_config.radial_velocity_tolerance_in_sound_speeds < 0.0:
+            raise ValueError(
+                "radial_velocity_tolerance_in_sound_speeds must not be negative."
+            )
 
     return config
 

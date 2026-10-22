@@ -4,8 +4,9 @@ Sink particle accretion pytest (fast).
 Checks the gas accretion onto sink particles of Federrath et al. (2010),
 Section 2.3: the mass, position and velocity of a new sink after its first
 accretion, the conservation of mass and momentum (with and without a magnetic
-field), the bound and radial velocity checks, and the choice of a single sink
-for each accreted cell.
+field), the bound and radial velocity checks and the options that loosen
+them, the size of the accretion sphere, accretion down to a lowered density
+threshold, and the choice of a single sink for each accreted cell.
 """
 
 # ==== GPU selection ====
@@ -34,6 +35,7 @@ from _sink_helpers import (
     _gas_mass_and_momentum,
     _num_accreted_cells,
     _num_sinks,
+    _one_sink_at,
     _setup,
     _sink_at_clump_center,
     _update_sinks_once,
@@ -185,7 +187,7 @@ def test_accretion_conservation(mhd):
         )
 
 
-def _accrete_around_sink_at_rest(velocity_gradient):
+def _accrete_around_sink_at_rest(velocity_gradient, **sink_particle_options):
     """Apply one formation and accretion step with an existing sink of mass 0.5
     at rest at the clump centre, and check that no new sink forms and that the
     sink gains exactly the mass above the threshold of the cells that lost gas.
@@ -193,11 +195,12 @@ def _accrete_around_sink_at_rest(velocity_gradient):
     Args:
         velocity_gradient: The gradient g of the gas velocity
             v = g (x − x_c) along every axis, about the sink at x_c.
+        **sink_particle_options: Further ``SinkParticleConfig`` fields.
 
     Returns:
         The number of cells that lost gas.
     """
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(**sink_particle_options)
     state = _with_linear_velocity(
         state,
         registered_variables,
@@ -268,6 +271,107 @@ def test_no_accretion_of_gas_moving_away():
     assert num_accreted_cells == 1, (
         f"{num_accreted_cells} cells were accreted; gas moving away must leave "
         "only the sink's own cell"
+    )
+
+
+def test_accretion_of_unbound_gas_without_bound_check():
+    """With accretion_bound_check off, gas moving toward the sink is accreted
+    whether it is bound or not: with fast infall, all 57 cells above the
+    threshold are accreted."""
+    num_accreted_cells = _accrete_around_sink_at_rest(
+        velocity_gradient=-1000.0,
+        accretion_bound_check=False,
+    )
+
+    assert num_accreted_cells == 57, (
+        f"{num_accreted_cells} of the 57 cells above the threshold were accreted"
+    )
+
+
+def test_accretion_of_gas_moving_away_within_tolerance():
+    """Gas moving away from the sink is accreted if its radial velocity is at
+    most radial_velocity_tolerance_in_sound_speeds × c_s. With slow expansion,
+    v_r ≤ r_acc ≈ 0.08 c_s within the accretion radius, so a tolerance of
+    0.1 c_s accepts all 57 cells above the threshold."""
+    num_accreted_cells = _accrete_around_sink_at_rest(
+        velocity_gradient=1.0,
+        radial_velocity_tolerance_in_sound_speeds=0.1,
+    )
+
+    assert num_accreted_cells == 57, (
+        f"{num_accreted_cells} of the 57 cells above the threshold were accreted"
+    )
+
+
+@pytest.mark.parametrize(
+    "density_threshold_factor, accretion_distance_cutoff_factor, "
+    "expected_num_accreted_cells",
+    [
+        # Half the threshold of Eq. 32: 123 cells are above it, and the 81
+        # cells within r_acc are accreted.
+        (0.5, 1.0, 81),
+        # r_cut = 0.5 r_acc = 1.25 cells holds the centre cell and its 6 face
+        # neighbours, all above the threshold.
+        (1.0, 0.5, 7),
+        # r_cut = 1.5 r_acc = 3.75 cells holds all 123 cells above half the
+        # threshold. The cells beyond r_acc are bound only because E_grav is
+        # measured from the edge of the accretion sphere, at r_cut.
+        (0.5, 1.5, 123),
+    ],
+    ids=["half_threshold", "half_cutoff", "half_threshold_and_larger_cutoff"],
+)
+def test_accretion_sphere(
+    density_threshold_factor,
+    accretion_distance_cutoff_factor,
+    expected_num_accreted_cells,
+):
+    """Bound infalling gas is accreted from every cell within r_cut =
+    accretion_distance_cutoff_factor × r_acc of the sink that is above the
+    threshold of Eq. 32 times density_threshold_factor."""
+    num_accreted_cells = _accrete_around_sink_at_rest(
+        velocity_gradient=-1.0,
+        density_threshold_factor=density_threshold_factor,
+        accretion_distance_cutoff_factor=accretion_distance_cutoff_factor,
+    )
+
+    assert num_accreted_cells == expected_num_accreted_cells, (
+        f"{num_accreted_cells} cells were accreted, expected "
+        f"{expected_num_accreted_cells}"
+    )
+
+
+def test_inner_cell_accretion_beyond_cutoff():
+    """The cell containing the sink is accreted from even when its centre lies
+    beyond r_cut: with r_cut = 0.25 cells and the sink 0.4 cells from its cell
+    centre along every axis (0.69 cells away), only that cell is accreted."""
+    state, config, params, registered_variables = _setup(
+        accretion_distance_cutoff_factor=0.1,
+    )
+    sink_coordinate = CLUMP_CENTER + 0.4 * CELL_SIZE
+    existing_sink = _one_sink_at(
+        (sink_coordinate, sink_coordinate, sink_coordinate),
+        config,
+        state.primitive_state.dtype,
+    )
+
+    new_primitive_state, sink_particles = _update_sinks_once(
+        state,
+        config,
+        params,
+        registered_variables,
+        existing_sink,
+    )
+
+    # The existing sink blocks creation (proximity check).
+    assert _num_sinks(sink_particles) == 1
+    num_accreted_cells = _num_accreted_cells(
+        state.primitive_state,
+        new_primitive_state,
+        registered_variables,
+    )
+    assert num_accreted_cells == 1, (
+        f"{num_accreted_cells} cells were accreted; only the sink's own cell "
+        "should be"
     )
 
 
@@ -363,5 +467,11 @@ if __name__ == "__main__":
     test_accretion_of_bound_infalling_gas()
     test_no_accretion_of_unbound_gas()
     test_no_accretion_of_gas_moving_away()
+    test_accretion_of_unbound_gas_without_bound_check()
+    test_accretion_of_gas_moving_away_within_tolerance()
+    test_accretion_sphere(0.5, 1.0, 81)
+    test_accretion_sphere(1.0, 0.5, 7)
+    test_accretion_sphere(0.5, 1.5, 123)
+    test_inner_cell_accretion_beyond_cutoff()
     test_accretion_most_bound_sink()
     test_accretion_tie_break()

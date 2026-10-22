@@ -2,10 +2,11 @@
 Sink particle formation pytest (fast).
 
 Checks the sink particle creation of Federrath et al. (2010), Section 2.2:
-the creation checks (converging flow, potential minimum, Jeans instability
-with and without a magnetic field, bound state, proximity to existing sinks
-and between sinks formed in the same call), the limit on the number of sink
-slots, and the wrapping of a new sink's position into a periodic box.
+the creation checks (density threshold, converging flow, potential minimum,
+Jeans instability with and without a magnetic field, bound state, proximity to
+existing sinks and between sinks formed in the same call), the options that
+loosen or tighten them, the limit on the number of sink slots, and the
+wrapping of a new sink's position into a periodic box.
 """
 
 # ==== GPU selection ====
@@ -118,22 +119,56 @@ def test_proximity():
 
 
 @pytest.mark.parametrize(
-    "velocity_gradient, expected_num_sinks",
+    "density_threshold_factor, expected_num_sinks",
+    [
+        # Half the threshold of Eq. 32 (ρ_thr ≈ 64): more cells pass, but the
+        # clump centre is still the only potential minimum, so one sink forms.
+        (0.5, 1),
+        # Four times the threshold (ρ_thr ≈ 515) is above the clump peak
+        # (ρ ≈ 401): no sink.
+        (4.0, 0),
+    ],
+    ids=["half_threshold", "threshold_above_peak"],
+)
+def test_density_threshold(density_threshold_factor, expected_num_sinks):
+    """A sink forms only where the density exceeds the threshold of Eq. 32
+    times density_threshold_factor (Section 2.2.1)."""
+    state, config, params, registered_variables = _setup(
+        density_threshold_factor=density_threshold_factor,
+    )
+
+    sink_particles = _form_sinks_once(state, config, params, registered_variables)
+
+    assert _num_sinks(sink_particles) == expected_num_sinks
+
+
+@pytest.mark.parametrize(
+    "velocity_gradient, converging_flow_check, expected_num_sinks",
     [
         # Contracting along every axis: a sink forms.
-        ((-1.0, -1.0, -1.0), 1),
+        ((-1.0, -1.0, -1.0), True, 1),
         # Expanding along every axis: no sink.
-        ((1.0, 1.0, 1.0), 0),
+        ((1.0, 1.0, 1.0), True, 0),
         # Contracting along y and z but expanding along x. The divergence is
         # negative, but the flow must converge along each axis: no sink.
-        ((1.0, -2.0, -2.0), 0),
+        ((1.0, -2.0, -2.0), True, 0),
+        # Expanding along every axis, with the check off: the slow expansion
+        # leaves the gas Jeans unstable and bound, so a sink forms.
+        ((1.0, 1.0, 1.0), False, 1),
     ],
-    ids=["contracting", "expanding", "expanding_along_x_only"],
+    ids=[
+        "contracting",
+        "expanding",
+        "expanding_along_x_only",
+        "expanding_without_converging_flow_check",
+    ],
 )
-def test_converging_flow(velocity_gradient, expected_num_sinks):
+def test_converging_flow(velocity_gradient, converging_flow_check, expected_num_sinks):
     """Sinks only form where the flow converges along every axis (Section
-    2.2.3)."""
-    state, config, params, registered_variables = _setup()
+    2.2.3), unless converging_flow_check is off."""
+    state, config, params, registered_variables = _setup(
+        converging_flow_check=converging_flow_check,
+    )
     state = _with_linear_velocity(state, registered_variables, velocity_gradient)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
@@ -193,28 +228,48 @@ def test_one_sink_per_control_volume():
 
 
 @pytest.mark.parametrize(
-    "peak_overdensity, sound_speed_squared, expected_num_sinks",
+    "peak_overdensity, sound_speed_squared, jeans_thermal_energy_factor, "
+    "expected_num_sinks",
     [
         # Cold and dense enough: |E_grav| ≈ 1.26 × 2 E_th, a sink forms.
-        (400.0, 1.0, 1),
+        (400.0, 1.0, 2.0, 1),
         # Above the density threshold, but not Jeans unstable:
         # |E_grav| ≈ 0.63 × 2 E_th.
-        (200.0, 1.0, 0),
+        (200.0, 1.0, 2.0, 0),
         # Hot: doubling c_s² doubles E_th (|E_grav| ≈ 0.63 × 2 E_th). The
         # threshold doubles too (ρ_res ≈ 257), but the centre (ρ ≈ 401) stays
         # above it, so only the Jeans check fails.
-        (400.0, 2.0, 0),
+        (400.0, 2.0, 2.0, 0),
+        # The same two clumps pass |E_grav| > 1 × E_th; they are also bound,
+        # since |E_grav| > E_th at rest, so a sink forms.
+        (200.0, 1.0, 1.0, 1),
+        (400.0, 2.0, 1.0, 1),
     ],
-    ids=["jeans_unstable", "not_dense_enough", "too_hot"],
+    ids=[
+        "jeans_unstable",
+        "not_dense_enough",
+        "too_hot",
+        "not_dense_enough_with_factor_1",
+        "too_hot_with_factor_1",
+    ],
 )
-def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_sinks):
+def test_jeans_instability(
+    peak_overdensity,
+    sound_speed_squared,
+    jeans_thermal_energy_factor,
+    expected_num_sinks,
+):
     """A sink forms only if the gas in the control volume is Jeans unstable,
-    |E_grav| > 2 E_th + E_mag (Section 2.2.5)."""
+    |E_grav| > f E_th + E_mag (Section 2.2.5), with
+    f = jeans_thermal_energy_factor."""
     settings = SETTINGS._replace(
         peak_overdensity=peak_overdensity,
         sound_speed_squared=sound_speed_squared,
     )
-    state, config, params, registered_variables = _setup(settings=settings)
+    state, config, params, registered_variables = _setup(
+        settings=settings,
+        jeans_thermal_energy_factor=jeans_thermal_energy_factor,
+    )
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
 
@@ -222,21 +277,31 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
 
 
 @pytest.mark.parametrize(
-    "angular_velocity, expected_num_sinks",
+    "angular_velocity, formation_bound_check, expected_num_sinks",
     [
         # At rest, |E_grav| − E_th ≈ 1.52 E_th, and the rotation becomes
         # unbound at Ω ≈ 25.5 (where E_kin reaches |E_grav| − E_th).
         # About half of that: bound, a sink forms.
-        (12.5, 1),
+        (12.5, True, 1),
         # About twice that: unbound, no sink.
-        (50.0, 0),
+        (50.0, True, 0),
+        # Unbound, but the bound check is off; the Jeans check does not see
+        # the rotation, so a sink forms.
+        (50.0, False, 1),
     ],
-    ids=["slow_rotation_bound", "fast_rotation_unbound"],
+    ids=[
+        "slow_rotation_bound",
+        "fast_rotation_unbound",
+        "fast_rotation_without_bound_check",
+    ],
 )
-def test_bound_state(angular_velocity, expected_num_sinks):
+def test_bound_state(angular_velocity, formation_bound_check, expected_num_sinks):
     """A sink forms only if the gas in the control volume is bound,
-    E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6)."""
-    state, config, params, registered_variables = _setup()
+    E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6), unless
+    formation_bound_check is off."""
+    state, config, params, registered_variables = _setup(
+        formation_bound_check=formation_bound_check,
+    )
 
     # Solid-body rotation about the z axis through the clump centre. Along
     # each axis, the velocity component along that axis does not change, so
@@ -304,15 +369,21 @@ def test_error_when_sink_slots_full():
 if __name__ == "__main__":
     test_position_wrapping()
     test_proximity()
-    test_converging_flow((-1.0, -1.0, -1.0), 1)
-    test_converging_flow((1.0, 1.0, 1.0), 0)
-    test_converging_flow((1.0, -2.0, -2.0), 0)
+    test_density_threshold(0.5, 1)
+    test_density_threshold(4.0, 0)
+    test_converging_flow((-1.0, -1.0, -1.0), True, 1)
+    test_converging_flow((1.0, 1.0, 1.0), True, 0)
+    test_converging_flow((1.0, -2.0, -2.0), True, 0)
+    test_converging_flow((1.0, 1.0, 1.0), False, 1)
     test_potential_minimum()
-    test_jeans_instability(400.0, 1.0, 1)
-    test_jeans_instability(200.0, 1.0, 0)
-    test_jeans_instability(400.0, 2.0, 0)
-    test_bound_state(12.5, 1)
-    test_bound_state(50.0, 0)
+    test_jeans_instability(400.0, 1.0, 2.0, 1)
+    test_jeans_instability(200.0, 1.0, 2.0, 0)
+    test_jeans_instability(400.0, 2.0, 2.0, 0)
+    test_jeans_instability(200.0, 1.0, 1.0, 1)
+    test_jeans_instability(400.0, 2.0, 1.0, 1)
+    test_bound_state(12.5, True, 1)
+    test_bound_state(50.0, True, 0)
+    test_bound_state(50.0, False, 1)
     test_magnetic_energy(1.0, 1)
     test_magnetic_energy(30.0, 0)
     test_error_when_sink_slots_full()

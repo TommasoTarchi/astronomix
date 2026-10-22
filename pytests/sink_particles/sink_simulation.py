@@ -248,8 +248,52 @@ def test_finalize_state():
         (dict(dimensionality=2), (4, 16, 16)),
         (dict(gravity_config=GravityConfig(self_gravity=False)), (5, 16, 16, 16)),
         (dict(state_struct=False), (5, 16, 16, 16)),
+        (
+            dict(
+                sink_particle_config=SinkParticleConfig(
+                    sink_particles=True,
+                    density_threshold_factor=0.0,
+                )
+            ),
+            (5, 16, 16, 16),
+        ),
+        (
+            dict(
+                sink_particle_config=SinkParticleConfig(
+                    sink_particles=True,
+                    jeans_thermal_energy_factor=-1.0,
+                )
+            ),
+            (5, 16, 16, 16),
+        ),
+        (
+            dict(
+                sink_particle_config=SinkParticleConfig(
+                    sink_particles=True,
+                    radial_velocity_tolerance_in_sound_speeds=-1.0,
+                )
+            ),
+            (5, 16, 16, 16),
+        ),
+        (
+            dict(
+                sink_particle_config=SinkParticleConfig(
+                    sink_particles=True,
+                    accretion_distance_cutoff_factor=0.0,
+                )
+            ),
+            (5, 16, 16, 16),
+        ),
     ],
-    ids=["2d", "no_self_gravity", "no_state_struct"],
+    ids=[
+        "2d",
+        "no_self_gravity",
+        "no_state_struct",
+        "zero_density_threshold_factor",
+        "negative_jeans_thermal_energy_factor",
+        "negative_radial_velocity_tolerance",
+        "zero_accretion_distance_cutoff_factor",
+    ],
 )
 def test_sink_particle_config_requirements(unsupported_options, state_shape):
     """``finalize_config`` must reject each configuration that sink particle
@@ -286,3 +330,39 @@ if __name__ == "__main__":
         (5, 16, 16, 16),
     )
     test_sink_particle_config_requirements(dict(state_struct=False), (5, 16, 16, 16))
+    test_sink_particle_config_requirements(
+        dict(
+            sink_particle_config=SinkParticleConfig(
+                sink_particles=True,
+                density_threshold_factor=0.0,
+            )
+        ),
+        (5, 16, 16, 16),
+    )
+    test_sink_particle_config_requirements(
+        dict(
+            sink_particle_config=SinkParticleConfig(
+                sink_particles=True,
+                jeans_thermal_energy_factor=-1.0,
+            )
+        ),
+        (5, 16, 16, 16),
+    )
+    test_sink_particle_config_requirements(
+        dict(
+            sink_particle_config=SinkParticleConfig(
+                sink_particles=True,
+                radial_velocity_tolerance_in_sound_speeds=-1.0,
+            )
+        ),
+        (5, 16, 16, 16),
+    )
+    test_sink_particle_config_requirements(
+        dict(
+            sink_particle_config=SinkParticleConfig(
+                sink_particles=True,
+                accretion_distance_cutoff_factor=0.0,
+            )
+        ),
+        (5, 16, 16, 16),
+    )
