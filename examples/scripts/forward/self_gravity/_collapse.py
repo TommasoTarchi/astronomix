@@ -54,7 +54,6 @@ from astronomix import (
     GravityConfig,
     SnapshotSettings,
     BackendConfig,
-    SinkParticleConfig,
 )
 
 # astronomix functions
@@ -64,7 +63,6 @@ from astronomix import (
     time_integration,
     construct_primitive_state,
     finalize_config,
-    finalize_state,
 )
 
 # figure helpers
@@ -124,7 +122,6 @@ def collapse_config(
     backend: int = PALLAS,
     num_snapshots: int = DEFAULT_NUM_SNAPSHOTS,
     want_states: bool = False,
-    sink_particles: bool = False,
     fixed_num_timesteps: Optional[int] = None,
 ) -> SimulationConfig:
     """Build the (not yet finalized) ``SimulationConfig`` of the collapse.
@@ -137,7 +134,6 @@ def collapse_config(
             natively.
         num_snapshots: Number of energy (and optionally state) snapshots.
         want_states: Whether the snapshots also keep the full states.
-        sink_particles: Whether sink particle formation should be enabled.
         fixed_num_timesteps: If given, integrate with this many equal time
             steps ``dt = t_end / fixed_num_timesteps`` instead of the CFL step.
 
@@ -186,8 +182,6 @@ def collapse_config(
             return_kinetic_energy=True,
             return_gravitational_energy=True,
         ),
-        state_struct=sink_particles,
-        sink_particle_config=SinkParticleConfig(sink_particles=sink_particles),
     )
     if fixed_num_timesteps is not None:
         config = config._replace(
@@ -270,7 +264,6 @@ def run_collapse(
     courant_number: Optional[float] = None,
     minimum_density: float = MINIMUM_DENSITY,
     minimum_pressure: float = MINIMUM_PRESSURE,
-    sink_particles: bool = False,
 ):
     """Run the Evrard collapse.
 
@@ -290,7 +283,6 @@ def run_collapse(
             finite-volume scheme).
         minimum_density: The density floor (see ``collapse_params``).
         minimum_pressure: The pressure floor (see ``collapse_params``).
-        sink_particles: Whether sink particle formation should be enabled.
 
     Returns:
         ``(snapshots, helper_data, registered_variables)`` of the completed run.
@@ -303,7 +295,6 @@ def run_collapse(
         backend=backend,
         num_snapshots=num_snapshots,
         want_states=want_states,
-        sink_particles=sink_particles,
         fixed_num_timesteps=fixed_num_timesteps,
     )
     params = collapse_params(
@@ -322,7 +313,6 @@ def run_collapse(
         registered_variables,
     )
     config = finalize_config(config, initial_state.shape)
-    initial_state = finalize_state(config, initial_state)
 
     snapshots = jax.block_until_ready(
         time_integration(initial_state, config, params, registered_variables)
