@@ -254,20 +254,25 @@ def _accrete_gas(
     else:
         bound = jnp.ones_like(total_energy, dtype=bool)
 
-    # Radial velocity check (Section 2.3): ΔM must move toward the sink,
-    # v_r = r · (v − v_n) / r, with r pointing from the sink to the cell. The
-    # paper asks for a negative v_r; v_r up to
-    # radial_velocity_tolerance_in_sound_speeds × c_s is accepted (10⁻⁵ by
-    # default, as in Federrath's FLASH code). Gas moving with the sink has
-    # v_r = 0 only up to rounding (the sink velocity is a mass-weighted
-    # average of gas velocities), so a bound of exactly 0 would accept or
-    # reject it at random.
-    radial_velocity = jnp.sum(separation * relative_velocity, axis=-1) / safe_distance
-    radial_velocity_tolerance = (
-        sink_particle_config.radial_velocity_tolerance_in_sound_speeds
-        * jnp.sqrt(sound_speed_squared[cell_indices])
-    )
-    moving_toward_sink = radial_velocity <= radial_velocity_tolerance
+    # Radial velocity check (Section 2.3), if accretion_radial_velocity_check
+    # is set: ΔM must move toward the sink, v_r = r · (v − v_n) / r, with r
+    # pointing from the sink to the cell. The paper asks for a negative v_r;
+    # v_r up to radial_velocity_tolerance_in_sound_speeds × c_s is accepted
+    # (10⁻⁵ by default, as in Federrath's FLASH code). Gas moving with the
+    # sink has v_r = 0 only up to rounding (the sink velocity is a
+    # mass-weighted average of gas velocities), so a bound of exactly 0 would
+    # accept or reject it at random.
+    if sink_particle_config.accretion_radial_velocity_check:
+        radial_velocity = (
+            jnp.sum(separation * relative_velocity, axis=-1) / safe_distance
+        )
+        radial_velocity_tolerance = (
+            sink_particle_config.radial_velocity_tolerance_in_sound_speeds
+            * jnp.sqrt(sound_speed_squared[cell_indices])
+        )
+        moving_toward_sink = radial_velocity <= radial_velocity_tolerance
+    else:
+        moving_toward_sink = jnp.ones_like(bound)
     passes_motion_checks = bound & moving_toward_sink
 
     # Above the safety density threshold, the bound and radial velocity

@@ -303,6 +303,20 @@ def test_accretion_of_gas_moving_away_within_tolerance():
     )
 
 
+def test_accretion_of_gas_moving_away_without_radial_velocity_check():
+    """With accretion_radial_velocity_check off, bound gas is accreted whether
+    it moves toward the sink or away from it: the slow expansion keeps the gas
+    bound, so all 57 cells above the threshold are accreted."""
+    num_accreted_cells = _accrete_around_sink_at_rest(
+        velocity_gradient=1.0,
+        accretion_radial_velocity_check=False,
+    )
+
+    assert num_accreted_cells == 57, (
+        f"{num_accreted_cells} of the 57 cells above the threshold were accreted"
+    )
+
+
 @pytest.mark.parametrize(
     "density_threshold_factor, accretion_distance_cutoff_factor, "
     "expected_num_accreted_cells",
@@ -469,6 +483,7 @@ if __name__ == "__main__":
     test_no_accretion_of_gas_moving_away()
     test_accretion_of_unbound_gas_without_bound_check()
     test_accretion_of_gas_moving_away_within_tolerance()
+    test_accretion_of_gas_moving_away_without_radial_velocity_check()
     test_accretion_sphere(0.5, 1.0, 81)
     test_accretion_sphere(1.0, 0.5, 7)
     test_accretion_sphere(0.5, 1.5, 123)

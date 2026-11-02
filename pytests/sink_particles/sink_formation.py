@@ -321,7 +321,9 @@ def test_bound_state(angular_velocity, formation_bound_check, expected_num_sinks
     """A sink forms only if the gas in the control volume is bound,
     E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6), unless
     formation_bound_check is off."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(
+        formation_bound_check=formation_bound_check,
+    )
     state = _with_rotation(state, registered_variables, angular_velocity)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)

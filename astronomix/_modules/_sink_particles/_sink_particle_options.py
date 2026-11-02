@@ -63,6 +63,12 @@ class SinkParticleConfig(NamedTuple):
     #: sink is accreted without this check either way.
     accretion_bound_check: bool = True
 
+    #: Whether accretion requires the gas to move toward the sink, with a
+    #: radial velocity of at most radial_velocity_tolerance_in_sound_speeds
+    #: × c_s (Section 2.3). The gas in the cell containing the sink is
+    #: accreted without this check either way.
+    accretion_radial_velocity_check: bool = True
+
     #: Factor multiplying r_acc to give the radius r_cut of the accretion
     #: sphere: a sink accretes from the cells whose centres lie within r_cut
     #: (Section 2.3), and the gravitational energy of the accretion bound check
@@ -72,8 +78,8 @@ class SinkParticleConfig(NamedTuple):
     accretion_distance_cutoff_factor: float = 1.0
 
     #: Largest radial velocity, away from the sink and in units of the local
-    #: sound speed, at which gas is still accreted (Section 2.3). Must not be
-    #: negative.
+    #: sound speed, at which gas is still accreted (Section 2.3), when
+    #: accretion_radial_velocity_check is set. Must not be negative.
     radial_velocity_tolerance_in_sound_speeds: float = 1e-5
 
     #: Jeans length N, in units of the grid spacing, that defines the safety
