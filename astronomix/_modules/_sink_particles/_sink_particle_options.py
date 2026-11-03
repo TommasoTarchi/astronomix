@@ -37,13 +37,17 @@ class SinkParticleConfig(NamedTuple):
 
     #: Jeans length N, in units of the grid spacing, that defines the safety
     #: density threshold ρ_safe = π c_s² / (G N² Δx²), the density at which
-    #: the Jeans length is N cells. Above ρ_safe, the checks that judge by gas
-    #: motion are skipped: the converging flow and bound state checks of the
-    #: creation, and the bound and radial velocity checks of the accretion. On
-    #: a uniform grid these checks can keep rejecting collapsing gas, e.g. a
-    #: dense layer fed by fast inflow, until the Jeans length is far below a
-    #: cell. The default puts ρ_safe at the Larson–Penston density at half a
-    #: cell, the creation threshold of Gong & Ostriker (2013), ApJS 204, 8,
-    #: about 22 ρ_res for r_acc = 2.5 cells. The safety threshold is not part
+    #: the Jeans length is N cells. Relative to the density of Eq. 32,
+    #: ρ_res = π c_s² / (4 G r_acc²), at which the Jeans length is 2 r_acc,
+    #: ρ_safe / ρ_res = (2 r_acc / (N Δx))², which is (5 / N)² for
+    #: r_acc = 2.5 Δx. density_threshold_factor does not change ρ_safe.
+    #: Above ρ_safe, the checks that judge by gas motion are skipped: the
+    #: converging flow and bound state checks of the creation, and the bound
+    #: and radial velocity checks of the accretion. On a uniform grid these
+    #: checks can keep rejecting collapsing gas, e.g. a dense layer fed by fast
+    #: inflow, until the Jeans length is far below a cell. The default puts
+    #: ρ_safe at the Larson–Penston density at half a cell, the creation
+    #: threshold of Gong & Ostriker (2013), ApJS 204, 8, so that
+    #: ρ_safe ≈ 22 ρ_res for r_acc = 2.5 Δx. The safety threshold is not part
     #: of the method of Federrath et al. (2010).
     safety_jeans_length_in_cells: float = 1.06
