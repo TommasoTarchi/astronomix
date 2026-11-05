@@ -2,8 +2,9 @@
 Sink particles in whole simulations pytest.
 
 Checks the configuration requirements enforced by ``finalize_config``, a run
-of the time loop in which a sink forms (through the in-memory snapshots), and
-a restart from the disk snapshots.
+of the time loop in which a sink forms (through the in-memory snapshots), a
+restart from the disk snapshots, and the sinks passed to the snapshot
+callback.
 """
 
 # ==== GPU selection ====
@@ -19,7 +20,11 @@ from pathlib import Path
 # testing
 import pytest
 
+# numerics
+import numpy as np
+
 # jax
+import jax
 import jax.numpy as jnp
 
 # astronomix constants
@@ -220,6 +225,78 @@ def test_restart_from_disk(tmp_path, slots_factor):
         assert restarted_field.shape[0] == slots_factor * max_num_sinks
         assert jnp.array_equal(restarted_field[:max_num_sinks], final_field)
         assert jnp.all(restarted_field[max_num_sinks:] == 0.0)
+
+
+def _run_with_snapshot_callback(sink_particles, snapshot_callable):
+    """Run the clump up to t = 0.06 (about 30 adaptive steps) with the
+    snapshot callback on.
+
+    Args:
+        sink_particles: Whether sink particles are switched on.
+        snapshot_callable: The callback, as passed to ``time_integration``.
+
+    Returns:
+        The final ``StateStruct``.
+    """
+    config = SimulationConfig(
+        num_cells=StaticIntVector(NUM_CELLS, NUM_CELLS, NUM_CELLS),
+        progress_bar=False,
+        gravity_config=GravityConfig(self_gravity=True),
+        activate_snapshot_callback=True,
+        num_snapshots=5,
+        sink_particle_config=SinkParticleConfig(sink_particles=sink_particles),
+    )
+    state, config, params = setup_sink_formation(
+        config,
+        SimulationParams(),
+        SETTINGS._replace(t_end=0.06),
+    )
+    registered_variables = get_registered_variables(config)
+    return time_integration(
+        state,
+        config,
+        params,
+        registered_variables,
+        snapshot_callable=snapshot_callable,
+    )
+
+
+def test_snapshot_callback_receives_sinks():
+    """With sinks on, the snapshot callback also receives the sinks, as the
+    keyword argument ``sink_particles``: none before the sink forms, one
+    after, and at the last call the sinks the run returns."""
+    calls = []
+
+    def record_on_host(time, mass, position, velocity):
+        calls.append(
+            (float(time), np.asarray(mass), np.asarray(position), np.asarray(velocity))
+        )
+
+    def snapshot_callable(time, primitive_state, registered_variables, sink_particles):
+        jax.debug.callback(record_on_host, time, *sink_particles, ordered=True)
+
+    final_state = _run_with_snapshot_callback(True, snapshot_callable)
+
+    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, _, _ in calls]
+    assert len(calls) >= 5
+    assert num_sinks[0] == 0
+    assert all(count == 1 for count in num_sinks[1:])
+    for recorded_field, final_field in zip(calls[-1][1:], final_state.sink_particles):
+        assert np.array_equal(recorded_field, np.asarray(final_field))
+
+
+def test_snapshot_callback_without_sinks():
+    """With sinks off, the snapshot callback is called with the three
+    positional arguments only, so callbacks of runs without sinks need no
+    change."""
+    times = []
+
+    def snapshot_callable(time, primitive_state, registered_variables):
+        jax.debug.callback(lambda t: times.append(float(t)), time, ordered=True)
+
+    _run_with_snapshot_callback(False, snapshot_callable)
+
+    assert len(times) >= 5
 
 
 def test_finalize_state():

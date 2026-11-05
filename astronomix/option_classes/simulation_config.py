@@ -1022,7 +1022,8 @@ class SimulationConfig(NamedTuple):
 
     #: Call a user given function on the snapshot data,
     #: e.g. for saving or plotting. Must have signature
-    #: callback(time, state, registered_variables).
+    #: callback(time, state, registered_variables); with sink particles on,
+    #: it is also given the keyword argument sink_particles.
     activate_snapshot_callback: bool = False
 
     #: Return snapshots at specific time points.
