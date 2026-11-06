@@ -41,7 +41,8 @@ class SinkParticleConfig(NamedTuple):
     #: the Jeans length is N cells. Relative to the density of Eq. 32,
     #: ρ_res = π c_s² / (4 G r_acc²), at which the Jeans length is 2 r_acc,
     #: ρ_safe / ρ_res = (2 r_acc / (N Δx))², which is (5 / N)² for
-    #: r_acc = 2.5 Δx. density_threshold_factor does not change ρ_safe.
+    #: r_acc = 2.5 Δx. accretion_radius_in_cells changes ρ_res but not
+    #: ρ_safe.
     #: Above ρ_safe, the checks that judge by gas motion are skipped: the
     #: converging flow and bound state checks of the creation, and the bound
     #: and radial velocity checks of the accretion. On a uniform grid these

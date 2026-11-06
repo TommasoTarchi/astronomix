@@ -259,6 +259,10 @@ def time_integration(
             To avoid moving large amounts of data to the host, only pass
             the necessary data to the function in the jax.debug.callback call,
             e.g. only the slice or summary statistics you need.
+            With sink particles on, the callable is also given the sinks,
+            as the keyword argument ``sink_particles`` (a
+            :class:`SinkParticles` with all ``max_num_sinks`` slots; empty
+            slots have zero mass), so it must accept it.
         sharding: The sharding to use for the padded helper data. If None,
                   no sharding is applied.
         restart_state: An optional :class:`LoopState` providing the PRNG key
@@ -1089,9 +1093,19 @@ def _integrate_core(
         NOTE: to pass data to the host, the callable must use
         ``jax.debug.callback`` internally, and should only pass the slice /
         summary statistics actually needed to avoid moving large arrays.
+        With sink particles on, the sinks are also passed, as the keyword
+        argument ``sink_particles``.
         """
         primitive_state = state.primitive_state
-        snapshot_callable(time, primitive_state, registered_variables)
+        if config.sink_particle_config.sink_particles:
+            snapshot_callable(
+                time,
+                primitive_state,
+                registered_variables,
+                sink_particles=state.sink_particles,
+            )
+        else:
+            snapshot_callable(time, primitive_state, registered_variables)
         return store
 
     def _should_record_callback(time, idx):
