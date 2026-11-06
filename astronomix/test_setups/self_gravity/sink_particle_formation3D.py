@@ -1,9 +1,9 @@
 """
 Sink particle formation setup (3D).
 
-A periodic box of uniform gas with a Gaussian overdensity at its centre,
-evolved with self-gravity. The setup is used to test the sink particle creation
-checks of Federrath et al. (2010), Section 2.2.
+A box of uniform gas, periodic by default, with a Gaussian overdensity at its
+centre, evolved with self-gravity. The setup is used to test the sink particle
+creation checks of Federrath et al. (2010), Section 2.2.
 
 ## References
 
@@ -32,6 +32,7 @@ from astronomix.option_classes.simulation_config import (
 from astronomix.option_classes.simulation_params import SimulationParams
 
 # astronomix functions
+from astronomix._modules._sink_particles._sink_particle_formation import _periodic_box
 from astronomix.data_classes.simulation_helper_data import get_helper_data
 from astronomix.initial_condition_generation.construct_primitive_state import (
     construct_primitive_state,
@@ -74,6 +75,13 @@ class SinkFormationSettings(NamedTuple):
     #: End time of the run.
     t_end: float = 1e-3
 
+    #: Boundary conditions of the box.
+    boundary_settings: BoundarySettings = BoundarySettings(
+        x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+        y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+        z=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
+    )
+
 
 def setup_sink_formation(
     config: SimulationConfig,
@@ -81,11 +89,11 @@ def setup_sink_formation(
     settings: SinkFormationSettings = SinkFormationSettings(),
 ) -> tuple[StateStruct, SimulationConfig, SimulationParams]:
     """
-    Set up a Gaussian overdensity in a periodic, self-gravitating 3D box.
+    Set up a Gaussian overdensity in a self-gravitating 3D box.
 
-    Enforces the geometry (3D Cartesian), a cubic box with periodic boundaries,
-    self-gravity, and the state struct (which carries the sink particles). The
-    gas is at rest with a uniform sound speed. With ``config.mhd`` on, the gas
+    Enforces the geometry (3D Cartesian), a cubic box with the boundaries of
+    ``settings.boundary_settings``, self-gravity, and the state struct (which
+    carries the sink particles). The gas is at rest with a uniform sound speed. With ``config.mhd`` on, the gas
     is threaded by the uniform field ``settings.magnetic_field_z`` along z,
     which has zero divergence. The number of cells, the sink particle
     configuration, MHD and the time-stepping options are left to the caller;
@@ -110,11 +118,7 @@ def setup_sink_formation(
             settings.box_length,
             settings.box_length,
         ),
-        boundary_settings=BoundarySettings(
-            x=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            y=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-            z=BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY),
-        ),
+        boundary_settings=settings.boundary_settings,
         gravity_config=config.gravity_config._replace(self_gravity=True),
         state_struct=True,
     )
@@ -128,15 +132,19 @@ def setup_sink_formation(
     helper_data = get_helper_data(config)
 
     # Gaussian overdensity with the gas at rest and at a uniform sound speed
-    # (pressure proportional to density). Distances to the centre are taken to
-    # its nearest periodic copy, so a clump near the boundary wraps around it.
+    # (pressure proportional to density). Along periodic axes, distances to the
+    # centre are taken to its nearest periodic copy, so a clump near the
+    # boundary wraps around it.
     if settings.overdensity_center is None:
         overdensity_center = jnp.full((3,), 0.5 * settings.box_length)
     else:
         overdensity_center = jnp.array(settings.overdensity_center)
     separation = helper_data.geometric_centers - overdensity_center
-    separation = separation - settings.box_length * jnp.round(
-        separation / settings.box_length
+    is_periodic, _ = _periodic_box(config)
+    separation = jnp.where(
+        is_periodic,
+        separation - settings.box_length * jnp.round(separation / settings.box_length),
+        separation,
     )
     distance_squared = jnp.sum(separation**2, axis=-1)
     density = settings.background_density + settings.peak_overdensity * jnp.exp(

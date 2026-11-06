@@ -605,6 +605,70 @@ def _seed_internal_energy(primitive_state, params, registered_variables):
     )
 
 
+def _fill_ghost_cells(primitive_state, config, params, registered_variables):
+    """
+    Fill the ghost cells of a padded primitive state via the boundary handler.
+
+    The gas boundary handler must not touch the three-component magnetic block
+    that the FV (PPCT) and FD MHD layouts keep behind the gas variables (the FD
+    integrators fill the interface field's ghost cells before every stage); the
+    VL2 GLM-MHD layout is cell centred throughout and handled as a whole.
+
+    Args:
+        primitive_state: The padded primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The padded primitive state with filled ghost cells.
+    """
+    if config.mhd and not registered_variables.magnetic_psi_active:
+        if config.solver_mode == FINITE_DIFFERENCE:
+            # FD MHD layout: gas and cell-centred field, the interface field,
+            # then the optional dual-energy g and passive scalars. The trailing
+            # rows behind the interface field are scalars that keep their sign
+            # at a reflective wall, so they get the passive-scalar boundary
+            # fill. For open, periodic and reflective boundaries this gives g
+            # the same ghost cells as deriving it from the filled pressure, as
+            # the step does.
+            interface_field_start = registered_variables.interface_magnetic_field_index.x
+            trailing_rows_start = interface_field_start + 3
+            primitive_state = primitive_state.at[:interface_field_start, ...].set(
+                _boundary_handler(
+                    primitive_state[:interface_field_start, ...],
+                    config,
+                    registered_variables,
+                    params,
+                )
+            )
+            if primitive_state.shape[0] > trailing_rows_start:
+                primitive_state = primitive_state.at[trailing_rows_start:, ...].set(
+                    _fill_scalar_ghost_cells(
+                        primitive_state[trailing_rows_start:, ...],
+                        config,
+                    )
+                )
+            return primitive_state
+
+        # FV (PPCT) layout: the magnetic field in the last three slots.
+        return primitive_state.at[:-3, ...].set(
+            _boundary_handler(
+                primitive_state[:-3, ...],
+                config,
+                registered_variables,
+                params,
+            )
+        )
+
+    return _boundary_handler(
+        primitive_state,
+        config,
+        registered_variables,
+        params,
+    )
+
+
 def _prepare_padded_state(primitive_state, config, params, registered_variables):
     """
     Pad the primitive state with ghost cells and fill them via the boundary
@@ -634,56 +698,15 @@ def _prepare_padded_state(primitive_state, config, params, registered_variables)
     if config.boundary_handling != PERIODIC_ROLL:
         primitive_state = _pad(primitive_state, config)
 
+    # The ghost cells are filled before the first time-step estimate, so that
+    # active boundaries enter the CFL criterion.
     if config.boundary_handling == GHOST_CELLS:
-        # Fill the ghost cells before the first time-step estimate, so that
-        # active boundaries enter the CFL criterion. The gas boundary handler
-        # must not touch the three-component magnetic block that the FV (PPCT)
-        # and FD MHD layouts keep behind the gas variables (the FD integrators
-        # fill the interface field's ghost cells before every stage); the VL2
-        # GLM-MHD layout is cell centred throughout and handled as a whole.
-        if config.mhd and not registered_variables.magnetic_psi_active:
-            if config.solver_mode == FINITE_DIFFERENCE:
-                # FD MHD layout: gas and cell-centred field, the interface
-                # field, then the optional dual-energy g and passive scalars.
-                # The trailing rows behind the interface field are scalars
-                # that keep their sign at a reflective wall, so they get the
-                # passive-scalar boundary fill. For open, periodic and
-                # reflective boundaries this gives g the same ghost cells as
-                # deriving it from the filled pressure, as the step does.
-                interface_field_start = registered_variables.interface_magnetic_field_index.x
-                trailing_rows_start = interface_field_start + 3
-                primitive_state = primitive_state.at[:interface_field_start, ...].set(
-                    _boundary_handler(
-                        primitive_state[:interface_field_start, ...],
-                        config,
-                        registered_variables,
-                        params,
-                    )
-                )
-                if primitive_state.shape[0] > trailing_rows_start:
-                    primitive_state = primitive_state.at[trailing_rows_start:, ...].set(
-                        _fill_scalar_ghost_cells(
-                            primitive_state[trailing_rows_start:, ...],
-                            config,
-                        )
-                    )
-            else:
-                # FV (PPCT) layout: the magnetic field in the last three slots.
-                primitive_state = primitive_state.at[:-3, ...].set(
-                    _boundary_handler(
-                        primitive_state[:-3, ...],
-                        config,
-                        registered_variables,
-                        params,
-                    )
-                )
-        else:
-            primitive_state = _boundary_handler(
-                primitive_state,
-                config,
-                registered_variables,
-                params,
-            )
+        primitive_state = _fill_ghost_cells(
+            primitive_state,
+            config,
+            params,
+            registered_variables,
+        )
 
     return primitive_state
 
@@ -1004,6 +1027,16 @@ def _integrate_core(
                 params,
                 registered_variables,
             )
+
+            # Accretion changes interior cells, and the next step can read the
+            # ghost cells before its first refill.
+            if config.boundary_handling == GHOST_CELLS:
+                primitive_state = _fill_ghost_cells(
+                    primitive_state,
+                    config,
+                    params,
+                    registered_variables,
+                )
 
         return dt, LoopState(primitive_state, key, forcing, sink_particles)
 

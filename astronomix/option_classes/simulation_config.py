@@ -1698,6 +1698,18 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 "Sink particles require state_struct = True; the sinks are "
                 "passed in and returned in the StateStruct."
             )
+        # The potential-minimum check shifts the potential with periodic rolls
+        # over the padded grid, so its reach must stay inside the ghost layer.
+        accretion_radius_in_cells = config.sink_particle_config.accretion_radius_in_cells
+        if (
+            config.boundary_handling == GHOST_CELLS
+            and math.floor(accretion_radius_in_cells) > config.num_ghost_cells
+        ):
+            raise ValueError(
+                f"accretion_radius_in_cells = {accretion_radius_in_cells} reaches "
+                f"beyond the ghost layer of num_ghost_cells = "
+                f"{config.num_ghost_cells} cells."
+            )
 
     return config
 

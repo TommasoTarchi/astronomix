@@ -32,7 +32,8 @@ class SinkParticleConfig(NamedTuple):
 
     #: Accretion radius r_acc in units of the grid spacing. It sets both the
     #: radius of the control volume and the density threshold. Federrath et
-    #: al. (2010), Section 4.2.1, use r_acc = 2.5 grid cells.
+    #: al. (2010), Section 4.2.1, use r_acc = 2.5 grid cells. With ghost cells,
+    #: its integer part must not exceed num_ghost_cells.
     accretion_radius_in_cells: float = 2.5
 
     #: Jeans length N, in units of the grid spacing, that defines the safety
