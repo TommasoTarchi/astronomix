@@ -90,9 +90,12 @@ def test_conservation_in_run(self_gravity_version, mhd):
     finite-difference self-gravity treatment and, for one treatment, with MHD.
     The gas moves with a small uniform bulk velocity, so the momentum is not
     zero. The run goes through the in-memory snapshots, which record the
-    sinks. Not checked: the physics of the collapse (the gravity of the sinks
-    on the gas is not implemented), total energy (accretion removes the energy
-    of the accreted gas) and angular momentum (sinks have no spin).
+    sinks. The gravity between the sink and the gas exchanges momentum exactly
+    in space, but not in time: the gas feels the sink at its mid-step position
+    in every stage of the hydro update, while the sink's kicks feel the gas at
+    the start and at the end of the step. Not checked: the physics of the
+    collapse, total energy (accretion removes the energy of the accreted gas)
+    and angular momentum (sinks have no spin).
 
     Args:
         self_gravity_version: The finite-difference self-gravity treatment.
@@ -120,8 +123,8 @@ def test_conservation_in_run(self_gravity_version, mhd):
     registered_variables = get_registered_variables(config)
 
     # A uniform bulk velocity makes the total momentum non-zero. Over the run
-    # the gas moves less than half a cell, so it stays around the sink, which
-    # does not move yet.
+    # the gas moves less than half a cell, and the sink, which starts with the
+    # centre-of-mass velocity of the gas it forms from, moves with it.
     bulk_velocity = jnp.array([0.1, -0.2, 0.05])
     primitive_state = state.primitive_state
     for axis, velocity_index in enumerate(registered_variables.velocity_index):
