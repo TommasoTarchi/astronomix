@@ -60,6 +60,7 @@ def _compute_total_potential(
     params: SimulationParams,
     registered_variables: RegisteredVariables,
     G: Union[float, Float[Array, ""]] = 1.0,
+    sink_density: Union[FIELD_TYPE, None] = None,
 ) -> FIELD_TYPE:
     """
     Compute the total gravitational potential, including contributions from
@@ -73,6 +74,9 @@ def _compute_total_potential(
         params: The simulation parameters (provides the external potential).
         registered_variables: The registered variables.
         G: The gravitational constant.
+        sink_density: The mass density of the sink particles, with the shape
+            of ``gas_density``, or ``None``. When given, the self-gravity is
+            that of the gas and the sinks together.
 
     Returns:
         The total gravitational potential, with the same shape as gas_density.
@@ -81,8 +85,11 @@ def _compute_total_potential(
 
     # Self-gravity contribution from the FFT Poisson solve.
     if config.gravity_config.self_gravity:
+        source_density = gas_density
+        if sink_density is not None:
+            source_density = gas_density + sink_density
         total_potential = total_potential + _compute_gravitational_potential(
-            gas_density,
+            source_density,
             grid_spacing,
             config,
             G,
@@ -219,6 +226,7 @@ def _fd_gravity_source(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
+    sink_density=None,
 ):
     """
     Build the finite-difference self-gravity source term for the full state.
@@ -240,6 +248,8 @@ def _fd_gravity_source(
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The full-state source term to be added over this time step.
@@ -256,6 +266,7 @@ def _fd_gravity_source(
         params,
         registered_variables,
         params.gravitational_constant,
+        sink_density=sink_density,
     )
 
     if self_gravity_version == SIMPLE_SOURCE:

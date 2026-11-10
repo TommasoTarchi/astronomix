@@ -237,6 +237,7 @@ def _ssprk4_with_ct(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    sink_density=None,
 ):
     """
     Integrates the MHD equations for one time step using a 5-stage, 4th-order
@@ -258,6 +259,8 @@ def _ssprk4_with_ct(
         internal_energy_density: The dual-energy ``g`` with shape
             ``(x, y, z)`` (used in the pressure recovery of the fluxes), or
             None.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The updated ``(conserved_state, bx_interface, by_interface,
@@ -497,6 +500,7 @@ def _ssprk4_with_ct(
             params,
             helper_data,
             registered_variables,
+            sink_density=sink_density,
         )
 
         return rhs_q, rhs_bx, rhs_by, rhs_bz
@@ -586,6 +590,7 @@ def _hydro_step_rhs(
     helper_data,
     density_fluxes_needed: bool,
     internal_energy_density=None,
+    sink_density=None,
 ):
     """
     RHS for one hydro WENO time-step stage (excluding RK coefficient logic),
@@ -609,6 +614,8 @@ def _hydro_step_rhs(
         internal_energy_density: The dual-energy ``g`` with shape
             ``(x, y, z)`` (used in the pressure recovery of the fluxes), or
             None.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The stage increment ``rhs_q``.
@@ -820,6 +827,7 @@ def _hydro_step_rhs(
         params,
         helper_data,
         registered_variables,
+        sink_density=sink_density,
     )
 
     return rhs_q
@@ -840,6 +848,7 @@ def _ssprk4_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    sink_density=None,
 ):
     """
     Integrates the Euler (hydrodynamics) equations for one time step using a
@@ -862,6 +871,8 @@ def _ssprk4_hydro(
         internal_energy_density: The dual-energy ``g`` with shape
             ``(x, y, z)`` (used in the pressure recovery of the fluxes), or
             None.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The updated conserved state.
@@ -892,6 +903,7 @@ def _ssprk4_hydro(
             helper_data=helper_data,
             density_fluxes_needed=density_fluxes_needed,
             internal_energy_density=internal_energy_density,
+            sink_density=sink_density,
         )
 
     rhs = _stage_remat(rhs, config)
@@ -919,6 +931,7 @@ def _lsrk4_hydro(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    sink_density=None,
 ):
     """
     Carpenter-Kennedy 2N-storage, 5-stage, 4th-order low-storage RK4.
@@ -947,6 +960,8 @@ def _lsrk4_hydro(
         internal_energy_density: The dual-energy ``g`` with shape
             ``(x, y, z)`` (used in the pressure recovery of the fluxes), or
             None.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The updated conserved state.
@@ -1048,6 +1063,7 @@ def _lsrk4_hydro(
                 params,
                 helper_data,
                 registered_variables,
+                sink_density=sink_density,
             )
             if sources is not None:
                 dq = dq + sources
@@ -1065,6 +1081,7 @@ def _lsrk4_hydro(
             helper_data=helper_data,
             density_fluxes_needed=density_fluxes_needed,
             internal_energy_density=internal_energy_density,
+            sink_density=sink_density,
         )
         return a_coef * dq + rhs
 
@@ -1096,6 +1113,7 @@ def _lsrk4_with_ct(
     config: SimulationConfig,
     registered_variables: RegisteredVariables,
     internal_energy_density=None,
+    sink_density=None,
 ):
     """
     Carpenter-Kennedy 2N-storage 5-stage 4th-order LSRK4 for MHD-CT.
@@ -1130,6 +1148,8 @@ def _lsrk4_with_ct(
         internal_energy_density: The dual-energy ``g`` with shape
             ``(x, y, z)`` (used in the pressure recovery of the fluxes), or
             None.
+        sink_density: The mass density of the sink particles, which adds to
+            the self-gravity of the gas, or ``None``.
 
     Returns:
         The updated ``(conserved_state, bx_interface, by_interface,
@@ -1542,6 +1562,7 @@ def _lsrk4_with_ct(
                 params,
                 helper_data,
                 registered_variables,
+                sink_density=sink_density,
             )
             if sources is not None:
                 dq = dq + sources
@@ -1556,6 +1577,7 @@ def _lsrk4_with_ct(
                 params,
                 helper_data,
                 registered_variables,
+                sink_density=sink_density,
             )
             dq = a_coef * dq + rhs_q_for_phys
 

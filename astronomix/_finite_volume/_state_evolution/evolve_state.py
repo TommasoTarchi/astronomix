@@ -75,12 +75,15 @@ def _gravity_source_presolve(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_density=None,
 ) -> STATE_TYPE:
     """Build the operator-split self-gravity source from the pre-hydro state.
 
     The source depends only on the pre-hydro state, so evaluating it before
     the hydro update and adding it afterwards reproduces the former
-    ``_apply_self_gravity`` scheme exactly.
+    ``_apply_self_gravity`` scheme exactly. ``sink_density``, the mass
+    density of the sink particles or ``None``, adds to the self-gravity of
+    the gas.
     """
     return _time_integrator_sources(
         conserved_state_from_primitive(
@@ -94,6 +97,7 @@ def _gravity_source_presolve(
         params,
         helper_data,
         registered_variables,
+        sink_density=sink_density,
     )
 
 
@@ -253,11 +257,19 @@ def _evolve_gas_state_split(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_density=None,
 ) -> STATE_TYPE:
     if config.dimensionality == 1:
         if config.gravity_config.gravity:
             gravity_source = _gravity_source_presolve(
-                primitive_state, dt, gamma, config, params, helper_data, registered_variables
+                primitive_state,
+                dt,
+                gamma,
+                config,
+                params,
+                helper_data,
+                registered_variables,
+                sink_density=sink_density,
             )
 
         primitive_state = _evolve_state_along_axis(
@@ -280,7 +292,14 @@ def _evolve_gas_state_split(
     elif config.dimensionality == 2:
         if config.gravity_config.gravity:
             gravity_source = _gravity_source_presolve(
-                primitive_state, dt, gamma, config, params, helper_data, registered_variables
+                primitive_state,
+                dt,
+                gamma,
+                config,
+                params,
+                helper_data,
+                registered_variables,
+                sink_density=sink_density,
             )
 
         primitive_state = _evolve_state_along_axis(
@@ -325,7 +344,14 @@ def _evolve_gas_state_split(
     elif config.dimensionality == 3:
         if config.gravity_config.gravity:
             gravity_source = _gravity_source_presolve(
-                primitive_state, dt, gamma, config, params, helper_data, registered_variables
+                primitive_state,
+                dt,
+                gamma,
+                config,
+                params,
+                helper_data,
+                registered_variables,
+                sink_density=sink_density,
             )
 
         primitive_state = _evolve_state_along_axis(
@@ -511,11 +537,19 @@ def _evolve_gas_state_unsplit(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_density=None,
 ) -> STATE_TYPE:
 
     if config.gravity_config.gravity:
         gravity_source = _gravity_source_presolve(
-            primitive_state, dt, gamma, config, params, helper_data, registered_variables
+            primitive_state,
+            dt,
+            gamma,
+            config,
+            params,
+            helper_data,
+            registered_variables,
+            sink_density=sink_density,
         )
 
     if config.time_integrator == RK2_SSP:
@@ -576,11 +610,14 @@ def _evolve_state_fv(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_density=None,
 ) -> STATE_TYPE:
     # The AthenaPK-equivalent VL2 scheme (hydro and GLM-MHD) replaces the whole
     # finite-volume step with its own Cartesian update, including Athena++'s
     # self-gravity coupling. It has no geometric source terms (applied by the
     # split / unsplit schemes below); finalize_config rejects that combination.
+    # The mass density of the sink particles (``sink_density``, or ``None``)
+    # adds to the self-gravity of the gas in every scheme.
     if config.time_integrator == VL2:
         return _evolve_state_vl2(
             primitive_state,
@@ -590,6 +627,7 @@ def _evolve_state_fv(
             params,
             helper_data,
             registered_variables,
+            sink_density=sink_density,
         )
 
     if config.mhd:
@@ -614,6 +652,7 @@ def _evolve_state_fv(
                     params,
                     helper_data,
                     registered_variables_gas,
+                    sink_density=sink_density,
                 )
             else:
                 evolved_gas = _evolve_gas_state_split(
@@ -624,6 +663,7 @@ def _evolve_state_fv(
                     params,
                     helper_data,
                     registered_variables_gas,
+                    sink_density=sink_density,
                 )
 
             magnetic_field, evolved_gas = magnetic_update(
@@ -645,6 +685,7 @@ def _evolve_state_fv(
                     params,
                     helper_data,
                     registered_variables_gas,
+                    sink_density=sink_density,
                 )
             else:
                 evolved_gas = _evolve_gas_state_split(
@@ -655,6 +696,7 @@ def _evolve_state_fv(
                     params,
                     helper_data,
                     registered_variables_gas,
+                    sink_density=sink_density,
                 )
 
             return jnp.concatenate((evolved_gas, magnetic_field), axis=0)
@@ -671,6 +713,7 @@ def _evolve_state_fv(
                 params,
                 helper_data,
                 registered_variables,
+                sink_density=sink_density,
             )
         else:
             return _evolve_gas_state_split(
@@ -681,4 +724,5 @@ def _evolve_state_fv(
                 params,
                 helper_data,
                 registered_variables,
+                sink_density=sink_density,
             )
