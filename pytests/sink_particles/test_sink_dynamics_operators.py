@@ -7,9 +7,12 @@ cells, empty slots, and weights whose derivative is continuous across a cell
 face), the zero self-force and the equal and opposite forces of the
 particle-mesh gravity, the force of an external potential read back with the
 6th-order (finite difference) and the 2nd-order (classic finite volume, VL2)
-stencil, and the kick and the drift. Three runs of the time loop with
-different step sizes check that the kick-drift-kick integration of two sinks
-on a circular orbit converges at second order.
+stencil, the balance between the force of the gas on the sinks and the force
+on the gas that each coupling applies, and the kick and the drift. Two sets of
+three runs of the time loop with different step sizes check that the
+kick-drift-kick integration of two sinks on a circular orbit, and the
+imbalance of the momentum the gas and a sink exchange, converge at second
+order.
 
 Run on the CPU with::
 
@@ -48,6 +51,11 @@ from astronomix import (
     PERIODIC_BOUNDARY,
     VL2,
 )
+from astronomix.option_classes.simulation_config import (
+    FOURTH_ORDER_CONSERVATIVE,
+    SECOND_ORDER_CONSERVATIVE,
+    SIMPLE_SOURCE,
+)
 
 # astronomix containers
 from astronomix import (
@@ -67,13 +75,20 @@ from astronomix import (
     get_registered_variables,
     time_integration,
 )
+from astronomix._finite_volume._state_evolution._van_leer_integrator import (
+    _vl2_gravitational_potential,
+)
+from astronomix._fluid_equations._equations import conserved_state_from_primitive
+from astronomix._modules._gravity._gravity import _add_athena_gravity_source
 from astronomix._modules._sink_particles._sink_particle_dynamics import (
     _drift,
     _kick,
     _sink_acceleration,
     _sink_density,
+    _sink_potential,
     _tsc_weights,
 )
+from astronomix._modules._time_integrator_sources import _time_integrator_sources
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
 )
@@ -87,6 +102,15 @@ from astronomix.time_stepping.time_integration import _prepare_padded_state
 NUM_CELLS = 16
 CELL_SIZE = 1.0 / NUM_CELLS
 MAX_NUM_SINKS = 4
+
+# The momentum-exchange runs use a finer grid, so that the clump and the sink
+# 7 cells from it fit in the periodic box.
+EXCHANGE_NUM_CELLS = 32
+EXCHANGE_CELL_SIZE = 1.0 / EXCHANGE_NUM_CELLS
+EXCHANGE_SINK_MASS = 0.5
+EXCHANGE_CLUMP_CENTER = np.full((3,), 0.5 + 0.5 * EXCHANGE_CELL_SIZE)
+# 7 cells from the clump centre, along a direction off the grid axes.
+EXCHANGE_SINK_POSITION = EXCHANGE_CLUMP_CENTER + np.array([6.0, 3.0, 2.0]) * EXCHANGE_CELL_SIZE
 
 PERIODIC_AXIS = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
 OPEN_AXIS = BoundarySettings1D(OPEN_BOUNDARY, OPEN_BOUNDARY)
@@ -107,12 +131,21 @@ def float64():
 # -------------------------------------------------------------
 
 
-def _setup(boundary_settings, gravity_config=GravityConfig(self_gravity=True), **config_options):
-    """A 16³ unit box of uniform gas at rest, with sink particles on.
+def _setup(
+    boundary_settings,
+    gravity_config=GravityConfig(self_gravity=True),
+    clump_options=None,
+    **config_options,
+):
+    """A 16³ unit box of gas at rest, uniform unless a clump is asked for,
+    with sink particles on.
 
     Args:
         boundary_settings: The boundaries of the box.
         gravity_config: The gravity configuration; self-gravity is always on.
+        clump_options: ``SinkFormationSettings`` fields of a Gaussian clump
+            (``peak_overdensity``, ``overdensity_width``, ...); no clump by
+            default.
         **config_options: Further ``SimulationConfig`` fields, e.g. the solver.
 
     Returns:
@@ -135,7 +168,7 @@ def _setup(boundary_settings, gravity_config=GravityConfig(self_gravity=True), *
         SinkFormationSettings(
             peak_overdensity=0.0,
             boundary_settings=boundary_settings,
-        ),
+        )._replace(**(clump_options or {})),
     )
     registered_variables = get_registered_variables(config)
     primitive_state = _prepare_padded_state(
@@ -252,6 +285,67 @@ def _orbit_setup(num_timesteps):
     )
     state = state._replace(sink_particles=sink_particles)
     return state, config, params, get_registered_variables(config)
+
+
+def _momentum_exchange_run(num_timesteps):
+    """A sink at rest next to a gas clump at rest, run with fixed steps up to
+    t = 0.05, about the time the sink takes to move half a cell. Periodic 32³
+    box, Gaussian clump of width 3.2 cells and peak 50 above a background of
+    1, c_s² = 4, which stays far below the density threshold of about 515;
+    default finite-difference self-gravity coupling.
+
+    Args:
+        num_timesteps: The number of fixed steps.
+
+    Returns:
+        ``(gas_momentum_change, sink_momentum_change, final_sink_particles)``,
+        the first two of shape (3,).
+    """
+    config = SimulationConfig(
+        num_cells=StaticIntVector(EXCHANGE_NUM_CELLS, EXCHANGE_NUM_CELLS, EXCHANGE_NUM_CELLS),
+        progress_bar=False,
+        fixed_timestep=True,
+        num_timesteps=num_timesteps,
+        sink_particle_config=SinkParticleConfig(
+            sink_particles=True,
+            max_num_sinks=MAX_NUM_SINKS,
+        ),
+    )
+    state, config, params = setup_sink_formation(
+        config,
+        SimulationParams(),
+        SinkFormationSettings(
+            background_density=1.0,
+            peak_overdensity=50.0,
+            overdensity_width=3.2 * EXCHANGE_CELL_SIZE,
+            overdensity_center=tuple(EXCHANGE_CLUMP_CENTER),
+            sound_speed_squared=4.0,
+            t_end=0.05,
+            boundary_settings=PERIODIC,
+        ),
+    )
+    state = state._replace(
+        sink_particles=_sinks([EXCHANGE_SINK_MASS], [EXCHANGE_SINK_POSITION], config)
+    )
+    registered_variables = get_registered_variables(config)
+
+    final_state = time_integration(state, config, params, registered_variables)
+
+    # The gas and the sink start at rest, so their final momenta are the
+    # momenta they exchanged.
+    primitive_state = final_state.primitive_state
+    density = primitive_state[registered_variables.density_index]
+    gas_momentum_change = np.array(
+        [
+            float(jnp.sum(density * primitive_state[velocity_index]))
+            for velocity_index in registered_variables.velocity_index
+        ]
+    ) * EXCHANGE_CELL_SIZE**3
+    final_sink_particles = final_state.sink_particles
+    sink_momentum_change = np.asarray(
+        final_sink_particles.mass[0] * final_sink_particles.velocity[0]
+    )
+    return gas_momentum_change, sink_momentum_change, final_sink_particles
 
 
 # -------------------------------------------------------------
@@ -443,6 +537,124 @@ def test_external_potential_on_sink(solver_options):
     )
 
 
+@pytest.mark.parametrize(
+    "solver_options",
+    [
+        dict(gravity_config=GravityConfig(self_gravity=True, self_gravity_version=SIMPLE_SOURCE)),
+        dict(
+            gravity_config=GravityConfig(
+                self_gravity=True,
+                self_gravity_version=SECOND_ORDER_CONSERVATIVE,
+            )
+        ),
+        dict(
+            gravity_config=GravityConfig(
+                self_gravity=True,
+                self_gravity_version=FOURTH_ORDER_CONSERVATIVE,
+            )
+        ),
+        dict(solver_mode=FINITE_VOLUME, time_integrator=VL2),
+    ],
+    ids=[
+        "fd_simple_source",
+        "fd_second_order_conservative",
+        "fd_fourth_order_conservative",
+        "vl2",
+    ],
+)
+def test_gas_sink_force_balance(solver_options):
+    """At one instant, the force of the gas on two sinks and the force that
+    the coupling applies to the gas add up to zero: on a periodic box without
+    ghost cells the gas-gas forces cancel among themselves, and the sinks read
+    the field back with the momentum stencil of the coupling. Classic finite
+    volume is not included: on a periodic box it keeps ghost cells, and the
+    Poisson solve counts the gas in them, which pulls the gas without being
+    pulled back.
+
+    Args:
+        solver_options: The ``SimulationConfig`` fields that select the solver
+            and the coupling.
+    """
+    primitive_state, config, params, registered_variables = _setup(
+        PERIODIC,
+        clump_options=dict(
+            peak_overdensity=20.0,
+            overdensity_width=0.1,
+            overdensity_center=(0.47, 0.52, 0.5),
+        ),
+        **solver_options,
+    )
+    sink_particles = _sinks(
+        [0.5, 0.3],
+        [[0.68, 0.41, 0.55], [0.33, 0.70, 0.37]],
+        config,
+    )
+    density = primitive_state[registered_variables.density_index]
+    sink_potential = _sink_potential(sink_particles, density.shape, config, params)
+
+    # The momentum the coupling gives the gas over a unit time step, without
+    # mass fluxes, is the gravitational force density on the gas.
+    if config.time_integrator == VL2:
+        potential = _vl2_gravitational_potential(
+            density,
+            config,
+            params,
+            registered_variables,
+            sink_potential=sink_potential,
+        )
+        state_change = _add_athena_gravity_source(
+            jnp.zeros_like(primitive_state),
+            density,
+            [jnp.zeros_like(density)] * 3,
+            potential,
+            potential,
+            1.0,
+            config,
+            registered_variables,
+        )
+    else:
+        no_flux = jnp.zeros_like(density)
+        state_change = _time_integrator_sources(
+            conserved_state_from_primitive(
+                primitive_state,
+                params.gamma,
+                config,
+                registered_variables,
+            ),
+            (no_flux, no_flux, no_flux),
+            no_flux,
+            1.0,
+            params.gamma,
+            config,
+            params,
+            get_helper_data(config),
+            registered_variables,
+            sink_potential=sink_potential,
+        )
+    gas_force_density = jnp.stack(
+        [state_change[index] for index in registered_variables.momentum_index]
+    )
+    gas_force = jnp.sum(gas_force_density, axis=(1, 2, 3)) * CELL_SIZE**3
+
+    sink_forces = sink_particles.mass[:, None] * _sink_acceleration(
+        primitive_state,
+        sink_particles,
+        config,
+        params,
+        registered_variables,
+    )
+
+    net_force = float(jnp.linalg.norm(gas_force + jnp.sum(sink_forces, axis=0)))
+    force_scale = float(
+        jnp.sum(jnp.linalg.norm(gas_force_density, axis=0)) * CELL_SIZE**3
+        + jnp.sum(jnp.linalg.norm(sink_forces, axis=-1))
+    )
+    assert net_force <= 1e-10 * force_scale, (
+        f"the forces on the gas and on the sinks add up to {net_force:.3e}, more than "
+        f"1e-10 of the sum of their magnitudes {force_scale:.3e}"
+    )
+
+
 def test_kick_and_drift_skip_empty_slots():
     """A kick and a drift move the filled slots only, even with an
     acceleration in every slot. A sink crossing the periodic boundary along x
@@ -512,3 +724,48 @@ def test_kdk_second_order():
         f"the convergence ratio is {ratio:.3f}, outside [4, 6] (second order gives 5, "
         "first order 3)"
     )
+
+
+def test_momentum_exchange_converges():
+    """A sink at rest next to a gas clump falls toward it and takes its
+    momentum from the gas, up to the time sampling of the coupling: in every
+    stage of the hydro update the gas feels the sink at its mid-step position,
+    and each kick feels the gas at the start or at the end of the step, a
+    midpoint and a trapezoid rule. Over fixed steps Δt, Δt/2 and Δt/4, the
+    imbalance |Δp_gas + Δp_sink| shrinks by about 4 per halving of the step:
+    2 would mean a first-order coupling, and a ratio near 1 an imbalance in
+    space that no step size removes."""
+    imbalances = []
+    for num_timesteps in (16, 32, 64):
+        gas_momentum_change, sink_momentum_change, final_sinks = _momentum_exchange_run(
+            num_timesteps
+        )
+        assert float(final_sinks.mass[0]) == EXCHANGE_SINK_MASS, (
+            f"with {num_timesteps} steps the sink mass changed from {EXCHANGE_SINK_MASS} "
+            f"to {float(final_sinks.mass[0])}: gas was accreted"
+        )
+        assert jnp.all(final_sinks.mass[1:] == 0.0), (
+            f"with {num_timesteps} steps a new sink formed, masses of the other slots: "
+            f"{final_sinks.mass[1:]}"
+        )
+        imbalances.append(np.linalg.norm(gas_momentum_change + sink_momentum_change))
+
+    toward_clump = EXCHANGE_CLUMP_CENTER - EXCHANGE_SINK_POSITION
+    cosine = np.dot(sink_momentum_change, toward_clump) / (
+        np.linalg.norm(sink_momentum_change) * np.linalg.norm(toward_clump)
+    )
+    assert cosine >= 0.99, (
+        f"the sink's momentum change does not point at the clump: cosine {cosine:.4f} < 0.99"
+    )
+
+    for coarse_imbalance, fine_imbalance, num_timesteps in zip(
+        imbalances[:-1],
+        imbalances[1:],
+        (16, 32),
+    ):
+        ratio = coarse_imbalance / fine_imbalance
+        assert 3.0 <= ratio <= 5.0, (
+            f"from {num_timesteps} to {2 * num_timesteps} steps the momentum imbalance "
+            f"shrinks by {ratio:.3f}, outside [3, 5] (second order gives 4); imbalances: "
+            f"{imbalances}"
+        )

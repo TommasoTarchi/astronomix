@@ -70,7 +70,7 @@ def _time_integrator_sources(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
-    sink_density=None,
+    sink_potential=None,
 ) -> STATE_TYPE:
     """
     Compute the physics source terms for the given **conserved** state.
@@ -86,8 +86,8 @@ def _time_integrator_sources(
         params: The simulation parameters.
         helper_data: The helper data.
         registered_variables: The registered variables.
-        sink_density: The mass density of the sink particles, which adds to
-            the self-gravity of the gas, or ``None``.
+        sink_potential: The gravitational potential of the sink particles,
+            which acts on the gas together with its own gravity, or ``None``.
 
     Returns:
         The physics source terms for the conserved state.
@@ -180,7 +180,7 @@ def _time_integrator_sources(
             config,
             params,
             registered_variables,
-            sink_density=sink_density,
+            sink_potential=sink_potential,
         )
 
     # Self-gravity (FV path): the source is built from the (pre-hydro) state
@@ -201,7 +201,7 @@ def _time_integrator_sources(
             params,
             registered_variables,
             params.gravitational_constant,
-            sink_density=sink_density,
+            sink_potential=sink_potential,
         )
 
         gravity_source = jnp.zeros_like(fv_primitive_state)

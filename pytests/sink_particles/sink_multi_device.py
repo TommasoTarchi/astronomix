@@ -93,11 +93,11 @@ def test_same_result_as_one_device(sinks_passed_in):
 
 
 def test_no_full_grid_all_gather():
-    """One formation call, one accretion call, one sink acceleration and one
-    sum of the gas and sink densities on the split state copy no array with
-    as many elements as the grid to every device, and the sum stays split
-    along x like the gas. Periodic boundaries, where the Poisson solve is
-    distributed."""
+    """One formation call, one accretion call, one sink acceleration, one sum
+    of the gas and sink densities and one sum of the gas and sink potentials
+    on the split state copy no array with as many elements as the grid to
+    every device, and both sums stay split along x like the gas. Periodic
+    boundaries, where the Poisson solve is distributed."""
     _assert_check_passes("no_full_grid_all_gather")
 
 
@@ -216,10 +216,11 @@ def _check_same_result(sink_passed_in):
 
 
 def _check_no_full_grid_all_gather():
-    """Compile one formation call, one accretion call, one sink acceleration
-    and one sum of the gas and sink densities on the split state. Fail if any
-    all-gather produces an array with as many elements as the grid, or if the
-    sum of the densities is not split along x like the gas.
+    """Compile one formation call, one accretion call, one sink acceleration,
+    one sum of the gas and sink densities and one sum of the gas and sink
+    potentials on the split state. Fail if any all-gather produces an array
+    with as many elements as the grid, or if either sum is not split along x
+    like the gas.
 
     The sink density is not compiled on its own: its only inputs are the
     replicated sinks, so it can produce no all-gather."""
@@ -235,7 +236,9 @@ def _check_no_full_grid_all_gather():
     from astronomix._modules._sink_particles._sink_particle_dynamics import (
         _sink_acceleration,
         _sink_density,
+        _sink_potential,
     )
+    from astronomix._modules._gravity._gravity import _compute_total_potential
     from astronomix._modules._sink_particles._sink_particle_formation import (
         _empty_sink_particles,
         _form_sink_particles,
@@ -265,11 +268,30 @@ def _check_no_full_grid_all_gather():
             config,
         )
 
+    def gas_plus_sink_potential(primitive_state, sink_particles):
+        """The potential the gas feels in the hydro update: that of the gas
+        plus that of the sinks, solved on its own."""
+        return _compute_total_potential(
+            primitive_state[registered_variables.density_index],
+            config.grid_spacing,
+            config,
+            params,
+            registered_variables,
+            params.gravitational_constant,
+            sink_potential=_sink_potential(
+                sink_particles,
+                primitive_state.shape[1:],
+                config,
+                params,
+            ),
+        )
+
     static = ["config", "registered_variables"]
     form = jax.jit(_form_sink_particles, static_argnames=static)
     accrete = jax.jit(_accrete_gas, static_argnames=static)
     accelerate = jax.jit(_sink_acceleration, static_argnames=static)
     add_densities = jax.jit(gas_plus_sink_density)
+    add_potentials = jax.jit(gas_plus_sink_potential)
     # The same mesh contexts as time_integration, so the Poisson solve takes
     # its distributed path.
     with mesh, pallas_mesh_context(mesh):
@@ -300,15 +322,20 @@ def _check_no_full_grid_all_gather():
             primitive_state,
             clump_sink,
         ).compile()
+        programs["gas plus sink potential"] = add_potentials.lower(
+            primitive_state,
+            clump_sink,
+        ).compile()
 
     # Split along x like the gas density, not a full-grid array on every
     # device.
-    density_sharding = programs["gas plus sink density"].output_shardings
-    print("gas plus sink density sharding:", density_sharding)
-    assert density_sharding.is_equivalent_to(
-        NamedSharding(mesh, PartitionSpec("x", "y", "z")),
-        3,
-    ), density_sharding
+    for name in ("gas plus sink density", "gas plus sink potential"):
+        output_sharding = programs[name].output_shardings
+        print(f"{name} sharding:", output_sharding)
+        assert output_sharding.is_equivalent_to(
+            NamedSharding(mesh, PartitionSpec("x", "y", "z")),
+            3,
+        ), f"{name}: {output_sharding}"
 
     # An all-gather line of the compiled program reads
     #   %name = <type>[<dims>]{<layout>} all-gather(...)

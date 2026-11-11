@@ -4,13 +4,15 @@ ApJS 204, 8.
 
 Every gravitational interaction that involves a sink goes through the grid
 (particle-mesh): each sink's mass is spread over the 3×3×3 cells around it with
-triangular-shaped-cloud (TSC) weights (Gong & Ostriker 2013, Eq. 16) and added
-to the gas density of the Poisson solve, and the force on the sink is read
-back from the same cells with the same weights. Depositing and reading back
-with the same weights gives a sink no force from itself and makes the forces
-between any two masses equal and opposite. The TSC weights and their first
-derivative are continuous in the sink position, so derivatives with respect to
-the positions have no jumps.
+triangular-shaped-cloud (TSC) weights (Gong & Ostriker 2013, Eq. 16), and the
+force on the sink is read back from the same cells with the same weights. The
+kicks solve the Poisson equation for gas and sink density together; the gas
+feels the sinks through the potential of the sink density alone, solved once
+per step and added to its own, which by linearity is the same field.
+Depositing and reading back with the same weights gives a sink no force from
+itself and makes the forces between any two masses equal and opposite. The
+TSC weights and their first derivative are continuous in the sink position,
+so derivatives with respect to the positions have no jumps.
 
 The sinks move with a kick-drift-kick leapfrog (Gong & Ostriker 2013, Section
 2.4), once per hydro step, and adaptive steps keep a sink from moving more than
@@ -55,9 +57,20 @@ from astronomix._modules._gravity._gravity import (
     _gravitational_acceleration,
     _second_order_gravitational_acceleration,
 )
+from astronomix._modules._gravity._poisson_solver import (
+    _compute_gravitational_potential,
+)
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _interior_cell_indices,
+    _periodic_box,
 )
+
+
+#: The largest distance, in cells, that a sink may move in one adaptive step.
+#: Federrath et al. (2010), Eq. 22, keep a sink from crossing more than half a
+#: cell per step, so that it stays almost fixed relative to the grid while the
+#: gas sees it at its mid-step position.
+MAXIMUM_SINK_DISPLACEMENT_IN_CELLS = 0.5
 
 
 def _tsc_offsets() -> np.ndarray:
@@ -175,6 +188,35 @@ def _sink_density(
     return sink_density.at[cell_indices].add(density_contributions)
 
 
+def _sink_potential(
+    sink_particles: SinkParticles,
+    grid_shape: tuple,
+    config: SimulationConfig,
+    params: SimulationParams,
+) -> FIELD_TYPE:
+    """
+    The gravitational potential of the sinks alone on the (padded) grid: the
+    Poisson solve of ``_sink_density``, the same solve the gas density gets.
+    The solve is linear, so adding this potential to that of the gas gives the
+    potential of gas and sinks together.
+
+    Args:
+        sink_particles: The sink particles.
+        grid_shape: The shape of a (padded) field.
+        config: The simulation configuration.
+        params: The simulation parameters.
+
+    Returns:
+        The potential of the sinks, with shape ``grid_shape``.
+    """
+    return _compute_gravitational_potential(
+        _sink_density(sink_particles, grid_shape, config),
+        config.grid_spacing,
+        config,
+        params.gravitational_constant,
+    )
+
+
 def _acceleration_field(
     gravitational_potential: FIELD_TYPE,
     config: SimulationConfig,
@@ -228,11 +270,11 @@ def _sink_acceleration(
     The gravitational acceleration of every sink slot, from the potential of
     the gas and the sinks together, plus the external potential when it is on.
 
-    The sink density is added to the gas density of one Poisson solve, the
-    acceleration is taken at the cell centres with the stencil of the gas
-    coupling (``_acceleration_field``), and each sink reads it back from its
-    27 TSC cells with the weights it was deposited with. Empty slots get the
-    finite acceleration at their position, which the kick ignores.
+    One Poisson solve of the gas density plus the sink density gives the
+    potential, the acceleration is taken at the cell centres with the stencil
+    of the gas coupling (``_acceleration_field``), and each sink reads it back
+    from its 27 TSC cells with the weights it was deposited with. Empty slots
+    get the finite acceleration at their position, which the kick ignores.
 
     Args:
         primitive_state: The (padded) primitive state.
@@ -248,13 +290,12 @@ def _sink_acceleration(
     grid_shape = gas_density.shape
 
     gravitational_potential = _compute_total_potential(
-        gas_density,
+        gas_density + _sink_density(sink_particles, grid_shape, config),
         config.grid_spacing,
         config,
         params,
         registered_variables,
         params.gravitational_constant,
-        sink_density=_sink_density(sink_particles, grid_shape, config),
     )
     acceleration_field = _acceleration_field(gravitational_potential, config)
 
@@ -269,3 +310,146 @@ def _sink_acceleration(
     )
     acceleration_in_cells = acceleration_field[(slice(None),) + cell_indices]
     return jnp.sum(weights[None, :, :] * acceleration_in_cells, axis=-1).T
+
+
+def _kick(
+    sink_particles: SinkParticles,
+    acceleration: jax.Array,
+    time_step,
+) -> SinkParticles:
+    """
+    Kick the sinks, v ← v + a Δt, in the filled slots. Empty slots keep their
+    zero velocity, whatever acceleration they are given.
+
+    Args:
+        sink_particles: The sink particles.
+        acceleration: The acceleration of every slot, shape (max_num_sinks, 3).
+        time_step: The time interval of the kick.
+
+    Returns:
+        The sink particles with the kicked velocities.
+    """
+    is_filled = sink_particles.mass[:, None] > 0.0
+    kicked_velocity = sink_particles.velocity + acceleration * time_step
+    return sink_particles._replace(
+        velocity=jnp.where(is_filled, kicked_velocity, sink_particles.velocity),
+    )
+
+
+def _warn_sinks_left_box(has_left_box: np.ndarray, position: np.ndarray) -> None:
+    """
+    Host callback: print a warning for every sink that has just left the box
+    through a non-periodic boundary.
+
+    Args:
+        has_left_box: Whether each slot has just left the box, shape
+            (max_num_sinks,).
+        position: The positions after the drift, shape (max_num_sinks, 3).
+    """
+    position = np.asarray(position)
+    for slot in np.flatnonzero(np.asarray(has_left_box)):
+        print(
+            f"WARNING: sink particle {slot} left the box through a non-periodic "
+            f"boundary, at position {position[slot]}. It keeps its slot; one "
+            "cell past the edge its gravity no longer acts, and it moves in a "
+            "straight line."
+        )
+
+
+def _drift(
+    sink_particles: SinkParticles,
+    time_step,
+    config: SimulationConfig,
+) -> SinkParticles:
+    """
+    Drift the sinks, x ← x + v Δt, in the filled slots, and wrap them back into
+    the box along periodic axes. Empty slots stay where they are.
+
+    Along a non-periodic axis a sink may leave the box. It keeps its slot, and
+    a warning is printed for every filled slot that goes from inside to
+    outside the box in this drift. The warning is printed from inside the
+    step, so it is printed again when a step is retried and when the
+    checkpointed loop recomputes a step in reverse mode.
+
+    Args:
+        sink_particles: The sink particles.
+        time_step: The time interval of the drift.
+        config: The simulation configuration.
+
+    Returns:
+        The sink particles with the drifted positions.
+    """
+    position = sink_particles.position
+    is_periodic, box_length = _periodic_box(config)
+    box_length = jnp.asarray(box_length, dtype=position.dtype)
+    is_filled = sink_particles.mass > 0.0
+
+    drifted_position = position + sink_particles.velocity * time_step
+    wrapped_position = jnp.mod(drifted_position, box_length)
+    # A position just below zero can round to exactly L, the same point as 0.
+    wrapped_position = jnp.where(
+        wrapped_position >= box_length,
+        wrapped_position - box_length,
+        wrapped_position,
+    )
+    drifted_position = jnp.where(is_periodic, wrapped_position, drifted_position)
+    new_position = jnp.where(is_filled[:, None], drifted_position, position)
+
+    def is_inside_box(slot_position):
+        """Whether each slot lies inside the box along every non-periodic axis."""
+        return jnp.all(
+            is_periodic | ((slot_position >= 0.0) & (slot_position < box_length)),
+            axis=-1,
+        )
+
+    has_left_box = is_filled & is_inside_box(position) & ~is_inside_box(new_position)
+    jax.lax.cond(
+        jnp.any(has_left_box),
+        lambda: jax.debug.callback(
+            _warn_sinks_left_box,
+            has_left_box,
+            new_position,
+        ),
+        lambda: None,
+    )
+
+    return sink_particles._replace(position=new_position)
+
+
+def _sink_time_step(
+    sink_particles: SinkParticles,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    The largest time step in which no filled slot moves more than
+    ``MAXIMUM_SINK_DISPLACEMENT_IN_CELLS`` cells, at the largest speed of the
+    filled slots at the start of the step. The kicks change the speed within
+    the step, so a sink can move a further ½ |a| Δt².
+
+    Only adaptive runs apply this limit; fixed-step runs take the steps they
+    are given.
+
+    Args:
+        sink_particles: The sink particles at the start of the step.
+        config: The simulation configuration.
+
+    Returns:
+        The time step, or +∞ when no filled slot moves.
+    """
+    is_filled = sink_particles.mass > 0.0
+    speed_squared = jnp.where(
+        is_filled,
+        jnp.sum(sink_particles.velocity**2, axis=-1),
+        0.0,
+    )
+    largest_speed_squared = jnp.max(speed_squared)
+    is_moving = largest_speed_squared > 0.0
+
+    # The inner where keeps the square root and the division away from zero,
+    # so that neither gives a non-finite value, in derivatives either.
+    largest_speed = jnp.sqrt(jnp.where(is_moving, largest_speed_squared, 1.0))
+    return jnp.where(
+        is_moving,
+        MAXIMUM_SINK_DISPLACEMENT_IN_CELLS * config.grid_spacing / largest_speed,
+        jnp.inf,
+    )

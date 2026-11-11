@@ -9,7 +9,9 @@ used by the finite-difference solver, and Athena++'s second-order coupling used
 by the finite-volume VL2 scheme. Optionally
 (``GravityConfig.work_flux_correction``) the potential-energy flux of the
 conservative finite-difference couplings is flux-corrected so that the
-gravitational work cannot drive the internal energy negative.
+gravitational work cannot drive the internal energy negative. The potential of
+sink particles, when given, adds to the total; on the finite-difference path
+it acts on the gas through the simple source, whatever the coupling.
 """
 
 # general
@@ -60,7 +62,7 @@ def _compute_total_potential(
     params: SimulationParams,
     registered_variables: RegisteredVariables,
     G: Union[float, Float[Array, ""]] = 1.0,
-    sink_density: Union[FIELD_TYPE, None] = None,
+    sink_potential: Union[FIELD_TYPE, None] = None,
 ) -> FIELD_TYPE:
     """
     Compute the total gravitational potential, including contributions from
@@ -74,9 +76,9 @@ def _compute_total_potential(
         params: The simulation parameters (provides the external potential).
         registered_variables: The registered variables.
         G: The gravitational constant.
-        sink_density: The mass density of the sink particles, with the shape
-            of ``gas_density``, or ``None``. When given, the self-gravity is
-            that of the gas and the sinks together.
+        sink_potential: The gravitational potential of the sink particles,
+            with the shape of ``gas_density``, or ``None``. When given, it is
+            added to the total.
 
     Returns:
         The total gravitational potential, with the same shape as gas_density.
@@ -85,11 +87,8 @@ def _compute_total_potential(
 
     # Self-gravity contribution from the FFT Poisson solve.
     if config.gravity_config.self_gravity:
-        source_density = gas_density
-        if sink_density is not None:
-            source_density = gas_density + sink_density
         total_potential = total_potential + _compute_gravitational_potential(
-            source_density,
+            gas_density,
             grid_spacing,
             config,
             G,
@@ -107,6 +106,9 @@ def _compute_total_potential(
             params,
         )
         total_potential = total_potential + external_potential
+
+    if sink_potential is not None:
+        total_potential = total_potential + sink_potential
 
     return total_potential
 
@@ -245,7 +247,7 @@ def _fd_gravity_source(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
-    sink_density=None,
+    sink_potential=None,
 ):
     """
     Build the finite-difference self-gravity source term for the full state.
@@ -255,7 +257,9 @@ def _fd_gravity_source(
     configured coupling (``SIMPLE_SOURCE`` or one of the conservative,
     flux-based schemes). With ``GravityConfig.work_flux_correction`` the
     potential-energy flux of the conservative couplings is then limited (see
-    ``_flux_correct_gravitational_work``).
+    ``_flux_correct_gravitational_work``). The potential of the sink
+    particles, when given, acts on the gas through the simple source
+    whatever the coupling.
 
     Args:
         primitive_state: The primitive state array.
@@ -267,8 +271,8 @@ def _fd_gravity_source(
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
-        sink_density: The mass density of the sink particles, which adds to
-            the self-gravity of the gas, or ``None``.
+        sink_potential: The gravitational potential of the sink particles, or
+            ``None``.
 
     Returns:
         The full-state source term to be added over this time step.
@@ -285,7 +289,6 @@ def _fd_gravity_source(
         params,
         registered_variables,
         params.gravitational_constant,
-        sink_density=sink_density,
     )
 
     if self_gravity_version == SIMPLE_SOURCE:
@@ -414,6 +417,28 @@ def _fd_gravity_source(
             params,
             registered_variables,
         )
+
+    # The potential of the sinks is external to the gas, so it does work
+    # ρ v · a on the gas. The conservative couplings treat their potential as
+    # self-gravity, and in the deep well of a sink their energy source drains
+    # the internal energy of the gas next to it. The momentum source keeps the
+    # 6th-order difference of every coupling, which the sinks read back.
+    if sink_potential is not None:
+        density = primitive_state[registered_variables.density_index]
+        for spatial_axis in range(config.dimensionality):
+            momentum_index = _component_index(registered_variables.momentum_index, spatial_axis)
+            velocity_index = _component_index(registered_variables.velocity_index, spatial_axis)
+            sink_acceleration = _gravitational_acceleration(
+                sink_potential,
+                spatial_axis,
+                grid_spacing,
+            )
+            gravity_source = gravity_source.at[momentum_index].add(
+                density * sink_acceleration * dt
+            )
+            gravity_source = gravity_source.at[registered_variables.energy_index].add(
+                density * primitive_state[velocity_index] * sink_acceleration * dt
+            )
 
     return gravity_source
 
