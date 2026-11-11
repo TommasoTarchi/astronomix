@@ -289,13 +289,18 @@ def test_sink_density(boundary_settings):
     sink_density = _sink_density(sink_particles, grid_shape, config)
 
     total_mass = float(jnp.sum(sink_density)) * CELL_SIZE**3
-    assert abs(total_mass - sum(masses)) <= 1e-12 * sum(masses)
+    assert abs(total_mass - sum(masses)) <= 1e-12 * sum(masses), (
+        f"the sink density holds a mass of {total_mass!r}, but the sinks have {sum(masses)!r}"
+    )
 
     num_ghost_cells = config.num_ghost_cells
     if num_ghost_cells > 0:
         interior = np.zeros(grid_shape, dtype=bool)
         interior[(slice(num_ghost_cells, -num_ghost_cells),) * 3] = True
-        assert np.all(np.asarray(sink_density)[~interior] == 0.0)
+        ghost_cell_density = np.asarray(sink_density)[~interior]
+        assert np.all(ghost_cell_density == 0.0), (
+            f"the sink density is non-zero in {np.count_nonzero(ghost_cell_density)} ghost cells"
+        )
 
     # An empty slot placed anywhere, and moving, adds nothing.
     moved_empty_slot = sink_particles._replace(
@@ -305,7 +310,7 @@ def test_sink_density(boundary_settings):
     assert jnp.array_equal(
         _sink_density(moved_empty_slot, grid_shape, config),
         sink_density,
-    )
+    ), "moving an empty slot changed the sink density"
 
     # Across the face between two cells, along each axis, the derivative of
     # each cell's weight changes only by the second derivative of the weights
@@ -325,7 +330,11 @@ def test_sink_density(boundary_settings):
         for cell in derivatives[-1.0].keys() | derivatives[1.0].keys():
             left = derivatives[-1.0].get(cell, np.zeros(3))
             right = derivatives[1.0].get(cell, np.zeros(3))
-            assert np.max(np.abs(left - right)) <= 1e-3 / CELL_SIZE, (axis, cell)
+            jump = np.max(np.abs(left - right))
+            assert jump <= 1e-3 / CELL_SIZE, (
+                f"the derivative of the TSC weight of cell {cell} jumps by {jump:.3e} across "
+                f"the cell face along axis {axis}, more than 1e-3 / Δx = {1e-3 / CELL_SIZE:.3e}"
+            )
 
 
 @pytest.mark.parametrize(
@@ -353,7 +362,11 @@ def test_force_balance(boundary_settings):
         registered_variables,
     )
     force_scale = gravitational_constant * 1.0 / (10.0 * CELL_SIZE) ** 2
-    assert float(jnp.linalg.norm(acceleration[0])) <= 1e-10 * force_scale
+    self_acceleration = float(jnp.linalg.norm(acceleration[0]))
+    assert self_acceleration <= 1e-10 * force_scale, (
+        f"a lone sink feels an acceleration of {self_acceleration:.3e} from itself, more than "
+        f"1e-10 of G M / (10 Δx)² = {float(force_scale):.3e}"
+    )
 
     masses = jnp.array([1.0, 0.4, 2.3])
     three_sinks = _sinks(
@@ -370,7 +383,11 @@ def test_force_balance(boundary_settings):
     )
     forces = masses[:, None] * acceleration[:3]
     largest_force = float(jnp.max(jnp.linalg.norm(forces, axis=-1)))
-    assert float(jnp.linalg.norm(jnp.sum(forces, axis=0))) <= 1e-10 * largest_force
+    net_force = float(jnp.linalg.norm(jnp.sum(forces, axis=0)))
+    assert net_force <= 1e-10 * largest_force, (
+        f"the forces between the three sinks add up to {net_force:.3e}, more than 1e-10 of "
+        f"the largest force {largest_force:.3e}"
+    )
 
 
 @pytest.mark.parametrize(
@@ -420,7 +437,10 @@ def test_external_potential_on_sink(solver_options):
 
     expected_acceleration = -omega_squared * (position - center)
     error = float(jnp.linalg.norm(acceleration - expected_acceleration))
-    assert error <= 1e-10 * float(jnp.linalg.norm(expected_acceleration)), error
+    assert error <= 1e-10 * float(jnp.linalg.norm(expected_acceleration)), (
+        f"the sink acceleration {np.asarray(acceleration)} differs from −ω² (x − c) = "
+        f"{np.asarray(expected_acceleration)} by {error:.3e}, more than 1e-10 relative"
+    )
 
 
 def test_kick_and_drift_skip_empty_slots():
@@ -443,20 +463,36 @@ def test_kick_and_drift_skip_empty_slots():
         kicked.velocity[:2],
         velocities + np.asarray(acceleration[:2]) * time_step,
         rtol=1e-14,
+        err_msg="the kicked velocities of the filled slots are not v + a Δt",
     )
-    assert jnp.array_equal(kicked.position, sink_particles.position)
-    assert jnp.array_equal(kicked.mass, sink_particles.mass)
-    assert jnp.all(kicked.velocity[2:] == 0.0)
+    assert jnp.array_equal(kicked.position, sink_particles.position), "the kick moved the sinks"
+    assert jnp.array_equal(kicked.mass, sink_particles.mass), "the kick changed the sink masses"
+    assert jnp.all(kicked.velocity[2:] == 0.0), (
+        f"the kick changed the velocities of the empty slots: {kicked.velocity[2:]}"
+    )
 
     drifted = _drift(sink_particles, time_step, config)
     expected_positions = positions + velocities * time_step
     # x = 1.05 lies past the periodic boundary and is wrapped to 0.05; y =
     # 1.045 lies past the open boundary and stays there.
     expected_positions[0, 0] -= 1.0
-    np.testing.assert_allclose(drifted.position[:2], expected_positions, rtol=1e-14, atol=1e-15)
-    assert jnp.array_equal(drifted.velocity, sink_particles.velocity)
-    assert jnp.array_equal(drifted.mass, sink_particles.mass)
-    assert jnp.all(drifted.position[2:] == 0.0)
+    np.testing.assert_allclose(
+        drifted.position[:2],
+        expected_positions,
+        rtol=1e-14,
+        atol=1e-15,
+        err_msg=(
+            "the drifted positions of the filled slots are not x + v Δt, wrapped along the "
+            "periodic x axis and not along the open y axis"
+        ),
+    )
+    assert jnp.array_equal(drifted.velocity, sink_particles.velocity), (
+        "the drift changed the sink velocities"
+    )
+    assert jnp.array_equal(drifted.mass, sink_particles.mass), "the drift changed the sink masses"
+    assert jnp.all(drifted.position[2:] == 0.0), (
+        f"the drift moved the empty slots: {drifted.position[2:]}"
+    )
 
 
 def test_kdk_second_order():
@@ -472,4 +508,7 @@ def test_kdk_second_order():
 
     coarse, medium, fine = final_positions
     ratio = np.linalg.norm(coarse - fine) / np.linalg.norm(medium - fine)
-    assert 4.0 <= ratio <= 6.0, ratio
+    assert 4.0 <= ratio <= 6.0, (
+        f"the convergence ratio is {ratio:.3f}, outside [4, 6] (second order gives 5, "
+        "first order 3)"
+    )

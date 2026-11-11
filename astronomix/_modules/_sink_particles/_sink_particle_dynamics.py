@@ -53,11 +53,11 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 from astronomix._modules._gravity._gravity import (
     _compute_total_potential,
     _gravitational_acceleration,
+    _second_order_gravitational_acceleration,
 )
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _interior_cell_indices,
 )
-from astronomix._stencil_operations._stencil_operations import _stencil_add
 
 
 def _tsc_offsets() -> np.ndarray:
@@ -188,9 +188,10 @@ def _acceleration_field(
     the force of the gas on the sink are equal and opposite. All three
     finite-difference couplings use the 6th-order difference
     (``_gravitational_acceleration``); classic finite volume and VL2 use the
-    2nd-order one, −(Φᵢ₊₁ − Φᵢ₋₁) / (2Δx), which is also the average
-    ½(g₋½ + g₊½) of the face accelerations of VL2. Any centred difference is
-    antisymmetric, so a sink feels no force from itself.
+    2nd-order one (``_second_order_gravitational_acceleration``),
+    −(Φᵢ₊₁ − Φᵢ₋₁) / (2Δx), which is also the average ½(g₋½ + g₊½) of the
+    face accelerations of VL2. Any centred difference is antisymmetric, so a
+    sink feels no force from itself.
 
     Args:
         gravitational_potential: The total potential at the cell centres.
@@ -199,27 +200,17 @@ def _acceleration_field(
     Returns:
         The acceleration, shape (3, nx, ny, nz).
     """
-    grid_spacing = config.grid_spacing
     if config.solver_mode == FINITE_DIFFERENCE:
-        return jnp.stack(
-            [
-                _gravitational_acceleration(
-                    gravitational_potential,
-                    spatial_axis,
-                    grid_spacing,
-                )
-                for spatial_axis in range(3)
-            ]
-        )
+        acceleration_along_axis = _gravitational_acceleration
+    else:
+        acceleration_along_axis = _second_order_gravitational_acceleration
     return jnp.stack(
         [
-            -_stencil_add(
+            acceleration_along_axis(
                 gravitational_potential,
-                indices=(1, -1),
-                factors=(1.0, -1.0),
-                axis=spatial_axis,
+                spatial_axis,
+                config.grid_spacing,
             )
-            / (2.0 * grid_spacing)
             for spatial_axis in range(3)
         ]
     )

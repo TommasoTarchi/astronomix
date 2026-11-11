@@ -145,6 +145,25 @@ def _gravitational_acceleration(
     ) / (60.0 * grid_spacing)
 
 
+def _second_order_gravitational_acceleration(
+    gravitational_potential: FIELD_TYPE,
+    spatial_axis: int,
+    grid_spacing: float,
+) -> FIELD_TYPE:
+    """
+    Gravitational acceleration at the cell centres from the 2nd-order centred
+    finite difference of the potential, a_i = -(phi_{i+1} - phi_{i-1}) / (2 dx).
+    The classic finite-volume coupling applies it to the gas momentum and the
+    sink particles read it back, so that gas and sinks feel the same field.
+    """
+    return -_stencil_add(
+        gravitational_potential,
+        indices=(1, -1),
+        factors=(1.0, -1.0),
+        axis=spatial_axis,
+    ) / (2 * grid_spacing)
+
+
 def _potential_at_right_face(
     gravitational_potential: FIELD_TYPE,
     spatial_axis: int,
@@ -724,14 +743,11 @@ def _gravitational_source_term_along_axis(
     density = primitive_state[registered_variables.density_index]
     velocity = primitive_state[velocity_index]
 
-    # 2nd-order centred gravitational acceleration,
-    # a_i = -(phi_{i+1} - phi_{i-1}) / (2 dx).
-    acceleration = -_stencil_add(
+    acceleration = _second_order_gravitational_acceleration(
         gravitational_potential,
-        indices=(1, -1),
-        factors=(1.0, -1.0),
-        axis=spatial_axis,
-    ) / (2 * grid_spacing)
+        spatial_axis,
+        grid_spacing,
+    )
 
     source_term = jnp.zeros_like(primitive_state)
     source_term = source_term.at[momentum_index].set(density * acceleration)

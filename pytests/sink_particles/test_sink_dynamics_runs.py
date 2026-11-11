@@ -199,17 +199,27 @@ def test_circular_orbit():
     separation_vector = positions[:, 1] - positions[:, 0]
 
     distance = np.linalg.norm(separation_vector, axis=-1)
-    assert np.max(np.abs(distance / separation - 1.0)) <= 0.01
+    separation_error = np.max(np.abs(distance / separation - 1.0))
+    assert separation_error <= 0.01, (
+        f"the separation deviates from the initial one by up to {separation_error:.2%}, "
+        "more than 1 %"
+    )
 
     center_of_mass = 0.5 * (positions[:, 0] + positions[:, 1])
     center_of_mass_drift = np.linalg.norm(center_of_mass - center, axis=-1)
-    assert np.max(center_of_mass_drift) <= 0.01 * CELL_SIZE
+    assert np.max(center_of_mass_drift) <= 0.01 * CELL_SIZE, (
+        f"the centre of mass drifts by up to {np.max(center_of_mass_drift) / CELL_SIZE:.3e} "
+        "cells, more than 0.01"
+    )
 
     # The separation starts along +x and turns counterclockwise in the x-y
     # plane, by 360° per period.
     angle = np.degrees(np.arctan2(separation_vector[:, 1], separation_vector[:, 0]))
     phase_error = (angle - 360.0 * times / period + 180.0) % 360.0 - 180.0
-    assert np.max(np.abs(phase_error)) <= 2.0, phase_error
+    assert np.max(np.abs(phase_error)) <= 2.0, (
+        f"the separation angle is up to {np.max(np.abs(phase_error)):.2f}° off the Newtonian "
+        f"phase, more than 2°; per snapshot: {phase_error}"
+    )
 
 
 def test_drift_through_uniform_gas():
@@ -242,14 +252,26 @@ def test_drift_through_uniform_gas():
     # Along x the sink crosses the boundary: x0 + v t = 1.2, stored as 0.2.
     expected_position = np.mod(initial_position + velocity * final_time, 1.0)
     position_error = np.max(np.abs(_wrapped(final_position - expected_position)))
-    assert position_error <= 1e-3 * CELL_SIZE, position_error
-    assert 0.0 <= final_position[0] < 1.0
+    assert position_error <= 1e-3 * CELL_SIZE, (
+        f"the final position is {position_error / CELL_SIZE:.3e} cells from "
+        "(x0 + v t) mod L, more than 1e-3"
+    )
+    assert 0.0 <= final_position[0] < 1.0, (
+        f"the final x = {final_position[0]} was not wrapped into the box"
+    )
 
     velocity_change = np.linalg.norm(final_velocity - velocity)
-    assert velocity_change <= 1e-4 * np.linalg.norm(velocity)
+    assert velocity_change <= 1e-4 * np.linalg.norm(velocity), (
+        f"the sink velocity changed by {velocity_change / np.linalg.norm(velocity):.3e} of "
+        "its magnitude, more than 1e-4"
+    )
 
     minimum_num_steps = np.linalg.norm(velocity) * final_time / (0.5 * CELL_SIZE)
-    assert int(snapshots.num_iterations) >= minimum_num_steps
+    assert int(snapshots.num_iterations) >= minimum_num_steps, (
+        f"the run took {int(snapshots.num_iterations)} steps, fewer than the "
+        f"{minimum_num_steps:.1f} that half a cell per step needs: the sink time-step limit "
+        "did not set the steps"
+    )
 
 
 @pytest.mark.parametrize(
@@ -323,12 +345,17 @@ def test_gas_falls_toward_sink(solver_options):
         np.asarray(velocity, dtype=np.float64) - expected_velocity,
         axis=0,
     ) / np.linalg.norm(expected_velocity, axis=0)
-    assert np.max(relative_error[in_shell]) <= 0.05, np.max(relative_error[in_shell])
+    assert np.max(relative_error[in_shell]) <= 0.05, (
+        f"the gas velocity 6 to 10 cells from the sink is up to "
+        f"{np.max(relative_error[in_shell]):.1%} off −G M t r̂ / r², more than 5 %"
+    )
 
     sink_displacement = np.linalg.norm(
         np.asarray(final_state.sink_particles.position[0], dtype=np.float64) - sink_position
     )
-    assert sink_displacement <= 1e-3 * CELL_SIZE, sink_displacement
+    assert sink_displacement <= 1e-3 * CELL_SIZE, (
+        f"the sink moved by {sink_displacement / CELL_SIZE:.3e} cells, more than 1e-3"
+    )
 
 
 def test_momentum_exchange():
@@ -361,8 +388,12 @@ def test_momentum_exchange():
     final_sinks = final_state.sink_particles
 
     # No sink forms and no gas is accreted.
-    assert float(final_sinks.mass[0]) == sink_mass
-    assert jnp.all(final_sinks.mass[1:] == 0.0)
+    assert float(final_sinks.mass[0]) == sink_mass, (
+        f"the sink mass changed from {sink_mass} to {float(final_sinks.mass[0])}: gas was accreted"
+    )
+    assert jnp.all(final_sinks.mass[1:] == 0.0), (
+        f"a new sink formed, masses of the other slots: {final_sinks.mass[1:]}"
+    )
 
     # The gas starts at rest, so its momentum is the change of its momentum.
     _, gas_momentum_change = _gas_velocity_and_momentum(
@@ -374,12 +405,14 @@ def test_momentum_exchange():
 
     imbalance = np.linalg.norm(gas_momentum_change + sink_momentum_change)
     assert imbalance <= 0.05 * np.linalg.norm(sink_momentum_change), (
-        imbalance,
-        np.linalg.norm(sink_momentum_change),
+        f"gas plus sink momentum changed by {imbalance:.3e}, more than 5 % of the sink's "
+        f"momentum change {np.linalg.norm(sink_momentum_change):.3e}"
     )
 
     toward_clump = clump_center - sink_position
     cosine = np.dot(sink_momentum_change, toward_clump) / (
         np.linalg.norm(sink_momentum_change) * np.linalg.norm(toward_clump)
     )
-    assert cosine >= 0.99, cosine
+    assert cosine >= 0.99, (
+        f"the sink's momentum change does not point at the clump: cosine {cosine:.4f} < 0.99"
+    )

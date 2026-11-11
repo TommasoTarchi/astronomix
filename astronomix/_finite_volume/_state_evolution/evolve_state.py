@@ -79,11 +79,10 @@ def _gravity_source_presolve(
 ) -> STATE_TYPE:
     """Build the operator-split self-gravity source from the pre-hydro state.
 
-    The source depends only on the pre-hydro state, so evaluating it before
-    the hydro update and adding it afterwards reproduces the former
-    ``_apply_self_gravity`` scheme exactly. ``sink_density``, the mass
-    density of the sink particles or ``None``, adds to the self-gravity of
-    the gas.
+    The source depends only on the pre-hydro state, so it is evaluated before
+    the hydro update and added to the post-hydro state by
+    ``_apply_gravity_source``. ``sink_density``, the mass density of the sink
+    particles or ``None``, adds to the self-gravity of the gas.
     """
     return _time_integrator_sources(
         conserved_state_from_primitive(

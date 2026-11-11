@@ -221,14 +221,23 @@ def _assert_only_dynamics(inputs, fixed_timestep, differentiation_mode):
         lambda inputs: _final_state(inputs, fixed_timestep, differentiation_mode)[0]
     )(inputs)
     sink_particles = final_state.sink_particles
-    assert jnp.array_equal(sink_particles.mass, inputs[0])
+    assert jnp.array_equal(sink_particles.mass, inputs[0]), (
+        f"the sink masses changed from {inputs[0]} to {sink_particles.mass}: a sink formed or "
+        "gas was accreted"
+    )
 
     initial_positions = np.asarray(inputs[1])
     final_positions = np.asarray(sink_particles.position)
     initial_cell = int(np.floor(initial_positions[0, 0] / CELL_SIZE))
     final_cell = int(np.floor(final_positions[0, 0] / CELL_SIZE))
-    assert final_cell == initial_cell + 1, (initial_cell, final_cell)
-    assert BOX_LENGTH - CELL_SIZE < final_positions[1, 0] < BOX_LENGTH, final_positions[1]
+    assert final_cell == initial_cell + 1, (
+        f"the heavier sink ended in cell {final_cell} along x, not {initial_cell + 1}: it did "
+        "not cross exactly one cell face"
+    )
+    assert BOX_LENGTH - CELL_SIZE < final_positions[1, 0] < BOX_LENGTH, (
+        f"the lighter sink ended at x = {final_positions[1, 0]}, not in the last cell along x: "
+        "it did not cross the periodic boundary"
+    )
 
 
 def _random_direction(rng):
@@ -284,11 +293,18 @@ def test_gradient_matches_finite_differences():
         return jnp.vdot(weights, _outputs(inputs, True, BACKWARDS))
 
     gradient = jax.jit(jax.grad(loss))(inputs)
-    for leaf in jax.tree.leaves(gradient):
-        assert jnp.all(jnp.isfinite(leaf))
+    input_names = ("masses", "positions", "velocities", "peak overdensity")
+    for name, leaf in zip(input_names, gradient):
+        assert jnp.all(jnp.isfinite(leaf)), f"the gradient for the {name} is not finite: {leaf}"
     _, position_gradient, velocity_gradient, _ = gradient
-    assert jnp.all(position_gradient[NUM_FILLED_SLOTS:] == 0.0)
-    assert jnp.all(velocity_gradient[NUM_FILLED_SLOTS:] == 0.0)
+    assert jnp.all(position_gradient[NUM_FILLED_SLOTS:] == 0.0), (
+        "the gradient for the positions of the empty slots is not exactly zero: "
+        f"{position_gradient[NUM_FILLED_SLOTS:]}"
+    )
+    assert jnp.all(velocity_gradient[NUM_FILLED_SLOTS:] == 0.0), (
+        "the gradient for the velocities of the empty slots is not exactly zero: "
+        f"{velocity_gradient[NUM_FILLED_SLOTS:]}"
+    )
 
     # Each direction takes two runs, instead of two for each of the 57 inputs.
     jitted_loss = jax.jit(loss)
@@ -302,8 +318,8 @@ def test_gradient_matches_finite_differences():
         )
         projected_gradient = float(_tree_dot(gradient, direction))
         assert abs(projected_gradient - finite_difference) <= 1e-5 * abs(projected_gradient), (
-            projected_gradient,
-            finite_difference,
+            f"along a random direction the gradient gives {projected_gradient!r} and the "
+            f"central difference {finite_difference!r}: more than 1e-5 relative apart"
         )
 
 
@@ -334,4 +350,7 @@ def test_forward_and_reverse_agree():
 
     lhs = float(_tree_dot(transposed_cotangent, direction))
     rhs = float(jnp.vdot(cotangent, jacobian_direction))
-    assert abs(lhs - rhs) <= 1e-10 * abs(rhs), (lhs, rhs)
+    assert abs(lhs - rhs) <= 1e-10 * abs(rhs), (
+        f"<J^T w, u> = {lhs!r} (BACKWARDS) and w . (J u) = {rhs!r} (FORWARDS) are more than "
+        "1e-10 relative apart"
+    )
