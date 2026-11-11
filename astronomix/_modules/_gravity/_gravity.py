@@ -9,7 +9,9 @@ used by the finite-difference solver, and Athena++'s second-order coupling used
 by the finite-volume VL2 scheme. Optionally
 (``GravityConfig.work_flux_correction``) the potential-energy flux of the
 conservative finite-difference couplings is flux-corrected so that the
-gravitational work cannot drive the internal energy negative.
+gravitational work cannot drive the internal energy negative. The potential of
+sink particles, when given, adds to the total; on the finite-difference path
+it acts on the gas through the simple source, whatever the coupling.
 """
 
 # general
@@ -60,6 +62,7 @@ def _compute_total_potential(
     params: SimulationParams,
     registered_variables: RegisteredVariables,
     G: Union[float, Float[Array, ""]] = 1.0,
+    sink_potential: Union[FIELD_TYPE, None] = None,
 ) -> FIELD_TYPE:
     """
     Compute the total gravitational potential, including contributions from
@@ -73,6 +76,9 @@ def _compute_total_potential(
         params: The simulation parameters (provides the external potential).
         registered_variables: The registered variables.
         G: The gravitational constant.
+        sink_potential: The gravitational potential of the sink particles,
+            with the shape of ``gas_density``, or ``None``. When given, it is
+            added to the total.
 
     Returns:
         The total gravitational potential, with the same shape as gas_density.
@@ -100,6 +106,9 @@ def _compute_total_potential(
             params,
         )
         total_potential = total_potential + external_potential
+
+    if sink_potential is not None:
+        total_potential = total_potential + sink_potential
 
     return total_potential
 
@@ -136,6 +145,25 @@ def _gravitational_acceleration(
         factors=(1.0, -9.0, 45.0, -45.0, 9.0, -1.0),
         axis=spatial_axis,
     ) / (60.0 * grid_spacing)
+
+
+def _second_order_gravitational_acceleration(
+    gravitational_potential: FIELD_TYPE,
+    spatial_axis: int,
+    grid_spacing: float,
+) -> FIELD_TYPE:
+    """
+    Gravitational acceleration at the cell centres from the 2nd-order centred
+    finite difference of the potential, a_i = -(phi_{i+1} - phi_{i-1}) / (2 dx).
+    The classic finite-volume coupling applies it to the gas momentum and the
+    sink particles read it back, so that gas and sinks feel the same field.
+    """
+    return -_stencil_add(
+        gravitational_potential,
+        indices=(1, -1),
+        factors=(1.0, -1.0),
+        axis=spatial_axis,
+    ) / (2 * grid_spacing)
 
 
 def _potential_at_right_face(
@@ -219,6 +247,7 @@ def _fd_gravity_source(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
+    sink_potential=None,
 ):
     """
     Build the finite-difference self-gravity source term for the full state.
@@ -228,7 +257,9 @@ def _fd_gravity_source(
     configured coupling (``SIMPLE_SOURCE`` or one of the conservative,
     flux-based schemes). With ``GravityConfig.work_flux_correction`` the
     potential-energy flux of the conservative couplings is then limited (see
-    ``_flux_correct_gravitational_work``).
+    ``_flux_correct_gravitational_work``). The potential of the sink
+    particles, when given, acts on the gas through the simple source
+    whatever the coupling.
 
     Args:
         primitive_state: The primitive state array.
@@ -240,6 +271,8 @@ def _fd_gravity_source(
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles, or
+            ``None``.
 
     Returns:
         The full-state source term to be added over this time step.
@@ -384,6 +417,28 @@ def _fd_gravity_source(
             params,
             registered_variables,
         )
+
+    # The potential of the sinks is external to the gas, so it does work
+    # ρ v · a on the gas. The conservative couplings treat their potential as
+    # self-gravity, and in the deep well of a sink their energy source drains
+    # the internal energy of the gas next to it. The momentum source keeps the
+    # 6th-order difference of every coupling, which the sinks read back.
+    if sink_potential is not None:
+        density = primitive_state[registered_variables.density_index]
+        for spatial_axis in range(config.dimensionality):
+            momentum_index = _component_index(registered_variables.momentum_index, spatial_axis)
+            velocity_index = _component_index(registered_variables.velocity_index, spatial_axis)
+            sink_acceleration = _gravitational_acceleration(
+                sink_potential,
+                spatial_axis,
+                grid_spacing,
+            )
+            gravity_source = gravity_source.at[momentum_index].add(
+                density * sink_acceleration * dt
+            )
+            gravity_source = gravity_source.at[registered_variables.energy_index].add(
+                density * primitive_state[velocity_index] * sink_acceleration * dt
+            )
 
     return gravity_source
 
@@ -713,14 +768,11 @@ def _gravitational_source_term_along_axis(
     density = primitive_state[registered_variables.density_index]
     velocity = primitive_state[velocity_index]
 
-    # 2nd-order centred gravitational acceleration,
-    # a_i = -(phi_{i+1} - phi_{i-1}) / (2 dx).
-    acceleration = -_stencil_add(
+    acceleration = _second_order_gravitational_acceleration(
         gravitational_potential,
-        indices=(1, -1),
-        factors=(1.0, -1.0),
-        axis=spatial_axis,
-    ) / (2 * grid_spacing)
+        spatial_axis,
+        grid_spacing,
+    )
 
     source_term = jnp.zeros_like(primitive_state)
     source_term = source_term.at[momentum_index].set(density * acceleration)

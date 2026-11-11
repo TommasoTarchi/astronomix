@@ -84,6 +84,7 @@ def _evolve_state_fd(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_potential=None,
 ) -> STATE_TYPE:
     """
     Advance the primitive state by one finite-difference time step.
@@ -103,6 +104,8 @@ def _evolve_state_fd(
         params: The simulation parameters.
         helper_data: The helper data.
         registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            which acts on the gas together with its own gravity, or ``None``.
 
     Returns:
         The primitive state after one time step.
@@ -269,6 +272,7 @@ def _evolve_state_fd(
             config,
             registered_variables,
             internal_energy_density=internal_energy_density,
+            sink_potential=sink_potential,
         )
 
         # back to primitive state
@@ -327,6 +331,7 @@ def _evolve_state_fd(
             config,
             registered_variables,
             internal_energy_density=internal_energy_density,
+            sink_potential=sink_potential,
         )
 
         primitive_state = primitive_state_from_conserved(
