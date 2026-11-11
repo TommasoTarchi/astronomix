@@ -47,12 +47,12 @@ class SinkParticleConfig(NamedTuple):
     #: more slots, the run stops with an error. Sinks passed into a run, or
     #: restored from a checkpoint, with fewer slots get empty slots appended;
     #: with more slots, the run does not start.
-    max_num_sinks: int = 64
+    max_num_sinks: int = 256
 
     #: Maximum number of cells that can be examined per time step with the
     #: control-volume checks (Jeans instability, bound state, proximity).
     #: Cells beyond this number are ignored for that step (with a warning).
-    max_num_candidates: int = 64
+    max_num_candidates: int = 128
 
     #: Accretion radius r_acc in units of the grid spacing. It sets both the
     #: radius of the control volume and the density threshold. Federrath et
