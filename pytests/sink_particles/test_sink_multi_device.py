@@ -13,7 +13,7 @@ check runs this file as a script in a fresh process, with
 Pallas kernels do not run on CPU devices. The pytest process itself does not
 use JAX. A check can also be run by hand::
 
-    python pytests/sink_particles/sink_multi_device.py same_result
+    python pytests/sink_particles/test_sink_multi_device.py same_result
 """
 
 # general
@@ -297,11 +297,19 @@ def _check_no_full_grid_all_gather():
     with mesh, pallas_mesh_context(mesh):
         programs = {
             "formation": form.lower(
-                primitive_state, sink_particles, config, params, registered_variables
+                primitive_state,
+                sink_particles,
+                config,
+                params,
+                registered_variables,
             ).compile(),
         }
         new_sinks, num_active_sinks = form(
-            primitive_state, sink_particles, config, params, registered_variables
+            primitive_state,
+            sink_particles,
+            config,
+            params,
+            registered_variables,
         )
         programs["accretion"] = accrete.lower(
             primitive_state,
