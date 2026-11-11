@@ -81,8 +81,21 @@ def _gravity_source_presolve(
 
     The source depends only on the pre-hydro state, so it is evaluated before
     the hydro update and added to the post-hydro state by
-    ``_apply_gravity_source``. ``sink_potential``, the gravitational potential
-    of the sink particles or ``None``, is added to the potential of the gas.
+    ``_apply_gravity_source``.
+
+    Args:
+        primitive_state: The primitive state.
+        dt: The time step.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        helper_data: The helper data.
+        registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            added to the potential of the gas, or ``None``.
+
+    Returns:
+        The self-gravity source of the conserved state over ``dt``.
     """
     return _time_integrator_sources(
         conserved_state_from_primitive(
@@ -258,6 +271,26 @@ def _evolve_gas_state_split(
     registered_variables: RegisteredVariables,
     sink_potential=None,
 ) -> STATE_TYPE:
+    """
+    Advance the gas by one dimensionally split (Strang) finite-volume step.
+    With gravity, the self-gravity source is built from the state before the
+    hydro update (``_gravity_source_presolve``) and added after it
+    (``_apply_gravity_source``).
+
+    Args:
+        primitive_state: The primitive state.
+        dt: The time step.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        helper_data: The helper data.
+        registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            added to the potential of the gas, or ``None``.
+
+    Returns:
+        The primitive state after the step.
+    """
     if config.dimensionality == 1:
         if config.gravity_config.gravity:
             gravity_source = _gravity_source_presolve(
@@ -538,7 +571,25 @@ def _evolve_gas_state_unsplit(
     registered_variables: RegisteredVariables,
     sink_potential=None,
 ) -> STATE_TYPE:
+    """
+    Advance the gas by one unsplit finite-volume step with SSP-RK2. With
+    gravity, the self-gravity source is built from the state before the
+    hydro update (``_gravity_source_presolve``).
 
+    Args:
+        primitive_state: The primitive state.
+        dt: The time step.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        helper_data: The helper data.
+        registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            added to the potential of the gas, or ``None``.
+
+    Returns:
+        The primitive state after the step.
+    """
     if config.gravity_config.gravity:
         gravity_source = _gravity_source_presolve(
             primitive_state,
@@ -611,6 +662,25 @@ def _evolve_state_fv(
     registered_variables: RegisteredVariables,
     sink_potential=None,
 ) -> STATE_TYPE:
+    """
+    Advance the primitive state by one finite-volume step: VL2, or the split
+    or unsplit gas update, with the magnetic-field update in between two
+    half steps of the gas for MHD.
+
+    Args:
+        primitive_state: The primitive state.
+        dt: The time step.
+        gamma: The adiabatic index.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        helper_data: The helper data.
+        registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            added to the potential of the gas, or ``None``.
+
+    Returns:
+        The primitive state after the step.
+    """
     # The AthenaPK-equivalent VL2 scheme (hydro and GLM-MHD) replaces the whole
     # finite-volume step with its own Cartesian update, including Athena++'s
     # self-gravity coupling. It has no geometric source terms (applied by the

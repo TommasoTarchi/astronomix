@@ -1201,6 +1201,7 @@ def _lsrk4_with_ct(
         grid_spacing,
         params,
         helper_data,
+        sink_potential,
     ):
         """Compute ``dq_new = a_coef * dq + dt * L_q`` (in-place via the
         Pallas div-axis accumulator when available) and the three
@@ -1214,7 +1215,10 @@ def _lsrk4_with_ct(
         ``rhs_q`` → ``dq = a_coef * dq + rhs_q`` pattern.
 
         ``kept_halo_path`` (static) selects the multi-GPU fast path described
-        above; both paths compute the same stage.
+        above; both paths compute the same stage. The fast path runs inside
+        the ``jax.custom_jvp`` of ``diffable_pallas_call_n``, which cannot
+        differentiate through values read from the enclosing scope, so every
+        traced input, ``sink_potential`` included, is an argument.
         """
         dtdx = dt / grid_spacing
         dtdy = dt / grid_spacing
@@ -1589,7 +1593,20 @@ def _lsrk4_with_ct(
 
     def compute_lqs(current_q, bx, by, bz, dq, a_coef):
         """The stage increments of ``stage_rhs``, on the fast path if it applies."""
-        primals = (current_q, bx, by, bz, dq, a_coef, dt, gamma, grid_spacing, params, helper_data)
+        primals = (
+            current_q,
+            bx,
+            by,
+            bz,
+            dq,
+            a_coef,
+            dt,
+            gamma,
+            grid_spacing,
+            params,
+            helper_data,
+            sink_potential,
+        )
         if not use_kept_x_flux_halo:
             return stage_rhs(False, *primals)
         # The kept-halo kernels call Pallas outside the differentiable

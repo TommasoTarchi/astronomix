@@ -341,12 +341,14 @@ def test_forward_and_reverse_agree():
         """The outputs of the reverse-mode configuration."""
         return _outputs(inputs, False, BACKWARDS)
 
-    _, jacobian_direction = jax.jit(
+    jacobian_vector_product = jax.jit(
         lambda inputs, direction: jax.jvp(forward_outputs, (inputs,), (direction,))
-    )(inputs, direction)
-    (transposed_cotangent,) = jax.jit(
+    )
+    vector_jacobian_product = jax.jit(
         lambda inputs, cotangent: jax.vjp(backward_outputs, inputs)[1](cotangent)
-    )(inputs, cotangent)
+    )
+    _, jacobian_direction = jacobian_vector_product(inputs, direction)
+    (transposed_cotangent,) = vector_jacobian_product(inputs, cotangent)
 
     lhs = float(_tree_dot(transposed_cotangent, direction))
     rhs = float(jnp.vdot(cotangent, jacobian_direction))
