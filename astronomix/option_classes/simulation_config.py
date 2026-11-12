@@ -1022,7 +1022,8 @@ class SimulationConfig(NamedTuple):
 
     #: Call a user given function on the snapshot data,
     #: e.g. for saving or plotting. Must have signature
-    #: callback(time, state, registered_variables).
+    #: callback(time, state, registered_variables); with sink particles on,
+    #: it is also given the keyword argument sink_particles.
     activate_snapshot_callback: bool = False
 
     #: Return snapshots at specific time points.
@@ -1710,7 +1711,19 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
             raise ValueError("accretion_distance_cutoff_factor must be positive.")
         if sink_particle_config.radial_velocity_tolerance_in_sound_speeds < 0.0:
             raise ValueError(
-                "radial_velocity_tolerance_in_sound_speeds must not be negative."
+                "radial_velocity_tolerance_in_sound_speeds must not be negative."    
+            )
+        # The potential-minimum check shifts the potential with periodic rolls
+        # over the padded grid, so its reach must stay inside the ghost layer.
+        accretion_radius_in_cells = sink_particle_config.accretion_radius_in_cells
+        if (
+            config.boundary_handling == GHOST_CELLS
+            and math.floor(accretion_radius_in_cells) > config.num_ghost_cells
+        ):
+            raise ValueError(
+                f"accretion_radius_in_cells = {accretion_radius_in_cells} reaches "
+                f"beyond the ghost layer of num_ghost_cells = "
+                f"{config.num_ghost_cells} cells."
             )
 
     return config

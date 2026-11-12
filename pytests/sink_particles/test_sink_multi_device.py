@@ -9,13 +9,11 @@ reproduces an uninterrupted run.
 The number of simulated devices can only be set before JAX starts, so each
 check runs this file as a script in a fresh process, with
 ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` and
-``JAX_PLATFORMS=cpu``. The checks use the native JAX backend: the Pallas
-kernels do not run on CPU devices, and the default ``OPTIMAL_BACKEND`` would
-still pick Pallas on a machine with a GPU, since it decides from
-``nvidia-smi``, not from the devices JAX runs on. The pytest process itself
-does not use JAX. A check can also be run by hand::
+``JAX_PLATFORMS=cpu``. The checks set the native JAX backend, since the
+Pallas kernels do not run on CPU devices. The pytest process itself does not
+use JAX. A check can also be run by hand::
 
-    python pytests/sink_particles/sink_multi_device.py same_result
+    python pytests/sink_particles/test_sink_multi_device.py same_result
 """
 
 # general
@@ -95,8 +93,10 @@ def test_same_result_as_one_device(sinks_passed_in):
 
 
 def test_no_full_grid_all_gather():
-    """One formation call and one accretion call on the split state copy no
-    array with as many elements as the grid to every device. Periodic
+    """One formation call, one accretion call, one sink acceleration, one sum
+    of the gas and sink densities and one sum of the gas and sink potentials
+    on the split state copy no array with as many elements as the grid to
+    every device, and both sums stay split along x like the gas. Periodic
     boundaries, where the Poisson solve is distributed."""
     _assert_check_passes("no_full_grid_all_gather")
 
@@ -216,44 +216,100 @@ def _check_same_result(sink_passed_in):
 
 
 def _check_no_full_grid_all_gather():
-    """Compile one formation call and one accretion call on the split state
-    and fail if any all-gather produces an array with as many elements as the
-    grid."""
+    """Compile one formation call, one accretion call, one sink acceleration,
+    one sum of the gas and sink densities and one sum of the gas and sink
+    potentials on the split state. Fail if any all-gather produces an array
+    with as many elements as the grid, or if either sum is not split along x
+    like the gas.
+
+    The sink density is not compiled on its own: its only inputs are the
+    replicated sinks, so it can produce no all-gather."""
     import re
 
     import jax
     import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec
 
     from astronomix._modules._sink_particles._sink_particle_accretion import (
         _accrete_gas,
     )
+    from astronomix._modules._sink_particles._sink_particle_dynamics import (
+        _sink_acceleration,
+        _sink_density,
+        _sink_potential,
+    )
+    from astronomix._modules._gravity._gravity import _compute_total_potential
     from astronomix._modules._sink_particles._sink_particle_formation import (
         _empty_sink_particles,
         _form_sink_particles,
     )
     from astronomix import NATIVE_JAX
     from astronomix._pallas_helpers import pallas_mesh_context
-    from _sink_helpers import _setup
+    from _sink_helpers import CLUMP_CENTER, _one_sink_at, _setup
 
     mesh, sharding = _mesh_and_sharding()
     state, config, params, registered_variables = _setup(backend=NATIVE_JAX)
     primitive_state = jax.device_put(state.primitive_state, sharding)
     sink_particles = _empty_sink_particles(config, primitive_state.dtype)
     num_cells = int(np.prod(primitive_state.shape[1:]))
+    # A sink at the clump centre, whose cells straddle the boundary between
+    # the second and the third device.
+    clump_sink = _one_sink_at(
+        (CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
+        config,
+        primitive_state.dtype,
+    )
+
+    def gas_plus_sink_density(primitive_state, sink_particles):
+        """The density the Poisson solve sees: gas plus sinks."""
+        return primitive_state[registered_variables.density_index] + _sink_density(
+            sink_particles,
+            primitive_state.shape[1:],
+            config,
+        )
+
+    def gas_plus_sink_potential(primitive_state, sink_particles):
+        """The potential the gas feels in the hydro update: that of the gas
+        plus that of the sinks, solved on its own."""
+        return _compute_total_potential(
+            primitive_state[registered_variables.density_index],
+            config.grid_spacing,
+            config,
+            params,
+            registered_variables,
+            params.gravitational_constant,
+            sink_potential=_sink_potential(
+                sink_particles,
+                primitive_state.shape[1:],
+                config,
+                params,
+            ),
+        )
 
     static = ["config", "registered_variables"]
     form = jax.jit(_form_sink_particles, static_argnames=static)
     accrete = jax.jit(_accrete_gas, static_argnames=static)
+    accelerate = jax.jit(_sink_acceleration, static_argnames=static)
+    add_densities = jax.jit(gas_plus_sink_density)
+    add_potentials = jax.jit(gas_plus_sink_potential)
     # The same mesh contexts as time_integration, so the Poisson solve takes
     # its distributed path.
     with mesh, pallas_mesh_context(mesh):
         programs = {
             "formation": form.lower(
-                primitive_state, sink_particles, config, params, registered_variables
+                primitive_state,
+                sink_particles,
+                config,
+                params,
+                registered_variables,
             ).compile(),
         }
         new_sinks, num_active_sinks = form(
-            primitive_state, sink_particles, config, params, registered_variables
+            primitive_state,
+            sink_particles,
+            config,
+            params,
+            registered_variables,
         )
         programs["accretion"] = accrete.lower(
             primitive_state,
@@ -263,6 +319,31 @@ def _check_no_full_grid_all_gather():
             params,
             registered_variables,
         ).compile()
+        programs["sink acceleration"] = accelerate.lower(
+            primitive_state,
+            clump_sink,
+            config,
+            params,
+            registered_variables,
+        ).compile()
+        programs["gas plus sink density"] = add_densities.lower(
+            primitive_state,
+            clump_sink,
+        ).compile()
+        programs["gas plus sink potential"] = add_potentials.lower(
+            primitive_state,
+            clump_sink,
+        ).compile()
+
+    # Split along x like the gas density, not a full-grid array on every
+    # device.
+    for name in ("gas plus sink density", "gas plus sink potential"):
+        output_sharding = programs[name].output_shardings
+        print(f"{name} sharding:", output_sharding)
+        assert output_sharding.is_equivalent_to(
+            NamedSharding(mesh, PartitionSpec("x", "y", "z")),
+            3,
+        ), f"{name}: {output_sharding}"
 
     # An all-gather line of the compiled program reads
     #   %name = <type>[<dims>]{<layout>} all-gather(...)

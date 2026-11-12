@@ -15,6 +15,10 @@ contains the sink and above the safety density threshold ρ_safe (see
 could otherwise pile up within r_acc, where the proximity check keeps a new
 sink from forming.
 
+Only gas in interior cells is accreted. The cells around a sink wrap around
+periodic axes and end at the edge of the box on non-periodic axes. Reflective
+walls are treated like the other edges: mirrored gas is not counted.
+
 The work is done per sink rather than per cell: each sink gathers the few cells
 around it, so the cost scales with the number of sinks, not with the grid.
 """
@@ -44,6 +48,7 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _density_thresholds,
+    _interior_cell_indices,
     _periodic_box,
     _sound_speed_squared,
 )
@@ -161,31 +166,13 @@ def _accrete_gas(
     sink_is_active = jnp.arange(max_num_sinks) < num_active_sinks
 
     offsets = _accretion_offsets(config)
-    grid_shape = np.array(density.shape)
-    num_interior_cells = grid_shape - 2 * num_ghost_cells
     is_periodic, box_length = _periodic_box(config)
 
     sink_cell = jnp.floor(sink_particles.position / grid_spacing).astype(jnp.int32)
-    interior_index = sink_cell[:, None, :] + offsets[None, :, :]
-
-    # Map every offset to a real (interior) cell. Along a periodic axis the
-    # index wraps around the interior, which reaches the real cell across the
-    # boundary whether or not ghost cells are used (with ghost cells, the
-    # ghost layer only holds copies, which must not be accreted from). Along
-    # a non-periodic axis there is no gas beyond the boundary, so offsets
-    # leaving the interior are dropped.
-    interior_index = jnp.where(
-        is_periodic,
-        interior_index % num_interior_cells,
-        interior_index,
-    )
-    is_real_cell = jnp.all(
-        (interior_index >= 0) & (interior_index < num_interior_cells),
-        axis=-1,
-    )
-    interior_index = jnp.clip(interior_index, 0, num_interior_cells - 1)
-    cell_indices = tuple(
-        interior_index[..., axis] + num_ghost_cells for axis in range(3)
+    cell_indices, interior_index, is_real_cell = _interior_cell_indices(
+        sink_cell[:, None, :] + offsets[None, :, :],
+        density.shape,
+        config,
     )
 
     # Separation from the sink to each cell centre, taken to the nearest
@@ -351,10 +338,10 @@ def _accrete_gas(
 
     # An accreted cell is left at the density threshold. The velocity is
     # unchanged, so the cell's momentum drops with its mass. For an ideal gas
-    # the pressure is scaled with the density, which keeps c_s² (the
-    # temperature) unchanged, as FLASH does at fixed specific internal
-    # energy. The update goes through a grid mask, so that several pairs
-    # pointing to the same cell never write conflicting values.
+    # the pressure and the dual-energy g are scaled with the density, which
+    # keeps c_s² (the temperature) unchanged, as FLASH does at fixed specific
+    # internal energy. The update goes through a grid mask, so that several
+    # pairs pointing to the same cell never write conflicting values.
     cell_is_accreted = jnp.zeros(density.shape, dtype=bool).at[cell_indices].max(
         accreted
     )
@@ -362,10 +349,14 @@ def _accrete_gas(
         jnp.where(cell_is_accreted, density_threshold, density)
     )
     if config.equation_of_state == IDEAL_GAS:
-        pressure = primitive_state[registered_variables.pressure_index]
-        primitive_state = primitive_state.at[registered_variables.pressure_index].set(
-            jnp.where(cell_is_accreted, pressure * density_threshold / density, pressure)
-        )
+        energy_rows = [registered_variables.pressure_index]
+        if registered_variables.internal_energy_active:
+            energy_rows.append(registered_variables.internal_energy_index)
+        for row in energy_rows:
+            energy = primitive_state[row]
+            primitive_state = primitive_state.at[row].set(
+                jnp.where(cell_is_accreted, energy * density_threshold / density, energy)
+            )
 
     # -------------------------------------------------------------
     # ==================== ↑ Gas update ↑ =========================

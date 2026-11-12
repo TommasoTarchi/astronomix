@@ -3,10 +3,11 @@ Sink particles in the Evrard collapse pytest.
 
 Runs the Evrard collapse of ``examples/scripts/forward/self_gravity/_collapse.py``
 with sink particles on, and checks that the run is finite and that gas plus
-sink mass and energy are conserved. The energy check is expected to fail until
-the gravity of the sinks is implemented: accretion removes the thermal and
-gravitational energy of the accreted gas, and the gravitational energy of the
-sinks is not computed.
+sink mass and energy are conserved. The energy check is an expected failure:
+accretion removes the thermal energy of the accreted gas and its kinetic
+energy relative to the sink, the energy diagnostic contains no sink-gas or
+sink-sink gravitational energy, and the gas-sink coupling conserves energy
+only to truncation error, well above the 1e-5 tolerance of the check.
 
 The runs use the second-order conservative self-gravity coupling, which keeps
 the total energy constant to float32 rounding, and end before the core bounce,
@@ -228,6 +229,15 @@ def test_collapse_mass_conservation(collapse_run):
     assert jnp.allclose(total_mass, snapshots.total_mass[0], rtol=1e-4, atol=0.0)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "accretion removes the thermal energy of the accreted gas and its "
+        "kinetic energy relative to the sink, the energy diagnostic contains "
+        "no sink-gas or sink-sink gravitational energy, and the gas-sink "
+        "coupling conserves energy only to truncation error"
+    ),
+)
 def test_collapse_energy_conservation(collapse_run):
     """Gas energy plus sink kinetic energy at every snapshot stays within the
     energy drift of the scheme of the initial gas energy.

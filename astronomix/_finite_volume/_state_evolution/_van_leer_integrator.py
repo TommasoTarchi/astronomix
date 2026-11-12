@@ -776,6 +776,7 @@ def _vl2_gravitational_potential(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
+    sink_potential=None,
 ):
     """
     The total gravitational potential (self-gravity and external) of a density
@@ -786,6 +787,8 @@ def _vl2_gravitational_potential(
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            which acts on the gas together with its own gravity, or ``None``.
 
     Returns:
         The potential, shaped like the density.
@@ -797,6 +800,7 @@ def _vl2_gravitational_potential(
         params,
         registered_variables,
         params.gravitational_constant,
+        sink_potential=sink_potential,
     )
 
 
@@ -813,6 +817,7 @@ def _vl2_stage(
     registered_variables: RegisteredVariables,
     stage_potential=None,
     initial_potential=None,
+    sink_potential=None,
 ):
     """
     One VL2 stage (native JAX): ``U = U_base - beta dt L(W_stage)``, the
@@ -834,6 +839,8 @@ def _vl2_stage(
             only).
         initial_potential: The potential at the start of the step, ``t^n``
             (gravity with the time-centred energy source only).
+        sink_potential: The gravitational potential of the sink particles,
+            added to the potential at the end of the stage, or ``None``.
 
     Returns:
         The primitive state after the stage, and the potential of the stage's
@@ -884,6 +891,7 @@ def _vl2_stage(
                 config,
                 params,
                 registered_variables,
+                sink_potential=sink_potential,
             )
             work_potential = 0.5 * (initial_potential + end_potential)
         conserved_state = _add_athena_gravity_source(
@@ -1089,6 +1097,7 @@ def _evolve_state_vl2(
     params: SimulationParams,
     helper_data: HelperData,
     registered_variables: RegisteredVariables,
+    sink_potential=None,
 ) -> STATE_TYPE:
     """
     Advance the primitive state by one VL2 step: a donor-cell predictor to the
@@ -1105,6 +1114,8 @@ def _evolve_state_vl2(
         params: The simulation parameters.
         helper_data: The helper data (unused, kept for the common signature).
         registered_variables: The registered variables.
+        sink_potential: The gravitational potential of the sink particles,
+            added to every potential of the step, or ``None``.
 
     Returns:
         The primitive state ``W^{n+1}``.
@@ -1181,6 +1192,7 @@ def _evolve_state_vl2(
             config,
             params,
             registered_variables,
+            sink_potential=sink_potential,
         )
 
     initial_conserved_state = _conserved_from_primitive_vl2(
@@ -1202,6 +1214,7 @@ def _evolve_state_vl2(
         registered_variables=registered_variables,
         stage_potential=initial_potential,
         initial_potential=initial_potential,
+        sink_potential=sink_potential,
     )
     half_step_primitive_state = _update_ghost_cells(
         half_step_primitive_state,
@@ -1220,6 +1233,7 @@ def _evolve_state_vl2(
             config,
             params,
             registered_variables,
+            sink_potential=sink_potential,
         )
 
     new_primitive_state, _ = _vl2_stage(
@@ -1235,6 +1249,7 @@ def _evolve_state_vl2(
         registered_variables=registered_variables,
         stage_potential=half_step_potential,
         initial_potential=initial_potential,
+        sink_potential=sink_potential,
     )
 
     # --------------- ↑ Native stages ↑ ----------------

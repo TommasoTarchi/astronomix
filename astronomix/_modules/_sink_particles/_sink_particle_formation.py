@@ -13,6 +13,11 @@ candidates, the gas in the control volume around each candidate (all cells
 within the accretion radius r_acc) is gathered and the remaining checks are
 evaluated on it. Candidates that pass every check become new sinks.
 
+Only gas in interior cells counts, as in the accretion step. A control volume
+wraps around periodic axes and ends at the edge of the box on non-periodic
+axes. Reflective walls are treated like the other edges: mirrored gas is not
+counted.
+
 Above a safety density threshold ρ_safe, where the Jeans length is shorter
 than ``safety_jeans_length_in_cells`` cells, the converging flow and bound
 state checks are skipped. Both judge by gas motion, and on a uniform grid they
@@ -55,6 +60,7 @@ from astronomix._pallas_helpers import _current_pallas_mesh
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
+    GHOST_CELLS,
     IDEAL_GAS,
     PERIODIC_BOUNDARY,
     STATE_TYPE,
@@ -67,6 +73,7 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._geometry.boundaries import _axis_slice, _periodic_boundaries
 from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._stencil_operations._stencil_operations import _shift
 
@@ -365,6 +372,95 @@ def _periodic_box(config: SimulationConfig) -> tuple[np.ndarray, np.ndarray]:
     return is_periodic, box_length
 
 
+def _interior_cell_indices(
+    interior_index: jax.Array,
+    grid_shape: tuple,
+    config: SimulationConfig,
+) -> tuple[tuple, jax.Array, jax.Array]:
+    """
+    Map cell indices counted from the first interior cell, which may lie past
+    the edge of the box, to real (interior) cells.
+
+    Along a periodic axis the index wraps around the interior, which reaches
+    the real cell across the boundary whether or not ghost cells are used
+    (the ghost layer only holds copies). Along a non-periodic axis there is no
+    gas beyond the boundary, so indices leaving the interior are invalid. They
+    are clipped into the interior, so that they never read a ghost cell.
+
+    Args:
+        interior_index: The cell indices, shape (..., 3).
+        grid_shape: The shape of a (padded) field.
+        config: The simulation configuration.
+
+    Returns:
+        ``(cell_indices, interior_index, is_real_cell)``: a tuple of three
+        index arrays into the padded field, the wrapped and clipped interior
+        indices, and whether each index is valid, shape (...).
+    """
+    num_ghost_cells = config.num_ghost_cells
+    num_interior_cells = np.array(grid_shape) - 2 * num_ghost_cells
+    is_periodic, _ = _periodic_box(config)
+
+    interior_index = jnp.where(
+        is_periodic,
+        interior_index % num_interior_cells,
+        interior_index,
+    )
+    is_real_cell = jnp.all(
+        (interior_index >= 0) & (interior_index < num_interior_cells),
+        axis=-1,
+    )
+    interior_index = jnp.clip(interior_index, 0, num_interior_cells - 1)
+    cell_indices = tuple(
+        interior_index[..., axis] + num_ghost_cells for axis in range(3)
+    )
+    return cell_indices, interior_index, is_real_cell
+
+
+def _fill_potential_ghost_cells(
+    gravitational_potential: FIELD_TYPE,
+    config: SimulationConfig,
+) -> FIELD_TYPE:
+    """
+    Overwrite the ghost cells of the potential for the potential-minimum check,
+    so that a control volume only compares real cells.
+
+    Along a periodic axis the ghost cells get periodic copies of the interior
+    potential. Along a non-periodic axis they get +∞, which can never be the
+    minimum; this includes the ghost cells that also lie beyond a periodic axis.
+
+    Args:
+        gravitational_potential: The (padded) gravitational potential.
+        config: The simulation configuration.
+
+    Returns:
+        The potential with its ghost cells overwritten.
+    """
+    if config.boundary_handling != GHOST_CELLS:
+        return gravitational_potential
+
+    num_ghost_cells = config.num_ghost_cells
+    num_axes = gravitational_potential.ndim
+    is_periodic, _ = _periodic_box(config)
+    for axis in range(num_axes):
+        if is_periodic[axis]:
+            gravitational_potential = _periodic_boundaries(
+                gravitational_potential,
+                num_ghost_cells,
+                axis=axis,
+            )
+        else:
+            left_ghost_cells = _axis_slice(axis, 0, num_ghost_cells, num_axes)
+            right_ghost_cells = _axis_slice(axis, -num_ghost_cells, None, num_axes)
+            gravitational_potential = (
+                gravitational_potential.at[left_ghost_cells]
+                .set(jnp.inf)
+                .at[right_ghost_cells]
+                .set(jnp.inf)
+            )
+    return gravitational_potential
+
+
 def _select_separated_candidates(
     candidate_passes: jax.Array,
     candidate_positions: jax.Array,
@@ -608,17 +704,22 @@ def _form_sink_particles(
     # =============== ↓ Stage 1: grid-wide checks ↓ ===============
     # -------------------------------------------------------------
 
-    # Density threshold check (Section 2.2.1), gravitational potential
-    # minimum check (Section 2.2.4) and, if converging_flow_check is set,
-    # converging flow check (Section 2.2.3). Ghost cells are excluded, as they
-    # only mirror physical cells or hold boundary values. Above the safety
-    # density threshold, the converging flow check is skipped: in a dense
-    # layer the grid cannot resolve, gas spreading sideways, or shear, can
-    # make a neighbour move away from a collapsing cell.
+    # Density threshold check (Section 2.2.1), converging flow check
+    # (Section 2.2.3) and gravitational potential minimum check (Section
+    # 2.2.4). Ghost cells are excluded, as they only mirror physical cells or
+    # hold boundary values. The converging flow check reads their velocity,
+    # since these ±1 neighbours are what the hydro solver sees at the boundary;
+    # the potential check does not count them as gas. Above the safety density
+    # threshold, the converging flow check is skipped: in a dense layer the grid
+    # cannot resolve, gas spreading sideways, or shear, can make a neighbour
+    # move away from a collapsing cell.
     converging_flow = _converging_flow_mask(velocity)
     candidate_mask = (
         (density > density_threshold)
-        & _potential_minimum_mask(gravitational_potential, offsets)
+        & _potential_minimum_mask(
+            _fill_potential_ghost_cells(gravitational_potential, config),
+            offsets,
+        )
         & _interior_mask(density, config)
     )
     if sink_particle_config.converging_flow_check:
@@ -641,31 +742,38 @@ def _form_sink_particles(
     )
     candidate_is_valid = jnp.arange(max_num_candidates) < num_candidates_found
 
-    # Cell indices of every candidate's control volume. The indices wrap
-    # around the grid, which is the right neighbourhood for periodic
-    # boundaries and never happens for ghost-cell boundaries, where the ghost
-    # layer is wider than the control volume.
-    grid_shape = np.array(density.shape)
-    control_volume_indices = tuple(
-        (candidate_indices[:, None, axis] + offsets[None, :, axis]) % grid_shape[axis]
-        for axis in range(3)
+    # Cell indices of every candidate's control volume. Cells past a
+    # non-periodic boundary get zero volume, and so zero mass, which removes
+    # them from every sum below.
+    control_volume_indices, _, is_real_cell = _interior_cell_indices(
+        candidate_indices[:, None, :] - config.num_ghost_cells + offsets[None, :, :],
+        density.shape,
+        config,
     )
+    cell_volume_in_volume = jnp.where(is_real_cell, cell_volume, 0.0)
 
     # Fields over the control volumes, shape (num_candidates, num_offsets),
     # with a trailing vector axis for the velocity.
     density_in_volume = density[control_volume_indices]
     velocity_in_volume = velocity[control_volume_indices]
-    cell_mass_in_volume = density_in_volume * cell_volume
+    cell_mass_in_volume = density_in_volume * cell_volume_in_volume
     gas_mass_in_volume = jnp.sum(cell_mass_in_volume, axis=-1)
 
     # Centre of the candidate cells, and the centre-of-mass velocity of the
-    # gas in their control volumes (Eq. 12).
+    # gas in their control volumes (Eq. 12). Unused entries of the list point
+    # at the corner of the padded grid, where a control volume can hold no
+    # real cell and so no mass.
     candidate_positions = (candidate_indices - config.num_ghost_cells + 0.5) * grid_spacing
+    safe_gas_mass_in_volume = jnp.where(
+        gas_mass_in_volume > 0.0,
+        gas_mass_in_volume,
+        1.0,
+    )
     center_of_mass_velocity = jnp.einsum(
         "ck,ckd->cd",
         cell_mass_in_volume,
         velocity_in_volume,
-    ) / gas_mass_in_volume[:, None]
+    ) / safe_gas_mass_in_volume[:, None]
 
     # Proximity check (Section 2.2.7): no new sink within r_acc of an existing
     # sink. Along periodic axes the separation is taken to the nearest
@@ -707,9 +815,18 @@ def _form_sink_particles(
     )
 
     potential_in_volume = gravitational_potential[control_volume_indices]
-    maximum_potential_in_volume = jnp.max(potential_in_volume, axis=-1, keepdims=True)
+    maximum_potential_in_volume = jnp.max(
+        jnp.where(is_real_cell, potential_in_volume, -jnp.inf),
+        axis=-1,
+        keepdims=True,
+    )
+    potential_below_maximum = jnp.where(
+        is_real_cell,
+        maximum_potential_in_volume - potential_in_volume,
+        0.0,
+    )
     gravitational_energy_magnitude = jnp.sum(
-        cell_mass_in_volume * (maximum_potential_in_volume - potential_in_volume),
+        cell_mass_in_volume * potential_below_maximum,
         axis=-1,
     )
 
@@ -720,7 +837,7 @@ def _form_sink_particles(
             + primitive_state[registered_variables.magnetic_index.z] ** 2
         )
         magnetic_energy = 0.5 * jnp.sum(
-            magnetic_field_squared[control_volume_indices] * cell_volume,
+            magnetic_field_squared[control_volume_indices] * cell_volume_in_volume,
             axis=-1,
         )
     else:

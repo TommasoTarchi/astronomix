@@ -6,7 +6,8 @@ the creation checks (converging flow, potential minimum, Jeans instability
 with and without a magnetic field, bound state, proximity to existing sinks
 and between sinks formed in the same call), the skipping of the bound state
 check above the safety density threshold, the limit on the number of sink
-slots, and the wrapping of a new sink's position into a periodic box.
+slots, the wrapping of a new sink's position into a periodic box, and the
+control volume at an open boundary.
 """
 
 # ==== GPU selection ====
@@ -20,6 +21,17 @@ import pytest
 
 # jax
 import jax.numpy as jnp
+
+# astronomix containers
+from astronomix.option_classes.simulation_config import BoundarySettings
+
+# astronomix functions
+from astronomix._modules._sink_particles._sink_particle_formation import (
+    _control_volume_offsets,
+    _empty_sink_particles,
+    _form_sink_particles,
+)
+from astronomix.time_stepping.time_integration import _prepare_padded_state
 
 # sink particle test helpers
 from _sink_helpers import (
@@ -378,6 +390,46 @@ def test_magnetic_energy(magnetic_field, expected_num_sinks):
     assert _num_sinks(sink_particles) == expected_num_sinks
 
 
+def test_control_volume_at_open_boundary():
+    """At an open boundary the control volume holds interior cells only, so
+    the starting velocity of a new sink is the mass-weighted mean over them.
+    """
+    # A clump on the first cell along x, in a flow contracting along x. The
+    # ghost cells copy the velocity of the first cell, which differs from the
+    # mean over the interior cells: counting them gives 0.488 instead of 0.480.
+    settings = SETTINGS._replace(
+        boundary_settings=BoundarySettings(),
+        overdensity_center=(0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
+    )
+    state, config, params, registered_variables = _setup(settings=settings)
+    state = _with_linear_velocity(state, registered_variables, (-1.0, 0.0, 0.0))
+    primitive_state = _prepare_padded_state(
+        state.primitive_state,
+        config,
+        params,
+        registered_variables,
+    )
+
+    # Formation alone, since accretion changes the velocity of the sink.
+    sink_particles, num_active_sinks = _form_sink_particles(
+        primitive_state,
+        _empty_sink_particles(config, primitive_state.dtype),
+        config,
+        params,
+        registered_variables,
+    )
+
+    offsets = _control_volume_offsets(config)
+    interior_offsets = offsets[offsets[:, 0] >= 0]
+    cells = tuple((interior_offsets + (0, NUM_CELLS // 2, NUM_CELLS // 2)).T)
+    density = state.primitive_state[registered_variables.density_index][cells]
+    velocity_x = state.primitive_state[registered_variables.velocity_index.x][cells]
+    expected_velocity_x = jnp.sum(density * velocity_x) / jnp.sum(density)
+
+    assert num_active_sinks == 1
+    assert jnp.allclose(sink_particles.velocity[0, 0], expected_velocity_x)
+
+
 def test_error_when_sink_slots_full():
     """When a new sink passes every check but all slots are taken, the run
     stops with an error, since the sink and its gas would otherwise be lost."""
@@ -413,4 +465,5 @@ if __name__ == "__main__":
     test_bound_state(50.0, False, 1)
     test_magnetic_energy(1.0, 1)
     test_magnetic_energy(30.0, 0)
+    test_control_volume_at_open_boundary()
     test_error_when_sink_slots_full()

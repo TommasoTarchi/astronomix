@@ -80,6 +80,13 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
     _pad_sink_particles,
 )
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
+from astronomix._modules._sink_particles._sink_particle_dynamics import (
+    _drift,
+    _kick,
+    _sink_acceleration,
+    _sink_potential,
+    _sink_time_step,
+)
 from astronomix._snapshotting._snapshot_diagnostics import (
     build_snapshot_store,
     record_snapshot,
@@ -235,6 +242,11 @@ def time_integration(
     the time integration see the simulation configuration and
     the simulation parameters.
 
+    With sink particles on (``SinkParticleConfig``), the sinks move with a
+    kick-drift-kick leapfrog around every hydro step, and adaptive steps are
+    also limited so that no sink moves more than half a cell per step
+    (Federrath et al. 2010, Eq. 22). Fixed-step runs do not apply that limit.
+
     Args:
         primitive_state: The primitive state array, or a
             :class:`StateStruct` wrapping it when ``config.state_struct``
@@ -259,6 +271,10 @@ def time_integration(
             To avoid moving large amounts of data to the host, only pass
             the necessary data to the function in the jax.debug.callback call,
             e.g. only the slice or summary statistics you need.
+            With sink particles on, the callable is also given the sinks,
+            as the keyword argument ``sink_particles`` (a
+            :class:`SinkParticles` with all ``max_num_sinks`` slots; empty
+            slots have zero mass), so it must accept it.
         sharding: The sharding to use for the padded helper data. If None,
                   no sharding is applied.
         restart_state: An optional :class:`LoopState` providing the PRNG key
@@ -605,6 +621,70 @@ def _seed_internal_energy(primitive_state, params, registered_variables):
     )
 
 
+def _fill_ghost_cells(primitive_state, config, params, registered_variables):
+    """
+    Fill the ghost cells of a padded primitive state via the boundary handler.
+
+    The gas boundary handler must not touch the three-component magnetic block
+    that the FV (PPCT) and FD MHD layouts keep behind the gas variables (the FD
+    integrators fill the interface field's ghost cells before every stage); the
+    VL2 GLM-MHD layout is cell centred throughout and handled as a whole.
+
+    Args:
+        primitive_state: The padded primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The padded primitive state with filled ghost cells.
+    """
+    if config.mhd and not registered_variables.magnetic_psi_active:
+        if config.solver_mode == FINITE_DIFFERENCE:
+            # FD MHD layout: gas and cell-centred field, the interface field,
+            # then the optional dual-energy g and passive scalars. The trailing
+            # rows behind the interface field are scalars that keep their sign
+            # at a reflective wall, so they get the passive-scalar boundary
+            # fill. For open, periodic and reflective boundaries this gives g
+            # the same ghost cells as deriving it from the filled pressure, as
+            # the step does.
+            interface_field_start = registered_variables.interface_magnetic_field_index.x
+            trailing_rows_start = interface_field_start + 3
+            primitive_state = primitive_state.at[:interface_field_start, ...].set(
+                _boundary_handler(
+                    primitive_state[:interface_field_start, ...],
+                    config,
+                    registered_variables,
+                    params,
+                )
+            )
+            if primitive_state.shape[0] > trailing_rows_start:
+                primitive_state = primitive_state.at[trailing_rows_start:, ...].set(
+                    _fill_scalar_ghost_cells(
+                        primitive_state[trailing_rows_start:, ...],
+                        config,
+                    )
+                )
+            return primitive_state
+
+        # FV (PPCT) layout: the magnetic field in the last three slots.
+        return primitive_state.at[:-3, ...].set(
+            _boundary_handler(
+                primitive_state[:-3, ...],
+                config,
+                registered_variables,
+                params,
+            )
+        )
+
+    return _boundary_handler(
+        primitive_state,
+        config,
+        registered_variables,
+        params,
+    )
+
+
 def _prepare_padded_state(primitive_state, config, params, registered_variables):
     """
     Pad the primitive state with ghost cells and fill them via the boundary
@@ -634,56 +714,15 @@ def _prepare_padded_state(primitive_state, config, params, registered_variables)
     if config.boundary_handling != PERIODIC_ROLL:
         primitive_state = _pad(primitive_state, config)
 
+    # The ghost cells are filled before the first time-step estimate, so that
+    # active boundaries enter the CFL criterion.
     if config.boundary_handling == GHOST_CELLS:
-        # Fill the ghost cells before the first time-step estimate, so that
-        # active boundaries enter the CFL criterion. The gas boundary handler
-        # must not touch the three-component magnetic block that the FV (PPCT)
-        # and FD MHD layouts keep behind the gas variables (the FD integrators
-        # fill the interface field's ghost cells before every stage); the VL2
-        # GLM-MHD layout is cell centred throughout and handled as a whole.
-        if config.mhd and not registered_variables.magnetic_psi_active:
-            if config.solver_mode == FINITE_DIFFERENCE:
-                # FD MHD layout: gas and cell-centred field, the interface
-                # field, then the optional dual-energy g and passive scalars.
-                # The trailing rows behind the interface field are scalars
-                # that keep their sign at a reflective wall, so they get the
-                # passive-scalar boundary fill. For open, periodic and
-                # reflective boundaries this gives g the same ghost cells as
-                # deriving it from the filled pressure, as the step does.
-                interface_field_start = registered_variables.interface_magnetic_field_index.x
-                trailing_rows_start = interface_field_start + 3
-                primitive_state = primitive_state.at[:interface_field_start, ...].set(
-                    _boundary_handler(
-                        primitive_state[:interface_field_start, ...],
-                        config,
-                        registered_variables,
-                        params,
-                    )
-                )
-                if primitive_state.shape[0] > trailing_rows_start:
-                    primitive_state = primitive_state.at[trailing_rows_start:, ...].set(
-                        _fill_scalar_ghost_cells(
-                            primitive_state[trailing_rows_start:, ...],
-                            config,
-                        )
-                    )
-            else:
-                # FV (PPCT) layout: the magnetic field in the last three slots.
-                primitive_state = primitive_state.at[:-3, ...].set(
-                    _boundary_handler(
-                        primitive_state[:-3, ...],
-                        config,
-                        registered_variables,
-                        params,
-                    )
-                )
-        else:
-            primitive_state = _boundary_handler(
-                primitive_state,
-                config,
-                registered_variables,
-                params,
-            )
+        primitive_state = _fill_ghost_cells(
+            primitive_state,
+            config,
+            params,
+            registered_variables,
+        )
 
     return primitive_state
 
@@ -830,13 +869,16 @@ def _integrate_core(
         """Advance the state by one timestep.
 
         Estimates ``dt``, clamps it to land on the next snapshot time / the
-        end time, runs the per-step modules and evolves the state.  Returns
+        end time, runs the per-step modules and evolves the state.  With sink
+        particles on, the sinks move with a kick-drift-kick leapfrog around
+        the evolve, and then form and accrete from the updated gas.  Returns
         ``(dt, new_state)``; the driver advances the time.
         """
         primitive_state = state.primitive_state
         key = state.key
         forcing = state.forcing
         sink_particles = state.sink_particles
+        sinks_active = config.sink_particle_config.sink_particles
 
         # determine the time step size
         if not config.fixed_timestep:
@@ -888,6 +930,13 @@ def _integrate_core(
                             params.C_cfl,
                         )
                     )
+
+            # No sink may move more than half a cell in one step.
+            if sinks_active:
+                dt = jnp.minimum(
+                    dt,
+                    jax.lax.stop_gradient(_sink_time_step(sink_particles, config)),
+                )
         else:
             dt = params.t_end / config.num_timesteps
 
@@ -903,9 +952,47 @@ def _integrate_core(
         if config.exact_end_time and not config.use_specific_snapshot_timepoints:
             dt = jnp.minimum(dt, params.t_end - time)
 
+        # The first kick of the sinks takes the acceleration from the gas and
+        # the sinks at the start of the step. It does not depend on the step
+        # size, so a retried step reuses it.
+        if sinks_active:
+            start_acceleration = _sink_acceleration(
+                primitive_state,
+                sink_particles,
+                config,
+                params,
+                registered_variables,
+            )
+
         def advance(step_size):
             """The per-step modules and the evolve over ``step_size``, from the
-            state, PRNG key and forcing at the start of the step."""
+            state, PRNG key, forcing and sinks at the start of the step. With
+            sink particles on, the sinks get a half kick and a half drift
+            before the per-step modules, so that the whole hydro update feels
+            them at their mid-step positions, and a half drift and a half kick
+            after the evolve, with the acceleration of the updated gas and the
+            sinks at their end positions."""
+
+            # --------------- ↓ First kick and half drift ↓ ----------------
+
+            sink_potential = None
+            if sinks_active:
+                mid_step_sinks = _drift(
+                    _kick(sink_particles, start_acceleration, 0.5 * step_size),
+                    0.5 * step_size,
+                    config,
+                )
+                # The sinks keep their mid-step positions for the whole hydro
+                # update, so their potential is solved once for the step.
+                sink_potential = _sink_potential(
+                    mid_step_sinks,
+                    primitive_state.shape[1:],
+                    config,
+                    params,
+                )
+
+            # --------------- ↑ First kick and half drift ↑ ----------------
+
             new_key, new_forcing, new_state = _iteration_level_updates(
                 primitive_state,
                 key,
@@ -926,6 +1013,7 @@ def _integrate_core(
                     params,
                     helper_data_pad,
                     registered_variables,
+                    sink_potential=sink_potential,
                 )
             elif config.solver_mode == FINITE_DIFFERENCE:
                 new_state = _evolve_state_fd(
@@ -936,8 +1024,26 @@ def _integrate_core(
                     params,
                     helper_data_pad,
                     registered_variables,
+                    sink_potential=sink_potential,
                 )
-            return new_key, new_forcing, new_state
+
+            # --------------- ↓ Second half drift and kick ↓ ---------------
+
+            new_sinks = sink_particles
+            if sinks_active:
+                end_sinks = _drift(mid_step_sinks, 0.5 * step_size, config)
+                end_acceleration = _sink_acceleration(
+                    new_state,
+                    end_sinks,
+                    config,
+                    params,
+                    registered_variables,
+                )
+                new_sinks = _kick(end_sinks, end_acceleration, 0.5 * step_size)
+
+            # --------------- ↑ Second half drift and kick ↑ ---------------
+
+            return new_key, new_forcing, new_state, new_sinks
 
         if config.positivity_config.step_retry:
             # Repeat a step that left a non-finite value or a non-positive
@@ -955,22 +1061,38 @@ def _integrate_core(
                 return admissible_state
 
             def retry_pending(carry):
-                attempt, _, _, _, _, accepted = carry
+                attempt, _, _, _, _, _, accepted = carry
                 return jnp.logical_not(accepted) & (attempt <= MAXIMUM_STEP_RETRIES)
 
             def attempt_step(carry):
-                attempt, step_size, _, _, _, _ = carry
+                attempt, step_size, _, _, _, _, _ = carry
                 step_size = jnp.where(attempt == 0, step_size, 0.5 * step_size)
-                new_key, new_forcing, new_state = advance(step_size)
-                return attempt + 1, step_size, new_key, new_forcing, new_state, admissible(new_state)
+                new_key, new_forcing, new_state, new_sinks = advance(step_size)
+                return (
+                    attempt + 1,
+                    step_size,
+                    new_key,
+                    new_forcing,
+                    new_state,
+                    new_sinks,
+                    admissible(new_state),
+                )
 
-            _, dt, key, forcing, primitive_state, _ = jax.lax.while_loop(
+            _, dt, key, forcing, primitive_state, sink_particles, _ = jax.lax.while_loop(
                 retry_pending,
                 attempt_step,
-                (jnp.asarray(0), dt, key, forcing, primitive_state, jnp.asarray(False)),
+                (
+                    jnp.asarray(0),
+                    dt,
+                    key,
+                    forcing,
+                    primitive_state,
+                    sink_particles,
+                    jnp.asarray(False),
+                ),
             )
         else:
-            key, forcing, primitive_state = advance(dt)
+            key, forcing, primitive_state, sink_particles = advance(dt)
 
         # AthenaPK floors the density in every stage's conversion to
         # primitives, so its time step and output see the floored state; the
@@ -1004,6 +1126,16 @@ def _integrate_core(
                 params,
                 registered_variables,
             )
+
+            # Accretion changes interior cells, and the next step can read the
+            # ghost cells before its first refill.
+            if config.boundary_handling == GHOST_CELLS:
+                primitive_state = _fill_ghost_cells(
+                    primitive_state,
+                    config,
+                    params,
+                    registered_variables,
+                )
 
         return dt, LoopState(primitive_state, key, forcing, sink_particles)
 
@@ -1056,9 +1188,19 @@ def _integrate_core(
         NOTE: to pass data to the host, the callable must use
         ``jax.debug.callback`` internally, and should only pass the slice /
         summary statistics actually needed to avoid moving large arrays.
+        With sink particles on, the sinks are also passed, as the keyword
+        argument ``sink_particles``.
         """
         primitive_state = state.primitive_state
-        snapshot_callable(time, primitive_state, registered_variables)
+        if config.sink_particle_config.sink_particles:
+            snapshot_callable(
+                time,
+                primitive_state,
+                registered_variables,
+                sink_particles=state.sink_particles,
+            )
+        else:
+            snapshot_callable(time, primitive_state, registered_variables)
         return store
 
     def _should_record_callback(time, idx):
