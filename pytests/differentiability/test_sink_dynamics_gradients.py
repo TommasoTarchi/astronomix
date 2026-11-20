@@ -20,21 +20,14 @@ What is checked:
   JVP (while loop) and the ``BACKWARDS`` VJP (checkpointed while loop), with
   adaptive steps.
 
-Run on the CPU (the preamble then selects fast-compiling XLA flags)::
+Run on the CPU with::
 
     JAX_PLATFORMS=cpu python -m pytest pytests/differentiability/test_sink_dynamics_gradients.py
 """
 
 # ==== GPU selection ====
 import os
-if os.environ.get("JAX_PLATFORMS") == "cpu":
-    # XLA:CPU compiles the unrolled step in seconds at optimisation level 0
-    # (minutes and tens of GB otherwise); the numerics differ at round-off only.
-    os.environ.setdefault(
-        "XLA_FLAGS",
-        "--xla_backend_optimization_level=0 --xla_llvm_disable_expensive_passes=true",
-    )
-elif os.environ.get("CUDA_VISIBLE_DEVICES") is None:
+if os.environ.get("JAX_PLATFORMS") != "cpu" and os.environ.get("CUDA_VISIBLE_DEVICES") is None:
     from autocvd import autocvd
     autocvd(num_gpus=1)
 # ruff: noqa: E402

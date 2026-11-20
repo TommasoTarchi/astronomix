@@ -48,6 +48,7 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 # astronomix functions
 from astronomix._geometry.boundaries import _axis_slice, _periodic_boundaries
 from astronomix._modules._gravity._gravity import _compute_total_potential
+from astronomix._modules._sink_particles._sink_particle_dynamics import _sink_density
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _collect_candidates,
     _control_volume_energies,
@@ -230,11 +231,12 @@ def _form_sink_particles(
         params,
     )
 
-    # The gravitational potential of the gas (plus any external potential),
-    # from a Poisson solve on the updated density. The hydro update computes it
-    # internally but does not return it, and for intermediate states only.
+    # The gravitational potential of the gas and the sinks (plus any external
+    # potential), from one Poisson solve of the updated gas density plus the
+    # sinks' masses spread with the TSC weights of their motion, so that the
+    # checks feel the sinks that already exist.
     gravitational_potential = _compute_total_potential(
-        density,
+        density + _sink_density(sink_particles, density.shape, config),
         grid_spacing,
         config,
         params,
