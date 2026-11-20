@@ -93,8 +93,9 @@ from astronomix._modules._sink_particles._sink_particle_dynamics import (
     _sink_potential,
     _tsc_weights,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
+    _pad_sink_particles,
 )
 from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
     SinkFormationSettings,
@@ -677,7 +678,11 @@ def test_kick_and_drift_skip_empty_slots():
     masses = [0.5, 0.8]
     positions = np.array([[0.95, 0.5, 0.5], [0.4, 0.97, 0.3]])
     velocities = np.array([[2.0, 0.3, -0.1], [0.1, 1.5, 0.2]])
-    sink_particles = _sinks(masses, positions, config, velocities=velocities)
+    # Completed as at the start of a run: the slots with mass are occupied.
+    sink_particles = _pad_sink_particles(
+        _sinks(masses, positions, config, velocities=velocities),
+        config,
+    )
     acceleration = 1.0 + jnp.arange(3.0 * MAX_NUM_SINKS).reshape(MAX_NUM_SINKS, 3)
 
     kicked = _kick(sink_particles, acceleration, time_step)

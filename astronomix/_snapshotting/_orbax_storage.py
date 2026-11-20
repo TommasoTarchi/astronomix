@@ -26,8 +26,10 @@ present; its absence on load is reported as ``driving_state = None``), its key
 as raw key data (``jax.random.key_data`` -> a plain uint32 array tensorstore
 can serialise), rebuilt with ``jax.random.wrap_key_data`` on load. It holds
 modes, not grid cells, and is restored replicated. The sink particles are
-written as the sub-tree ``sink_particles`` (mass, position, velocity), only
-when present; their absence on load is reported as ``None``.
+written as the sub-tree ``sink_particles`` (one entry per field that is set),
+only when present; their absence on load is reported as ``None``. Sinks
+restored without ``activation`` and ``occupied`` are completed from their
+masses when the run starts.
 """
 
 # general
@@ -119,7 +121,11 @@ class _LoopCheckpointWriter:
         if driving_state is not None:
             tree["turbulence_driving"] = driving_state._replace(key=jax.random.key_data(driving_state.key))._asdict()
         if sink_particles is not None:
-            tree["sink_particles"] = sink_particles._asdict()
+            tree["sink_particles"] = {
+                name: field
+                for name, field in sink_particles._asdict().items()
+                if field is not None
+            }
         # Synchronous save; ``force`` overwrites a partially written step dir.
         self._checkpointer.save(self._directory / str(step), tree, force=True)
 

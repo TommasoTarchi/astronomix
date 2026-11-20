@@ -70,7 +70,7 @@ from astronomix import (
     get_registered_variables,
     time_integration,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
 )
 from astronomix.test_setups.self_gravity.sink_particle_formation3D import (

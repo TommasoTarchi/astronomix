@@ -26,11 +26,12 @@ from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
     SinkFormationSettings,
     setup_sink_formation,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
-    _form_sink_particles,
 )
-from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
+from astronomix._modules._sink_particles._sink_particle_update import (
+    _update_sink_particles,
+)
 
 
 NUM_CELLS = 32
@@ -104,17 +105,9 @@ def _update_sinks_once(state, config, params, registered_variables, sink_particl
     """
     if sink_particles is None:
         sink_particles = _empty_sink_particles(config, state.primitive_state.dtype)
-    sink_particles, num_active_sinks = _form_sink_particles(
+    return _update_sink_particles(
         state.primitive_state,
         sink_particles,
-        config,
-        params,
-        registered_variables,
-    )
-    return _accrete_gas(
-        state.primitive_state,
-        sink_particles,
-        num_active_sinks,
         config,
         params,
         registered_variables,
@@ -133,13 +126,21 @@ def _form_sinks_once(state, config, params, registered_variables, sink_particles
     return sink_particles
 
 
+def _with_sink(sink_particles, slot, mass, position):
+    """The sink particles with an active sink at rest of ``mass`` at
+    ``position`` in ``slot``."""
+    return sink_particles._replace(
+        mass=sink_particles.mass.at[slot].set(mass),
+        position=sink_particles.position.at[slot].set(jnp.array(position)),
+        velocity=sink_particles.velocity.at[slot].set(0.0),
+        activation=sink_particles.activation.at[slot].set(1.0),
+        occupied=sink_particles.occupied.at[slot].set(True),
+    )
+
+
 def _one_sink_at(position, config, dtype):
     """Sink particles with a single (unit-mass) sink at ``position``."""
-    sink_particles = _empty_sink_particles(config, dtype)
-    return sink_particles._replace(
-        mass=sink_particles.mass.at[0].set(1.0),
-        position=sink_particles.position.at[0].set(jnp.array(position)),
-    )
+    return _with_sink(_empty_sink_particles(config, dtype), 0, 1.0, position)
 
 
 def _num_sinks(sink_particles):

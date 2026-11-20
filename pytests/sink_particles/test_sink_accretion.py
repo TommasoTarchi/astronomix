@@ -21,7 +21,7 @@ import pytest
 import jax.numpy as jnp
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
 )
 
@@ -38,6 +38,7 @@ from _sink_helpers import (
     _sink_at_clump_center,
     _update_sinks_once,
     _with_linear_velocity,
+    _with_sink,
 )
 
 
@@ -283,13 +284,17 @@ def test_accretion_most_bound_sink():
     heavy_sink_mass = 5.0
     light_sink_mass = 0.05
     sink_particles = _empty_sink_particles(config, dtype)
-    sink_particles = sink_particles._replace(
-        mass=sink_particles.mass.at[0].set(heavy_sink_mass).at[1].set(light_sink_mass),
-        position=sink_particles.position.at[0].set(
-            jnp.array([CLUMP_CENTER - 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
-        ).at[1].set(
-            jnp.array([CLUMP_CENTER + 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
-        ),
+    sink_particles = _with_sink(
+        sink_particles,
+        0,
+        heavy_sink_mass,
+        [CLUMP_CENTER - 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER],
+    )
+    sink_particles = _with_sink(
+        sink_particles,
+        1,
+        light_sink_mass,
+        [CLUMP_CENTER + 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER],
     )
 
     new_primitive_state, new_sink_particles = _update_sinks_once(
@@ -329,9 +334,11 @@ def test_accretion_tie_break():
     # and bind every other cell with exactly the same energy.
     sink_mass = 0.5
     sink_particles = _sink_at_clump_center(sink_mass, config, dtype)
-    sink_particles = sink_particles._replace(
-        mass=sink_particles.mass.at[1].set(sink_mass),
-        position=sink_particles.position.at[1].set(sink_particles.position[0]),
+    sink_particles = _with_sink(
+        sink_particles,
+        1,
+        sink_mass,
+        sink_particles.position[0],
     )
 
     new_primitive_state, new_sink_particles = _update_sinks_once(

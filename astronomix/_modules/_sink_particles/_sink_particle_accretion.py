@@ -22,9 +22,6 @@ around it, so the cost scales with the number of sinks, not with the grid.
 # general
 from functools import partial
 
-# numerics
-import numpy as np
-
 # jax
 import jax
 import jax.numpy as jnp
@@ -42,7 +39,8 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
+    _accretion_offsets,
     _density_threshold,
     _interior_cell_indices,
     _periodic_box,
@@ -50,41 +48,10 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
 )
 
 
-def _accretion_offsets(config: SimulationConfig) -> np.ndarray:
-    """
-    Integer cell offsets (i, j, k), from the cell containing a sink, of every
-    cell that can lie within the accretion radius of that sink.
-
-    A sink can sit anywhere inside its cell, at most √3/2 cells from the cell
-    centre, so the offsets are those with i² + j² + k² ≤ (r_acc/Δx + √3/2)².
-    Whether a cell is actually within r_acc is checked per sink. The offsets
-    are computed with NumPy at trace time, since they only depend on the
-    static configuration.
-
-    Args:
-        config: The simulation configuration.
-
-    Returns:
-        The offsets, shape (num_offsets, 3), with (0, 0, 0) among them.
-    """
-    reach_in_cells = (
-        config.sink_particle_config.accretion_radius_in_cells + 0.5 * np.sqrt(3.0)
-    )
-    max_offset = int(np.floor(reach_in_cells))
-    offset_range = np.arange(-max_offset, max_offset + 1)
-    offsets = np.stack(
-        np.meshgrid(offset_range, offset_range, offset_range, indexing="ij"),
-        axis=-1,
-    ).reshape(-1, 3)
-    within_reach = np.sum(offsets**2, axis=-1) <= reach_in_cells**2
-    return offsets[within_reach]
-
-
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
 def _accrete_gas(
     primitive_state: STATE_TYPE,
     sink_particles: SinkParticles,
-    num_active_sinks: jax.Array,
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
@@ -95,8 +62,8 @@ def _accrete_gas(
 
     Args:
         primitive_state: The (padded) primitive state.
-        sink_particles: The sink particles, including the new massless ones.
-        num_active_sinks: The number of filled slots, including the new sinks.
+        sink_particles: The sink particles, including the new massless ones;
+            every occupied slot accretes.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -138,10 +105,9 @@ def _accrete_gas(
     # -------------------------------------------------------------
 
     # Each sink gathers the cells around the cell that contains it, giving
-    # arrays of shape (max_num_sinks, num_offsets). The filled slots are
-    # contiguous at the front, so the active sinks are the first ones.
+    # arrays of shape (max_num_sinks, num_offsets).
     max_num_sinks = sink_particle_config.max_num_sinks
-    sink_is_active = jnp.arange(max_num_sinks) < num_active_sinks
+    sink_is_active = sink_particles.occupied
 
     offsets = _accretion_offsets(config)
     is_periodic, box_length = _periodic_box(config)
@@ -335,7 +301,7 @@ def _accrete_gas(
         new_position,
     )
 
-    sink_particles = SinkParticles(
+    sink_particles = sink_particles._replace(
         mass=new_mass,
         position=new_position,
         velocity=sink_particles.velocity + velocity_shift,

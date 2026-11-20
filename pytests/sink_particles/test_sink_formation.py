@@ -26,9 +26,11 @@ from astronomix.option_classes.simulation_config import BoundarySettings
 
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_formation import (
+    _form_sink_particles,
+)
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _control_volume_offsets,
     _empty_sink_particles,
-    _form_sink_particles,
 )
 from astronomix.time_stepping.time_integration import _prepare_padded_state
 
@@ -328,7 +330,7 @@ def test_control_volume_at_open_boundary():
     )
 
     # Formation alone, since accretion changes the velocity of the sink.
-    sink_particles, num_active_sinks = _form_sink_particles(
+    sink_particles = _form_sink_particles(
         primitive_state,
         _empty_sink_particles(config, primitive_state.dtype),
         config,
@@ -336,7 +338,8 @@ def test_control_volume_at_open_boundary():
         registered_variables,
     )
 
-    assert num_active_sinks == 1
+    num_occupied_slots = int(jnp.sum(sink_particles.occupied))
+    assert num_occupied_slots == 1, f"{num_occupied_slots} sinks formed instead of 1"
     sink_cell_x = int(sink_particles.position[0, 0] / CELL_SIZE)
     offsets = _control_volume_offsets(config)
     assert sink_cell_x + int(offsets[:, 0].min()) < 0, (

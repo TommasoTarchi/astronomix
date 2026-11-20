@@ -68,8 +68,9 @@ class SnapshotData(NamedTuple):
     temperature_pdf: jnp.ndarray = None
 
     #: The sink particles at the times the snapshots were taken (when sink
-    #: particles are on): mass of shape (num_snapshots, max_num_sinks),
-    #: position and velocity of shape (num_snapshots, max_num_sinks, 3).
+    #: particles are on): mass, activation and occupied of shape
+    #: (num_snapshots, max_num_sinks), position and velocity of shape
+    #: (num_snapshots, max_num_sinks, 3).
     sink_particles: SinkParticles = None
 
     #: The runtime of the simulation loop.

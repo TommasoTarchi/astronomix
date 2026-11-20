@@ -1214,6 +1214,36 @@ def _required_ghost_cells(config: SimulationConfig) -> int:
     return _rounded_for_kernels(layers, config)
 
 
+def _check_sink_smoothing_parameters(sink_particle_config: SinkParticleConfig) -> None:
+    """
+    Reject smoothing parameters of the sink formation and accretion outside their ranges.
+
+    Raises:
+        ValueError: If a parameter is out of range. Only the sharpness may be infinite (its hard limit).
+    """
+    ranges = {
+        # name: (lowest value, whether the lowest value is allowed, highest value)
+        "creation_margin": (0.0, False, 1.0),
+        "check_width": (0.0, True, math.inf),
+        "spatial_width_in_cells": (0.0, True, 1.0),
+        "sharing_sharpness": (0.0, False, math.inf),
+        "position_update_mass": (0.0, True, math.inf),
+        "recycling_activation": (0.0, True, 1.0),
+        "recycling_mass": (0.0, True, math.inf),
+    }
+    for name, (lowest, lowest_allowed, highest) in ranges.items():
+        value = getattr(sink_particle_config, name)
+        above_lowest = value >= lowest if lowest_allowed else value > lowest
+        finite = name == "sharing_sharpness" or math.isfinite(value)
+        if not (above_lowest and value <= highest and finite):
+            lowest_bracket = "[" if lowest_allowed else "("
+            highest_bracket = ")" if math.isinf(highest) else "]"
+            raise ValueError(
+                f"SinkParticleConfig.{name} = {value} lies outside "
+                f"{lowest_bracket}{lowest}, {highest}{highest_bracket}."
+            )
+
+
 def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
     """Fill in derived configuration fields and validate the configuration.
 
@@ -1879,6 +1909,8 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 "Sink particles require state_struct = True; the sinks are "
                 "passed in and returned in the StateStruct."
             )
+        _check_sink_smoothing_parameters(config.sink_particle_config)
+
         # The potential-minimum check shifts the potential with periodic rolls
         # over the padded grid, so its reach must stay inside the ghost layer.
         accretion_radius_in_cells = config.sink_particle_config.accretion_radius_in_cells

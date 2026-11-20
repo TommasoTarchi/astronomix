@@ -270,9 +270,16 @@ def test_snapshot_callback_receives_sinks():
     after, and at the last call the sinks the run returns."""
     calls = []
 
-    def record_on_host(time, mass, position, velocity):
+    def record_on_host(time, mass, position, velocity, activation, occupied):
         calls.append(
-            (float(time), np.asarray(mass), np.asarray(position), np.asarray(velocity))
+            (
+                float(time),
+                np.asarray(mass),
+                np.asarray(position),
+                np.asarray(velocity),
+                np.asarray(activation),
+                np.asarray(occupied),
+            )
         )
 
     def snapshot_callable(time, primitive_state, registered_variables, sink_particles):
@@ -280,7 +287,7 @@ def test_snapshot_callback_receives_sinks():
 
     final_state = _run_with_snapshot_callback(True, snapshot_callable)
 
-    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, _, _ in calls]
+    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, *_ in calls]
     assert len(calls) >= 5
     assert num_sinks[0] == 0
     assert all(count == 1 for count in num_sinks[1:])
@@ -350,6 +357,70 @@ def test_sink_particle_config_requirements(unsupported_options, state_shape):
 
     with pytest.raises(ValueError):
         finalize_config(config, state_shape)
+
+
+def _sink_config(**sink_particle_options):
+    """A configuration that supports sink particles, with the given
+    ``SinkParticleConfig`` fields."""
+    return SimulationConfig(
+        dimensionality=3,
+        gravity_config=GravityConfig(self_gravity=True),
+        state_struct=True,
+        sink_particle_config=SinkParticleConfig(
+            sink_particles=True,
+            **sink_particle_options,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "out_of_range",
+    [
+        dict(creation_margin=0.0),
+        dict(creation_margin=1.5),
+        dict(check_width=-0.1),
+        dict(check_width=float("inf")),
+        dict(spatial_width_in_cells=1.5),
+        dict(sharing_sharpness=0.0),
+        dict(position_update_mass=-0.01),
+        dict(recycling_activation=1.5),
+        dict(recycling_mass=float("nan")),
+    ],
+    ids=[
+        "creation_margin_zero",
+        "creation_margin_above_one",
+        "check_width_negative",
+        "check_width_infinite",
+        "spatial_width_above_one_cell",
+        "sharing_sharpness_zero",
+        "position_update_mass_negative",
+        "recycling_activation_above_one",
+        "recycling_mass_nan",
+    ],
+)
+def test_smoothing_parameter_out_of_range(out_of_range):
+    """``finalize_config`` rejects a smoothing parameter of the sink formation
+    and accretion outside its range, naming the parameter.
+
+    Args:
+        out_of_range: The ``SinkParticleConfig`` field set out of range.
+    """
+    (name,) = out_of_range
+    with pytest.raises(ValueError, match=name):
+        finalize_config(_sink_config(**out_of_range), (5, 16, 16, 16))
+
+
+def test_smoothing_parameters_at_hard_limit_accepted():
+    """The hard limit of every smoothing parameter, an infinite sharpness
+    included, is a valid configuration."""
+    hard_limit = dict(
+        creation_margin=1.0,
+        check_width=0.0,
+        spatial_width_in_cells=0.0,
+        sharing_sharpness=float("inf"),
+        position_update_mass=0.0,
+    )
+    finalize_config(_sink_config(**hard_limit), (5, 16, 16, 16))
 
 
 if __name__ == "__main__":

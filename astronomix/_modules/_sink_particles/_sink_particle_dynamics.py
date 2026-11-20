@@ -59,7 +59,7 @@ from astronomix._modules._gravity._gravity import (
 from astronomix._modules._gravity._poisson_solver import (
     _compute_gravitational_potential,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _interior_cell_indices,
     _periodic_box,
 )
@@ -318,8 +318,8 @@ def _kick(
     time_step,
 ) -> SinkParticles:
     """
-    Kick the sinks, v ← v + a Δt, in the filled slots. Empty slots keep their
-    zero velocity, whatever acceleration they are given.
+    Kick the sinks, v ← v + a Δt, in the occupied slots. Empty slots keep
+    their zero velocity, whatever acceleration they are given.
 
     Args:
         sink_particles: The sink particles.
@@ -329,10 +329,10 @@ def _kick(
     Returns:
         The sink particles with the kicked velocities.
     """
-    is_filled = sink_particles.mass[:, None] > 0.0
+    is_occupied = sink_particles.occupied[:, None]
     kicked_velocity = sink_particles.velocity + acceleration * time_step
     return sink_particles._replace(
-        velocity=jnp.where(is_filled, kicked_velocity, sink_particles.velocity),
+        velocity=jnp.where(is_occupied, kicked_velocity, sink_particles.velocity),
     )
 
 
@@ -362,11 +362,11 @@ def _drift(
     config: SimulationConfig,
 ) -> SinkParticles:
     """
-    Drift the sinks, x ← x + v Δt, in the filled slots, and wrap them back into
-    the box along periodic axes. Empty slots stay where they are.
+    Drift the sinks, x ← x + v Δt, in the occupied slots, and wrap them back
+    into the box along periodic axes. Empty slots stay where they are.
 
     Along a non-periodic axis a sink may leave the box. It keeps its slot, and
-    a warning is printed for every filled slot that goes from inside to
+    a warning is printed for every occupied slot that goes from inside to
     outside the box in this drift. The warning is printed from inside the
     step, so it is printed again when a step is retried and when the
     checkpointed loop recomputes a step in reverse mode.
@@ -382,7 +382,7 @@ def _drift(
     position = sink_particles.position
     is_periodic, box_length = _periodic_box(config)
     box_length = jnp.asarray(box_length, dtype=position.dtype)
-    is_filled = sink_particles.mass > 0.0
+    is_occupied = sink_particles.occupied
 
     drifted_position = position + sink_particles.velocity * time_step
     wrapped_position = jnp.mod(drifted_position, box_length)
@@ -393,7 +393,7 @@ def _drift(
         wrapped_position,
     )
     drifted_position = jnp.where(is_periodic, wrapped_position, drifted_position)
-    new_position = jnp.where(is_filled[:, None], drifted_position, position)
+    new_position = jnp.where(is_occupied[:, None], drifted_position, position)
 
     def is_inside_box(slot_position):
         """Whether each slot lies inside the box along every non-periodic axis."""
@@ -402,7 +402,7 @@ def _drift(
             axis=-1,
         )
 
-    has_left_box = is_filled & is_inside_box(position) & ~is_inside_box(new_position)
+    has_left_box = is_occupied & is_inside_box(position) & ~is_inside_box(new_position)
     jax.lax.cond(
         jnp.any(has_left_box),
         lambda: jax.debug.callback(
@@ -421,9 +421,9 @@ def _sink_time_step(
     config: SimulationConfig,
 ) -> jax.Array:
     """
-    The largest time step in which no filled slot moves more than
+    The largest time step in which no occupied slot moves more than
     ``MAXIMUM_SINK_DISPLACEMENT_IN_CELLS`` cells, at the largest speed of the
-    filled slots at the start of the step. The kicks change the speed within
+    occupied slots at the start of the step. The kicks change the speed within
     the step, so a sink can move a further ½ |a| Δt².
 
     Only adaptive runs apply this limit; fixed-step runs take the steps they
@@ -434,11 +434,10 @@ def _sink_time_step(
         config: The simulation configuration.
 
     Returns:
-        The time step, or +∞ when no filled slot moves.
+        The time step, or +∞ when no occupied slot moves.
     """
-    is_filled = sink_particles.mass > 0.0
     speed_squared = jnp.where(
-        is_filled,
+        sink_particles.occupied,
         jnp.sum(sink_particles.velocity**2, axis=-1),
         0.0,
     )

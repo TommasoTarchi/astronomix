@@ -25,9 +25,15 @@ class SinkParticles(NamedTuple):
     Sink particle data in fixed-size arrays.
 
     JIT requires array sizes known at compile time, so the arrays always have
-    ``config.sink_particle_config.max_num_sinks`` slots. Sinks are only ever
-    appended, so the filled slots are contiguous at the front; a slot is
-    empty when its mass is zero.
+    ``config.sink_particle_config.max_num_sinks`` slots. An occupied slot
+    holds a candidate, which becomes a sink as its activation grows to 1; a
+    candidate can hold mass before it is fully active. Occupied slots need
+    not be contiguous, and an empty slot is zero in every field.
+
+    ``activation`` and ``occupied`` may be left out (``None``) on sinks given
+    by mass, position and velocity alone, e.g. sinks placed by hand. A run
+    completes them from the masses: a slot with a positive mass holds a sink
+    of activation 1, and the other slots are empty.
     """
 
     #: Sink masses, shape (max_num_sinks,).
@@ -38,6 +44,13 @@ class SinkParticles(NamedTuple):
 
     #: Sink velocities, shape (max_num_sinks, 3).
     velocity: jax.Array
+
+    #: Activation of each slot, from 0 for a new candidate to 1 for a sink,
+    #: shape (max_num_sinks,).
+    activation: Union[jax.Array, NoneType] = None
+
+    #: Whether each slot holds a candidate, shape (max_num_sinks,), boolean.
+    occupied: Union[jax.Array, NoneType] = None
 
 
 class StateStruct(NamedTuple):
@@ -72,8 +85,10 @@ def finalize_state(
         primitive_state: The primitive state array.
         sink_particles: Sinks that already exist when the run starts, e.g. the
             final sinks of an earlier run or sinks placed by hand: arrays
-            ``mass`` (N,), ``position`` (N, 3) and ``velocity`` (N, 3), where a
-            slot with zero mass is empty. N may be smaller than
+            ``mass`` (N,), ``position`` (N, 3) and ``velocity`` (N, 3), and
+            optionally ``activation`` (N,) and ``occupied`` (N,); without the
+            last two, a slot with zero mass is empty and the others hold sinks
+            of activation 1. N may be smaller than
             ``max_num_sinks`` (empty slots are appended when the run starts)
             but not larger. ``None`` starts the run without sinks. A restart
             from disk does not need it: the restored sinks come with the

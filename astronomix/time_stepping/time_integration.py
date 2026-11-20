@@ -83,12 +83,13 @@ from astronomix._modules._turbulence_driving import (
     update_interval,
     velocity_dispersion,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
-    _form_sink_particles,
     _pad_sink_particles,
 )
-from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
+from astronomix._modules._sink_particles._sink_particle_update import (
+    _update_sink_particles,
+)
 from astronomix._modules._sink_particles._sink_particle_dynamics import (
     _drift,
     _kick,
@@ -1131,17 +1132,9 @@ def _integrate_core(
         # sinks form from and accrete the gas as it is at the end of this step.
         # New sinks are created massless and get their mass from the accretion.
         if sinks_active:
-            sink_particles, num_active_sinks = _form_sink_particles(
+            primitive_state, sink_particles = _update_sink_particles(
                 primitive_state,
                 sink_particles,
-                config,
-                params,
-                registered_variables,
-            )
-            primitive_state, sink_particles = _accrete_gas(
-                primitive_state,
-                sink_particles,
-                num_active_sinks,
                 config,
                 params,
                 registered_variables,

@@ -58,3 +58,42 @@ class SinkParticleConfig(NamedTuple):
     #: al. (2010), Section 4.2.1, use r_acc = 2.5 grid cells. With ghost cells,
     #: its integer part must not exceed num_ghost_cells.
     accretion_radius_in_cells: float = 2.5
+
+    # The parameters below set how smooth the formation and accretion are.
+    # Each has a hard limit (given in its description) at which the decisions
+    # are those of the hard checks of Federrath et al. (2010).
+
+    #: Creation margin μ, in (0, 1]: a cell becomes a candidate once its
+    #: density, Jeans and bound-state ratios exceed μ times their thresholds,
+    #: before its gas can activate it. Hard limit 1.
+    creation_margin: float = 0.5
+
+    #: Width ω of the smooth checks, in the units of each check (a density or
+    #: energy ratio, a velocity in units of c_s, a potential in units of
+    #: c_s²); it also sets the temperature ω c_s² of the soft minimum and
+    #: maximum of the potential. Hard limit 0.
+    check_width: float = 0.1
+
+    #: Spatial width ℓ in cells, in [0, 1]: the band of the radial weight
+    #: inside r_acc, the band over which the cell weights pass from one cell
+    #: to the next, and the softening ℓ Δx of a sink's point-mass potential.
+    #: Hard limit 0.
+    spatial_width_in_cells: float = 0.5
+
+    #: Sharpness β of the sharing of a cell's gas between the sinks that can
+    #: accrete it, which favours the sink the gas is most bound to. Hard
+    #: limit ∞.
+    sharing_sharpness: float = 10.0
+
+    #: Mass ε that damps the position update of a sink with almost no mass,
+    #: in units of ρ_thr ΔV at the sink. Hard limit 0.
+    position_update_mass: float = 0.01
+
+    #: A candidate with an activation below this value and a mass below
+    #: ``recycling_mass`` frees its slot once its gas fails the relaxed
+    #: creation checks.
+    recycling_activation: float = 0.01
+
+    #: The mass below which a candidate can be recycled, in units of
+    #: ρ_thr ΔV at the candidate.
+    recycling_mass: float = 0.01
