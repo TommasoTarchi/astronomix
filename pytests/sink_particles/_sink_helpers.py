@@ -2,7 +2,8 @@
 Shared setup and helpers for the sink particle pytests.
 
 The tests run on the Gaussian overdensity setup in
-``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``.
+``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``, and the
+polytropic tests on a uniform polytropic gas.
 """
 
 # general
@@ -13,10 +14,17 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix import OPTIMAL_BACKEND
+from astronomix.option_classes.simulation_config import (
+    PERIODIC_BOUNDARY,
+    POLYTROPIC,
+)
 
 # astronomix containers
 from astronomix import (
     BackendConfig,
+    BoundarySettings,
+    BoundarySettings1D,
+    GravityConfig,
     SimulationConfig,
     SimulationParams,
     SinkParticleConfig,
@@ -24,7 +32,11 @@ from astronomix import (
 from astronomix.option_classes.simulation_config import StaticIntVector
 
 # astronomix functions
-from astronomix import get_registered_variables
+from astronomix import (
+    construct_primitive_state,
+    finalize_config,
+    get_registered_variables,
+)
 from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
     SinkFormationSettings,
     setup_sink_formation,
@@ -109,6 +121,60 @@ def _setup_hard_limit(
     """``_setup`` with every smoothing parameter at its hard limit, unless
     given in ``sink_particle_options``."""
     return _setup(settings, mhd, backend, **{**HARD_LIMIT, **sink_particle_options})
+
+
+#: The polytropic gas of the polytropic tests, p = K ρ^Γ, on a periodic 16³
+#: unit box with G = 1 and r_acc = 2.5 cells, where ρ* ≈ 1810.
+POLYTROPIC_CONSTANT = 2.0
+POLYTROPIC_EXPONENT = 1.4
+POLYTROPIC_NUM_CELLS = 16
+
+
+def _polytropic_setup(density):
+    """A uniform polytropic gas at rest of the given density, with
+    self-gravity and sink particles on, and every smoothing parameter at its
+    hard limit.
+
+    Args:
+        density: The density of the gas.
+
+    Returns:
+        ``(primitive_state, config, params, registered_variables)``. The
+        box is periodic, so the primitive state needs no padding.
+    """
+    periodic = BoundarySettings1D(PERIODIC_BOUNDARY, PERIODIC_BOUNDARY)
+    config = SimulationConfig(
+        dimensionality=3,
+        num_cells=StaticIntVector(
+            POLYTROPIC_NUM_CELLS,
+            POLYTROPIC_NUM_CELLS,
+            POLYTROPIC_NUM_CELLS,
+        ),
+        progress_bar=False,
+        equation_of_state=POLYTROPIC,
+        boundary_settings=BoundarySettings(periodic, periodic, periodic),
+        gravity_config=GravityConfig(self_gravity=True),
+        state_struct=True,
+        sink_particle_config=SinkParticleConfig(sink_particles=True, **HARD_LIMIT),
+    )
+    params = SimulationParams(
+        polytropic_constant=POLYTROPIC_CONSTANT,
+        polytropic_exponent=POLYTROPIC_EXPONENT,
+        gravitational_constant=1.0,
+    )
+    registered_variables = get_registered_variables(config)
+    shape = (POLYTROPIC_NUM_CELLS,) * 3
+    at_rest = jnp.zeros(shape)
+    primitive_state = construct_primitive_state(
+        config=config,
+        registered_variables=registered_variables,
+        density=jnp.full(shape, density),
+        velocity_x=at_rest,
+        velocity_y=at_rest,
+        velocity_z=at_rest,
+    )
+    config = finalize_config(config, primitive_state.shape)
+    return primitive_state, config, params, registered_variables
 
 
 def _density_threshold(config, params):

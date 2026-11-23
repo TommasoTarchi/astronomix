@@ -5,9 +5,11 @@ Gas accretion onto sink particles following Federrath et al. (2010), ApJ 713,
 Once per time step, after the creation and activation of candidates, every
 occupied slot takes gas above the density threshold from the cells within
 its accretion radius (Section 2.3). A cell can give at most its excess
-e = (ρ − ρ_thr) ΔV (Eq. 13). The gas must be bound to the slot and move toward
-it, except in the cell that contains the slot. Each check is a smooth step,
-and the weight of a slot-cell pair is
+e = (ρ − ρ_thr) ΔV (Eq. 13). For a polytropic gas ρ_thr drops with the
+density, and the excess is e = (ρ − ρ*) ΔV instead, with ρ* the density at
+which the gas is at its own threshold. The gas must be bound to the slot and
+move toward it, except in the cell that contains the slot. Each check is a
+smooth step, and the weight of a slot-cell pair is
 
     g = a K [1 − (1 − b n)(1 − h)],
 
@@ -42,6 +44,7 @@ import jax.numpy as jnp
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     IDEAL_GAS,
+    POLYTROPIC,
     STATE_TYPE,
 )
 
@@ -56,7 +59,10 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
     CellQuantities,
     SlotNeighbourhood,
 )
-from astronomix._modules._sink_particles._sink_particle_helpers import _periodic_box
+from astronomix._modules._sink_particles._sink_particle_helpers import (
+    _periodic_box,
+    _polytropic_resolved_density,
+)
 from astronomix._modules._sink_particles._sink_particle_smoothing import (
     _point_mass_potential,
     _safe_divide,
@@ -304,11 +310,18 @@ def _accrete(
         config,
         params,
     )
+
+    # The density a cell is left at when its whole excess is taken. For an
+    # ideal or isothermal gas c_s² does not change with the accretion, so this
+    # is the threshold. For a polytropic gas c_s² drops with the density, and
+    # the threshold with it, so a cell left at the threshold of its density
+    # before accretion would still be above its threshold; it is left at ρ*
+    # instead.
+    accreted_cell_density = cells.density_threshold[cell_indices]
+    if config.equation_of_state == POLYTROPIC:
+        accreted_cell_density = _polytropic_resolved_density(config, params)
     excess = (
-        jnp.maximum(
-            0.0,
-            cells.density[cell_indices] - cells.density_threshold[cell_indices],
-        )
+        jnp.maximum(0.0, cells.density[cell_indices] - accreted_cell_density)
         * cell_volume
     )
     accreted_mass = (
