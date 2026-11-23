@@ -95,8 +95,8 @@ def _soft_minimum(
         check_width: The width ω, static. At 0, the result is the minimum
             over the cells with k > 0.
         temperature_scale: The scale of the temperature, shape (...), e.g.
-            c_s². Where the temperature is 0, 1 is used in its place, which
-            keeps the result finite.
+            c_s². Where the temperature is 0, the result is the minimum over
+            the cells with k > 0, the limit T → 0.
 
     Returns:
         The soft minimum, shape (...); 0 where every weight is 0.
@@ -114,7 +114,8 @@ def _soft_minimum(
     reference = jax.lax.stop_gradient(minimum)
     included_values = jnp.where(is_included, values, reference[..., None])
     temperature = check_width * temperature_scale
-    safe_temperature = jnp.where(temperature > 0.0, temperature, 1.0)
+    has_temperature = temperature > 0.0
+    safe_temperature = jnp.where(has_temperature, temperature, 1.0)
     boltzmann_weights = weights * jnp.exp(
         -(included_values - reference[..., None]) / safe_temperature[..., None]
     )
@@ -123,7 +124,8 @@ def _soft_minimum(
     soft_minimum = (
         jnp.sum(boltzmann_weights * included_values, axis=-1) / safe_normalization
     )
-    return jnp.where(normalization > 0.0, soft_minimum, 0.0)
+    soft_minimum = jnp.where(normalization > 0.0, soft_minimum, 0.0)
+    return jnp.where(has_temperature, soft_minimum, minimum)
 
 
 def _soft_maximum(

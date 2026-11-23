@@ -8,10 +8,10 @@ An isothermal sphere at rest with the density
 in a box of thin gas, evolved with self-gravity. With A = 1 and r_c = 0 it is
 the singular isothermal sphere, the equilibrium whose inside-out collapse
 accretes onto the centre at the constant rate 0.975 c_s³ / G (Shu 1977); A > 1
-makes it overdense and the accretion faster. The core radius r_c, a fraction
-of a cell, replaces the singularity on the grid. The sphere is centred on a
-cell centre, so that one cell is the unique potential minimum, and the
-boundaries are periodic by default.
+makes it overdense and the accretion faster. The core radius r_c replaces the
+singularity on the grid. The sphere is centred on a cell centre, so that one
+cell is the unique potential minimum, and the boundaries are periodic by
+default.
 
 The overdensity factor A is the input with respect to which the sink particle
 gradients are validated.
@@ -60,12 +60,17 @@ class SingularIsothermalSphereSettings(NamedTuple):
 
     #: Overdensity factor A of ρ = A c_s² / (2πG r²); 1 is the equilibrium.
     #: At 32³ cells the equilibrium does not collapse: the grid softens the
-    #: gravity of the centre, and the core stays pressure supported. It may be
-    #: a traced value.
-    overdensity_factor: float = 2.0
+    #: gravity of the centre, and the core stays pressure supported. With the
+    #: default core, A = 4 forms the first sink at t ≈ 0.08. It may be a traced
+    #: value.
+    overdensity_factor: float = 4.0
 
-    #: Core radius r_c in units of the grid spacing.
-    core_radius_in_cells: float = 0.5
+    #: Core radius r_c in units of the grid spacing. The central density
+    #: A c_s² / (2πG r_c²) lies below the density threshold of the sink
+    #: particles, π c_s² / (4G r_acc²), for r_c > r_acc √(2A) / π (2.25 cells
+    #: at A = 4 with r_acc = 2.5 cells), so that the collapse, not the initial
+    #: state, crosses the threshold.
+    core_radius_in_cells: float = 2.5
 
     #: Density of the gas outside the sphere, in units of the density at its
     #: edge.

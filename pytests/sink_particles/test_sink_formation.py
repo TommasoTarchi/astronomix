@@ -2,9 +2,10 @@
 Sink particle formation pytest (fast).
 
 Checks the sink particle creation of Federrath et al. (2010), Section 2.2:
-the creation checks (converging flow, potential minimum, Jeans instability
-with and without a magnetic field, bound state, proximity to existing sinks
-and between sinks formed in the same call), the limit on the number of sink
+the creation checks (converging flow, potential minimum, with the potential
+of the existing sinks, Jeans instability with and without a magnetic field,
+bound state, proximity to existing sinks and between sinks formed in the same
+call), the limit on the number of sink
 slots, the wrapping of a new sink's position into a periodic box, and the
 control volume at an open boundary.
 """
@@ -45,6 +46,7 @@ from _sink_helpers import (
     _one_sink_at,
     _setup,
     _with_linear_velocity,
+    _with_sink,
 )
 
 
@@ -185,6 +187,54 @@ def test_potential_minimum():
     # slightly toward the spike, but stays within half a cell of the centre.
     assert _num_sinks(sink_particles) == 1
     assert jnp.all(jnp.abs(sink_particles.position[0] - CLUMP_CENTER) < 0.5 * CELL_SIZE)
+
+
+def _num_new_sinks_next_to_sink(sink_mass):
+    """The number of sinks the formation alone creates in the clump, with an
+    existing sink of ``sink_mass`` at rest 3 cells from the clump centre along
+    x, beyond r_acc = 2.5 cells, so that proximity does not block the centre."""
+    state, config, params, registered_variables = _setup()
+    primitive_state = _prepare_padded_state(
+        state.primitive_state,
+        config,
+        params,
+        registered_variables,
+    )
+    existing_sink = _with_sink(
+        _empty_sink_particles(config, primitive_state.dtype),
+        0,
+        sink_mass,
+        (CLUMP_CENTER + 3.0 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
+    )
+    sink_particles = _form_sink_particles(
+        primitive_state,
+        existing_sink,
+        config,
+        params,
+        registered_variables,
+    )
+    return int(jnp.sum(sink_particles.occupied)) - 1
+
+
+def test_massless_sink_beyond_accretion_radius_allows_formation():
+    """A massless sink 3 cells from the clump centre neither blocks the centre
+    by proximity nor deepens the potential, so a sink forms at the centre."""
+    num_new_sinks = _num_new_sinks_next_to_sink(0.0)
+    assert num_new_sinks == 1, (
+        f"{num_new_sinks} sinks formed next to a massless sink instead of 1"
+    )
+
+
+def test_massive_sink_beyond_accretion_radius_moves_potential_minimum():
+    """The potential of the formation includes the existing sinks: a sink of
+    unit mass (about twice the gas mass of the centre's control volume) 3
+    cells from the clump centre makes the cell 2 cells toward it the potential
+    minimum of the centre's control volume, so no sink forms."""
+    num_new_sinks = _num_new_sinks_next_to_sink(1.0)
+    assert num_new_sinks == 0, (
+        f"{num_new_sinks} sinks formed next to a massive sink instead of 0: the "
+        "formation does not feel the potential of the existing sinks"
+    )
 
 
 def test_one_sink_per_control_volume():
@@ -376,6 +426,8 @@ if __name__ == "__main__":
     test_converging_flow((1.0, 1.0, 1.0), 0)
     test_converging_flow((1.0, -2.0, -2.0), 0)
     test_potential_minimum()
+    test_massless_sink_beyond_accretion_radius_allows_formation()
+    test_massive_sink_beyond_accretion_radius_moves_potential_minimum()
     test_jeans_instability(400.0, 1.0, 1)
     test_jeans_instability(200.0, 1.0, 0)
     test_jeans_instability(400.0, 2.0, 0)

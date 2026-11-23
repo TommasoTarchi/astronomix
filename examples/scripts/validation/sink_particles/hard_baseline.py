@@ -24,10 +24,9 @@ native JAX backend and the finite-volume scheme (RK2, HLL, minmod), and
 Each setup writes ``results/<setup>.npz``; ``results/report.md`` gathers them.
 
 The finite-volume scheme is used because the default finite-difference scheme
-breaks down in the turbulent cluster at 32³: next to the heaviest sink a nearly
-empty cell reaches Mach 40–70, alternating from step to step, and the state
-turns non-finite at t ≈ 0.05 (at t ≈ 0.07 with the positivity-preserving WENO
-flux). The finite-volume scheme runs every setup to its end.
+turns the turbulent cluster non-finite at 32³ with or without sinks, once the
+collapse is no longer resolved (by t ≈ 0.046 without sinks, t ≈ 0.051 with
+them). The finite-volume scheme runs every setup to its end.
 
     python hard_baseline.py                       # every setup, both parts
     python hard_baseline.py --setups bonnor_ebert --part reference
@@ -210,7 +209,7 @@ def run_reference(case: Case) -> dict:
     Returns:
         The reference: snapshot times, the sink fields at every snapshot, the
         gas mass, the formation time of every slot (NaN for a slot never
-        occupied), the number of steps and the wall time.
+        occupied) and the number of steps.
     """
     config = _config(
         return_snapshots=True,
@@ -220,11 +219,9 @@ def run_reference(case: Case) -> dict:
     state, config, params = case.setup(config, SimulationParams(), case.settings)
     registered_variables = get_registered_variables(config)
 
-    start = time.perf_counter()
     snapshots = jax.block_until_ready(
         time_integration(state, config, params, registered_variables)
     )
-    wall_time = time.perf_counter() - start
 
     sinks = snapshots.sink_particles
     times = np.asarray(snapshots.time_points)
@@ -245,7 +242,6 @@ def run_reference(case: Case) -> dict:
         formation_time=formation_time,
         end_time=float(params.t_end),
         num_steps=int(snapshots.num_iterations),
-        wall_time=wall_time,
     )
 
 
@@ -258,20 +254,20 @@ def run_reference(case: Case) -> dict:
 # -------------------------------------------------------------
 
 
-def _sink_outputs(sink_particles, box_length) -> jax.Array:
+def _sink_outputs(mass, position, box_length) -> jax.Array:
     """
     The compared outputs of a run: the total sink mass and the random
     combination of the mass-weighted position moments.
 
     Args:
-        sink_particles: The sinks at the end of the run.
+        mass: The sink masses, shape (max_num_sinks,).
+        position: The sink positions, shape (max_num_sinks, 3).
         box_length: The side length of the box.
 
     Returns:
         The two outputs, shape (2,).
     """
-    mass = sink_particles.mass
-    phase = 2.0 * jnp.pi * sink_particles.position / box_length
+    phase = 2.0 * jnp.pi * position / box_length
     moments = jnp.concatenate(
         [
             jnp.sum(mass[:, None] * jnp.cos(phase), axis=0),
@@ -325,7 +321,11 @@ def _output_function(case: Case, end_time: float, num_segments: int) -> Callable
             None,
             length=num_segments,
         )
-        return _sink_outputs(final_state.sink_particles, settings.box_length)
+        return _sink_outputs(
+            final_state.sink_particles.mass,
+            final_state.sink_particles.position,
+            settings.box_length,
+        )
 
     return outputs
 
@@ -349,9 +349,9 @@ def compare_gradients(case: Case, end_time: float, num_segments: int) -> dict:
 
     def value_and_gradients(parameter):
         value, pullback = jax.vjp(outputs, parameter)
-        gradients = jnp.stack(
-            [pullback(jnp.eye(len(OUTPUT_NAMES))[output])[0] for output in range(len(OUTPUT_NAMES))]
-        )
+        # One batched backward pass for all outputs, which recomputes each
+        # checkpointed segment once.
+        (gradients,) = jax.vmap(pullback)(jnp.eye(len(OUTPUT_NAMES)))
         return value, gradients
 
     start = time.perf_counter()
@@ -415,6 +415,32 @@ def _end_times_and_segments(reference: dict) -> list[tuple[float, int]]:
 # -------------------------------------------------------------
 
 
+def _reference_at(times, outputs, occupied, time_point):
+    """
+    An output of the adaptive reference at ``time_point``, interpolated
+    between the snapshots around it.
+
+    Args:
+        times: The snapshot times, shape (num_snapshots,).
+        outputs: The output at every snapshot, shape (num_snapshots,).
+        occupied: The occupied slots at every snapshot, shape
+            (num_snapshots, max_num_sinks).
+        time_point: The time of the comparison.
+
+    Returns:
+        ``(value, sinks_form)``: the interpolated output, and whether the
+        number of sinks changes between the two snapshots around
+        ``time_point``, where the output jumps and the interpolated value is
+        not meaningful.
+    """
+    value = np.interp(time_point, times, outputs)
+    after = min(int(np.searchsorted(times, time_point)), times.size - 1)
+    if after == 0 or times[after] == time_point:
+        return value, False
+    sinks_form = occupied[after].sum() != occupied[after - 1].sum()
+    return value, bool(sinks_form)
+
+
 def _relative_difference(gradient, finite_difference):
     """|g − fd| / max(|g|, |fd|), and 0 where both are 0."""
     scale = np.maximum(np.abs(gradient), np.abs(finite_difference))
@@ -445,8 +471,7 @@ def write_report() -> Path:
             "",
             "Reference (adaptive steps):",
             "",
-            f"- end time {float(data['end_time']):g}, {int(data['num_steps'])} steps, "
-            f"{float(data['wall_time']):.0f} s",
+            f"- end time {float(data['end_time']):g}, {int(data['num_steps'])} steps",
             f"- sinks formed: {int(formed.sum())}; first formation at "
             + (f"t = {np.nanmin(formation_time):.4g}" if formed.any() else "never"),
             f"- total sink mass at the last snapshot (t = {data['times'][-1]:.4g}): "
@@ -456,12 +481,22 @@ def write_report() -> Path:
         if "comparison_end_time" not in data:
             lines += ["No gradient comparison.", ""]
             continue
+        # The outputs of the adaptive reference at every snapshot, to compare
+        # with the values of the fixed-step runs.
+        reference_outputs = np.asarray(
+            jax.vmap(
+                lambda mass, position: _sink_outputs(mass, position, case.settings.box_length)
+            )(data["mass"], data["position"])
+        )
         steps_header = " | ".join(f"FD h={step:g}" for step in RELATIVE_STEPS)
         lines += [
-            f"| end time | steps | output | value | jax.grad | {steps_header} |",
-            "| --- | --- | --- | --- | --- | " + " | ".join("---" for _ in RELATIVE_STEPS) + " |",
+            f"| end time | steps | output | value | reference | jax.grad | {steps_header} |",
+            "| --- | --- | --- | --- | --- | --- | "
+            + " | ".join("---" for _ in RELATIVE_STEPS)
+            + " |",
         ]
         for comparison in range(data["comparison_end_time"].size):
+            end_time = data["comparison_end_time"][comparison]
             for output, output_name in enumerate(OUTPUT_NAMES):
                 gradient = data["comparison_gradient"][comparison, output]
                 finite_differences = data["comparison_finite_differences"][comparison, :, output]
@@ -470,13 +505,26 @@ def write_report() -> Path:
                     f"{difference:.4g} ({error:.1e})"
                     for difference, error in zip(finite_differences, errors)
                 )
+                reference_value, sinks_form = _reference_at(
+                    data["times"],
+                    reference_outputs[:, output],
+                    data["occupied"],
+                    end_time,
+                )
                 lines.append(
-                    f"| {data['comparison_end_time'][comparison]:.4g} "
+                    f"| {end_time:.4g} "
                     f"| {int(data['comparison_num_steps'][comparison])} "
                     f"| {output_name} | {data['comparison_value'][comparison, output]:.6g} "
+                    f"| {reference_value:.6g}{' *' if sinks_form else ''} "
                     f"| {gradient:.4g} | {cells} |"
                 )
         lines += [
+            "",
+            "The value is that of the fixed-step run; the reference is the same output of the "
+            "adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit "
+            "and the half-cell limit on sink motion, so the two must agree, except where marked "
+            "with *: there sinks form between the two snapshots around the time, the output "
+            "jumps, and the interpolated reference is not meaningful.",
             "",
             "Each finite difference is followed by its relative difference from `jax.grad`, "
             "|g − fd| / max(|g|, |fd|).",
@@ -510,7 +558,7 @@ def main():
         print(
             f"{name}: {int(np.isfinite(reference['formation_time']).sum())} sinks, "
             f"first at t = {np.nanmin(reference['formation_time'], initial=np.inf):.4g}, "
-            f"{reference['num_steps']} steps, {reference['wall_time']:.0f} s",
+            f"{reference['num_steps']} steps",
             flush=True,
         )
 

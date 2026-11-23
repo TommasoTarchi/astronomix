@@ -198,8 +198,9 @@ def test_soft_maximum_is_mirrored_soft_minimum():
 
 @pytest.mark.parametrize("width", [0.0, 0.1], ids=["hard", "smooth"])
 def test_soft_minimum_of_empty_volume_is_zero_with_finite_gradient(width):
-    """A volume whose weights are all 0, or with a temperature scale of 0,
-    gives 0 (empty) or a finite value, with finite derivatives.
+    """A volume whose weights are all 0 gives 0, and a volume with a
+    temperature scale of 0 gives the minimum over its weighted cells, the
+    limit T → 0, both with finite derivatives.
 
     Args:
         width: The width ω of the soft minimum.
@@ -213,7 +214,9 @@ def test_soft_minimum_of_empty_volume_is_zero_with_finite_gradient(width):
 
     result = _soft_minimum(values, weights, width, scale)
     assert result[0] == 0.0, f"the soft minimum of an empty volume is {result[0]}, not 0"
-    assert jnp.isfinite(result[1]), "the soft minimum at a temperature scale of 0 is not finite"
+    assert result[1] == 3.0, (
+        f"the soft minimum at a temperature scale of 0 is {result[1]}, not the minimum 3"
+    )
     gradients = jax.grad(total, argnums=(0, 1))(values, weights)
     assert all(jnp.all(jnp.isfinite(gradient)) for gradient in gradients), (
         f"the derivatives of the soft minimum are not finite: {gradients}"

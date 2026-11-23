@@ -159,6 +159,30 @@ def test_singular_isothermal_sphere_profile():
     assert jnp.all(velocity == 0.0), "the gas of the singular isothermal sphere is not at rest"
 
 
+def test_singular_isothermal_sphere_starts_below_density_threshold():
+    """The core of the singular isothermal sphere keeps its centre below the
+    density threshold of the sink particles at the start, also at 1.1 A, the
+    largest overdensity of the finite differences of ``hard_baseline.py``, so
+    that the collapse, not the initial state, crosses the threshold."""
+    settings = SingularIsothermalSphereSettings()
+    for overdensity_factor in (settings.overdensity_factor, 1.1 * settings.overdensity_factor):
+        density, _, config = _build(
+            setup_singular_isothermal_sphere,
+            settings._replace(overdensity_factor=overdensity_factor),
+        )
+        accretion_radius = config.sink_particle_config.accretion_radius_in_cells * CELL_SIZE
+        density_threshold = (
+            np.pi
+            * settings.sound_speed**2
+            / (4.0 * settings.gravitational_constant * accretion_radius**2)
+        )
+        peak = float(jnp.max(density))
+        assert peak < density_threshold, (
+            f"at A = {overdensity_factor:g} the centre starts at {peak:.4g}, above the "
+            f"density threshold {density_threshold:.4g}"
+        )
+
+
 def test_rotating_cloud_core_rotation_and_perturbation():
     """The rotating core turns as a solid body about z inside R and is at
     rest outside; its density is ρ_0 (1 ± a) along x and y; the defaults
