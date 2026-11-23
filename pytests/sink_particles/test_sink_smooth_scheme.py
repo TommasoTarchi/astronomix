@@ -2,8 +2,8 @@
 The smooth sink formation and accretion, with the default smoothing
 parameters: the factors of the creation weight, the activation of a candidate,
 the conservation of mass and momentum in the accretion, the motion of a
-candidate with its gas, and finite values and derivatives for a slot past a
-non-periodic edge.
+candidate with its gas, without overshoot for a candidate heavier than its
+gas, and finite values and derivatives for a slot past a non-periodic edge.
 """
 
 # numerics
@@ -21,6 +21,7 @@ from astronomix.data_classes.simulation_state_struct import SinkParticles
 from astronomix.option_classes.simulation_config import BoundarySettings
 
 # astronomix functions
+from astronomix._modules._sink_particles._sink_particle_dynamics import _tsc_weights
 from astronomix._modules._sink_particles._sink_particle_formation import (
     SlotChecks,
     _creation_factors,
@@ -367,17 +368,25 @@ def test_smooth_accretion_leaves_no_cell_below_threshold():
 # -------------------------------------------------------------
 
 
-def test_candidate_moves_with_gas_and_conserves_momentum():
-    """An inactive candidate with some mass takes the velocity of the gas
-    around it, and its momentum change goes to the gas; a sink far away keeps
-    its velocity. The clump (peak 200) is not Jeans unstable, so the candidate
-    stays inactive."""
-    settings = SETTINGS._replace(peak_overdensity=200.0)
+#: The velocity of the candidates relative to the gas.
+CANDIDATE_RELATIVE_VELOCITY = jnp.array([0.3, 0.2, -0.1])
+
+
+def _update_with_inactive_candidate(candidate_mass, peak_overdensity):
+    """One update of a clump that is not Jeans unstable, so that a candidate
+    stays inactive, moving with ``BULK_VELOCITY``, with an inactive candidate
+    of ``candidate_mass`` at its centre moving relative to the gas, and a sink
+    far away in the thin gas.
+
+    Returns:
+        ``(state, sink_particles, new_primitive_state, new_sink_particles,
+        config, registered_variables)``.
+    """
+    settings = SETTINGS._replace(peak_overdensity=peak_overdensity)
     state, config, params, registered_variables = _setup(settings=settings)
     state = _with_bulk_velocity(state, registered_variables)
     dtype = state.primitive_state.dtype
 
-    candidate_mass = 1e-3
     sink_particles = _with_sink(
         _empty_sink_particles(config, dtype),
         0,
@@ -386,12 +395,13 @@ def test_candidate_moves_with_gas_and_conserves_momentum():
     )
     sink_particles = sink_particles._replace(
         activation=sink_particles.activation.at[0].set(0.0),
-        velocity=sink_particles.velocity.at[0].set(BULK_VELOCITY + jnp.array([0.3, 0.2, -0.1])),
+        velocity=sink_particles.velocity.at[0].set(
+            BULK_VELOCITY + CANDIDATE_RELATIVE_VELOCITY
+        ),
     )
-    sink_velocity = jnp.array([-0.5, 0.4, 0.3])
     sink_particles = _with_sink(sink_particles, 1, 0.1, [0.1, 0.1, 0.1])
     sink_particles = sink_particles._replace(
-        velocity=sink_particles.velocity.at[1].set(sink_velocity)
+        velocity=sink_particles.velocity.at[1].set(FAR_SINK_VELOCITY)
     )
 
     new_primitive_state, new_sink_particles = _update_sinks_once(
@@ -401,20 +411,24 @@ def test_candidate_moves_with_gas_and_conserves_momentum():
         registered_variables,
         sink_particles,
     )
-
     activation = float(new_sink_particles.activation[0])
     assert activation == 0.0, f"the candidate's activation grew to {activation}"
-    np.testing.assert_allclose(
-        new_sink_particles.velocity[0],
-        BULK_VELOCITY,
-        rtol=1e-5,
-        err_msg="the inactive candidate does not move with the gas",
+    return (
+        state,
+        sink_particles,
+        new_primitive_state,
+        new_sink_particles,
+        config,
+        registered_variables,
     )
-    np.testing.assert_array_equal(
-        new_sink_particles.velocity[1],
-        sink_velocity,
-        err_msg="the velocity of the sink far away changed",
-    )
+
+
+#: The velocity of the sink far from the clump.
+FAR_SINK_VELOCITY = jnp.array([-0.5, 0.4, 0.3])
+
+
+def _assert_momentum_conserved(state, sink_particles, new_primitive_state, new_sink_particles, registered_variables):
+    """Fail if gas plus slot momentum changed."""
     _, momentum_before = _total_mass_and_momentum(
         state.primitive_state,
         sink_particles,
@@ -429,7 +443,90 @@ def test_candidate_moves_with_gas_and_conserves_momentum():
         momentum_after,
         momentum_before,
         rtol=1e-6,
-        err_msg="gas plus candidate momentum changed",
+        err_msg="gas plus slot momentum changed",
+    )
+
+
+def test_light_candidate_moves_with_gas_and_conserves_momentum():
+    """An inactive candidate much lighter than the gas in its TSC cells takes
+    the velocity of that gas, its momentum change goes to the gas, and a sink
+    far away keeps its velocity."""
+    (
+        state,
+        sink_particles,
+        new_primitive_state,
+        new_sink_particles,
+        _,
+        registered_variables,
+    ) = _update_with_inactive_candidate(candidate_mass=1e-6, peak_overdensity=200.0)
+
+    np.testing.assert_allclose(
+        new_sink_particles.velocity[0],
+        BULK_VELOCITY,
+        rtol=0.0,
+        atol=1e-4,
+        err_msg="the light inactive candidate does not move with the gas",
+    )
+    np.testing.assert_array_equal(
+        new_sink_particles.velocity[1],
+        FAR_SINK_VELOCITY,
+        err_msg="the velocity of the sink far away changed",
+    )
+    _assert_momentum_conserved(
+        state, sink_particles, new_primitive_state, new_sink_particles, registered_variables
+    )
+
+
+def test_heavy_candidate_takes_center_of_mass_velocity_without_overshoot():
+    """An inactive candidate heavier than the gas in its TSC cells takes the
+    centre-of-mass velocity of itself and that gas, which moves by less than
+    the relative velocity: it never overshoots the candidate's velocity.
+    Momentum is conserved. The clump (peak 150) is less dense than in the
+    light case, so that the candidate's own mass does not make it Jeans
+    unstable."""
+    candidate_mass = 0.02
+    (
+        state,
+        sink_particles,
+        new_primitive_state,
+        new_sink_particles,
+        config,
+        registered_variables,
+    ) = _update_with_inactive_candidate(candidate_mass, peak_overdensity=150.0)
+
+    cell_indices, weights = _tsc_weights(
+        sink_particles.position[:1],
+        state.primitive_state.shape[1:],
+        config,
+    )
+    density = state.primitive_state[registered_variables.density_index]
+    gas_mass = float(jnp.sum(weights * density[cell_indices])) * CELL_SIZE**3
+    assert candidate_mass > 2.0 * gas_mass, (
+        f"the candidate ({candidate_mass}) is not heavier than its gas ({gas_mass:.3g})"
+    )
+    candidate_velocity = BULK_VELOCITY + CANDIDATE_RELATIVE_VELOCITY
+    center_of_mass_velocity = (
+        candidate_mass * candidate_velocity + gas_mass * BULK_VELOCITY
+    ) / (candidate_mass + gas_mass)
+    np.testing.assert_allclose(
+        new_sink_particles.velocity[0],
+        center_of_mass_velocity,
+        rtol=1e-5,
+        err_msg="the heavy candidate does not take the centre-of-mass velocity",
+    )
+
+    velocity_rows = jnp.array(registered_variables.velocity_index)
+    gas_velocity_change = (
+        new_primitive_state[velocity_rows] - state.primitive_state[velocity_rows]
+    )
+    largest_change = float(jnp.max(jnp.linalg.norm(gas_velocity_change, axis=0)))
+    relative_speed = float(jnp.linalg.norm(CANDIDATE_RELATIVE_VELOCITY))
+    assert 0.0 < largest_change < relative_speed, (
+        f"the gas velocity changed by up to {largest_change:.3g}, not between 0 and the "
+        f"relative speed {relative_speed:.3g}"
+    )
+    _assert_momentum_conserved(
+        state, sink_particles, new_primitive_state, new_sink_particles, registered_variables
     )
 
 

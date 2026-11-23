@@ -6,8 +6,9 @@ Federrath et al. (2010), ApJ 713, 269, with smooth formation and accretion:
 2. raise the activation of every occupied slot to its creation weight;
 3. and 4. accrete gas onto every occupied slot, and update the gas and the
    slots;
-5. relax the velocity of every slot toward that of the gas around it by the
-   fraction 1 − a, so that a candidate moves with its gas;
+5. relax the velocity of every slot toward the centre-of-mass velocity of the
+   slot and the gas around it by the fraction 1 − a, so that a candidate
+   moves with its gas;
 6. free the slots of candidates that have neither activation nor mass and
    whose gas fails the relaxed creation checks.
 
@@ -67,13 +68,17 @@ def _move_candidates_with_gas(
 ) -> tuple[STATE_TYPE, SinkParticles]:
     """
     Step 5: keep only the fraction a of each occupied slot's velocity
-    relative to the gas around it,
+    relative to the centre-of-mass velocity of the slot and the gas around
+    it,
 
-        v_gas = Σ W ρ v / Σ W ρ,   v ← v + (a − 1)(v − v_gas),
+        M_gas = Σ W ρ ΔV,   v_gas = Σ W ρ v / Σ W ρ,
+        v_cm = (m v + M_gas v_gas) / (m + M_gas),   v ← v + (a − 1)(v − v_cm),
 
     with the TSC weights W of the dynamics. The momentum change m Δv is taken
-    from the gas of the same cells, in proportion to W ρ, at fixed pressure. A
-    candidate with a = 0 moves with the gas; a sink with a = 1 is unaffected.
+    from the gas of the same cells, in proportion to W ρ, at fixed pressure,
+    which moves the gas velocity by at most (1 − a) |v − v_gas|, also for a
+    slot much heavier than its gas. A candidate with a = 0 and m ≪ M_gas
+    moves with the gas; a sink with a = 1 is unaffected.
 
     Args:
         primitive_state: The (padded) primitive state.
@@ -100,12 +105,18 @@ def _move_candidates_with_gas(
         jnp.sum(weighted_density[..., None] * gas_velocity_in_cells, axis=1),
         total_weighted_density[:, None],
     )
+    gas_mass = total_weighted_density * cell_volume
+    center_of_mass_velocity = _safe_divide(
+        sink_particles.mass[:, None] * sink_particles.velocity
+        + gas_mass[:, None] * gas_velocity,
+        (sink_particles.mass + gas_mass)[:, None],
+    )
 
     is_moved = sink_particles.occupied & (total_weighted_density > 0.0)
     velocity_change = jnp.where(
         is_moved[:, None],
         (sink_particles.activation[:, None] - 1.0)
-        * (sink_particles.velocity - gas_velocity),
+        * (sink_particles.velocity - center_of_mass_velocity),
         0.0,
     )
 

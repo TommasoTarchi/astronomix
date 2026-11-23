@@ -19,10 +19,20 @@ records
 ```
 python hard_baseline.py                                   # every setup, both parts
 python hard_baseline.py --setups rotating_core --part gradients
+python hard_baseline.py --parameters smooth --diagnostics # the smooth scheme
 ```
 
 Each setup writes `results/<setup>.npz`; `results/report.md` gathers the
 numbers.
+
+With `--parameters smooth` the same runs use the default (smooth) parameters
+of the sink formation and accretion and write to `results/smooth`. The
+gradients are compared at the times of the hard baseline, and the report gives
+the hard reference next to the smooth one. A sink is a slot with activation
+above ½, and its formation time is the first snapshot at which its activation
+exceeds ½. `--diagnostics` prints, at every step of the reference runs, the
+candidates created and recycled with their activation and mass, the number of
+occupied slots, and the gas above the density threshold far from every slot.
 
 | Setup | Input of the gradients | End time |
 | --- | --- | --- |
