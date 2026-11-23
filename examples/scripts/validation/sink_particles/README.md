@@ -40,6 +40,7 @@ occupied slots, and the gas above the density threshold far from every slot.
 | `singular_isothermal`: ρ = A c_s² / (2πG (r² + r_c²)), A = 4, r_c = 2.5 cells | overdensity factor A | 0.2 |
 | `rotating_core`: Boss & Bodenheimer (1979), α ≈ 0.26, β ≈ 0.16 | rotation rate | 0.2 |
 | `turbulent_cluster`: 64 Jeans masses, Mach 3 | Mach number | 0.1 |
+| `bonnor_ebert_offset`: the Bonnor–Ebert sphere with its centre 0.25 cells off the cell centre along x | the offset, in cells | 0.3 |
 
 All runs use 32³ cells, G = c_s = 1, float64, the native JAX backend and the
 finite-volume scheme (RK2, HLL, minmod), in periodic boxes.
@@ -74,7 +75,11 @@ finite-volume scheme (RK2, HLL, minmod), in periodic boxes.
 * **Positions.** In the symmetric setups (Bonnor–Ebert sphere, singular
   isothermal sphere, rotating core) the single sink stays on the central
   cell, so the position moments are the total mass times a constant; only the
-  turbulent cluster measures positions.
+  turbulent cluster measures positions with them. `bonnor_ebert_offset`
+  measures the position of a single sink instead: its outputs are the total
+  sink mass and the mass-weighted mean x of the sinks, in cells from the
+  centre of the central cell, and its input is the offset of the sphere's
+  centre from there.
 * **Checkpointed segments.** The fixed-step loop of `time_integration` is a
   plain `fori_loop` whatever `differentiation_mode` says, so reverse mode keeps
   every step (about 160 MB per step at 32³ in float64). A gradient run is

@@ -13,7 +13,11 @@ native JAX backend and the finite-volume scheme (RK2, HLL, minmod), and
   respect to one input per setup, for two outputs: the total sink mass, and a
   fixed random combination of the mass-weighted moments of the sink positions,
   Σ m cos(2π x_d / L) and Σ m sin(2π x_d / L), which stay continuous when a
-  sink crosses a periodic boundary. The comparison runs twice: shortly after
+  sink crosses a periodic boundary. In the symmetric setups the sink stays on
+  the central cell and these moments are the mass times a constant, so a fifth
+  case, ``bonnor_ebert_offset``, moves the Bonnor–Ebert sphere off the cell
+  centre along x and takes the mass-weighted mean x of the sinks as its second
+  output. The comparison runs twice: shortly after
   the first formation and at the end of the run, with fixed steps, so that the
   gradient and the finite differences follow the same step sequence. The
   fixed-step loop of ``time_integration`` keeps every step for reverse mode
@@ -135,9 +139,6 @@ STEPS_PER_SEGMENT = 25
 #: fraction of the time between the first formation and the end of the run.
 SHORTLY_AFTER_FORMATION = 0.1
 
-#: The outputs whose gradients are compared.
-OUTPUT_NAMES = ("total sink mass", "position moments")
-
 #: The weights of the random combination of the 6 position moments.
 POSITION_WEIGHTS = np.random.default_rng(2026).normal(size=6)
 POSITION_WEIGHTS = POSITION_WEIGHTS / np.linalg.norm(POSITION_WEIGHTS)
@@ -148,8 +149,71 @@ RESULTS = Path(__file__).resolve().parent / "results"
 SMOOTH_RESULTS = RESULTS / "smooth"
 
 
+def _sink_outputs(mass, position, settings) -> jax.Array:
+    """
+    The total sink mass and the random combination of the mass-weighted
+    position moments.
+
+    Args:
+        mass: The sink masses, shape (max_num_sinks,).
+        position: The sink positions, shape (max_num_sinks, 3).
+        settings: The problem constants, for the box length.
+
+    Returns:
+        The two outputs, shape (2,).
+    """
+    phase = 2.0 * jnp.pi * position / settings.box_length
+    moments = jnp.concatenate(
+        [
+            jnp.sum(mass[:, None] * jnp.cos(phase), axis=0),
+            jnp.sum(mass[:, None] * jnp.sin(phase), axis=0),
+        ]
+    )
+    return jnp.stack([jnp.sum(mass), jnp.dot(POSITION_WEIGHTS, moments)])
+
+
+def _central_cell_center(box_length: float) -> float:
+    """The coordinate of the centre of the cell at the middle of the box,
+    where the symmetric setups put their centre."""
+    return (NUM_CELLS // 2 + 0.5) * box_length / NUM_CELLS
+
+
+def _mass_and_mean_x(mass, position, settings) -> jax.Array:
+    """
+    The total sink mass and the mass-weighted mean x of the sinks, in cells
+    from the centre of the central cell.
+
+    Args:
+        mass: The sink masses, shape (max_num_sinks,).
+        position: The sink positions, shape (max_num_sinks, 3).
+        settings: The problem constants, for the box length.
+
+    Returns:
+        The two outputs, shape (2,); the mean x is 0 without sinks.
+    """
+    total_mass = jnp.sum(mass)
+    has_mass = total_mass > 0.0
+    mean_x = jnp.where(
+        has_mass,
+        jnp.sum(mass * position[:, 0]) / jnp.where(has_mass, total_mass, 1.0),
+        _central_cell_center(settings.box_length),
+    )
+    grid_spacing = settings.box_length / NUM_CELLS
+    return jnp.stack(
+        [total_mass, (mean_x - _central_cell_center(settings.box_length)) / grid_spacing]
+    )
+
+
+def _with_center_offset(settings, offset):
+    """The settings with the centre moved by ``offset`` cells along x from the
+    centre of the central cell."""
+    center = _central_cell_center(settings.box_length)
+    grid_spacing = settings.box_length / NUM_CELLS
+    return settings._replace(center=(center + offset * grid_spacing, center, center))
+
+
 class Case(NamedTuple):
-    """A validation setup and the input of its gradient."""
+    """A validation setup, the input of its gradients and their outputs."""
 
     #: The setup function, ``(config, params, settings) -> (state, config, params)``.
     setup: Callable
@@ -157,11 +221,48 @@ class Case(NamedTuple):
     #: The problem constants.
     settings: NamedTuple
 
-    #: The field of ``settings`` the gradients are taken with respect to.
+    #: The input of the gradients: a field of ``settings``, unless
+    #: ``with_input`` is given, in which case it only names the input.
     parameter: str
 
     #: The name of the setup in the report.
     title: str
+
+    #: The value of the input; ``None`` takes the field ``parameter`` of
+    #: ``settings``.
+    input_value: float = None
+
+    #: ``(settings, value) -> settings`` with the input set to ``value``;
+    #: ``None`` sets the field ``parameter``.
+    with_input: Callable = None
+
+    #: ``(mass, position, settings) -> outputs``, the outputs of a run from
+    #: the final sink masses and positions.
+    outputs: Callable = _sink_outputs
+
+    #: The names of the outputs.
+    output_names: tuple = ("total sink mass", "position moments")
+
+
+def _input_value(case: Case) -> float:
+    """The value of the input of the gradients of a setup."""
+    if case.input_value is None:
+        return getattr(case.settings, case.parameter)
+    return case.input_value
+
+
+def _input_name(case: Case) -> str:
+    """The name of the input of the gradients of a setup in the report."""
+    if case.with_input is None:
+        return f"`{case.parameter}`"
+    return case.parameter
+
+
+def _settings_with_input(case: Case, value):
+    """The problem constants of a setup with its input set to ``value``."""
+    if case.with_input is None:
+        return case.settings._replace(**{case.parameter: value})
+    return case.with_input(case.settings, value)
 
 
 CASES = {
@@ -188,6 +289,16 @@ CASES = {
         TurbulentClusterSettings(),
         "mach_number",
         "Turbulent cluster",
+    ),
+    "bonnor_ebert_offset": Case(
+        setup_bonnor_ebert_sphere,
+        BonnorEbertSettings(),
+        "offset of the centre from the central cell centre along x, in cells",
+        "Bonnor–Ebert sphere off the cell centre",
+        input_value=0.25,
+        with_input=_with_center_offset,
+        outputs=_mass_and_mean_x,
+        output_names=("total sink mass", "mean x of the sinks, in cells"),
     ),
 }
 
@@ -231,7 +342,8 @@ def run_reference(case: Case, sink_options: dict) -> dict:
         num_snapshots=NUM_SNAPSHOTS,
         snapshot_settings=SnapshotSettings(return_total_mass=True),
     )
-    state, config, params = case.setup(config, SimulationParams(), case.settings)
+    settings = _settings_with_input(case, _input_value(case))
+    state, config, params = case.setup(config, SimulationParams(), settings)
     registered_variables = get_registered_variables(config)
 
     snapshots = jax.block_until_ready(
@@ -270,29 +382,6 @@ def run_reference(case: Case, sink_options: dict) -> dict:
 # -------------------------------------------------------------
 
 
-def _sink_outputs(mass, position, box_length) -> jax.Array:
-    """
-    The compared outputs of a run: the total sink mass and the random
-    combination of the mass-weighted position moments.
-
-    Args:
-        mass: The sink masses, shape (max_num_sinks,).
-        position: The sink positions, shape (max_num_sinks, 3).
-        box_length: The side length of the box.
-
-    Returns:
-        The two outputs, shape (2,).
-    """
-    phase = 2.0 * jnp.pi * position / box_length
-    moments = jnp.concatenate(
-        [
-            jnp.sum(mass[:, None] * jnp.cos(phase), axis=0),
-            jnp.sum(mass[:, None] * jnp.sin(phase), axis=0),
-        ]
-    )
-    return jnp.stack([jnp.sum(mass), jnp.dot(POSITION_WEIGHTS, moments)])
-
-
 def _output_function(
     case: Case,
     end_time: float,
@@ -315,11 +404,11 @@ def _output_function(
         sink_options: The ``SinkParticleConfig`` fields of the runs.
 
     Returns:
-        ``outputs(parameter) -> (2,)``.
+        ``outputs(parameter)``, the outputs of the setup.
     """
 
     def outputs(parameter):
-        settings = case.settings._replace(**{case.parameter: parameter, "t_end": end_time})
+        settings = _settings_with_input(case, parameter)._replace(t_end=end_time)
         config = _config(sink_options, fixed_timestep=True, num_timesteps=STEPS_PER_SEGMENT)
         state, config, params = case.setup(config, SimulationParams(), settings)
         params = params._replace(t_end=end_time / num_segments)
@@ -343,10 +432,10 @@ def _output_function(
             None,
             length=num_segments,
         )
-        return _sink_outputs(
+        return case.outputs(
             final_state.sink_particles.mass,
             final_state.sink_particles.position,
-            settings.box_length,
+            settings,
         )
 
     return outputs
@@ -372,14 +461,14 @@ def compare_gradients(
         The outputs at the setup's input, their gradients, the finite
         differences (one row per step) and the wall times.
     """
-    parameter = jnp.asarray(getattr(case.settings, case.parameter), dtype=jnp.float64)
+    parameter = jnp.asarray(_input_value(case), dtype=jnp.float64)
     outputs = _output_function(case, end_time, num_segments, sink_options)
 
     def value_and_gradients(parameter):
         value, pullback = jax.vjp(outputs, parameter)
         # One batched backward pass for all outputs, which recomputes each
         # checkpointed segment once.
-        (gradients,) = jax.vmap(pullback)(jnp.eye(len(OUTPUT_NAMES)))
+        (gradients,) = jax.vmap(pullback)(jnp.eye(len(case.output_names)))
         return value, gradients
 
     start = time.perf_counter()
@@ -509,7 +598,7 @@ def write_report(smooth: bool) -> Path:
         lines += [
             f"## {case.title} (`{name}`)",
             "",
-            f"Input of the gradients: `{case.parameter}` = {getattr(case.settings, case.parameter):g}.",
+            f"Input of the gradients: {_input_name(case)} = {_input_value(case):g}.",
             "",
             "Reference (adaptive steps):",
             "",
@@ -540,9 +629,9 @@ def write_report(smooth: bool) -> Path:
         # The outputs of the adaptive reference at every snapshot, to compare
         # with the values of the fixed-step runs.
         reference_outputs = np.asarray(
-            jax.vmap(
-                lambda mass, position: _sink_outputs(mass, position, case.settings.box_length)
-            )(data["mass"], data["position"])
+            jax.vmap(lambda mass, position: case.outputs(mass, position, case.settings))(
+                data["mass"], data["position"]
+            )
         )
         steps_header = " | ".join(f"FD h={step:g}" for step in RELATIVE_STEPS)
         lines += [
@@ -553,7 +642,7 @@ def write_report(smooth: bool) -> Path:
         ]
         for comparison in range(data["comparison_end_time"].size):
             end_time = data["comparison_end_time"][comparison]
-            for output, output_name in enumerate(OUTPUT_NAMES):
+            for output, output_name in enumerate(case.output_names):
                 gradient = data["comparison_gradient"][comparison, output]
                 finite_differences = data["comparison_finite_differences"][comparison, :, output]
                 errors = _relative_difference(gradient, finite_differences)

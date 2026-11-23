@@ -85,3 +85,24 @@ Reference (adaptive steps):
 The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
+
+## Bonnor–Ebert sphere off the cell centre (`bonnor_ebert_offset`)
+
+Input of the gradients: offset of the centre from the central cell centre along x, in cells = 0.25.
+
+Reference (adaptive steps):
+
+- end time 0.3, 423 steps
+- sinks formed: 1; first formation at t = 0.08828
+- total sink mass at the last snapshot (t = 0.3): 1.46077, gas mass 0.526727
+
+| end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.1094 | 325 | total sink mass | 0.146303 | 0.146845 | -0.0175 | -0.01347 (2.3e-01) | -0.01746 (2.2e-03) | -0.01749 (4.1e-04) | -0.0175 (2.3e-04) |
+| 0.1094 | 325 | mean x of the sinks, in cells | 0.222172 | 0.222382 | 0.852 | 0.9682 (1.2e-01) | 0.8516 (4.4e-04) | 0.852 (2.8e-05) | 0.852 (1.8e-05) |
+| 0.3 | 850 | total sink mass | 1.4607 | 1.46077 | -0.001457 | 0.003575 (1.4e+00) | -0.001443 (9.7e-03) | -0.001413 (3.0e-02) | -0.001457 (6.5e-05) |
+| 0.3 | 850 | mean x of the sinks, in cells | 0.178948 | 0.172404 | 0.5669 | 0.7476 (2.4e-01) | 0.5568 (1.8e-02) | 0.5286 (6.8e-02) | 0.5669 (2.8e-06) |
+
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+
+Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).

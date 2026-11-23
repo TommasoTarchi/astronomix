@@ -105,3 +105,29 @@ Hard reference:
 The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
+
+## Bonnor–Ebert sphere off the cell centre (`bonnor_ebert_offset`)
+
+Input of the gradients: offset of the centre from the central cell centre along x, in cells = 0.25.
+
+Reference (adaptive steps):
+
+- end time 0.3, 426 steps
+- sinks formed: 1; first formation at t = 0.08828
+- total sink mass at the last snapshot (t = 0.3): 1.46077, gas mass 0.526723
+
+Hard reference:
+
+- sinks formed: 1; first formation at t = 0.08828
+- total sink mass at the last snapshot (t = 0.3): 1.46077
+
+| end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.1094 | 325 | total sink mass | 0.145774 | 0.146004 | -0.0132 | -0.01918 (3.1e-01) | -0.02094 (3.7e-01) | -0.01309 (8.6e-03) | -0.0132 (3.0e-05) |
+| 0.1094 | 325 | mean x of the sinks, in cells | 0.219805 | 0.222269 | 0.8025 | 0.9426 (1.5e-01) | 0.826 (2.8e-02) | 0.8021 (5.0e-04) | 0.8025 (1.8e-05) |
+| 0.3 | 850 | total sink mass | 1.46071 | 1.46077 | -0.00127 | 0.003672 (1.3e+00) | -0.001295 (2.0e-02) | -0.001412 (1.0e-01) | -0.00127 (2.0e-05) |
+| 0.3 | 850 | mean x of the sinks, in cells | 0.173352 | 0.168436 | 0.3972 | 0.6674 (4.0e-01) | 0.4325 (8.2e-02) | 0.5923 (3.3e-01) | 0.3972 (5.6e-05) |
+
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+
+Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
