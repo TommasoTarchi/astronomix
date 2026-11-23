@@ -100,5 +100,5 @@ class SinkParticleConfig(NamedTuple):
 
     #: Print, at every step, the candidates created and recycled with their
     #: largest activation and mass, the number of occupied slots, and the gas
-    #: mass above the density threshold farther than r_acc from every slot.
+    #: mass that accretion would take farther than r_acc from every slot.
     print_diagnostics: bool = False

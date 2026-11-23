@@ -40,6 +40,7 @@ from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
     IDEAL_GAS,
     PERIODIC_BOUNDARY,
+    POLYTROPIC,
     STATE_TYPE,
 )
 
@@ -321,6 +322,33 @@ def _polytropic_resolved_density(
         * params.polytropic_constant
         / (4.0 * params.gravitational_constant * accretion_radius**2)
     ) ** (1.0 / (2.0 - exponent))
+
+
+def _accreted_cell_density(
+    density_threshold: jax.Array,
+    config: SimulationConfig,
+    params: SimulationParams,
+) -> jax.Array:
+    """
+    The density a cell is left at when accretion takes its whole excess.
+
+    For an ideal or isothermal gas c_s² does not change with the accretion,
+    so this is the threshold. For a polytropic gas c_s² drops with the
+    density, and the threshold with it, so a cell left at the threshold of
+    its density before accretion would still be above its threshold; it is
+    left at ρ* instead.
+
+    Args:
+        density_threshold: The density threshold of the cells.
+        config: The simulation configuration.
+        params: The simulation parameters.
+
+    Returns:
+        The density threshold, or the scalar ρ* for a polytropic gas.
+    """
+    if config.equation_of_state == POLYTROPIC:
+        return _polytropic_resolved_density(config, params)
+    return density_threshold
 
 
 # -------------------------------------------------------------

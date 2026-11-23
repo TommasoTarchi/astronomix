@@ -44,7 +44,6 @@ import jax.numpy as jnp
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     IDEAL_GAS,
-    POLYTROPIC,
     STATE_TYPE,
 )
 
@@ -60,8 +59,8 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
     SlotNeighbourhood,
 )
 from astronomix._modules._sink_particles._sink_particle_helpers import (
+    _accreted_cell_density,
     _periodic_box,
-    _polytropic_resolved_density,
 )
 from astronomix._modules._sink_particles._sink_particle_smoothing import (
     _point_mass_potential,
@@ -310,16 +309,11 @@ def _accrete(
         config,
         params,
     )
-
-    # The density a cell is left at when its whole excess is taken. For an
-    # ideal or isothermal gas c_s² does not change with the accretion, so this
-    # is the threshold. For a polytropic gas c_s² drops with the density, and
-    # the threshold with it, so a cell left at the threshold of its density
-    # before accretion would still be above its threshold; it is left at ρ*
-    # instead.
-    accreted_cell_density = cells.density_threshold[cell_indices]
-    if config.equation_of_state == POLYTROPIC:
-        accreted_cell_density = _polytropic_resolved_density(config, params)
+    accreted_cell_density = _accreted_cell_density(
+        cells.density_threshold[cell_indices],
+        config,
+        params,
+    )
     excess = (
         jnp.maximum(0.0, cells.density[cell_indices] - accreted_cell_density)
         * cell_volume

@@ -45,7 +45,10 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
     _slot_neighbourhood,
     _slot_separation_squared,
 )
-from astronomix._modules._sink_particles._sink_particle_helpers import _interior_mask
+from astronomix._modules._sink_particles._sink_particle_helpers import (
+    _accreted_cell_density,
+    _interior_mask,
+)
 from astronomix._modules._sink_particles._sink_particle_smoothing import _safe_divide
 
 
@@ -267,7 +270,7 @@ def _print_diagnostics(
     Print the candidates created in this step with their largest activation
     and mass after it, the candidates freed with their largest activation and
     mass before they were freed, the number of occupied slots, and the gas
-    mass above the density threshold farther than r_acc from every slot.
+    mass that accretion would take farther than r_acc from every slot.
 
     Args:
         is_created: Whether each slot got a new candidate in this step.
@@ -296,7 +299,11 @@ def _print_diagnostics(
     uncovered_mass = jnp.sum(
         jnp.where(
             _interior_mask(cells.density, config) & ~is_near_slot,
-            jnp.maximum(0.0, cells.density - cells.density_threshold),
+            jnp.maximum(
+                0.0,
+                cells.density
+                - _accreted_cell_density(cells.density_threshold, config, params),
+            ),
             0.0,
         )
     ) * config.grid_spacing**3
@@ -323,7 +330,7 @@ def _print_diagnostics(
         lambda: None,
     )
     jax.debug.print(
-        "occupied sink slots: {}, gas mass above the density threshold farther "
+        "occupied sink slots: {}, gas mass that accretion would take farther "
         "than r_acc from every slot: {}",
         jnp.sum(sink_particles.occupied),
         uncovered_mass,
