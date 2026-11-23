@@ -135,7 +135,7 @@ def test_conservation_in_run(self_gravity_version, mhd):
 
     # No sink at t = 0 (recorded before the first formation call); one sink
     # from the next snapshot on.
-    num_sinks = jnp.sum(snapshots.sink_particles.mass > 0.0, axis=1)
+    num_sinks = jnp.sum(snapshots.sink_particles.activation > 0.5, axis=1)
     assert num_sinks[0] == 0
     assert jnp.all(num_sinks[1:] == 1)
 
@@ -287,7 +287,7 @@ def test_snapshot_callback_receives_sinks():
 
     final_state = _run_with_snapshot_callback(True, snapshot_callable)
 
-    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, *_ in calls]
+    num_sinks = [int(np.sum(activation > 0.5)) for *_, activation, _ in calls]
     assert len(calls) >= 5
     assert num_sinks[0] == 0
     assert all(count == 1 for count in num_sinks[1:])

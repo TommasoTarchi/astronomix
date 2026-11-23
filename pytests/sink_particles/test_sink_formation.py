@@ -1,13 +1,13 @@
 """
 Sink particle formation pytest (fast).
 
-Checks the sink particle creation of Federrath et al. (2010), Section 2.2:
-the creation checks (converging flow, potential minimum, with the potential
-of the existing sinks, Jeans instability with and without a magnetic field,
-bound state, proximity to existing sinks and between sinks formed in the same
-call), the limit on the number of sink
-slots, the wrapping of a new sink's position into a periodic box, and the
-control volume at an open boundary.
+Checks the sink particle creation of Federrath et al. (2010), Section 2.2,
+with every smoothing parameter at its hard limit: the creation checks
+(converging flow, potential minimum, with the potential of the existing sinks,
+Jeans instability with and without a magnetic field, bound state, proximity to
+existing sinks and between sinks formed in the same call), the limit on the
+number of sink slots, the wrapping of a new sink's position into a periodic
+box, and the control volume at an open boundary.
 """
 
 # ==== GPU selection ====
@@ -27,7 +27,8 @@ from astronomix.option_classes.simulation_config import BoundarySettings
 
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_formation import (
-    _form_sink_particles,
+    _cell_quantities,
+    _create_candidates,
 )
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _control_volume_offsets,
@@ -44,7 +45,7 @@ from _sink_helpers import (
     _form_sinks_once,
     _num_sinks,
     _one_sink_at,
-    _setup,
+    _setup_hard_limit,
     _with_linear_velocity,
     _with_sink,
 )
@@ -62,7 +63,7 @@ def test_position_wrapping():
         peak_overdensity=400.0,
         overdensity_center=(1.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    state, config, params, registered_variables = _setup(settings=boundary_settings)
+    state, config, params, registered_variables = _setup_hard_limit(settings=boundary_settings)
     config = config._replace(
         gravity_config=config.gravity_config._replace(external_potential=True)
     )
@@ -81,7 +82,7 @@ def test_position_wrapping():
 def test_proximity():
     """No sink forms within r_acc of an existing sink (Section 2.2.7), with
     distances taken across periodic boundaries."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     dtype = state.primitive_state.dtype
     box_length = SETTINGS.box_length
 
@@ -119,7 +120,7 @@ def test_proximity():
     boundary_settings = SETTINGS._replace(
         overdensity_center=(0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    state, config, params, registered_variables = _setup(settings=boundary_settings)
+    state, config, params, registered_variables = _setup_hard_limit(settings=boundary_settings)
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
     assert _num_sinks(sink_particles) == 1
     across_boundary_sink = _one_sink_at(
@@ -149,7 +150,7 @@ def test_proximity():
 def test_converging_flow(velocity_gradient, expected_num_sinks):
     """Sinks only form where the flow converges along every axis (Section
     2.2.3)."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     state = _with_linear_velocity(state, registered_variables, velocity_gradient)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
@@ -160,7 +161,7 @@ def test_converging_flow(velocity_gradient, expected_num_sinks):
 def test_potential_minimum():
     """A sink forms only where the potential is lowest in the control volume
     (Section 2.2.4), which need not be the densest cell."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
 
     # Add a narrow density spike in a single cell, 2 cells from the clump
     # centre along x (within r_acc). The spike cell becomes the densest cell
@@ -190,10 +191,11 @@ def test_potential_minimum():
 
 
 def _num_new_sinks_next_to_sink(sink_mass):
-    """The number of sinks the formation alone creates in the clump, with an
-    existing sink of ``sink_mass`` at rest 3 cells from the clump centre along
-    x, beyond r_acc = 2.5 cells, so that proximity does not block the centre."""
-    state, config, params, registered_variables = _setup()
+    """The number of candidates the creation (step 1) alone creates in the
+    clump, at the hard limit, with an existing sink of ``sink_mass`` at rest 3
+    cells from the clump centre along x, beyond r_acc = 2.5 cells, so that
+    proximity does not block the centre."""
+    state, config, params, registered_variables = _setup_hard_limit()
     primitive_state = _prepare_padded_state(
         state.primitive_state,
         config,
@@ -206,12 +208,16 @@ def _num_new_sinks_next_to_sink(sink_mass):
         sink_mass,
         (CLUMP_CENTER + 3.0 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    sink_particles = _form_sink_particles(
-        primitive_state,
+    sink_particles = _create_candidates(
         existing_sink,
+        _cell_quantities(
+            primitive_state,
+            existing_sink,
+            config,
+            params,
+            registered_variables,
+        ),
         config,
-        params,
-        registered_variables,
     )
     return int(jnp.sum(sink_particles.occupied)) - 1
 
@@ -246,7 +252,7 @@ def test_one_sink_per_control_volume():
     # only by rounding, and several of them pass every creation check.
     corner = CLUMP_CENTER - 0.5 * CELL_SIZE
     settings = SETTINGS._replace(overdensity_center=(corner, corner, corner))
-    state, config, params, registered_variables = _setup(settings)
+    state, config, params, registered_variables = _setup_hard_limit(settings)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
 
@@ -278,7 +284,7 @@ def test_jeans_instability(peak_overdensity, sound_speed_squared, expected_num_s
         peak_overdensity=peak_overdensity,
         sound_speed_squared=sound_speed_squared,
     )
-    state, config, params, registered_variables = _setup(settings=settings)
+    state, config, params, registered_variables = _setup_hard_limit(settings=settings)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
 
@@ -322,7 +328,7 @@ def _with_rotation(state, registered_variables, angular_velocity):
 def test_bound_state(angular_velocity, expected_num_sinks):
     """A sink forms only if the gas in the control volume is bound,
     E_grav + E_th + E_kin + E_mag < 0 (Section 2.2.6)."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     state = _with_rotation(state, registered_variables, angular_velocity)
 
     sink_particles = _form_sinks_once(state, config, params, registered_variables)
@@ -346,7 +352,7 @@ def test_magnetic_energy(magnetic_field, expected_num_sinks):
     """The magnetic energy E_mag = ½ Σ |B|² ΔV of the control volume counts
     against sink formation in the Jeans check, |E_grav| > 2 E_th + E_mag
     (Section 2.2.5)."""
-    state, config, params, registered_variables = _setup(
+    state, config, params, registered_variables = _setup_hard_limit(
         settings=SETTINGS._replace(magnetic_field_z=magnetic_field),
         mhd=True,
     )
@@ -370,7 +376,7 @@ def test_control_volume_at_open_boundary():
         boundary_settings=BoundarySettings(),
         overdensity_center=(0.5 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER),
     )
-    state, config, params, registered_variables = _setup(settings=settings)
+    state, config, params, registered_variables = _setup_hard_limit(settings=settings)
     state = _with_linear_velocity(state, registered_variables, (-1.0, 0.0, 0.0))
     primitive_state = _prepare_padded_state(
         state.primitive_state,
@@ -379,13 +385,12 @@ def test_control_volume_at_open_boundary():
         registered_variables,
     )
 
-    # Formation alone, since accretion changes the velocity of the sink.
-    sink_particles = _form_sink_particles(
-        primitive_state,
-        _empty_sink_particles(config, primitive_state.dtype),
+    # Creation alone, since accretion changes the velocity of the sink.
+    no_sinks = _empty_sink_particles(config, primitive_state.dtype)
+    sink_particles = _create_candidates(
+        no_sinks,
+        _cell_quantities(primitive_state, no_sinks, config, params, registered_variables),
         config,
-        params,
-        registered_variables,
     )
 
     num_occupied_slots = int(jnp.sum(sink_particles.occupied))
@@ -407,7 +412,7 @@ def test_control_volume_at_open_boundary():
 def test_error_when_sink_slots_full():
     """When a new sink passes every check but all slots are taken, the run
     stops with an error, since the sink and its gas would otherwise be lost."""
-    state, config, params, registered_variables = _setup(max_num_sinks=1)
+    state, config, params, registered_variables = _setup_hard_limit(max_num_sinks=1)
     far_sink = _one_sink_at((0.1, 0.1, 0.1), config, state.primitive_state.dtype)
 
     # JAX wraps the RuntimeError raised in the host callback in its own

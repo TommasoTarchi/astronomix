@@ -93,11 +93,11 @@ def test_same_result_as_one_device(sinks_passed_in):
 
 
 def test_no_full_grid_all_gather():
-    """One formation call, one accretion call, one sink acceleration, one sum
-    of the gas and sink densities and one sum of the gas and sink potentials
-    on the split state copy no array with as many elements as the grid to
-    every device, and both sums stay split along x like the gas. Periodic
-    boundaries, where the Poisson solve is distributed."""
+    """One sink update (formation and accretion), one sink acceleration, one
+    sum of the gas and sink densities and one sum of the gas and sink
+    potentials on the split state copy no array with as many elements as the
+    grid to every device, and both sums stay split along x like the gas.
+    Periodic boundaries, where the Poisson solve is distributed."""
     _assert_check_passes("no_full_grid_all_gather")
 
 
@@ -189,8 +189,8 @@ def _check_same_result(sink_passed_in):
 
     # Same sinks at every snapshot. Float32 rounding differs between the two
     # runs, because the reductions run in a different order across devices.
-    num_sinks_single = np.asarray((single.sink_particles.mass > 0.0).sum(axis=1))
-    num_sinks_split = np.asarray((split.sink_particles.mass > 0.0).sum(axis=1))
+    num_sinks_single = np.asarray((single.sink_particles.activation > 0.5).sum(axis=1))
+    num_sinks_split = np.asarray((split.sink_particles.activation > 0.5).sum(axis=1))
     print("sinks per snapshot:", num_sinks_single, num_sinks_split)
     assert np.array_equal(num_sinks_single, num_sinks_split)
     assert num_sinks_single[-1] == 1 + int(sink_passed_in)
@@ -216,9 +216,9 @@ def _check_same_result(sink_passed_in):
 
 
 def _check_no_full_grid_all_gather():
-    """Compile one formation call, one accretion call, one sink acceleration,
-    one sum of the gas and sink densities and one sum of the gas and sink
-    potentials on the split state. Fail if any all-gather produces an array
+    """Compile one sink update (formation and accretion), one sink
+    acceleration, one sum of the gas and sink densities and one sum of the gas
+    and sink potentials on the split state. Fail if any all-gather produces an array
     with as many elements as the grid, or if either sum is not split along x
     like the gas.
 
@@ -230,20 +230,14 @@ def _check_no_full_grid_all_gather():
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from astronomix._modules._sink_particles._sink_particle_accretion import (
-        _accrete_gas,
-    )
     from astronomix._modules._sink_particles._sink_particle_dynamics import (
         _sink_acceleration,
         _sink_density,
         _sink_potential,
     )
     from astronomix._modules._gravity._gravity import _compute_total_potential
-    from astronomix._modules._sink_particles._sink_particle_formation import (
-        _form_sink_particles,
-    )
-    from astronomix._modules._sink_particles._sink_particle_helpers import (
-        _empty_sink_particles,
+    from astronomix._modules._sink_particles._sink_particle_update import (
+        _update_sink_particles,
     )
     from astronomix import NATIVE_JAX
     from astronomix._pallas_helpers import pallas_mesh_context
@@ -252,7 +246,6 @@ def _check_no_full_grid_all_gather():
     mesh, sharding = _mesh_and_sharding()
     state, config, params, registered_variables = _setup(backend=NATIVE_JAX)
     primitive_state = jax.device_put(state.primitive_state, sharding)
-    sink_particles = _empty_sink_particles(config, primitive_state.dtype)
     num_cells = int(np.prod(primitive_state.shape[1:]))
     # A sink at the clump centre, whose cells straddle the boundary between
     # the second and the third device.
@@ -289,8 +282,7 @@ def _check_no_full_grid_all_gather():
         )
 
     static = ["config", "registered_variables"]
-    form = jax.jit(_form_sink_particles, static_argnames=static)
-    accrete = jax.jit(_accrete_gas, static_argnames=static)
+    update = jax.jit(_update_sink_particles, static_argnames=static)
     accelerate = jax.jit(_sink_acceleration, static_argnames=static)
     add_densities = jax.jit(gas_plus_sink_density)
     add_potentials = jax.jit(gas_plus_sink_potential)
@@ -298,28 +290,14 @@ def _check_no_full_grid_all_gather():
     # its distributed path.
     with mesh, pallas_mesh_context(mesh):
         programs = {
-            "formation": form.lower(
+            "sink update": update.lower(
                 primitive_state,
-                sink_particles,
+                clump_sink,
                 config,
                 params,
                 registered_variables,
             ).compile(),
         }
-        new_sinks = form(
-            primitive_state,
-            sink_particles,
-            config,
-            params,
-            registered_variables,
-        )
-        programs["accretion"] = accrete.lower(
-            primitive_state,
-            new_sinks,
-            config,
-            params,
-            registered_variables,
-        ).compile()
         programs["sink acceleration"] = accelerate.lower(
             primitive_state,
             clump_sink,

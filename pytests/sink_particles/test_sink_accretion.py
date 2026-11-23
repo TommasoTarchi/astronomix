@@ -2,10 +2,11 @@
 Sink particle accretion pytest (fast).
 
 Checks the gas accretion onto sink particles of Federrath et al. (2010),
-Section 2.3: the mass, position and velocity of a new sink after its first
-accretion, the conservation of mass and momentum (with and without a magnetic
-field), the bound and radial velocity checks, and the choice of a single sink
-for each accreted cell.
+Section 2.3, with every smoothing parameter at its hard limit: the mass,
+position and velocity of a new sink after its first accretion, the
+conservation of mass and momentum (with and without a magnetic field), the
+bound and radial velocity checks, and the choice of a single sink for each
+accreted cell.
 """
 
 # ==== GPU selection ====
@@ -34,7 +35,7 @@ from _sink_helpers import (
     _gas_mass_and_momentum,
     _num_accreted_cells,
     _num_sinks,
-    _setup,
+    _setup_hard_limit,
     _sink_at_clump_center,
     _update_sinks_once,
     _with_linear_velocity,
@@ -48,7 +49,7 @@ def test_new_sink_accretion():
     centre-of-mass velocity of the accreted gas. The accreted cells are left at
     the threshold with an unchanged sound speed; the other cells are
     untouched."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
 
     # Give the gas a uniform bulk velocity, which the sink must inherit as its
     # centre-of-mass velocity.
@@ -124,7 +125,7 @@ def test_accretion_conservation(mhd):
     Args:
         mhd: Whether MHD is switched on, with a uniform field B_z = 1.
     """
-    state, config, params, registered_variables = _setup(
+    state, config, params, registered_variables = _setup_hard_limit(
         settings=SETTINGS._replace(magnetic_field_z=1.0),
         mhd=mhd,
     )
@@ -198,7 +199,7 @@ def _accrete_around_sink_at_rest(velocity_gradient):
     Returns:
         The number of cells that lost gas.
     """
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     state = _with_linear_velocity(
         state,
         registered_variables,
@@ -275,7 +276,7 @@ def test_no_accretion_of_gas_moving_away():
 def test_accretion_most_bound_sink():
     """A cell within reach of several sinks is accreted once, by the sink it
     is most strongly bound to (Section 2.3)."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     dtype = state.primitive_state.dtype
 
     # Two sinks at rest, 2 cells on either side of the clump centre along x:
@@ -327,7 +328,7 @@ def test_accretion_most_bound_sink():
 def test_accretion_tie_break():
     """A cell for which several sinks tie exactly is accreted once, by the
     sink in the lowest slot."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup_hard_limit()
     dtype = state.primitive_state.dtype
 
     # Two equal sinks at rest at the same position: they share the inner cell

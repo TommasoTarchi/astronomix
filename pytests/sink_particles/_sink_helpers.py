@@ -5,6 +5,9 @@ The tests run on the Gaussian overdensity setup in
 ``astronomix/test_setups/self_gravity/sink_particle_formation3D.py``.
 """
 
+# general
+import math
+
 # jax
 import jax.numpy as jnp
 
@@ -51,6 +54,17 @@ SETTINGS = SinkFormationSettings(
 )
 
 
+#: The hard limit of the smoothing parameters of the sink formation and
+#: accretion, at which they make the decisions of the hard checks.
+HARD_LIMIT = dict(
+    creation_margin=1.0,
+    check_width=0.0,
+    spatial_width_in_cells=0.0,
+    sharing_sharpness=math.inf,
+    position_update_mass=0.0,
+)
+
+
 def _setup(
     settings=SETTINGS,
     mhd=False,
@@ -84,6 +98,17 @@ def _setup(
     state, config, params = setup_sink_formation(config, SimulationParams(), settings)
     registered_variables = get_registered_variables(config)
     return state, config, params, registered_variables
+
+
+def _setup_hard_limit(
+    settings=SETTINGS,
+    mhd=False,
+    backend=OPTIMAL_BACKEND,
+    **sink_particle_options,
+):
+    """``_setup`` with every smoothing parameter at its hard limit, unless
+    given in ``sink_particle_options``."""
+    return _setup(settings, mhd, backend, **{**HARD_LIMIT, **sink_particle_options})
 
 
 def _density_threshold(config, params):
@@ -144,8 +169,8 @@ def _one_sink_at(position, config, dtype):
 
 
 def _num_sinks(sink_particles):
-    """The number of filled sink slots."""
-    return int(jnp.sum(sink_particles.mass > 0.0))
+    """The number of sinks: slots with an activation above ½."""
+    return int(jnp.sum(sink_particles.activation > 0.5))
 
 
 def _gas_mass_and_momentum(primitive_state, registered_variables):

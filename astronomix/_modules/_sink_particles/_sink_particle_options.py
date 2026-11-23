@@ -97,3 +97,8 @@ class SinkParticleConfig(NamedTuple):
     #: The mass below which a candidate can be recycled, in units of
     #: ρ_thr ΔV at the candidate.
     recycling_mass: float = 0.01
+
+    #: Print, at every step, the candidates created and recycled with their
+    #: largest activation and mass, the number of occupied slots, and the gas
+    #: mass above the density threshold farther than r_acc from every slot.
+    print_diagnostics: bool = False

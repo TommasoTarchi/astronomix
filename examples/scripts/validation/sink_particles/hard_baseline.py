@@ -23,6 +23,13 @@ native JAX backend and the finite-volume scheme (RK2, HLL, minmod), and
 
 Each setup writes ``results/<setup>.npz``; ``results/report.md`` gathers them.
 
+With ``--parameters smooth`` the same runs use the default (smooth)
+parameters of the sink formation and accretion and write to
+``results/smooth``. They take the times of the gradient comparisons from the
+hard baseline, and the report gives the hard reference next to their own. A
+sink is a slot with activation above ½: its formation time is the first
+snapshot at which the activation of its slot exceeds ½.
+
 The finite-volume scheme is used because the default finite-difference scheme
 turns the turbulent cluster non-finite at 32³ with or without sinks, once the
 collapse is no longer resolved (by t ≈ 0.046 without sinks, t ≈ 0.051 with
@@ -30,6 +37,7 @@ them). The finite-volume scheme runs every setup to its end.
 
     python hard_baseline.py                       # every setup, both parts
     python hard_baseline.py --setups bonnor_ebert --part reference
+    python hard_baseline.py --parameters smooth    # the smooth scheme
 """
 
 # ==== GPU selection ====
@@ -136,6 +144,9 @@ POSITION_WEIGHTS = POSITION_WEIGHTS / np.linalg.norm(POSITION_WEIGHTS)
 
 RESULTS = Path(__file__).resolve().parent / "results"
 
+#: Where the runs with the smooth parameters write their results.
+SMOOTH_RESULTS = RESULTS / "smooth"
+
 
 class Case(NamedTuple):
     """A validation setup and the input of its gradient."""
@@ -181,15 +192,16 @@ CASES = {
 }
 
 
-def _config(**options) -> SimulationConfig:
-    """The configuration shared by every run, with the given further fields."""
+def _config(sink_options: dict, **options) -> SimulationConfig:
+    """The configuration shared by every run, with the given
+    ``SinkParticleConfig`` fields and further configuration fields."""
     return SimulationConfig(
         num_cells=NUM_CELLS,
         backend_config=BackendConfig(backend=NATIVE_JAX),
         solver_mode=FINITE_VOLUME,
         solver_config=FVSolverConfig(),
         progress_bar=False,
-        sink_particle_config=SinkParticleConfig(sink_particles=True, **HARD_LIMIT),
+        sink_particle_config=SinkParticleConfig(sink_particles=True, **sink_options),
         **options,
     )
 
@@ -199,19 +211,22 @@ def _config(**options) -> SimulationConfig:
 # -------------------------------------------------------------
 
 
-def run_reference(case: Case) -> dict:
+def run_reference(case: Case, sink_options: dict) -> dict:
     """
     Run a setup with adaptive steps and record its sinks at every snapshot.
 
     Args:
         case: The setup.
+        sink_options: The ``SinkParticleConfig`` fields of the run.
 
     Returns:
         The reference: snapshot times, the sink fields at every snapshot, the
-        gas mass, the formation time of every slot (NaN for a slot never
-        occupied) and the number of steps.
+        gas mass, the formation time of every slot (the first snapshot at
+        which its activation exceeds ½; NaN for a slot never a sink) and the
+        number of steps.
     """
     config = _config(
+        sink_options,
         return_snapshots=True,
         num_snapshots=NUM_SNAPSHOTS,
         snapshot_settings=SnapshotSettings(return_total_mass=True),
@@ -225,11 +240,11 @@ def run_reference(case: Case) -> dict:
 
     sinks = snapshots.sink_particles
     times = np.asarray(snapshots.time_points)
-    occupied = np.asarray(sinks.occupied)
-    ever_occupied = occupied.any(axis=0)
+    activation = np.asarray(sinks.activation)
+    is_sink = activation > 0.5
     formation_time = np.where(
-        ever_occupied,
-        times[np.argmax(occupied, axis=0)],
+        is_sink.any(axis=0),
+        times[np.argmax(is_sink, axis=0)],
         np.nan,
     )
     return dict(
@@ -237,7 +252,8 @@ def run_reference(case: Case) -> dict:
         mass=np.asarray(sinks.mass),
         position=np.asarray(sinks.position),
         velocity=np.asarray(sinks.velocity),
-        occupied=occupied,
+        activation=activation,
+        occupied=np.asarray(sinks.occupied),
         gas_mass=np.asarray(snapshots.total_mass),
         formation_time=formation_time,
         end_time=float(params.t_end),
@@ -277,7 +293,12 @@ def _sink_outputs(mass, position, box_length) -> jax.Array:
     return jnp.stack([jnp.sum(mass), jnp.dot(POSITION_WEIGHTS, moments)])
 
 
-def _output_function(case: Case, end_time: float, num_segments: int) -> Callable:
+def _output_function(
+    case: Case,
+    end_time: float,
+    num_segments: int,
+    sink_options: dict,
+) -> Callable:
     """
     The outputs of a run with fixed steps, as a function of the input of the
     setup.
@@ -291,6 +312,7 @@ def _output_function(case: Case, end_time: float, num_segments: int) -> Callable
         case: The setup.
         end_time: The end time of the run.
         num_segments: The number of segments.
+        sink_options: The ``SinkParticleConfig`` fields of the runs.
 
     Returns:
         ``outputs(parameter) -> (2,)``.
@@ -298,7 +320,7 @@ def _output_function(case: Case, end_time: float, num_segments: int) -> Callable
 
     def outputs(parameter):
         settings = case.settings._replace(**{case.parameter: parameter, "t_end": end_time})
-        config = _config(fixed_timestep=True, num_timesteps=STEPS_PER_SEGMENT)
+        config = _config(sink_options, fixed_timestep=True, num_timesteps=STEPS_PER_SEGMENT)
         state, config, params = case.setup(config, SimulationParams(), settings)
         params = params._replace(t_end=end_time / num_segments)
         registered_variables = get_registered_variables(config)
@@ -330,7 +352,12 @@ def _output_function(case: Case, end_time: float, num_segments: int) -> Callable
     return outputs
 
 
-def compare_gradients(case: Case, end_time: float, num_segments: int) -> dict:
+def compare_gradients(
+    case: Case,
+    end_time: float,
+    num_segments: int,
+    sink_options: dict,
+) -> dict:
     """
     Compare the reverse-mode gradient of the outputs with central finite
     differences at the relative steps of ``RELATIVE_STEPS``.
@@ -339,13 +366,14 @@ def compare_gradients(case: Case, end_time: float, num_segments: int) -> dict:
         case: The setup.
         end_time: The end time of the runs.
         num_segments: The number of segments of ``STEPS_PER_SEGMENT`` steps.
+        sink_options: The ``SinkParticleConfig`` fields of the runs.
 
     Returns:
         The outputs at the setup's input, their gradients, the finite
         differences (one row per step) and the wall times.
     """
     parameter = jnp.asarray(getattr(case.settings, case.parameter), dtype=jnp.float64)
-    outputs = _output_function(case, end_time, num_segments)
+    outputs = _output_function(case, end_time, num_segments, sink_options)
 
     def value_and_gradients(parameter):
         value, pullback = jax.vjp(outputs, parameter)
@@ -447,18 +475,32 @@ def _relative_difference(gradient, finite_difference):
     return np.where(scale > 0.0, np.abs(gradient - finite_difference) / np.where(scale > 0.0, scale, 1.0), 0.0)
 
 
-def write_report() -> Path:
-    """Gather the results of every setup into ``results/report.md``."""
+def write_report(smooth: bool) -> Path:
+    """
+    Gather the results of every setup into ``report.md`` in the results
+    directory of the parameters.
+
+    Args:
+        smooth: Whether to report the runs with the smooth parameters, with
+            the hard reference next to them, instead of the hard baseline.
+
+    Returns:
+        The path of the report.
+    """
+    results = SMOOTH_RESULTS if smooth else RESULTS
+    parameters = (
+        "the default (smooth) parameters" if smooth else "the hard limit of the smoothing parameters"
+    )
     lines = [
-        "# Hard baseline of the sink particles",
+        "# Sink particles on the collapse setups" if smooth else "# Hard baseline of the sink particles",
         "",
         f"Generated by `hard_baseline.py`: {NUM_CELLS}³ cells, float64, native JAX backend, "
-        "finite-volume scheme (RK2, HLL, minmod), formation and accretion at the hard limit "
-        "of the smoothing parameters.",
+        f"finite-volume scheme (RK2, HLL, minmod), formation and accretion with {parameters}. "
+        "A sink is a slot with activation above ½.",
         "",
     ]
     for name, case in CASES.items():
-        path = RESULTS / f"{name}.npz"
+        path = results / f"{name}.npz"
         if not path.exists():
             continue
         data = dict(np.load(path))
@@ -478,6 +520,20 @@ def write_report() -> Path:
             f"{data['mass'][-1].sum():.6g}, gas mass {data['gas_mass'][-1]:.6g}",
             "",
         ]
+        hard_path = RESULTS / f"{name}.npz"
+        if smooth and hard_path.exists():
+            hard = dict(np.load(hard_path))
+            hard_formation_time = hard["formation_time"]
+            hard_formed = np.isfinite(hard_formation_time)
+            lines += [
+                "Hard reference:",
+                "",
+                f"- sinks formed: {int(hard_formed.sum())}; first formation at "
+                + (f"t = {np.nanmin(hard_formation_time):.4g}" if hard_formed.any() else "never"),
+                f"- total sink mass at the last snapshot (t = {hard['times'][-1]:.4g}): "
+                f"{hard['mass'][-1].sum():.6g}",
+                "",
+            ]
         if "comparison_end_time" not in data:
             lines += ["No gradient comparison.", ""]
             continue
@@ -508,7 +564,7 @@ def write_report() -> Path:
                 reference_value, sinks_form = _reference_at(
                     data["times"],
                     reference_outputs[:, output],
-                    data["occupied"],
+                    data["activation"] > 0.5 if "activation" in data else data["occupied"],
                     end_time,
                 )
                 lines.append(
@@ -530,7 +586,7 @@ def write_report() -> Path:
             "|g − fd| / max(|g|, |fd|).",
             "",
         ]
-    report = RESULTS / "report.md"
+    report = results / "report.md"
     report.write_text("\n".join(lines))
     return report
 
@@ -544,15 +600,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--setups", nargs="+", choices=list(CASES), default=list(CASES))
     parser.add_argument("--part", choices=["reference", "gradients", "all"], default="all")
+    parser.add_argument("--parameters", choices=["hard", "smooth"], default="hard")
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="print the diagnostics of the sink update at every step of the reference runs",
+    )
     arguments = parser.parse_args()
-    RESULTS.mkdir(exist_ok=True)
+    smooth = arguments.parameters == "smooth"
+    sink_options = {} if smooth else dict(HARD_LIMIT)
+    results = SMOOTH_RESULTS if smooth else RESULTS
+    results.mkdir(parents=True, exist_ok=True)
 
     for name in arguments.setups:
         case = CASES[name]
-        path = RESULTS / f"{name}.npz"
+        path = results / f"{name}.npz"
         if arguments.part in ("reference", "all"):
             print(f"{name}: reference run", flush=True)
-            reference = run_reference(case)
+            reference = run_reference(
+                case,
+                dict(sink_options, print_diagnostics=arguments.diagnostics),
+            )
             np.savez(path, **reference)
         reference = dict(np.load(path))
         print(
@@ -563,14 +631,28 @@ def main():
         )
 
         if arguments.part in ("gradients", "all"):
+            # The smooth runs are compared at the times of the hard baseline.
+            if smooth:
+                hard = dict(np.load(RESULTS / f"{name}.npz"))
+                end_times_and_segments = [
+                    (float(end_time), int(num_steps) // STEPS_PER_SEGMENT)
+                    for end_time, num_steps in zip(
+                        hard.get("comparison_end_time", []),
+                        hard.get("comparison_num_steps", []),
+                    )
+                ]
+            else:
+                end_times_and_segments = _end_times_and_segments(reference)
             comparisons = []
-            for end_time, num_segments in _end_times_and_segments(reference):
+            for end_time, num_segments in end_times_and_segments:
                 print(
                     f"{name}: gradients at t = {end_time:.4g} "
                     f"({num_segments * STEPS_PER_SEGMENT} steps)",
                     flush=True,
                 )
-                comparisons.append(compare_gradients(case, end_time, num_segments))
+                comparisons.append(
+                    compare_gradients(case, end_time, num_segments, sink_options)
+                )
             reference = {
                 key: value for key, value in reference.items() if not key.startswith("comparison_")
             }
@@ -581,7 +663,7 @@ def main():
                     )
             np.savez(path, **reference)
 
-    print(f"report: {write_report()}")
+    print(f"report: {write_report(smooth)}")
 
 
 if __name__ == "__main__":

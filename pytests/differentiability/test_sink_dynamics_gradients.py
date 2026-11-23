@@ -153,9 +153,13 @@ def _final_state(inputs, fixed_timestep, differentiation_mode):
         fixed_timestep=fixed_timestep,
         num_timesteps=NUM_FIXED_STEPS,
         differentiation_mode=differentiation_mode,
+        # With μ = 1 the density check of the creation is the hard one, which
+        # the clump (peak 0.65 ρ_thr) fails throughout the run: no candidate
+        # forms, and the gradients of the empty slots stay exactly 0.
         sink_particle_config=SinkParticleConfig(
             sink_particles=True,
             max_num_sinks=MAX_NUM_SINKS,
+            creation_margin=1.0,
         ),
     )
     state, config, params = setup_sink_formation(

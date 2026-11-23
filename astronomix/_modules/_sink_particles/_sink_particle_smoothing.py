@@ -1,8 +1,9 @@
 """
 Building blocks of the smooth sink formation and accretion: a smooth step for
 the checks, a soft minimum and maximum, the radial weight of the accretion
-radius, the cell weights that read a cell quantity at a sink, and the
-point-mass potential of the bound check.
+radius, the cell weights that read a cell quantity at a sink, the
+point-mass potential of the bound check, and a division guarded against a
+zero denominator.
 
 Each block has a width or a sharpness, a static configuration value. Its
 formula divides by the width, so the hard case (width 0, sharpness ∞) is a
@@ -176,14 +177,35 @@ def _radial_weight(
     return _smooth_step(accretion_radius - distance, width)
 
 
+def _safe_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
+    """
+    numerator / denominator for a denominator ≥ 0, and 0 where the
+    denominator is 0, with a finite derivative there as well.
+
+    Args:
+        numerator: The numerator.
+        denominator: The denominator, ≥ 0.
+
+    Returns:
+        The quotient.
+    """
+    is_positive = denominator > 0.0
+    return jnp.where(
+        is_positive,
+        numerator / jnp.where(is_positive, denominator, 1.0),
+        0.0,
+    )
+
+
 def _cell_weights(
     position: jax.Array,
     grid_shape: tuple,
     config: SimulationConfig,
     spatial_width_in_cells: float,
+    offsets=None,
 ) -> tuple[tuple, jax.Array]:
     """
-    The cell weights h of the 27 cells around each sink: 1 on the cell that
+    The cell weights h of the cells around each sink: 1 on the cell that
     contains the sink, passing smoothly to a neighbouring cell within ½ ℓ cells
     of a face.
 
@@ -191,7 +213,8 @@ def _cell_weights(
     cells, the weight is step_ℓ(½ + ½ ℓ − |d|), and the weight of a cell is
     the product over the axes. For ℓ ≤ 1 the weights of the cells around a
     sink sum to 1, except next to a non-periodic edge: cells past it get
-    weight 0.
+    weight 0. Only the cell that contains the sink and its 26 neighbours can
+    have a weight above 0.
 
     Args:
         position: The sink positions, shape (num_sinks, 3).
@@ -202,40 +225,40 @@ def _cell_weights(
             ``floor`` as in the motion and the accretion of the sinks, and 0
             elsewhere; on a face the sink belongs to the upper cell, where the
             limit of the formula would give 0 to both.
+        offsets: The integer offsets (i, j, k) of the cells, from the cell
+            that contains the sink, shape (num_offsets, 3); by default the 27
+            offsets of ``_tsc_offsets``.
 
     Returns:
         ``(cell_indices, weights)``: a tuple of three integer index arrays into
-        the padded field, and the weights, each of shape (num_sinks, 27).
+        the padded field, and the weights, each of shape (num_sinks,
+        num_offsets).
     """
-    offsets = _tsc_offsets()
+    if offsets is None:
+        offsets = _tsc_offsets()
 
     scaled_position = position / config.grid_spacing
     containing_cell = jnp.floor(scaled_position)
     offset_from_cell_center = scaled_position - (containing_cell + 0.5)
 
-    # The 1D weights of the neighbours at −1, 0 and +1 along each axis, shape
-    # (num_sinks, 3 axes, 3 neighbours).
     if spatial_width_in_cells == 0.0:
-        weights_along_axes = jnp.broadcast_to(
-            jnp.array([0.0, 1.0, 0.0], dtype=position.dtype),
-            position.shape + (3,),
+        weights = jnp.broadcast_to(
+            jnp.all(offsets == 0, axis=-1).astype(position.dtype),
+            (position.shape[0], offsets.shape[0]),
         )
     else:
+        # The offset of the sink from each cell centre along each axis, in
+        # cells, shape (num_sinks, num_offsets, 3).
         distance_to_centers = jnp.abs(
-            offset_from_cell_center[..., None]
-            - jnp.arange(-1, 2, dtype=position.dtype)
+            offset_from_cell_center[:, None, :] - offsets[None, :, :]
         )
-        weights_along_axes = _smooth_step(
-            0.5 + 0.5 * spatial_width_in_cells - distance_to_centers,
-            spatial_width_in_cells,
+        weights = jnp.prod(
+            _smooth_step(
+                0.5 + 0.5 * spatial_width_in_cells - distance_to_centers,
+                spatial_width_in_cells,
+            ),
+            axis=-1,
         )
-
-    # For every one of the 27 cells, pick the 1D weight of its offset along
-    # each axis and multiply them, shape (num_sinks, 27).
-    weights = jnp.prod(
-        weights_along_axes[:, jnp.arange(3), offsets + 1],
-        axis=-1,
-    )
 
     cell_indices, _, is_real_cell = _interior_cell_indices(
         containing_cell.astype(jnp.int32)[:, None, :] + offsets[None, :, :],

@@ -1,26 +1,39 @@
 """
-Gas accretion onto sink particles following Federrath et al. (2010), ApJ 713, 269.
+Gas accretion onto sink particles following Federrath et al. (2010), ApJ 713,
+269, with smooth checks (``_sink_particle_smoothing.py``).
 
-Once per time step, after sink creation, every sink takes the gas above the
-density threshold from the cells within its accretion radius (Section 2.3):
-from a cell with ρ > ρ_res, the mass increment ΔM = (ρ − ρ_res) ΔV (Eq. 13)
-moves to the sink and the cell is left at ρ_res. Mass and linear momentum are
-conserved (Appendix B); the sink moves to the centre of mass of itself and the
-accreted gas. New sinks, created with zero mass, get their mass here too.
+Once per time step, after the creation and activation of candidates, every
+occupied slot takes gas above the density threshold from the cells within
+its accretion radius (Section 2.3). A cell can give at most its excess
+e = (ρ − ρ_thr) ΔV (Eq. 13). The gas must be bound to the slot and move toward
+it, except in the cell that contains the slot. Each check is a smooth step,
+and the weight of a slot-cell pair is
 
-Gas must be bound to the sink and move toward it, except in the cell that
-contains the sink.
+    g = a K [1 − (1 − b n)(1 − h)],
 
-Only gas in interior cells is accreted. The cells around a sink wrap around
+with a the activation of the slot, K the radial weight, b the bound check,
+n the radial-velocity check and h the cell weight: the bracket is a smooth
+OR of the motion checks and of the slot lying in the cell. The fraction
+F = 1 − Π (1 − g) of the excess is taken from the cell, and shared between the
+slots with a softmax of sharpness β that favours the slot the gas is most
+bound to. Mass and linear momentum are conserved (Appendix B).
+
+With every smoothing parameter at its hard limit, a cell passes or fails
+each check as in the hard scheme, an active sink takes the whole excess of a
+cell that passes, and a cell within reach of several sinks goes to the one it
+is most bound to, ties going to the lowest slot.
+
+Only gas in interior cells is accreted. The cells around a slot wrap around
 periodic axes and end at the edge of the box on non-periodic axes. Reflective
 walls are treated like the other edges: mirrored gas is not counted.
 
-The work is done per sink rather than per cell: each sink gathers the few cells
-around it, so the cost scales with the number of sinks, not with the grid.
+The work is done per slot rather than per cell: each slot gathers the few
+cells around it, so the cost scales with the number of slots, not with the
+grid.
 """
 
 # general
-from functools import partial
+import math
 
 # jax
 import jax
@@ -39,31 +52,240 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_helpers import (
-    _accretion_offsets,
-    _density_threshold,
-    _interior_cell_indices,
-    _periodic_box,
-    _sound_speed_squared,
+from astronomix._modules._sink_particles._sink_particle_formation import (
+    CellQuantities,
+    SlotNeighbourhood,
+)
+from astronomix._modules._sink_particles._sink_particle_helpers import _periodic_box
+from astronomix._modules._sink_particles._sink_particle_smoothing import (
+    _point_mass_potential,
+    _safe_divide,
+    _smooth_step,
 )
 
+#: The largest radial velocity, in units of c_s, of gas that counts as moving
+#: toward a sink. FLASH accepts gas up to this tolerance, since gas moving with
+#: the sink has v_r = 0 only up to rounding.
+RADIAL_VELOCITY_TOLERANCE = 1e-5
 
-@partial(jax.jit, static_argnames=["config", "registered_variables"])
-def _accrete_gas(
+
+def _pair_weights(
+    sink_particles: SinkParticles,
+    neighbourhood: SlotNeighbourhood,
+    cells: CellQuantities,
+    config: SimulationConfig,
+    params: SimulationParams,
+) -> tuple[jax.Array, jax.Array]:
+    """
+    The weight g of every slot-cell pair, and the specific energy η of the
+    gas of the cell relative to the slot, in units of c_s².
+
+    η has the bound-check potential of FLASH: the gas within r_acc as a
+    uniform sphere of density ρ_thr, plus the slot as a point mass, both
+    measured from the edge of the accretion sphere,
+
+        η = [−G (2π/3) ρ_thr (r_acc² − r²) + ψ(r) + ½ |v − v_n|²] / c_s².
+
+    The radial velocity is v_r = r · (v − v_n) / √(r² + λ²), with λ = ℓ Δx; at
+    λ = 0 and r = 0 the denominator is r_acc, so that v_r = 0 there.
+
+    Args:
+        sink_particles: The sink particles.
+        neighbourhood: The cells around every slot.
+        cells: The cell quantities.
+        config: The simulation configuration.
+        params: The simulation parameters.
+
+    Returns:
+        ``(weight, energy)``, each of shape (num_slots, num_offsets).
+    """
+    sink_particle_config = config.sink_particle_config
+    check_width = sink_particle_config.check_width
+    softening_length = sink_particle_config.spatial_width_in_cells * config.grid_spacing
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
+    gravitational_constant = params.gravitational_constant
+
+    cell_indices = neighbourhood.cell_indices
+    distance_squared = neighbourhood.distance_squared
+    sound_speed_squared = cells.sound_speed_squared[cell_indices]
+    relative_velocity = cells.velocity[cell_indices] - sink_particles.velocity[:, None, :]
+
+    energy = (
+        -gravitational_constant
+        * (2.0 * jnp.pi / 3.0)
+        * cells.density_threshold[cell_indices]
+        * (accretion_radius**2 - distance_squared)
+        + _point_mass_potential(
+            distance_squared,
+            sink_particles.mass[:, None],
+            accretion_radius,
+            softening_length,
+            gravitational_constant,
+        )
+        + 0.5 * jnp.sum(relative_velocity**2, axis=-1)
+    ) / sound_speed_squared
+
+    if softening_length == 0.0:
+        is_positive = distance_squared > 0.0
+        radial_distance = jnp.where(
+            is_positive,
+            jnp.sqrt(jnp.where(is_positive, distance_squared, 1.0)),
+            accretion_radius,
+        )
+    else:
+        radial_distance = jnp.sqrt(distance_squared + softening_length**2)
+    radial_velocity = (
+        jnp.sum(neighbourhood.separation * relative_velocity, axis=-1) / radial_distance
+    )
+
+    bound = _smooth_step(-energy, check_width)
+    moving_inward = 1.0 - _smooth_step(
+        radial_velocity / jnp.sqrt(sound_speed_squared) - RADIAL_VELOCITY_TOLERANCE,
+        check_width,
+    )
+    weight = (
+        sink_particles.activation[:, None]
+        * neighbourhood.radial_weight
+        * (1.0 - (1.0 - bound * moving_inward) * (1.0 - neighbourhood.cell_weight))
+    )
+    weight = jnp.where(sink_particles.occupied[:, None], weight, 0.0)
+    return weight, energy
+
+
+def _taken_fraction(
+    weight: jax.Array,
+    cell_indices: tuple,
+    grid_shape: tuple,
+) -> jax.Array:
+    """
+    The fraction F = 1 − Π_i (1 − g_i) of a cell's excess that is taken, at the
+    cell of every slot-cell pair.
+
+    The product over the slots is a sum of logarithms scattered onto the
+    grid; pairs with g = 1 are counted apart, since they make the product 0.
+
+    Args:
+        weight: The weight g of every pair, shape (num_slots, num_offsets).
+        cell_indices: The cell of every pair.
+        grid_shape: The shape of a (padded) field.
+
+    Returns:
+        F, shape (num_slots, num_offsets).
+    """
+    is_saturated = weight >= 1.0
+    log_remaining = jnp.where(
+        is_saturated,
+        0.0,
+        jnp.log1p(-jnp.where(is_saturated, 0.0, weight)),
+    )
+    num_saturated = jnp.zeros(grid_shape, dtype=jnp.int32).at[cell_indices].add(
+        is_saturated.astype(jnp.int32)
+    )
+    total_log_remaining = jnp.zeros(grid_shape, dtype=weight.dtype).at[
+        cell_indices
+    ].add(log_remaining)
+    remaining = jnp.where(
+        num_saturated[cell_indices] > 0,
+        0.0,
+        jnp.exp(total_log_remaining[cell_indices]),
+    )
+    return 1.0 - remaining
+
+
+def _shares(
+    weight: jax.Array,
+    energy: jax.Array,
+    cell_indices: tuple,
+    grid_shape: tuple,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    The share of every slot in the gas taken from a cell: the softmax
+    g e^(−β η) / Σ g e^(−β η) over the slots that reach the cell.
+
+    The softmax runs over the pairs with g > 0 only, with the largest of their
+    exponents in each cell subtracted (its derivative stopped), so that a
+    deeply bound slot with g = 0 cannot make the terms of the others
+    underflow. At β = ∞ the slot with g > 0 and the lowest η takes the whole
+    share, ties going to the lowest slot.
+
+    Args:
+        weight: The weight g of every pair, shape (num_slots, num_offsets).
+        energy: The specific energy η of every pair.
+        cell_indices: The cell of every pair.
+        grid_shape: The shape of a (padded) field.
+        config: The simulation configuration.
+
+    Returns:
+        The shares, shape (num_slots, num_offsets); 0 in cells that no slot
+        reaches with g > 0.
+    """
+    sharing_sharpness = config.sink_particle_config.sharing_sharpness
+    can_take = weight > 0.0
+
+    if math.isinf(sharing_sharpness):
+        candidate_energy = jnp.where(can_take, energy, jnp.inf)
+        lowest_energy = jnp.full(grid_shape, jnp.inf, dtype=energy.dtype).at[
+            cell_indices
+        ].min(candidate_energy)
+        is_lowest = can_take & (candidate_energy == lowest_energy[cell_indices])
+        num_slots = weight.shape[0]
+        slot = jnp.broadcast_to(jnp.arange(num_slots)[:, None], weight.shape)
+        lowest_slot = jnp.full(grid_shape, num_slots).at[cell_indices].min(
+            jnp.where(is_lowest, slot, num_slots)
+        )
+        return (is_lowest & (slot == lowest_slot[cell_indices])).astype(weight.dtype)
+
+    exponent = jnp.where(can_take, -sharing_sharpness * energy, -jnp.inf)
+    largest_exponent = jax.lax.stop_gradient(
+        jnp.full(grid_shape, -jnp.inf, dtype=energy.dtype).at[cell_indices].max(exponent)
+    )
+    term = jnp.where(
+        can_take,
+        weight
+        * jnp.exp(
+            jnp.where(can_take, exponent - largest_exponent[cell_indices], 0.0)
+        ),
+        0.0,
+    )
+    normalization = jnp.zeros(grid_shape, dtype=weight.dtype).at[cell_indices].add(term)
+    return _safe_divide(term, normalization[cell_indices])
+
+
+def _accrete(
     primitive_state: STATE_TYPE,
     sink_particles: SinkParticles,
+    neighbourhood: SlotNeighbourhood,
+    cells: CellQuantities,
+    slot_density_threshold: jax.Array,
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
 ) -> tuple[STATE_TYPE, SinkParticles]:
     """
-    Move the gas above the density threshold within each sink's accretion
-    radius onto that sink.
+    Steps 3 and 4: move gas above the density threshold within reach of each
+    occupied slot onto it, and update the gas and the slots.
+
+    Slot i takes ΔM = F e g e^(−β η) / Σ_j g_j e^(−β η_j) from a cell. The
+    cell's density drops by Σ_i ΔM / ΔV; for an ideal gas its pressure and
+    dual-energy g drop with it, which keeps c_s² unchanged, and its velocity
+    is unchanged. The slot's mass, position and velocity become (Appendix B)
+
+        M' = M + Σ ΔM,
+        x' = x + Σ ΔM r / (M' + ε ρ_thr ΔV),
+        v' = v + Σ ΔM (v_gas − v) / M',
+
+    which conserves mass and momentum; the mass ε ρ_thr ΔV keeps a candidate
+    with almost no mass from jumping to the centre of mass of the first gas
+    it accretes. The position is wrapped back along periodic axes.
 
     Args:
         primitive_state: The (padded) primitive state.
-        sink_particles: The sink particles, including the new massless ones;
-            every occupied slot accretes.
+        sink_particles: The sink particles, with their new activations.
+        neighbourhood: The cells around every slot.
+        cells: The cell quantities, from the same primitive state.
+        slot_density_threshold: The density threshold read at every slot, the
+            unit of ε, shape (num_slots,).
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -71,197 +293,56 @@ def _accrete_gas(
     Returns:
         ``(primitive_state, sink_particles)`` after accretion.
     """
+    cell_volume = config.grid_spacing**3
+    grid_shape = cells.density.shape
+    cell_indices = neighbourhood.cell_indices
 
-    sink_particle_config = config.sink_particle_config
-    grid_spacing = config.grid_spacing
-    cell_volume = grid_spacing**3
-    accretion_radius = sink_particle_config.accretion_radius_in_cells * grid_spacing
-
-    density = primitive_state[registered_variables.density_index]
-    velocity = jnp.stack(
-        [
-            primitive_state[registered_variables.velocity_index.x],
-            primitive_state[registered_variables.velocity_index.y],
-            primitive_state[registered_variables.velocity_index.z],
-        ],
-        axis=-1,
-    )
-
-    # The density threshold of Eq. 32, per cell, as in the creation step.
-    sound_speed_squared = _sound_speed_squared(
-        primitive_state,
-        config,
-        params,
-        registered_variables,
-    )
-    density_threshold = _density_threshold(
-        sound_speed_squared,
+    weight, energy = _pair_weights(
+        sink_particles,
+        neighbourhood,
+        cells,
         config,
         params,
     )
-
-    # -------------------------------------------------------------
-    # ================ ↓ Cells around each sink ↓ =================
-    # -------------------------------------------------------------
-
-    # Each sink gathers the cells around the cell that contains it, giving
-    # arrays of shape (max_num_sinks, num_offsets).
-    max_num_sinks = sink_particle_config.max_num_sinks
-    sink_is_active = sink_particles.occupied
-
-    offsets = _accretion_offsets(config)
-    is_periodic, box_length = _periodic_box(config)
-
-    sink_cell = jnp.floor(sink_particles.position / grid_spacing).astype(jnp.int32)
-    cell_indices, interior_index, is_real_cell = _interior_cell_indices(
-        sink_cell[:, None, :] + offsets[None, :, :],
-        density.shape,
-        config,
+    excess = (
+        jnp.maximum(
+            0.0,
+            cells.density[cell_indices] - cells.density_threshold[cell_indices],
+        )
+        * cell_volume
     )
-
-    # Separation from the sink to each cell centre, taken to the nearest
-    # periodic copy along periodic axes (minimum-image convention).
-    cell_centers = (interior_index + 0.5) * grid_spacing
-    separation = cell_centers - sink_particles.position[:, None, :]
-    separation = jnp.where(
-        is_periodic,
-        separation - box_length * jnp.round(separation / box_length),
-        separation,
+    accreted_mass = (
+        _taken_fraction(weight, cell_indices, grid_shape)
+        * excess
+        * _shares(weight, energy, cell_indices, grid_shape, config)
     )
-    distance = jnp.linalg.norm(separation, axis=-1)
-
-    density_in_reach = density[cell_indices]
-    density_threshold_in_reach = density_threshold[cell_indices]
-    velocity_in_reach = velocity[cell_indices]
-    mass_increment = (density_in_reach - density_threshold_in_reach) * cell_volume
-
-    # A (sink, cell) pair is a possible accretion if the sink is active, the
-    # cell is a real cell within r_acc of the sink, and the cell is above the
-    # density threshold (Section 2.3).
-    possible_accretion = (
-        sink_is_active[:, None]
-        & is_real_cell
-        & (distance <= accretion_radius)
-        & (density_in_reach > density_threshold_in_reach)
-    )
-
-    # -------------------------------------------------------------
-    # ================= ↓ Accretion checks ↓ ======================
-    # -------------------------------------------------------------
-
-    # The gas in the cell containing the sink is always accreted, with no
-    # further check (Section 2.3); this also avoids r = 0 below.
-    is_inner_cell = jnp.all(offsets == 0, axis=-1)[None, :]
-
-    # Bound check (Section 2.3): ΔM must be bound to the sink and the gas
-    # around it, E_grav + E_kin < 0, with E_kin = ½ ΔM |v − v_n|² in the sink's
-    # frame. The paper gives no formula for E_grav; as in Federrath's FLASH
-    # code, the gas within r_acc is a uniform sphere of density ρ_res and the
-    # sink a point mass M_n, both measured from the edge of the accretion
-    # sphere:
-    #   E_grav = −G (2π/3) ρ_res (r_acc² − r²) ΔM − G M_n ΔM (1/r − 1/r_acc).
-    gravitational_constant = params.gravitational_constant
-    safe_distance = jnp.where(distance > 0.0, distance, accretion_radius)
-    gravitational_energy = (
-        -gravitational_constant
-        * (2.0 * jnp.pi / 3.0)
-        * density_threshold_in_reach
-        * (accretion_radius**2 - distance**2)
-        * mass_increment
-        - gravitational_constant
-        * sink_particles.mass[:, None]
-        * mass_increment
-        * (1.0 / safe_distance - 1.0 / accretion_radius)
-    )
-    relative_velocity = velocity_in_reach - sink_particles.velocity[:, None, :]
-    kinetic_energy = 0.5 * mass_increment * jnp.sum(relative_velocity**2, axis=-1)
-    total_energy = gravitational_energy + kinetic_energy
-    bound = total_energy < 0.0
-
-    # Radial velocity check (Section 2.3): ΔM must move toward the sink,
-    # v_r = r · (v − v_n) / r, with r pointing from the sink to the cell. The
-    # paper asks for a negative v_r; as in Federrath's FLASH code, v_r up to
-    # 10⁻⁵ c_s is accepted. Gas moving with the sink has v_r = 0 only up to
-    # rounding (the sink velocity is a mass-weighted average of gas
-    # velocities), so a bound of exactly 0 would accept or reject it at
-    # random.
-    radial_velocity = jnp.sum(separation * relative_velocity, axis=-1) / safe_distance
-    radial_velocity_tolerance = 1e-5 * jnp.sqrt(sound_speed_squared[cell_indices])
-    moving_toward_sink = radial_velocity <= radial_velocity_tolerance
-
-    eligible_accretion = possible_accretion & (
-        is_inner_cell | (bound & moving_toward_sink)
-    )
-
-    # -------------------------------------------------------------
-    # ================= ↑ Accretion checks ↑ ======================
-    # -------------------------------------------------------------
-
-    # -------------------------------------------------------------
-    # ================ ↑ Cells around each sink ↑ =================
-    # -------------------------------------------------------------
-
-    # -------------------------------------------------------------
-    # ============= ↓ Choosing one sink per cell ↓ ================
-    # -------------------------------------------------------------
-
-    # A cell within reach of several sinks is accreted by one of them only.
-    # The sink whose position lies in the cell comes first; among the other
-    # sinks, the cell goes to the one it is most strongly bound to, the lowest
-    # E_grav + E_kin (Section 2.3). This order follows FLASH; the paper states
-    # both rules but not their order. An exact tie goes to the lowest slot, as
-    # FLASH's loop order does; otherwise every tied sink would take the same
-    # ΔM. Each choice is made with a scatter-min onto a grid-shaped array,
-    # which handles several pairs pointing to the same cell.
-    priority = jnp.where(is_inner_cell, 0, 1)
-    no_priority = 2
-    best_priority = jnp.full(density.shape, no_priority).at[cell_indices].min(
-        jnp.where(eligible_accretion, priority, no_priority)
-    )
-    has_best_priority = eligible_accretion & (priority == best_priority[cell_indices])
-
-    # The energy of the inner cell is not used (r may be 0 there); it only
-    # competes with other inner cells, which would need two sinks in one cell.
-    selection_key = jnp.where(is_inner_cell, -jnp.inf, total_energy)
-    best_key = jnp.full(density.shape, jnp.inf, dtype=distance.dtype).at[
-        cell_indices
-    ].min(jnp.where(has_best_priority, selection_key, jnp.inf))
-    has_best_key = has_best_priority & (selection_key == best_key[cell_indices])
-
-    slot = jnp.broadcast_to(jnp.arange(max_num_sinks)[:, None], distance.shape)
-    best_slot = jnp.full(density.shape, max_num_sinks).at[cell_indices].min(
-        jnp.where(has_best_key, slot, max_num_sinks)
-    )
-    accreted = has_best_key & (slot == best_slot[cell_indices])
-
-    # -------------------------------------------------------------
-    # ============= ↑ Choosing one sink per cell ↑ ================
-    # -------------------------------------------------------------
 
     # -------------------------------------------------------------
     # ==================== ↓ Gas update ↓ =========================
     # -------------------------------------------------------------
 
-    # An accreted cell is left at the density threshold. The velocity is
-    # unchanged, so the cell's momentum drops with its mass. For an ideal gas
-    # the pressure and the dual-energy g are scaled with the density, which
-    # keeps c_s² (the temperature) unchanged, as FLASH does at fixed specific
-    # internal energy. The update goes through a grid mask, so that several
-    # pairs pointing to the same cell never write conflicting values.
-    cell_is_accreted = jnp.zeros(density.shape, dtype=bool).at[cell_indices].max(
-        accreted
+    density = cells.density
+    new_density = density - (
+        jnp.zeros(grid_shape, dtype=density.dtype).at[cell_indices].add(accreted_mass)
+        / cell_volume
     )
     primitive_state = primitive_state.at[registered_variables.density_index].set(
-        jnp.where(cell_is_accreted, density_threshold, density)
+        new_density
     )
     if config.equation_of_state == IDEAL_GAS:
+        # Only the cells that lost gas are scaled, so that the others keep
+        # their pressure to the last bit.
+        has_lost_gas = new_density != density
         energy_rows = [registered_variables.pressure_index]
         if registered_variables.internal_energy_active:
             energy_rows.append(registered_variables.internal_energy_index)
         for row in energy_rows:
-            energy = primitive_state[row]
             primitive_state = primitive_state.at[row].set(
-                jnp.where(cell_is_accreted, energy * density_threshold / density, energy)
+                jnp.where(
+                    has_lost_gas,
+                    primitive_state[row] * (new_density / density),
+                    primitive_state[row],
+                )
             )
 
     # -------------------------------------------------------------
@@ -272,28 +353,26 @@ def _accrete_gas(
     # ==================== ↓ Sink update ↓ ========================
     # -------------------------------------------------------------
 
-    # Mass and linear momentum are conserved, and the sink moves to the
-    # centre of mass of itself and the accreted gas (Appendix B, Eqs. B1, B2
-    # and B6):
-    #   M' = M + Σ ΔM,
-    #   x' = x + Σ ΔM r / M',
-    #   v' = v + Σ ΔM (v_gas − v) / M'.
-    accreted_mass = jnp.where(accreted, mass_increment, 0.0)
+    position_update_mass = (
+        config.sink_particle_config.position_update_mass
+        * slot_density_threshold
+        * cell_volume
+    )
     new_mass = sink_particles.mass + jnp.sum(accreted_mass, axis=-1)
-    safe_new_mass = jnp.where(new_mass > 0.0, new_mass, 1.0)
+    position_shift = _safe_divide(
+        jnp.sum(accreted_mass[..., None] * neighbourhood.separation, axis=1),
+        (new_mass + position_update_mass)[:, None],
+    )
+    velocity_shift = _safe_divide(
+        jnp.sum(
+            accreted_mass[..., None]
+            * (cells.velocity[cell_indices] - sink_particles.velocity[:, None, :]),
+            axis=1,
+        ),
+        new_mass[:, None],
+    )
 
-    position_shift = jnp.sum(
-        accreted_mass[..., None] * separation,
-        axis=1,
-    ) / safe_new_mass[:, None]
-    velocity_shift = jnp.sum(
-        accreted_mass[..., None]
-        * (velocity_in_reach - sink_particles.velocity[:, None, :]),
-        axis=1,
-    ) / safe_new_mass[:, None]
-
-    # The new position can lie just past the edge of the box; it is wrapped
-    # back along periodic axes.
+    is_periodic, box_length = _periodic_box(config)
     new_position = sink_particles.position + position_shift
     new_position = jnp.where(
         is_periodic,
