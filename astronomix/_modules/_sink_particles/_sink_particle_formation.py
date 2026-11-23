@@ -398,6 +398,29 @@ class SlotChecks(NamedTuple):
     center_of_mass_velocity: jax.Array
 
 
+def _read_at_positions(
+    field: FIELD_TYPE,
+    neighbourhood: SlotNeighbourhood,
+) -> jax.Array:
+    """
+    A cell quantity q read at each position with the cell weights,
+    Σ h q / Σ h.
+
+    Args:
+        field: The (padded) field of q.
+        neighbourhood: The cells around each position.
+
+    Returns:
+        q at each position, shape (num_positions,); 0 at a position with no
+        cell weight above 0.
+    """
+    cell_weight = neighbourhood.cell_weight
+    return _safe_divide(
+        jnp.sum(cell_weight * field[neighbourhood.cell_indices], axis=-1),
+        jnp.sum(cell_weight, axis=-1),
+    )
+
+
 def _slot_checks(
     neighbourhood: SlotNeighbourhood,
     mass: jax.Array,
@@ -426,17 +449,10 @@ def _slot_checks(
     check_width = config.sink_particle_config.check_width
     cell_volume = config.grid_spacing**3
     cell_indices = neighbourhood.cell_indices
-    cell_weight = neighbourhood.cell_weight
     radial_weight = neighbourhood.radial_weight
 
-    total_cell_weight = jnp.sum(cell_weight, axis=-1)
-
     def read(field):
-        """The field read at each position with the cell weights."""
-        return _safe_divide(
-            jnp.sum(cell_weight * field[cell_indices], axis=-1),
-            total_cell_weight,
-        )
+        return _read_at_positions(field, neighbourhood)
 
     density = read(cells.density) + mass / cell_volume
     density_threshold = read(cells.density_threshold)
@@ -474,7 +490,7 @@ def _slot_checks(
     )
 
     return SlotChecks(
-        has_cells=total_cell_weight > 0.0,
+        has_cells=jnp.sum(neighbourhood.cell_weight, axis=-1) > 0.0,
         density_threshold=density_threshold,
         density_ratio=_safe_divide(density, density_threshold),
         converging_velocity=converging_velocity,

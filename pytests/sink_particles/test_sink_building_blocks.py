@@ -27,6 +27,7 @@ from astronomix._modules._sink_particles._sink_particle_smoothing import (
     _smooth_step,
     _soft_maximum,
     _soft_minimum,
+    _soft_minimum_weights,
 )
 from astronomix.time_stepping.time_integration import _prepare_padded_state
 
@@ -220,6 +221,43 @@ def test_soft_minimum_of_empty_volume_is_zero_with_finite_gradient(width):
     gradients = jax.grad(total, argnums=(0, 1))(values, weights)
     assert all(jnp.all(jnp.isfinite(gradient)) for gradient in gradients), (
         f"the derivatives of the soft minimum are not finite: {gradients}"
+    )
+
+
+def test_soft_minimum_weights_average_to_soft_minimum():
+    """The weights of the soft minimum sum to 1, are 0 on the cells left out
+    with weight 0, and average the values to the soft minimum; at width 0
+    they are 1 on the cell of the minimum and 0 elsewhere, and a small width
+    gives the same weights."""
+    values, weights = _random_volumes()
+    width = 0.5
+    soft = _soft_minimum_weights(values, weights, width, jnp.ones(5))
+    np.testing.assert_allclose(
+        jnp.sum(soft, axis=-1), 1.0, rtol=1e-14, err_msg="the weights do not sum to 1"
+    )
+    np.testing.assert_array_equal(
+        soft[:, ::4], 0.0, err_msg="the cells left out have a weight above 0"
+    )
+    np.testing.assert_allclose(
+        jnp.sum(soft * jnp.where(weights > 0.0, values, 0.0), axis=-1),
+        _soft_minimum(values, weights, width, jnp.ones(5)),
+        rtol=1e-13,
+        err_msg="the weights do not average the values to the soft minimum",
+    )
+
+    hard = _soft_minimum_weights(values, weights, 0.0, jnp.ones(5))
+    is_minimum = jnp.arange(20) == jnp.argmin(
+        jnp.where(weights > 0.0, values, jnp.inf), axis=-1
+    )[:, None]
+    np.testing.assert_array_equal(
+        hard, is_minimum, err_msg="the hard weights are not 1 on the minimum alone"
+    )
+    np.testing.assert_allclose(
+        _soft_minimum_weights(values, weights, SMALL_WIDTH, jnp.ones(5)),
+        hard,
+        rtol=0.0,
+        atol=1e-12,
+        err_msg="the weights at a small width differ from the hard weights",
     )
 
 

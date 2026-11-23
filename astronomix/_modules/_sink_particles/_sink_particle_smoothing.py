@@ -1,6 +1,7 @@
 """
 Building blocks of the smooth sink formation and accretion: a smooth step for
-the checks, a soft minimum and maximum, the radial weight of the accretion
+the checks, a soft minimum and maximum and the weights of the soft minimum,
+which give the soft-minimum position, the radial weight of the accretion
 radius, the cell weights that read a cell quantity at a sink, the
 point-mass potential of the bound check, and a division guarded against a
 zero denominator.
@@ -127,6 +128,62 @@ def _soft_minimum(
     )
     soft_minimum = jnp.where(normalization > 0.0, soft_minimum, 0.0)
     return jnp.where(has_temperature, soft_minimum, minimum)
+
+
+def _soft_minimum_weights(
+    values: jax.Array,
+    weights: jax.Array,
+    check_width: float,
+    temperature_scale: jax.Array,
+) -> jax.Array:
+    """
+    The weights of the soft minimum over the last axis,
+
+        p = k e^(−f/T) / Σ k e^(−f/T),
+
+    with weights k and the temperature T = ω × ``temperature_scale``, so that
+    Σ p f is the soft minimum (``_soft_minimum``) and Σ p x the soft-minimum
+    position of points x. The minimum is subtracted from the exponent (with
+    its derivative stopped). Cells are left out by a weight of 0, and their
+    values are not read, even when infinite.
+
+    Args:
+        values: The values f, shape (..., n).
+        weights: The weights k ≥ 0, shape (..., n).
+        check_width: The width ω, static. At 0, p is 1 on the cell of the
+            minimum among those with k > 0, the first one on a tie, and 0
+            elsewhere.
+        temperature_scale: The scale of the temperature, shape (...). Where
+            the temperature is 0, p is that of ω = 0, the limit T → 0.
+
+    Returns:
+        The weights p, shape (..., n); 0 where every weight k is 0.
+    """
+    is_included = weights > 0.0
+    any_included = jnp.any(is_included, axis=-1)
+    included_values = jnp.where(is_included, values, jnp.inf)
+    is_minimum = (
+        jnp.arange(values.shape[-1]) == jnp.argmin(included_values, axis=-1)[..., None]
+    )
+    hard_weights = (is_minimum & any_included[..., None]).astype(weights.dtype)
+    if check_width == 0.0:
+        return hard_weights
+
+    reference = jax.lax.stop_gradient(
+        jnp.where(any_included, jnp.min(included_values, axis=-1), 0.0)
+    )
+    temperature = check_width * temperature_scale
+    has_temperature = temperature > 0.0
+    safe_temperature = jnp.where(has_temperature, temperature, 1.0)
+    boltzmann_weights = weights * jnp.exp(
+        -(jnp.where(is_included, values, reference[..., None]) - reference[..., None])
+        / safe_temperature[..., None]
+    )
+    soft_weights = _safe_divide(
+        boltzmann_weights,
+        jnp.sum(boltzmann_weights, axis=-1, keepdims=True),
+    )
+    return jnp.where(has_temperature[..., None], soft_weights, hard_weights)
 
 
 def _soft_maximum(

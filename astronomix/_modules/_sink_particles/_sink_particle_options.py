@@ -71,7 +71,8 @@ class SinkParticleConfig(NamedTuple):
     #: Width ω of the smooth checks, in the units of each check (a density or
     #: energy ratio, a velocity in units of c_s, a potential in units of
     #: c_s²); it also sets the temperature ω c_s² of the soft minimum and
-    #: maximum of the potential. Hard limit 0.
+    #: maximum of the potential and of the soft-minimum position toward which
+    #: light candidates are moved. Hard limit 0.
     check_width: float = 0.1
 
     #: Spatial width ℓ in cells, in [0, 1]: the band of the radial weight
@@ -94,8 +95,10 @@ class SinkParticleConfig(NamedTuple):
     #: creation checks.
     recycling_activation: float = 0.01
 
-    #: The mass below which a candidate can be recycled, in units of
-    #: ρ_thr ΔV at the candidate.
+    #: The mass m_min below which a candidate can be recycled, in units of
+    #: ρ_thr ΔV at the candidate. Candidates that are not fully active and
+    #: hold less than m_min are moved toward the minimum of the potential
+    #: around them, the lighter the more.
     recycling_mass: float = 0.01
 
     #: Print, at every step, the candidates created and recycled with their

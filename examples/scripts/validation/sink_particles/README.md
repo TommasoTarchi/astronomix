@@ -13,8 +13,10 @@ records
   Σ m sin(2π x_d / L), shortly after the first formation and at the end of
   the run. Next to the value of each fixed-step run, the report gives the same
   output of the adaptive reference at that time, interpolated between its
-  snapshots; the two must agree, except where sinks form between the two
+  snapshots; the two should agree, except where sinks form between the two
   snapshots around that time (marked with *), since the output jumps there.
+  Where they differ by more than 1% otherwise (marked with †), the two runs
+  may follow different paths.
 
 ```
 python hard_baseline.py                                   # every setup, both parts
@@ -30,9 +32,12 @@ of the sink formation and accretion and write to `results/smooth`. The
 gradients are compared at the times of the hard baseline, and the report gives
 the hard reference next to the smooth one. A sink is a slot with activation
 above ½, and its formation time is the first snapshot at which its activation
-exceeds ½. `--diagnostics` prints, at every step of the reference runs, the
-candidates created and recycled with their activation and mass, the number of
-occupied slots, and the gas above the density threshold far from every slot.
+exceeds ½. `--diagnostics` prints, at every step of the reference runs and
+of the runs of the finite differences, the candidates created and recycled
+with their activation and mass, the number of occupied slots, and the gas
+above the density threshold far from every slot; each run of a finite
+difference starts with a line that gives its input, so that a jump can be
+traced to the step that causes it.
 
 | Setup | Input of the gradients | End time |
 | --- | --- | --- |

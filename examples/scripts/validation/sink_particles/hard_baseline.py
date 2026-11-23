@@ -34,6 +34,11 @@ hard baseline, and the report gives the hard reference next to their own. A
 sink is a slot with activation above ½: its formation time is the first
 snapshot at which the activation of its slot exceeds ½.
 
+The report marks every comparison whose fixed-step value differs from the
+adaptive reference by more than 1%. With ``--diagnostics`` the reference runs
+and the runs of the finite differences print the creation and recycling of
+candidates at every step.
+
 The finite-volume scheme is used because the default finite-difference scheme
 turns the turbulent cluster non-finite at 32³ with or without sinks, once the
 collapse is no longer resolved (by t ≈ 0.046 without sinks, t ≈ 0.051 with
@@ -446,6 +451,7 @@ def compare_gradients(
     end_time: float,
     num_segments: int,
     sink_options: dict,
+    diagnostics: bool = False,
 ) -> dict:
     """
     Compare the reverse-mode gradient of the outputs with central finite
@@ -456,6 +462,10 @@ def compare_gradients(
         end_time: The end time of the runs.
         num_segments: The number of segments of ``STEPS_PER_SEGMENT`` steps.
         sink_options: The ``SinkParticleConfig`` fields of the runs.
+        diagnostics: Whether the runs of the finite differences print the
+            diagnostics of the sink update at every step, each run after a
+            line that names it, so that a jump of a finite difference can be
+            traced to the step that causes it.
 
     Returns:
         The outputs at the setup's input, their gradients, the finite
@@ -475,13 +485,20 @@ def compare_gradients(
     value, gradients = jax.block_until_ready(jax.jit(value_and_gradients)(parameter))
     gradient_wall_time = time.perf_counter() - start
 
-    forward = jax.jit(outputs)
+    forward_options = dict(sink_options, print_diagnostics=diagnostics)
+    forward = jax.jit(_output_function(case, end_time, num_segments, forward_options))
+
+    def run_forward(value):
+        if diagnostics:
+            print(f"finite-difference run at {_input_name(case)} = {float(value):.10g}", flush=True)
+        return jax.block_until_ready(forward(value))
+
     finite_differences = []
     start = time.perf_counter()
     for relative_step in RELATIVE_STEPS:
         step = relative_step * parameter
-        above = forward(parameter + step)
-        below = forward(parameter - step)
+        above = run_forward(parameter + step)
+        below = run_forward(parameter - step)
         finite_differences.append(np.asarray((above - below) / (2.0 * step)))
     finite_difference_wall_time = time.perf_counter() - start
 
@@ -562,6 +579,12 @@ def _relative_difference(gradient, finite_difference):
     """|g − fd| / max(|g|, |fd|), and 0 where both are 0."""
     scale = np.maximum(np.abs(gradient), np.abs(finite_difference))
     return np.where(scale > 0.0, np.abs(gradient - finite_difference) / np.where(scale > 0.0, scale, 1.0), 0.0)
+
+
+#: The relative difference between a fixed-step value and the adaptive
+#: reference above which the report marks the comparison: the two runs may
+#: follow different paths.
+REFERENCE_TOLERANCE = 0.01
 
 
 def write_report(smooth: bool) -> Path:
@@ -656,20 +679,28 @@ def write_report(smooth: bool) -> Path:
                     data["activation"] > 0.5 if "activation" in data else data["occupied"],
                     end_time,
                 )
+                value = data["comparison_value"][comparison, output]
+                if sinks_form:
+                    mark = " *"
+                elif _relative_difference(value, reference_value) > REFERENCE_TOLERANCE:
+                    mark = " †"
+                else:
+                    mark = ""
                 lines.append(
                     f"| {end_time:.4g} "
                     f"| {int(data['comparison_num_steps'][comparison])} "
-                    f"| {output_name} | {data['comparison_value'][comparison, output]:.6g} "
-                    f"| {reference_value:.6g}{' *' if sinks_form else ''} "
+                    f"| {output_name} | {value:.6g} "
+                    f"| {reference_value:.6g}{mark} "
                     f"| {gradient:.4g} | {cells} |"
                 )
         lines += [
             "",
             "The value is that of the fixed-step run; the reference is the same output of the "
             "adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit "
-            "and the half-cell limit on sink motion, so the two must agree, except where marked "
-            "with *: there sinks form between the two snapshots around the time, the output "
-            "jumps, and the interpolated reference is not meaningful.",
+            "and the half-cell limit on sink motion, so the two should agree. Marked with *: "
+            "sinks form between the two snapshots around the time, the output jumps, and the "
+            "interpolated reference is not meaningful. Marked with †: the two differ by more "
+            f"than {REFERENCE_TOLERANCE:.0%}, and the runs may follow different paths.",
             "",
             "Each finite difference is followed by its relative difference from `jax.grad`, "
             "|g − fd| / max(|g|, |fd|).",
@@ -693,7 +724,8 @@ def main():
     parser.add_argument(
         "--diagnostics",
         action="store_true",
-        help="print the diagnostics of the sink update at every step of the reference runs",
+        help="print the diagnostics of the sink update at every step of the reference runs "
+        "and of the runs of the finite differences",
     )
     arguments = parser.parse_args()
     smooth = arguments.parameters == "smooth"
@@ -740,7 +772,13 @@ def main():
                     flush=True,
                 )
                 comparisons.append(
-                    compare_gradients(case, end_time, num_segments, sink_options)
+                    compare_gradients(
+                        case,
+                        end_time,
+                        num_segments,
+                        sink_options,
+                        arguments.diagnostics,
+                    )
                 )
             reference = {
                 key: value for key, value in reference.items() if not key.startswith("comparison_")

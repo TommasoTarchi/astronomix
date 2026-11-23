@@ -10,9 +10,16 @@ Federrath et al. (2010), ApJ 713, 269, with smooth formation and accretion:
    slot and the gas around it by the fraction 1 − a, so that a candidate
    moves with its gas;
 6. free the slots of candidates that have neither activation nor mass and
-   whose gas fails the relaxed creation checks.
+   whose gas fails the relaxed creation checks, or that lie within r_acc of a
+   slot that ranks above them;
+7. move every slot that holds less than m_min and is not fully active toward
+   the soft-minimum position of the potential around it, so that a candidate
+   activates where the gas puts the minimum at that time, whatever the step
+   or the cell in which it was created.
 
 Steps 1 and 6 are hard; the others change the gas and the slots smoothly.
+The move of step 7 is made before step 6 frees the slots, so that the
+proximity check of step 6 sees the moved positions.
 """
 
 # general
@@ -35,12 +42,15 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete
 from astronomix._modules._sink_particles._sink_particle_dynamics import _tsc_weights
 from astronomix._modules._sink_particles._sink_particle_formation import (
+    CellQuantities,
     SlotChecks,
+    SlotNeighbourhood,
     _activate,
     _cell_quantities,
     _create_candidates,
     _near_slots_mask,
     _passes_relaxed_checks,
+    _read_at_positions,
     _slot_checks,
     _slot_neighbourhood,
     _slot_separation_squared,
@@ -48,8 +58,13 @@ from astronomix._modules._sink_particles._sink_particle_formation import (
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _accreted_cell_density,
     _interior_mask,
+    _periodic_box,
 )
-from astronomix._modules._sink_particles._sink_particle_smoothing import _safe_divide
+from astronomix._modules._sink_particles._sink_particle_smoothing import (
+    _safe_divide,
+    _smooth_step,
+    _soft_minimum_weights,
+)
 
 
 def _velocity_rows(registered_variables: RegisteredVariables) -> jax.Array:
@@ -140,6 +155,97 @@ def _move_candidates_with_gas(
     )
 
 
+def _soft_minimum_position(
+    position: jax.Array,
+    neighbourhood: SlotNeighbourhood,
+    cells: CellQuantities,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    The soft-minimum position of the potential around each position: the
+    cell centres within r_acc averaged with the weights of the soft minimum
+    of the potential-minimum check,
+
+        p = x + Σ K r e^(−φ/T) / Σ K e^(−φ/T),   T = ω c_s²,
+
+    with r the separation from x to the cell centre and c_s² read at x. At
+    ω = 0 it is the centre of the cell of lowest φ.
+
+    Args:
+        position: The positions x, shape (num_positions, 3).
+        neighbourhood: The cells around each position.
+        cells: The cell quantities.
+        config: The simulation configuration.
+
+    Returns:
+        p, shape (num_positions, 3), not wrapped back along periodic axes; x
+        where no cell is within r_acc.
+    """
+    weights = _soft_minimum_weights(
+        cells.potential[neighbourhood.cell_indices],
+        neighbourhood.radial_weight,
+        config.sink_particle_config.check_width,
+        _read_at_positions(cells.sound_speed_squared, neighbourhood),
+    )
+    return position + jnp.sum(weights[..., None] * neighbourhood.separation, axis=1)
+
+
+def _relocate_candidates(
+    sink_particles: SinkParticles,
+    minimum_position: jax.Array,
+    checks: SlotChecks,
+    config: SimulationConfig,
+) -> SinkParticles:
+    """
+    Step 7: move every occupied slot toward the soft-minimum position p of
+    the potential around it (``_soft_minimum_position``),
+
+        x ← x + λ (p − x),   λ = (1 − a) [1 − step_{m_min}(m / (ρ_thr ΔV))],
+
+    with m_min = ``recycling_mass`` and ρ_thr read at the slot. λ is 1 for a
+    massless candidate and 0 for a sink and for a slot that holds m_min ρ_thr
+    ΔV or more; a slot with no cell to read ρ_thr from does not move either.
+    The velocity is unchanged, and the position is wrapped back along
+    periodic axes.
+
+    A massless candidate carries neither mass nor momentum, so moving it
+    changes nothing in the gas. Repeated at every step, the move settles it
+    at the bottom of the smoothed potential well it is in, wherever in the
+    well it was created. The derivative of the move is kept, so that the
+    position at activation follows the gas.
+
+    Args:
+        sink_particles: The sink particles.
+        minimum_position: p of every slot, shape (num_slots, 3).
+        checks: The quantities of the creation checks at every slot.
+        config: The simulation configuration.
+
+    Returns:
+        The sink particles with the new positions.
+    """
+    is_periodic, box_length = _periodic_box(config)
+    scaled_mass = _safe_divide(
+        sink_particles.mass,
+        checks.density_threshold * config.grid_spacing**3,
+    )
+    fraction = jnp.where(
+        sink_particles.occupied & checks.has_cells,
+        (1.0 - sink_particles.activation)
+        * (1.0 - _smooth_step(scaled_mass, config.sink_particle_config.recycling_mass)),
+        0.0,
+    )
+    displacement = minimum_position - sink_particles.position
+    displacement = jnp.where(
+        is_periodic,
+        displacement - box_length * jnp.round(displacement / box_length),
+        displacement,
+    )
+    position = sink_particles.position + fraction[:, None] * displacement
+    return sink_particles._replace(
+        position=jnp.where(is_periodic, jnp.mod(position, box_length), position)
+    )
+
+
 def _recycle_slots(
     primitive_state: STATE_TYPE,
     sink_particles: SinkParticles,
@@ -151,20 +257,22 @@ def _recycle_slots(
     """
     Step 6: free the slot of every candidate with an activation below
     ``recycling_activation`` and a mass below ``recycling_mass`` ρ_thr ΔV
-    that fails a relaxed creation check: (b) another occupied slot lies
-    within r_acc, or (c) to (g) fail at the slot, with the quantities of
-    step 2. Its mass and momentum go back to the gas with the TSC weights of
-    the dynamics; for an ideal gas the pressure and dual-energy g grow with
-    the density, which keeps c_s² unchanged. A freed slot is zero in every
-    field, like a slot never filled.
+    that fails a relaxed creation check: (b) an occupied slot that ranks
+    above it lies within r_acc, or (c) to (g) fail at the slot, with the
+    quantities of step 2. Slot j ranks above slot i when (a_j, m_j, −j) >
+    (a_i, m_i, −i) in lexicographic order, so of two candidates within r_acc
+    of each other only the lower-ranked one is freed. Its mass and momentum
+    go back to the gas with the TSC weights of the dynamics; for an ideal gas
+    the pressure and dual-energy g grow with the density, which keeps c_s²
+    unchanged. A freed slot is zero in every field, like a slot never filled.
 
     Args:
         primitive_state: The (padded) primitive state.
         sink_particles: The sink particles.
         checks: The quantities of the creation checks at every slot, from
             step 2.
-        slot_separation_squared: The squared distances between slots, from
-            step 2.
+        slot_separation_squared: The squared distances between the slots at
+            their current positions.
         config: The simulation configuration.
         registered_variables: The registered variables.
 
@@ -177,20 +285,28 @@ def _recycle_slots(
     accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
     num_slots = sink_particles.mass.shape[0]
 
-    is_other_slot_near = jnp.any(
+    # ranks_above[i, j]: slot j ranks above slot i.
+    activation = sink_particles.activation
+    mass = sink_particles.mass
+    slot = jnp.arange(num_slots)
+    ranks_above = (activation[None, :] > activation[:, None]) | (
+        (activation[None, :] == activation[:, None])
+        & (
+            (mass[None, :] > mass[:, None])
+            | ((mass[None, :] == mass[:, None]) & (slot[None, :] < slot[:, None]))
+        )
+    )
+    is_higher_slot_near = jnp.any(
         sink_particles.occupied[None, :]
-        & ~jnp.eye(num_slots, dtype=bool)
+        & ranks_above
         & (slot_separation_squared <= accretion_radius**2),
         axis=-1,
     )
     is_freed = (
         sink_particles.occupied
-        & (sink_particles.activation < sink_particle_config.recycling_activation)
-        & (
-            sink_particles.mass
-            < sink_particle_config.recycling_mass * checks.density_threshold * cell_volume
-        )
-        & (is_other_slot_near | ~_passes_relaxed_checks(checks, config))
+        & (activation < sink_particle_config.recycling_activation)
+        & (mass < sink_particle_config.recycling_mass * checks.density_threshold * cell_volume)
+        & (is_higher_slot_near | ~_passes_relaxed_checks(checks, config))
     )
 
     # -------------------------------------------------------------
@@ -346,12 +462,13 @@ def _update_sink_particles(
     registered_variables: RegisteredVariables,
 ) -> tuple[STATE_TYPE, SinkParticles]:
     """
-    Create, activate and recycle candidates, and let every occupied slot
-    accrete gas, after the hydro update and the leapfrog of the sinks.
+    Create, activate and recycle candidates, let every occupied slot accrete
+    gas, and move the light candidates toward the potential minimum, after
+    the hydro update and the leapfrog of the sinks.
 
-    The checks read one potential, of the gas and of the slots' masses,
-    solved before any change, and the quantities of step 2 are evaluated
-    once, at the slots' positions before accretion.
+    The checks and the move read one potential, of the gas and of the slots'
+    masses, solved before any change, and the quantities of step 2 are
+    evaluated once, at the slots' positions before accretion.
 
     Args:
         primitive_state: The (padded) primitive state after the hydro update.
@@ -378,6 +495,12 @@ def _update_sink_particles(
 
     neighbourhood = _slot_neighbourhood(sink_particles.position, grid_shape, config)
     checks = _slot_checks(neighbourhood, sink_particles.mass, cells, config)
+    minimum_position = _soft_minimum_position(
+        sink_particles.position,
+        neighbourhood,
+        cells,
+        config,
+    )
     slot_separation_squared = _slot_separation_squared(sink_particles.position, config)
     sink_particles = _activate(sink_particles, checks, slot_separation_squared, config)
 
@@ -398,12 +521,16 @@ def _update_sink_particles(
         registered_variables,
     )
 
+    # Step 7 before step 6, so that the proximity check of recycling sees the
+    # moved positions.
+    sink_particles = _relocate_candidates(sink_particles, minimum_position, checks, config)
+
     unrecycled_sink_particles = sink_particles
     primitive_state, sink_particles, is_freed = _recycle_slots(
         primitive_state,
         sink_particles,
         checks,
-        slot_separation_squared,
+        _slot_separation_squared(sink_particles.position, config),
         config,
         registered_variables,
     )
