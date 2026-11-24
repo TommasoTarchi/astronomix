@@ -86,9 +86,9 @@ Input of the gradients: `mach_number` = 3.
 
 Reference (adaptive steps):
 
-- end time 0.1, 193 steps
-- sinks formed: 20; first formation at t = 0.02556
-- total sink mass at the last snapshot (t = 0.1): 16.0391, gas mass 34.2264
+- end time 0.1, 194 steps
+- sinks formed: 19; first formation at t = 0.02556
+- total sink mass at the last snapshot (t = 0.1): 16.0168, gas mass 34.2487
 
 Hard reference:
 
@@ -97,10 +97,10 @@ Hard reference:
 
 | end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.02895 | 125 | total sink mass | 0.406412 | 0.301815 * | 2.415 | 0.02932 (9.9e-01) | 0.07132 (9.7e-01) | 2.008 (1.7e-01) | 18.17 (8.7e-01) |
-| 0.02895 | 125 | position moments | -0.108923 | -0.0503368 * | 0.5264 | -0.1544 (1.3e+00) | -1.217 (1.4e+00) | 0.7814 (3.3e-01) | 4.86 (8.9e-01) |
-| 0.1 | 400 | total sink mass | 16.6784 | 16.0391 † | -3.983 | 1.366 (1.3e+00) | -7.005 (4.3e-01) | 3.228 (1.8e+00) | 473.4 (1.0e+00) |
-| 0.1 | 400 | position moments | 7.3924 | 6.95244 † | -7.047 | 1.393 (1.2e+00) | -8.874 (2.1e-01) | -2.424 (6.6e-01) | 472.5 (1.0e+00) |
+| 0.02895 | 125 | total sink mass | 0.357947 | 0.27723 * | 2.204 | 0.05807 (9.7e-01) | -0.3034 (1.1e+00) | 1.546 (3.0e-01) | 92.04 (9.8e-01) |
+| 0.02895 | 125 | position moments | -0.0852894 | -0.0459369 * | 0.6417 | -0.1744 (1.3e+00) | 0.3962 (3.8e-01) | 3.096 (7.9e-01) | -98.99 (1.0e+00) |
+| 0.1 | 400 | total sink mass | 16.4879 | 16.0168 † | 4.51 | 1.429 (6.8e-01) | 0.2133 (9.5e-01) | -5.798 (1.8e+00) | 491.6 (9.9e-01) |
+| 0.1 | 400 | position moments | 7.19098 | 6.82824 † | -12.19 | 1.766 (1.1e+00) | -2.598 (7.9e-01) | 11.03 (1.9e+00) | 169.6 (1.1e+00) |
 
 The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 

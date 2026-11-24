@@ -91,8 +91,9 @@ class SinkParticleConfig(NamedTuple):
     position_update_mass: float = 0.01
 
     #: A candidate with an activation below this value and a mass below
-    #: ``recycling_mass`` frees its slot once its gas fails the relaxed
-    #: creation checks.
+    #: ``recycling_mass`` frees its slot once its gas has failed the relaxed
+    #: creation checks in ``recycling_steps`` consecutive steps, or at once
+    #: when a slot that ranks above it lies within r_acc.
     recycling_activation: float = 0.01
 
     #: The mass m_min below which a candidate can be recycled, in units of
@@ -100,6 +101,13 @@ class SinkParticleConfig(NamedTuple):
     #: hold less than m_min are moved toward the minimum of the potential
     #: around them, the lighter the more.
     recycling_mass: float = 0.01
+
+    #: The consecutive steps in which the gas around a candidate must fail the
+    #: relaxed creation checks before its slot is freed, at least 1. The gas
+    #: can pass them off the potential minimum before it does at the minimum,
+    #: where light candidates are moved; freed at its first failure, such a
+    #: candidate may be created again at the next step.
+    recycling_steps: int = 10
 
     #: Print, at every step, the candidates created and recycled with their
     #: largest activation and mass, the number of occupied slots, and the gas

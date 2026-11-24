@@ -1230,6 +1230,7 @@ def _check_sink_smoothing_parameters(sink_particle_config: SinkParticleConfig) -
         "position_update_mass": (0.0, True, math.inf),
         "recycling_activation": (0.0, True, 1.0),
         "recycling_mass": (0.0, True, math.inf),
+        "recycling_steps": (1, True, math.inf),
     }
     for name, (lowest, lowest_allowed, highest) in ranges.items():
         value = getattr(sink_particle_config, name)

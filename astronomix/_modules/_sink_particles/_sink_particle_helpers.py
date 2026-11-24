@@ -101,6 +101,7 @@ def _empty_sink_particles(
         velocity=jnp.zeros((max_num_sinks, 3), dtype=dtype),
         activation=jnp.zeros((max_num_sinks,), dtype=dtype),
         occupied=jnp.zeros((max_num_sinks,), dtype=bool),
+        failing_steps=jnp.zeros((max_num_sinks,), dtype=jnp.int32),
     )
 
 
@@ -117,6 +118,7 @@ def _pad_sink_particles(
     hand or restored from a checkpoint that holds only these fields, are
     completed from their masses: a slot with a positive mass is occupied by a
     sink of activation 1, and the other slots are empty, with activation 0.
+    Sinks without ``failing_steps`` start with 0.
 
     Args:
         sink_particles: The sink particles passed into the run.
@@ -143,6 +145,10 @@ def _pad_sink_particles(
     if sink_particles.activation is None:
         sink_particles = sink_particles._replace(
             activation=holds_mass.astype(sink_particles.mass.dtype)
+        )
+    if sink_particles.failing_steps is None:
+        sink_particles = sink_particles._replace(
+            failing_steps=jnp.zeros((num_slots,), dtype=jnp.int32)
         )
 
     num_missing_slots = max_num_sinks - num_slots

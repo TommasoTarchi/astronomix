@@ -274,6 +274,7 @@ def _recycle_two_candidates(activation, mass, distance_in_cells):
         velocity=jnp.zeros((2, 3)),
         activation=jnp.array(activation),
         occupied=jnp.ones(2, dtype=bool),
+        failing_steps=jnp.zeros(2, dtype=jnp.int32),
     )
     _, _, is_freed = _recycle_slots(
         state.primitive_state,
@@ -318,6 +319,70 @@ def test_recycling_keeps_candidates_farther_apart_than_accretion_radius():
     2.5 cells, whose gas passes every creation check, are both kept."""
     is_freed = _recycle_two_candidates((0.0, 0.0), (0.0, 0.0), distance_in_cells=3.0)
     assert not is_freed.any(), f"recycling freed slots {is_freed} of two distant candidates"
+
+
+def _updates_until_freed(recycling_steps, fails):
+    """Recycle a candidate below a_min and m_min, alone in the box, once per
+    entry of ``fails``, with a density below the relaxed threshold where the
+    entry is true and every check passed where it is false.
+
+    Returns:
+        The number of updates after which the slot is free, or ``None`` if it
+        is still occupied after the last.
+    """
+    state, config, _, registered_variables = _setup(recycling_steps=recycling_steps)
+    position = jnp.full((1, 3), CLUMP_CENTER)
+    sink_particles = SinkParticles(
+        mass=jnp.zeros(1),
+        position=position,
+        velocity=jnp.zeros((1, 3)),
+        activation=jnp.zeros(1),
+        occupied=jnp.ones(1, dtype=bool),
+        failing_steps=jnp.zeros(1, dtype=jnp.int32),
+    )
+    passing = _passing_checks(1)
+    failing = passing._replace(density_ratio=jnp.zeros(1))
+    for update, does_fail in enumerate(fails):
+        _, sink_particles, is_freed = _recycle_slots(
+            state.primitive_state,
+            sink_particles,
+            failing if does_fail else passing,
+            _slot_separation_squared(position, config),
+            config,
+            registered_variables,
+        )
+        if bool(is_freed[0]):
+            assert int(sink_particles.failing_steps[0]) == 0, (
+                "the freed slot keeps its count of failing steps"
+            )
+            return update + 1
+    return None
+
+
+def test_candidate_is_freed_at_its_last_allowed_failure():
+    """A candidate that fails the relaxed checks at every step is freed at its
+    ``recycling_steps``-th failure and not before; with ``recycling_steps`` = 1
+    at its first."""
+    for recycling_steps in (1, 4):
+        freed_after = _updates_until_freed(recycling_steps, [True] * 6)
+        assert freed_after == recycling_steps, (
+            f"with recycling_steps = {recycling_steps} the candidate is freed after "
+            f"{freed_after} failing steps"
+        )
+
+
+def test_passing_step_restarts_count_of_failing_steps():
+    """A step in which the checks pass starts the count of failing steps
+    again: with ``recycling_steps`` = 4 a candidate survives three failures, a
+    pass and three more failures, and is freed at the fourth after the pass."""
+    fails = [True] * 3 + [False] + [True] * 3
+    freed_after = _updates_until_freed(4, fails)
+    assert freed_after is None, f"the candidate is freed after {freed_after} steps"
+    freed_after = _updates_until_freed(4, fails + [True])
+    assert freed_after == 8, (
+        f"the candidate is freed after {freed_after} steps, not at the fourth failure after "
+        "the pass, step 8"
+    )
 
 
 #: Two clumps of this peak density, this many cells apart along x, keep a
@@ -468,27 +533,33 @@ def _bonnor_ebert_off_center(creation_margin):
 
 
 def test_candidate_activates_at_same_position_whatever_its_creation_step():
-    """In the Bonnor–Ebert sphere off the cell centre, a creation margin of
-    0.45 instead of 0.5 creates the candidate about 80 steps earlier. μ
-    enters only creation and recycling, and a candidate with a = m = 0
-    neither accretes, nor exchanges momentum with the gas, nor adds to the
-    potential, so the two runs have the same gas until the candidate
-    activates. Step 7 moves the candidate to the same position before then:
-    it becomes a sink in the same step, at the same position, and the two
-    runs end with the same sinks, to rounding. Without step 7 the positions
-    at activation differ by 2.6e-4 cells and the final masses by 0.12%."""
+    """In the Bonnor–Ebert sphere off the cell centre, the candidate that
+    becomes the sink is created at least 5 steps earlier with a creation
+    margin of 0.45 than with 0.5. μ enters only creation and recycling, and a
+    candidate with a = m = 0 neither accretes, nor exchanges momentum with the
+    gas, nor adds to the potential, so the two runs have the same gas until
+    the candidate activates. Step 7 moves the candidate to the same position
+    before then: it becomes a sink in the same step, at the same position, and
+    the two runs end with the same sinks, to rounding. Without step 7 the
+    positions at activation differ by 2.6e-4 cells and the final masses by
+    0.12%."""
     late = _bonnor_ebert_off_center(creation_margin=0.5)
     early = _bonnor_ebert_off_center(creation_margin=0.45)
 
-    created = [int(np.argmax(sinks.occupied.any(axis=1))) for sinks in (late, early)]
-    assert created[0] - created[1] > 10, (
-        f"the candidate is created at steps {created} with μ = 0.5 and 0.45, not at "
-        "least 10 steps apart, so the test does not change the creation step"
-    )
     formed = [int(np.argmax((sinks.activation > 0.5).any(axis=1))) for sinks in (late, early)]
     assert formed[0] == formed[1] and formed[0] > 0, (
         f"the first sink forms at steps {formed} with μ = 0.5 and 0.45, not in the "
         "same step"
+    )
+    # The candidate that becomes the sink was created after the last step in
+    # which its slot was empty; earlier ones may have been recycled.
+    created = [
+        int(np.max(np.flatnonzero(~sinks.occupied[: step + 1, sinks.activation[step].argmax()]))) + 1
+        for sinks, step in zip((late, early), formed)
+    ]
+    assert created[0] - created[1] >= 5, (
+        f"the candidate that becomes the sink is created at steps {created} with μ = 0.5 "
+        "and 0.45, not at least 5 steps apart, so the test does not change its creation step"
     )
 
     position_in_cells = [

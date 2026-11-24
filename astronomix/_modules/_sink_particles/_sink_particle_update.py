@@ -10,8 +10,8 @@ Federrath et al. (2010), ApJ 713, 269, with smooth formation and accretion:
    slot and the gas around it by the fraction 1 − a, so that a candidate
    moves with its gas;
 6. free the slots of candidates that have neither activation nor mass and
-   whose gas fails the relaxed creation checks, or that lie within r_acc of a
-   slot that ranks above them;
+   whose gas has failed the relaxed creation checks for several steps, or that
+   lie within r_acc of a slot that ranks above them;
 7. move every slot that holds less than m_min and is not fully active toward
    the soft-minimum position of the potential around it, so that a candidate
    activates where the gas puts the minimum at that time, whatever the step
@@ -257,14 +257,15 @@ def _recycle_slots(
     """
     Step 6: free the slot of every candidate with an activation below
     ``recycling_activation`` and a mass below ``recycling_mass`` ρ_thr ΔV
-    that fails a relaxed creation check: (b) an occupied slot that ranks
-    above it lies within r_acc, or (c) to (g) fail at the slot, with the
-    quantities of step 2. Slot j ranks above slot i when (a_j, m_j, −j) >
-    (a_i, m_i, −i) in lexicographic order, so of two candidates within r_acc
-    of each other only the lower-ranked one is freed. Its mass and momentum
-    go back to the gas with the TSC weights of the dynamics; for an ideal gas
-    the pressure and dual-energy g grow with the density, which keeps c_s²
-    unchanged. A freed slot is zero in every field, like a slot never filled.
+    for which (b) an occupied slot that ranks above it lies within r_acc, or
+    (c) to (g), with the quantities of step 2 at the slot, have failed in
+    ``recycling_steps`` consecutive steps, this one included. Slot j ranks
+    above slot i when (a_j, m_j, −j) > (a_i, m_i, −i) in lexicographic order,
+    so of two candidates within r_acc of each other only the lower-ranked one
+    is freed. Its mass and momentum go back to the gas with the TSC weights of
+    the dynamics; for an ideal gas the pressure and dual-energy g grow with
+    the density, which keeps c_s² unchanged. A freed slot is zero in every
+    field, like a slot never filled.
 
     Args:
         primitive_state: The (padded) primitive state.
@@ -302,11 +303,17 @@ def _recycle_slots(
         & (slot_separation_squared <= accretion_radius**2),
         axis=-1,
     )
+    failing_steps = jnp.where(
+        sink_particles.occupied & ~_passes_relaxed_checks(checks, config),
+        sink_particles.failing_steps + 1,
+        0,
+    )
+    sink_particles = sink_particles._replace(failing_steps=failing_steps)
     is_freed = (
         sink_particles.occupied
         & (activation < sink_particle_config.recycling_activation)
         & (mass < sink_particle_config.recycling_mass * checks.density_threshold * cell_volume)
-        & (is_higher_slot_near | ~_passes_relaxed_checks(checks, config))
+        & (is_higher_slot_near | (failing_steps >= sink_particle_config.recycling_steps))
     )
 
     # -------------------------------------------------------------

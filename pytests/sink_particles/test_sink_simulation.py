@@ -270,7 +270,7 @@ def test_snapshot_callback_receives_sinks():
     after, and at the last call the sinks the run returns."""
     calls = []
 
-    def record_on_host(time, mass, position, velocity, activation, occupied):
+    def record_on_host(time, mass, position, velocity, activation, occupied, failing_steps):
         calls.append(
             (
                 float(time),
@@ -279,6 +279,7 @@ def test_snapshot_callback_receives_sinks():
                 np.asarray(velocity),
                 np.asarray(activation),
                 np.asarray(occupied),
+                np.asarray(failing_steps),
             )
         )
 
@@ -287,7 +288,7 @@ def test_snapshot_callback_receives_sinks():
 
     final_state = _run_with_snapshot_callback(True, snapshot_callable)
 
-    num_sinks = [int(np.sum(activation > 0.5)) for *_, activation, _ in calls]
+    num_sinks = [int(np.sum(activation > 0.5)) for *_, activation, _, _ in calls]
     assert len(calls) >= 5
     assert num_sinks[0] == 0
     assert all(count == 1 for count in num_sinks[1:])
@@ -385,6 +386,7 @@ def _sink_config(**sink_particle_options):
         dict(position_update_mass=-0.01),
         dict(recycling_activation=1.5),
         dict(recycling_mass=float("nan")),
+        dict(recycling_steps=0),
     ],
     ids=[
         "creation_margin_zero",
@@ -396,6 +398,7 @@ def _sink_config(**sink_particle_options):
         "position_update_mass_negative",
         "recycling_activation_above_one",
         "recycling_mass_nan",
+        "recycling_steps_zero",
     ],
 )
 def test_smoothing_parameter_out_of_range(out_of_range):

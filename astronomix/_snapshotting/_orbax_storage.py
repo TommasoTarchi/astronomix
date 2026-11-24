@@ -29,7 +29,7 @@ modes, not grid cells, and is restored replicated. The sink particles are
 written as the sub-tree ``sink_particles`` (one entry per field that is set),
 only when present; their absence on load is reported as ``None``. Sinks
 restored without ``activation`` and ``occupied`` are completed from their
-masses when the run starts.
+masses when the run starts, and without ``failing_steps`` with 0.
 """
 
 # general
