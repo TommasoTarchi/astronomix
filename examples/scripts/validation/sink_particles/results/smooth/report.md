@@ -24,7 +24,7 @@ Hard reference:
 | 0.3 | 850 | total sink mass | 1.45838 | 1.45845 | 0.01203 | 0.01218 (1.2e-02) | 0.01203 (1.2e-04) | 0.01203 (1.1e-05) | 0.01203 (4.8e-06) |
 | 0.3 | 850 | position moments | 1.27464 | 1.27469 | 0.01051 | 0.01064 (1.2e-02) | 0.01052 (1.2e-04) | 0.01051 (1.1e-05) | 0.01051 (4.8e-06) |
 
-The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
 
@@ -50,7 +50,7 @@ Hard reference:
 | 0.2 | 450 | total sink mass | 1.55961 | 1.55874 | 0.8525 | 0.8549 (2.8e-03) | 0.8525 (2.2e-05) | 0.8525 (5.7e-06) | 0.8525 (9.0e-08) |
 | 0.2 | 450 | position moments | 1.36311 | 1.36235 | 0.7451 | 0.7472 (2.8e-03) | 0.7451 (2.2e-05) | 0.7451 (5.7e-06) | 0.7451 (9.0e-08) |
 
-The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
 
@@ -60,9 +60,9 @@ Input of the gradients: `rotation_rate` = 7.16.
 
 Reference (adaptive steps):
 
-- end time 0.2, 205 steps
-- sinks formed: 1; first formation at t = 0.1505
-- total sink mass at the last snapshot (t = 0.2): 1.45876, gas mass 1.67991
+- end time 0.2, 204 steps
+- sinks formed: 1; first formation at t = 0.1106
+- total sink mass at the last snapshot (t = 0.2): 1.44029, gas mass 1.69837
 
 Hard reference:
 
@@ -71,12 +71,12 @@ Hard reference:
 
 | end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.1231 | 275 | total sink mass | 0.121713 | 0.00173368 | -0.08207 | -0.07278 (1.1e-01) | -0.08166 (5.1e-03) | -0.08207 (3.8e-05) | -0.08207 (1.7e-05) |
-| 0.1231 | 275 | position moments | 0.106378 | 0.00161232 | -0.07173 | -0.06361 (1.1e-01) | -0.07137 (5.1e-03) | -0.07173 (3.8e-05) | -0.07173 (1.7e-05) |
-| 0.2 | 425 | total sink mass | 1.4401 | 1.45876 | -0.3915 | -0.3853 (1.6e-02) | -0.3879 (9.3e-03) | -0.389 (6.4e-03) | -0.3914 (2.0e-04) |
-| 0.2 | 425 | position moments | 1.25866 | 1.27492 | -0.3422 | -0.3368 (1.6e-02) | -0.339 (9.3e-03) | -0.34 (6.4e-03) | -0.3421 (2.0e-04) |
+| 0.1231 | 275 | total sink mass | 0.121713 | 0.122319 | -0.08207 | -0.0734 (1.1e-01) | -0.08166 (5.1e-03) | -0.08207 (3.8e-05) | -0.08207 (1.7e-05) |
+| 0.1231 | 275 | position moments | 0.106378 | 0.106908 | -0.07173 | -0.06415 (1.1e-01) | -0.07137 (5.1e-03) | -0.07173 (3.8e-05) | -0.07173 (1.7e-05) |
+| 0.2 | 425 | total sink mass | 1.4401 | 1.44029 | -0.3915 | -0.3853 (1.6e-02) | -0.3879 (9.3e-03) | -0.389 (6.4e-03) | -0.3914 (2.0e-04) |
+| 0.2 | 425 | position moments | 1.25866 | 1.25883 | -0.3422 | -0.3368 (1.6e-02) | -0.339 (9.3e-03) | -0.34 (6.4e-03) | -0.3421 (2.0e-04) |
 
-The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
 
@@ -87,8 +87,8 @@ Input of the gradients: `mach_number` = 3.
 Reference (adaptive steps):
 
 - end time 0.1, 193 steps
-- sinks formed: 19; first formation at t = 0.02234
-- total sink mass at the last snapshot (t = 0.1): 15.8928, gas mass 34.3727
+- sinks formed: 20; first formation at t = 0.02556
+- total sink mass at the last snapshot (t = 0.1): 16.0391, gas mass 34.2264
 
 Hard reference:
 
@@ -97,12 +97,12 @@ Hard reference:
 
 | end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.02895 | 125 | total sink mass | 0.288886 | 0.313501 * | -0.1945 | -0.06422 (6.7e-01) | -1.132 (8.3e-01) | 14.79 (1.0e+00) | -0.1935 (5.1e-03) |
-| 0.02895 | 125 | position moments | -0.147082 | -0.015756 * | 0.4309 | -0.166 (1.4e+00) | -0.4564 (1.9e+00) | 18.5 (9.8e-01) | 0.4294 (3.3e-03) |
-| 0.1 | 400 | total sink mass | 15.7974 | 15.8928 | -1.133 | 1.262 (1.9e+00) | -3.425 (6.7e-01) | -46.8 (9.8e-01) | 20.87 (1.1e+00) |
-| 0.1 | 400 | position moments | 6.59324 | 6.70873 | 0.2844 | 1.642 (8.3e-01) | -3.109 (1.1e+00) | -43.37 (1.0e+00) | 27.8 (9.9e-01) |
+| 0.02895 | 125 | total sink mass | 0.406412 | 0.301815 * | 2.415 | 0.02932 (9.9e-01) | 0.07132 (9.7e-01) | 2.008 (1.7e-01) | 18.17 (8.7e-01) |
+| 0.02895 | 125 | position moments | -0.108923 | -0.0503368 * | 0.5264 | -0.1544 (1.3e+00) | -1.217 (1.4e+00) | 0.7814 (3.3e-01) | 4.86 (8.9e-01) |
+| 0.1 | 400 | total sink mass | 16.6784 | 16.0391 † | -3.983 | 1.366 (1.3e+00) | -7.005 (4.3e-01) | 3.228 (1.8e+00) | 473.4 (1.0e+00) |
+| 0.1 | 400 | position moments | 7.3924 | 6.95244 † | -7.047 | 1.393 (1.2e+00) | -8.874 (2.1e-01) | -2.424 (6.6e-01) | 472.5 (1.0e+00) |
 
-The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
 
@@ -113,8 +113,8 @@ Input of the gradients: offset of the centre from the central cell centre along 
 Reference (adaptive steps):
 
 - end time 0.3, 426 steps
-- sinks formed: 1; first formation at t = 0.08828
-- total sink mass at the last snapshot (t = 0.3): 1.46077, gas mass 0.526723
+- sinks formed: 1; first formation at t = 0.09759
+- total sink mass at the last snapshot (t = 0.3): 1.46077, gas mass 0.526724
 
 Hard reference:
 
@@ -123,11 +123,11 @@ Hard reference:
 
 | end time | steps | output | value | reference | jax.grad | FD h=0.1 | FD h=0.01 | FD h=0.001 | FD h=0.0001 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0.1094 | 325 | total sink mass | 0.145774 | 0.146004 | -0.0132 | -0.01918 (3.1e-01) | -0.02094 (3.7e-01) | -0.01309 (8.6e-03) | -0.0132 (3.0e-05) |
-| 0.1094 | 325 | mean x of the sinks, in cells | 0.219805 | 0.222269 | 0.8025 | 0.9426 (1.5e-01) | 0.826 (2.8e-02) | 0.8021 (5.0e-04) | 0.8025 (1.8e-05) |
-| 0.3 | 850 | total sink mass | 1.46071 | 1.46077 | -0.00127 | 0.003672 (1.3e+00) | -0.001295 (2.0e-02) | -0.001412 (1.0e-01) | -0.00127 (2.0e-05) |
-| 0.3 | 850 | mean x of the sinks, in cells | 0.173352 | 0.168436 | 0.3972 | 0.6674 (4.0e-01) | 0.4325 (8.2e-02) | 0.5923 (3.3e-01) | 0.3972 (5.6e-05) |
+| 0.1094 | 325 | total sink mass | 0.145766 | 0.146431 | -0.02824 | -0.02221 (2.1e-01) | -0.02822 (6.4e-04) | -0.02824 (1.2e-04) | -0.02824 (4.6e-07) |
+| 0.1094 | 325 | mean x of the sinks, in cells | 0.219737 | 0.220246 | 0.8452 | 0.9385 (9.9e-02) | 0.8449 (3.3e-04) | 0.8452 (1.1e-05) | 0.8452 (1.4e-06) |
+| 0.3 | 850 | total sink mass | 1.46071 | 1.46077 | -0.001272 | 0.00369 (1.3e+00) | -0.001285 (9.8e-03) | -0.001274 (1.0e-03) | -0.001272 (2.0e-05) |
+| 0.3 | 850 | mean x of the sinks, in cells | 0.17307 | 0.169515 † | 0.4035 | 0.6488 (3.8e-01) | 0.4217 (4.3e-02) | 0.4051 (4.1e-03) | 0.4035 (3.2e-05) |
 
-The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two must agree, except where marked with *: there sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful.
+The value is that of the fixed-step run; the reference is the same output of the adaptive run, interpolated between its snapshots. Fixed steps skip the CFL limit and the half-cell limit on sink motion, so the two should agree. Marked with *: sinks form between the two snapshots around the time, the output jumps, and the interpolated reference is not meaningful. Marked with †: the two differ by more than 1%, and the runs may follow different paths.
 
 Each finite difference is followed by its relative difference from `jax.grad`, |g − fd| / max(|g|, |fd|).
