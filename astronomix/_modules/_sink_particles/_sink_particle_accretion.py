@@ -37,10 +37,6 @@ around it, so the cost scales with the number of sinks, not with the grid.
 # general
 import math
 from functools import partial
-from typing import NamedTuple
-
-# numerics
-import numpy as np
 
 # jax
 import jax
@@ -48,7 +44,6 @@ import jax.numpy as jnp
 
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
-    FIELD_TYPE,
     IDEAL_GAS,
     POLYTROPIC,
     STATE_TYPE,
@@ -61,17 +56,18 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._modules._sink_particles._sink_particle_formation import (
+    CellQuantities,
+    SlotNeighbourhood,
+    _gas_quantities,
+    _slot_neighbourhood,
+)
 from astronomix._modules._sink_particles._sink_particle_helpers import (
-    _density_threshold,
-    _interior_cell_indices,
     _periodic_box,
     _polytropic_resolved_density,
-    _sound_speed_squared,
 )
 from astronomix._modules._sink_particles._sink_particle_smoothing import (
-    _cell_weights,
     _point_mass_potential,
-    _radial_weight,
     _safe_divide,
     _smooth_step,
 )
@@ -80,141 +76,6 @@ from astronomix._modules._sink_particles._sink_particle_smoothing import (
 #: toward a sink. FLASH accepts gas up to this tolerance, since gas moving with
 #: the sink has v_r = 0 only up to rounding.
 RADIAL_VELOCITY_TOLERANCE = 1e-5
-
-
-class CellQuantities(NamedTuple):
-    """The gas quantities that accretion reads, on the (padded) grid."""
-
-    #: The density.
-    density: FIELD_TYPE
-
-    #: The velocity, with the three components on the last axis.
-    velocity: jax.Array
-
-    #: The squared sound speed.
-    sound_speed_squared: FIELD_TYPE
-
-    #: The density threshold ρ_res (Eq. 32).
-    density_threshold: FIELD_TYPE
-
-
-class SlotNeighbourhood(NamedTuple):
-    """The cells within reach of every slot, each array of shape
-    (num_slots, num_offsets), with a trailing vector axis for the
-    separation."""
-
-    #: A tuple of three integer index arrays into the padded field.
-    cell_indices: tuple
-
-    #: The separation from the slot to each cell centre, taken to the
-    #: nearest periodic copy along periodic axes (minimum-image convention).
-    separation: jax.Array
-
-    #: The squared length of the separation.
-    distance_squared: jax.Array
-
-    #: The radial weight K of each cell, 0 past a non-periodic edge.
-    radial_weight: jax.Array
-
-    #: The cell weight h of each cell: 1 on the cell that contains the slot.
-    cell_weight: jax.Array
-
-
-def _accretion_offsets(config: SimulationConfig) -> np.ndarray:
-    """
-    Integer cell offsets (i, j, k), from the cell containing a sink, of every
-    cell that can lie within the accretion radius of that sink.
-
-    A sink can sit anywhere inside its cell, at most √3/2 cells from the cell
-    centre, so the offsets are those with i² + j² + k² ≤ (r_acc/Δx + √3/2)².
-    Whether a cell is actually within r_acc is checked per sink. The offsets
-    are computed with NumPy at trace time, since they only depend on the
-    static configuration.
-
-    Args:
-        config: The simulation configuration.
-
-    Returns:
-        The offsets, shape (num_offsets, 3), with (0, 0, 0) among them.
-    """
-    reach_in_cells = (
-        config.sink_particle_config.accretion_radius_in_cells + 0.5 * np.sqrt(3.0)
-    )
-    max_offset = int(np.floor(reach_in_cells))
-    offset_range = np.arange(-max_offset, max_offset + 1)
-    offsets = np.stack(
-        np.meshgrid(offset_range, offset_range, offset_range, indexing="ij"),
-        axis=-1,
-    ).reshape(-1, 3)
-    within_reach = np.sum(offsets**2, axis=-1) <= reach_in_cells**2
-    return offsets[within_reach]
-
-
-def _slot_neighbourhood(
-    position: jax.Array,
-    grid_shape: tuple,
-    config: SimulationConfig,
-) -> SlotNeighbourhood:
-    """
-    Gather the cells within reach of every slot (``_accretion_offsets``
-    around the cell that contains it), with their separations and their
-    radial and cell weights.
-
-    Args:
-        position: The slot positions, shape (num_slots, 3).
-        grid_shape: The shape of a (padded) field.
-        config: The simulation configuration.
-
-    Returns:
-        The neighbourhood of every slot.
-    """
-    sink_particle_config = config.sink_particle_config
-    grid_spacing = config.grid_spacing
-    accretion_radius = sink_particle_config.accretion_radius_in_cells * grid_spacing
-    spatial_width_in_cells = sink_particle_config.spatial_width_in_cells
-    offsets = _accretion_offsets(config)
-    is_periodic, box_length = _periodic_box(config)
-
-    containing_cell = jnp.floor(position / grid_spacing).astype(jnp.int32)
-    cell_indices, interior_index, is_real_cell = _interior_cell_indices(
-        containing_cell[:, None, :] + offsets[None, :, :],
-        grid_shape,
-        config,
-    )
-
-    cell_centers = (interior_index + 0.5) * grid_spacing
-    separation = cell_centers - position[:, None, :]
-    separation = jnp.where(
-        is_periodic,
-        separation - box_length * jnp.round(separation / box_length),
-        separation,
-    )
-    distance_squared = jnp.sum(separation**2, axis=-1)
-
-    radial_weight = jnp.where(
-        is_real_cell,
-        _radial_weight(
-            distance_squared,
-            accretion_radius,
-            spatial_width_in_cells * grid_spacing,
-        ),
-        0.0,
-    )
-    _, cell_weight = _cell_weights(
-        position,
-        grid_shape,
-        config,
-        spatial_width_in_cells,
-        offsets=offsets,
-    )
-
-    return SlotNeighbourhood(
-        cell_indices=cell_indices,
-        separation=separation,
-        distance_squared=distance_squared,
-        radial_weight=radial_weight,
-        cell_weight=cell_weight,
-    )
 
 
 def _accreted_cell_density(
@@ -472,27 +333,9 @@ def _accrete_gas(
     """
     cell_volume = config.grid_spacing**3
 
-    density = primitive_state[registered_variables.density_index]
+    cells = _gas_quantities(primitive_state, config, params, registered_variables)
+    density = cells.density
     grid_shape = density.shape
-    sound_speed_squared = _sound_speed_squared(
-        primitive_state,
-        config,
-        params,
-        registered_variables,
-    )
-    cells = CellQuantities(
-        density=density,
-        velocity=jnp.stack(
-            [
-                primitive_state[registered_variables.velocity_index.x],
-                primitive_state[registered_variables.velocity_index.y],
-                primitive_state[registered_variables.velocity_index.z],
-            ],
-            axis=-1,
-        ),
-        sound_speed_squared=sound_speed_squared,
-        density_threshold=_density_threshold(sound_speed_squared, config, params),
-    )
     neighbourhood = _slot_neighbourhood(sink_particles.position, grid_shape, config)
     cell_indices = neighbourhood.cell_indices
 

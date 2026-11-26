@@ -1,10 +1,13 @@
 """
 Configuration container for sink particles.
 
-Sink particles are created following the checks of Federrath et al. (2010),
-ApJ 713, 269, Section 2.2, and they accrete the gas above the density
-threshold within their accretion radius (Section 2.3). The density threshold
-is derived from the Jeans length resolution (Eq. 32 of the paper).
+Sink particles grow from seeds, one in every cell, whose activation rises
+from 0 to 1 with smooth versions of the creation checks of Federrath et al.
+(2010), ApJ 713, 269, Section 2.2, and they accrete the gas above the density
+threshold within their accretion radius (Section 2.3), in proportion to their
+activation. The widths of the smooth checks are set here; at their hard
+limit the checks are those of the paper. The density threshold is derived
+from the Jeans length resolution (Eq. 32 of the paper).
 They move with a kick-drift-kick leapfrog, once per hydro step, and all their
 gravity goes through the grid (Gong & Ostriker 2013, ApJS 204, 8). All options
 here are static: changing them triggers recompilation.
@@ -42,15 +45,19 @@ class SinkParticleConfig(NamedTuple):
     sink_particles: bool = False
 
     #: Size of the sink particle arrays. JIT requires fixed array sizes, so
-    #: this many slots are allocated up front. When a new sink would need
-    #: more slots, the run stops with an error. Sinks passed into a run, or
+    #: this many slots are allocated up front; every seed whose activation
+    #: has ever exceeded 0 holds one. When a new seed would need more slots,
+    #: the run stops with an error. Sinks passed into a run, or
     #: restored from a checkpoint, with fewer slots get empty slots appended;
     #: with more slots, the run does not start.
     max_num_sinks: int = 256
 
-    #: Maximum number of cells that can be examined per time step with the
-    #: control-volume checks (Jeans instability, bound state, proximity).
-    #: Cells beyond this number are ignored for that step (with a warning).
+    #: Length of the list of cells whose inactive seed can get a creation
+    #: weight above 0: the interior cells that pass the density and
+    #: converging-flow checks and are not blocked by a sink or by an earlier
+    #: seed of their cell. Only these get the checks that need a control
+    #: volume (potential minimum, Jeans instability, bound state). Cells
+    #: beyond this number are skipped for that step, with a warning.
     max_num_candidates: int = 128
 
     #: Accretion radius r_acc in units of the grid spacing. It sets both the

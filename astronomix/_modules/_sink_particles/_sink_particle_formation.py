@@ -1,22 +1,49 @@
 """
-Sink particle formation following Federrath et al. (2010), ApJ 713, 269.
+Sink particle formation with fixed seeds, following the creation checks of
+Federrath et al. (2010), ApJ 713, 269, Section 2.2, made smooth
+(``_sink_particle_smoothing.py``).
 
-Once per time step, the gas is checked for regions that should turn into sink
-particles, using the creation checks of Section 2.2 of the paper. A new sink is
-created with zero mass at the centre of its cell and gets its mass from the
-accretion step that follows in the same time step
-(``_sink_particle_accretion.py``), as in Federrath's FLASH code.
+Every cell holds an inactive seed from the start of the run, and a seed turns
+into a sink gradually. Once per time step every seed gets a creation weight
+w in [0, 1], the product of one factor per creation check, and its activation
+grows to max(a, w). A seed of activation 0 has no effect on anything; one of
+activation 1 is a sink. A seed is stored in a slot of ``SinkParticles`` from
+the step its activation first exceeds 0, with its cell as home cell; the
+inactive seed of the next generation then takes its place in that cell.
 
-The formation runs in two stages. First, cheap checks are evaluated on the
-whole grid, giving a mask of candidate cells. Then, for a fixed-size list of
-candidates, the gas in the control volume around each candidate (all cells
-within the accretion radius r_acc) is gathered and the remaining checks are
-evaluated on it. Candidates that pass every check become new sinks.
+The factors of seed s, at position y_s, are
 
-Only gas in interior cells counts, as in the accretion step. A control volume
-wraps around periodic axes and ends at the edge of the box on non-periodic
-axes. Reflective walls are treated like the other edges: mirrored gas is not
-counted.
+    f_ρ    = step_ω(ρ_s / ρ_res − 1), the seed's mass added to its density,
+    f_conv = Π_k [1 − step_ω(−δ_k)], the six converging-flow velocities,
+    f_φ    = 1 − step_ω((φ_s − min_T φ) / c_s²),
+    f_J    = step_ω(|E_grav| / (2 E_th + E_mag) − 1),
+    f_b    = step_ω(|E_grav| / (E_th + E_kin + E_mag) − 1),
+    f_prox = Π_{s' ≠ s} [1 − a_s' K(|y_s' − y_s| − ℓ Δx)],
+    f_home = Π_{s'} [1 − K(|y_s' − x_c(s)| − ℓ Δx)], over the seeds s' that
+             activated before s in its home cell c(s),
+
+each exactly 0 where its hard check fails. A cell quantity is read at y_s
+with the cell weights h, and the control volume holds the gas within r_acc
+of y_s with the radial weights K; the soft minimum and maximum have the
+temperature ω c_s². The potential φ is that of the gas, of the seeds and of
+any external field. All activations are updated together, with those of the
+previous step in f_prox, so seeds that pass in the same step do not hold
+each other back.
+
+The weights of the inactive seeds are computed only where they can be above
+0. f_ρ, f_conv, f_prox and f_home need no control volume: the interior cells
+where all four are above 0 are listed, in a list of fixed length, and only
+the listed cells get the factors that need a control volume. A cell leaving
+or entering the list has w = 0, so the list changes no result unless it is
+full.
+
+With every width at its hard limit (ω = ℓ = 0), each factor is a hard check
+of Federrath et al. (2010), and a seed becomes a full sink in the first step
+its cell passes them all.
+
+Only gas in interior cells counts. A control volume wraps around periodic
+axes and ends at the edge of the box on non-periodic axes. Reflective walls
+are treated like the other edges: mirrored gas is not counted.
 
 The refinement check of Section 2.2.2 is not applied: astronomix uses a
 uniform grid, so every cell is already on the highest level of refinement.
@@ -25,8 +52,9 @@ uniform grid, so every cell is already on the highest level of refinement.
 # general
 from functools import partial
 
-# numerics
-import numpy as np
+# typing
+from types import NoneType
+from typing import NamedTuple, Union
 
 # jax
 import jax
@@ -46,148 +74,671 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._modules._gravity._gravity import _compute_total_potential
+from astronomix._modules._sink_particles._sink_particle_dynamics import _sink_density
 from astronomix._modules._sink_particles._sink_particle_helpers import (
+    _accretion_offsets,
     _collect_candidates,
-    _control_volume_offsets,
+    _control_volume_energies,
     _density_threshold,
-    _fill_potential_ghost_cells,
     _interior_cell_indices,
     _interior_mask,
     _periodic_box,
     _raise_sink_slots_full,
     _sound_speed_squared,
 )
+from astronomix._modules._sink_particles._sink_particle_smoothing import (
+    _cell_weights,
+    _radial_weight,
+    _safe_divide,
+    _smooth_step,
+    _soft_maximum,
+    _soft_minimum,
+)
 from astronomix._stencil_operations._stencil_operations import _shift
 
 
-def _converging_flow_mask(velocity: jax.Array) -> FIELD_TYPE:
-    """
-    Boolean mask of the cells toward which the flow converges along every axis.
+# -------------------------------------------------------------
+# ===================== ↓ Cell quantities ↓ ===================
+# -------------------------------------------------------------
 
-    Along each axis d, the neighbour at +1 must not move away from the cell,
-    v_d(+1) − v_d(0) ≤ 0, and the neighbour at −1 must not move away either,
-    v_d(−1) − v_d(0) ≥ 0 (Federrath et al. 2010, Section 2.2.3). The
-    inequalities are not strict, so that gas at rest or in uniform motion
-    passes, as in Federrath's FLASH code; only flow away from the cell fails.
+
+class CellQuantities(NamedTuple):
+    """The cell quantities that the creation and accretion checks read, on
+    the (padded) grid. Accretion reads only the first four, and its
+    quantities leave the others ``None``."""
+
+    #: The gas density ρ.
+    density: FIELD_TYPE
+
+    #: The gas velocity, with the three components on the last axis.
+    velocity: jax.Array
+
+    #: The squared sound speed c_s².
+    sound_speed_squared: FIELD_TYPE
+
+    #: The density threshold ρ_res of Eq. 32.
+    density_threshold: FIELD_TYPE
+
+    #: The potential of the gas, of the seeds (their masses spread with the
+    #: TSC weights of their motion) and the external potential.
+    potential: Union[FIELD_TYPE, NoneType] = None
+
+    #: The six velocity differences δ_k of the converging-flow check, in
+    #: units of c_s and positive where the flow converges, shape (6, ...).
+    converging_velocity: Union[jax.Array, NoneType] = None
+
+    #: |B|², or ``None`` without a magnetic field.
+    magnetic_field_squared: Union[FIELD_TYPE, NoneType] = None
+
+
+def _gas_quantities(
+    primitive_state: STATE_TYPE,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+) -> CellQuantities:
+    """
+    The cell quantities that accretion reads: ρ, v, c_s² and ρ_res.
 
     Args:
-        velocity: The (padded) velocity field, with the three components on
-            the last axis.
+        primitive_state: The (padded) primitive state.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
 
     Returns:
-        The converging-flow mask, with the shape of one field.
+        The cell quantities, with the potential, the converging-flow
+        velocities and |B|² left ``None``.
     """
-    converging = jnp.ones(velocity.shape[:-1], dtype=bool)
+    sound_speed_squared = _sound_speed_squared(
+        primitive_state,
+        config,
+        params,
+        registered_variables,
+    )
+    return CellQuantities(
+        density=primitive_state[registered_variables.density_index],
+        velocity=jnp.stack(
+            [
+                primitive_state[registered_variables.velocity_index.x],
+                primitive_state[registered_variables.velocity_index.y],
+                primitive_state[registered_variables.velocity_index.z],
+            ],
+            axis=-1,
+        ),
+        sound_speed_squared=sound_speed_squared,
+        density_threshold=_density_threshold(sound_speed_squared, config, params),
+    )
+
+
+def _cell_quantities(
+    primitive_state: STATE_TYPE,
+    sink_particles: SinkParticles,
+    config: SimulationConfig,
+    params: SimulationParams,
+    registered_variables: RegisteredVariables,
+) -> CellQuantities:
+    """
+    The cell quantities of the creation checks, with one Poisson solve of the
+    gas density plus the seeds' masses.
+
+    Along each axis d, the converging-flow check compares the cell with its
+    neighbours at ±1: δ = (v_d(0) − v_d(+1)) / c_s and (v_d(−1) − v_d(0)) / c_s,
+    both ≥ 0 where neither neighbour moves away from the cell (Federrath et
+    al. 2010, Section 2.2.3). It reads the velocity of the ghost cells, since
+    these ±1 neighbours are what the hydro solver sees at the boundary.
+
+    Args:
+        primitive_state: The (padded) primitive state.
+        sink_particles: The sink particles, whose masses enter the potential.
+        config: The simulation configuration.
+        params: The simulation parameters.
+        registered_variables: The registered variables.
+
+    Returns:
+        The cell quantities.
+    """
+    cells = _gas_quantities(primitive_state, config, params, registered_variables)
+    density = cells.density
+    potential = _compute_total_potential(
+        density + _sink_density(sink_particles, density.shape, config),
+        config.grid_spacing,
+        config,
+        params,
+        registered_variables,
+        params.gravitational_constant,
+    )
+
+    sound_speed = jnp.sqrt(cells.sound_speed_squared)
+    converging_velocity = []
     for axis in range(3):
-        velocity_component = velocity[..., axis]
+        velocity_component = cells.velocity[..., axis]
         # _shift(field, -1, axis) holds the value of the neighbour at +1.
         velocity_at_plus_one = _shift(velocity_component, -1, axis)
         velocity_at_minus_one = _shift(velocity_component, 1, axis)
-        converging = (
-            converging
-            & (velocity_at_plus_one - velocity_component <= 0.0)
-            & (velocity_at_minus_one - velocity_component >= 0.0)
+        converging_velocity.append(
+            (velocity_component - velocity_at_plus_one) / sound_speed
         )
-    return converging
+        converging_velocity.append(
+            (velocity_at_minus_one - velocity_component) / sound_speed
+        )
+
+    magnetic_field_squared = None
+    if config.mhd:
+        magnetic_field_squared = (
+            primitive_state[registered_variables.magnetic_index.x] ** 2
+            + primitive_state[registered_variables.magnetic_index.y] ** 2
+            + primitive_state[registered_variables.magnetic_index.z] ** 2
+        )
+
+    return cells._replace(
+        potential=potential,
+        converging_velocity=jnp.stack(converging_velocity),
+        magnetic_field_squared=magnetic_field_squared,
+    )
 
 
-def _potential_minimum_mask(
-    gravitational_potential: FIELD_TYPE,
-    offsets: np.ndarray,
-) -> FIELD_TYPE:
-    """
-    Boolean mask of the cells where the potential is lowest in their control
-    volume.
+# -------------------------------------------------------------
+# ===================== ↑ Cell quantities ↑ ===================
+# -------------------------------------------------------------
 
-    A cell passes if its potential is not above the potential of any cell in
-    its control volume, φ(0) ≤ min φ (Federrath et al. 2010, Eq. 4).
-
-    Args:
-        gravitational_potential: The (padded) gravitational potential.
-        offsets: The control-volume offsets, shape (num_offsets, 3).
-
-    Returns:
-        The potential-minimum mask, with the shape of the potential.
-    """
-    minimum_in_volume = gravitational_potential
-    for offset in offsets:
-        # Shifting by −offset brings the value at cell + offset to each cell.
-        potential_at_offset = gravitational_potential
-        for axis in range(3):
-            if offset[axis] != 0:
-                potential_at_offset = _shift(
-                    potential_at_offset,
-                    -int(offset[axis]),
-                    axis,
-                )
-        minimum_in_volume = jnp.minimum(minimum_in_volume, potential_at_offset)
-    return gravitational_potential <= minimum_in_volume
+# -------------------------------------------------------------
+# =================== ↓ Cells around a slot ↓ =================
+# -------------------------------------------------------------
 
 
-def _select_separated_candidates(
-    candidate_passes: jax.Array,
-    candidate_positions: jax.Array,
-    potential_at_candidates: jax.Array,
-    accretion_radius: float,
-    is_periodic: np.ndarray,
-    box_length: np.ndarray,
+class SlotNeighbourhood(NamedTuple):
+    """The cells around each of a set of positions: those of the accretion
+    offsets around the cell that contains it, which hold every cell within
+    r_acc. Arrays have the shape (num_positions, num_offsets)."""
+
+    #: A tuple of three integer index arrays into the padded field.
+    cell_indices: tuple
+
+    #: Whether each cell is a real cell; cells past a non-periodic edge are
+    #: not, and every weight is 0 on them.
+    is_real_cell: jax.Array
+
+    #: The separation from the position to each cell centre, to the nearest
+    #: periodic copy along periodic axes, with a trailing vector axis.
+    separation: jax.Array
+
+    #: The squared length of the separation.
+    distance_squared: jax.Array
+
+    #: The radial weight K of each cell.
+    radial_weight: jax.Array
+
+    #: The cell weight h of each cell.
+    cell_weight: jax.Array
+
+
+def _minimum_image(
+    separation: jax.Array,
+    config: SimulationConfig,
 ) -> jax.Array:
     """
-    Keep only passing candidates that lie farther than r_acc from every other
-    kept candidate, so that new sinks formed in the same call respect the
-    proximity rule (Section 2.2.7) among themselves.
-
-    The candidates are taken in order of increasing potential, the deepest
-    first, with exact ties going to the lower candidate index. Each one is kept
-    if it passes and no candidate kept before it lies within r_acc. The pass is
-    sequential: a single parallel rule ("drop a candidate if a higher-priority
-    passing candidate is within r_acc") would also drop candidates that are
-    only near a candidate dropped itself.
+    Separations taken to the nearest periodic copy along periodic axes.
 
     Args:
-        candidate_passes: Whether each candidate passes the creation checks,
-            shape (num_candidates,).
-        candidate_positions: The candidate cell centres, shape
-            (num_candidates, 3).
-        potential_at_candidates: The gravitational potential at each candidate
-            cell, shape (num_candidates,).
-        accretion_radius: The accretion radius r_acc.
-        is_periodic: Which axes are periodic, shape (3,).
-        box_length: The box length along each axis, shape (3,).
+        separation: The separations, with the three components on the last
+            axis.
+        config: The simulation configuration.
 
     Returns:
-        Whether each candidate becomes a sink, shape (num_candidates,).
+        The separations, with the shape of ``separation``.
     """
-    # Distances between candidates, to the nearest periodic copy along
-    # periodic axes, as in the proximity check to existing sinks.
-    separation = candidate_positions[:, None, :] - candidate_positions[None, :, :]
-    separation = jnp.where(
+    is_periodic, box_length = _periodic_box(config)
+    return jnp.where(
         is_periodic,
         separation - box_length * jnp.round(separation / box_length),
         separation,
     )
-    within_accretion_radius = (
-        jnp.linalg.norm(separation, axis=-1) <= accretion_radius
+
+
+def _slot_neighbourhood(
+    position: jax.Array,
+    grid_shape: tuple,
+    config: SimulationConfig,
+) -> SlotNeighbourhood:
+    """
+    The cells around each position, with their separations and weights.
+
+    Args:
+        position: The positions, shape (num_positions, 3).
+        grid_shape: The shape of a (padded) field.
+        config: The simulation configuration.
+
+    Returns:
+        The neighbourhood of each position.
+    """
+    sink_particle_config = config.sink_particle_config
+    grid_spacing = config.grid_spacing
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * grid_spacing
+    spatial_width_in_cells = sink_particle_config.spatial_width_in_cells
+    offsets = _accretion_offsets(config)
+
+    containing_cell = jnp.floor(position / grid_spacing).astype(jnp.int32)
+    cell_indices, interior_index, is_real_cell = _interior_cell_indices(
+        containing_cell[:, None, :] + offsets[None, :, :],
+        grid_shape,
+        config,
     )
 
-    # Failing candidates go last; the stable sort keeps exact ties in
-    # candidate order.
-    order = jnp.argsort(
-        jnp.where(candidate_passes, potential_at_candidates, jnp.inf),
-        stable=True,
+    cell_centers = (interior_index + 0.5) * grid_spacing
+    separation = _minimum_image(cell_centers - position[:, None, :], config)
+    distance_squared = jnp.sum(separation**2, axis=-1)
+
+    radial_weight = jnp.where(
+        is_real_cell,
+        _radial_weight(
+            distance_squared,
+            accretion_radius,
+            spatial_width_in_cells * grid_spacing,
+        ),
+        0.0,
+    )
+    _, cell_weight = _cell_weights(
+        position,
+        grid_shape,
+        config,
+        spatial_width_in_cells,
+        offsets,
     )
 
-    def keep_if_separated(rank, kept):
-        candidate = order[rank]
-        near_kept = jnp.any(kept & within_accretion_radius[candidate])
-        return kept.at[candidate].set(candidate_passes[candidate] & ~near_kept)
-
-    return jax.lax.fori_loop(
-        0,
-        candidate_passes.shape[0],
-        keep_if_separated,
-        jnp.zeros_like(candidate_passes),
+    return SlotNeighbourhood(
+        cell_indices=cell_indices,
+        is_real_cell=is_real_cell,
+        separation=separation,
+        distance_squared=distance_squared,
+        radial_weight=radial_weight,
+        cell_weight=cell_weight,
     )
+
+
+def _separation_squared(
+    position: jax.Array,
+    other_position: jax.Array,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    The squared distances between two sets of points, to the nearest
+    periodic copy along periodic axes.
+
+    Args:
+        position: The first points, shape (num_positions, 3).
+        other_position: The second points, shape (num_other_positions, 3).
+        config: The simulation configuration.
+
+    Returns:
+        The squared distances, shape (num_positions, num_other_positions).
+    """
+    separation = _minimum_image(
+        position[:, None, :] - other_position[None, :, :],
+        config,
+    )
+    return jnp.sum(separation**2, axis=-1)
+
+
+# -------------------------------------------------------------
+# =================== ↑ Cells around a slot ↑ =================
+# -------------------------------------------------------------
+
+# -------------------------------------------------------------
+# =================== ↓ Checks at a position ↓ ================
+# -------------------------------------------------------------
+
+
+class SlotChecks(NamedTuple):
+    """The quantities of the creation checks at a set of positions, each of
+    shape (num_positions,) unless stated otherwise."""
+
+    #: Whether any cell weight h is above 0; a position past a non-periodic
+    #: edge has no cell to read its values from.
+    has_cells: jax.Array
+
+    #: ρ / ρ_res, with the seed's own mass added to its density.
+    density_ratio: jax.Array
+
+    #: The six converging-flow velocities δ_k, shape (num_positions, 6).
+    converging_velocity: jax.Array
+
+    #: (φ − min_T φ) / c_s², the height above the potential minimum of the
+    #: control volume.
+    potential_height: jax.Array
+
+    #: |E_grav| / (2 E_th + E_mag).
+    jeans_ratio: jax.Array
+
+    #: |E_grav| / (E_th + E_kin + E_mag).
+    bound_ratio: jax.Array
+
+    #: The centre-of-mass velocity of the control volume, shape
+    #: (num_positions, 3).
+    center_of_mass_velocity: jax.Array
+
+
+def _read_at_positions(
+    field: FIELD_TYPE,
+    neighbourhood: SlotNeighbourhood,
+) -> jax.Array:
+    """
+    A cell quantity q read at each position with the cell weights,
+    Σ h q / Σ h.
+
+    Args:
+        field: The (padded) field of q.
+        neighbourhood: The cells around each position.
+
+    Returns:
+        q at each position, shape (num_positions,); 0 at a position with no
+        cell weight above 0.
+    """
+    cell_weight = neighbourhood.cell_weight
+    return _safe_divide(
+        jnp.sum(cell_weight * field[neighbourhood.cell_indices], axis=-1),
+        jnp.sum(cell_weight, axis=-1),
+    )
+
+
+def _slot_checks(
+    neighbourhood: SlotNeighbourhood,
+    mass: jax.Array,
+    cells: CellQuantities,
+    config: SimulationConfig,
+) -> SlotChecks:
+    """
+    The quantities of the creation checks at a set of positions.
+
+    A cell quantity q is read at a position as Σ h q / Σ h. The control
+    volume holds the gas within r_acc, each cell with the mass M = K ρ ΔV;
+    its gravitational energy is measured from the soft maximum of the
+    potential, and the soft minimum and maximum have the temperature ω c_s²,
+    with c_s² read at the position.
+
+    Args:
+        neighbourhood: The cells around each position.
+        mass: The mass of the seed at each position, added to its density,
+            shape (num_positions,).
+        cells: The cell quantities.
+        config: The simulation configuration.
+
+    Returns:
+        The quantities of the checks.
+    """
+    check_width = config.sink_particle_config.check_width
+    cell_volume = config.grid_spacing**3
+    cell_indices = neighbourhood.cell_indices
+    radial_weight = neighbourhood.radial_weight
+
+    def read(field):
+        return _read_at_positions(field, neighbourhood)
+
+    density = read(cells.density) + mass / cell_volume
+    density_threshold = read(cells.density_threshold)
+    sound_speed_squared = read(cells.sound_speed_squared)
+    potential = read(cells.potential)
+    converging_velocity = jnp.stack(
+        [read(component) for component in cells.converging_velocity],
+        axis=-1,
+    )
+
+    potential_in_reach = cells.potential[cell_indices]
+    minimum_potential = _soft_minimum(
+        potential_in_reach,
+        radial_weight,
+        check_width,
+        sound_speed_squared,
+    )
+    maximum_potential = _soft_maximum(
+        potential_in_reach,
+        radial_weight,
+        check_width,
+        sound_speed_squared,
+    )
+
+    magnetic_field_squared = None
+    if cells.magnetic_field_squared is not None:
+        magnetic_field_squared = cells.magnetic_field_squared[cell_indices]
+    energies = _control_volume_energies(
+        radial_weight * cells.density[cell_indices] * cell_volume,
+        radial_weight * cell_volume,
+        cells.velocity[cell_indices],
+        cells.sound_speed_squared[cell_indices],
+        magnetic_field_squared,
+        maximum_potential[:, None] - potential_in_reach,
+    )
+
+    return SlotChecks(
+        has_cells=jnp.sum(neighbourhood.cell_weight, axis=-1) > 0.0,
+        density_ratio=_safe_divide(density, density_threshold),
+        converging_velocity=converging_velocity,
+        potential_height=_safe_divide(
+            potential - minimum_potential,
+            sound_speed_squared,
+        ),
+        jeans_ratio=_safe_divide(
+            energies.gravitational_energy_magnitude,
+            2.0 * energies.thermal_energy + energies.magnetic_energy,
+        ),
+        bound_ratio=_safe_divide(
+            energies.gravitational_energy_magnitude,
+            energies.thermal_energy + energies.kinetic_energy + energies.magnetic_energy,
+        ),
+        center_of_mass_velocity=energies.center_of_mass_velocity,
+    )
+
+
+# -------------------------------------------------------------
+# =================== ↑ Checks at a position ↑ ================
+# -------------------------------------------------------------
+
+# -------------------------------------------------------------
+# ===================== ↓ Creation weight ↓ ===================
+# -------------------------------------------------------------
+
+
+class CreationFactors(NamedTuple):
+    """The factors of the creation weight of each seed, each of shape
+    (num_positions,), in [0, 1]."""
+
+    #: f_ρ = step_ω(ρ / ρ_res − 1).
+    density: jax.Array
+
+    #: f_conv = Π_k [1 − step_ω(−δ_k)].
+    converging_flow: jax.Array
+
+    #: f_φ = 1 − step_ω(potential height).
+    potential_minimum: jax.Array
+
+    #: f_J = step_ω(Jeans ratio − 1).
+    jeans_instability: jax.Array
+
+    #: f_b = step_ω(bound ratio − 1).
+    bound_state: jax.Array
+
+    #: f_prox, from the active seeds around.
+    proximity: jax.Array
+
+    #: f_home, from the earlier seeds of the home cell.
+    home: jax.Array
+
+
+def _exclusion_factor(
+    distance_squared: jax.Array,
+    strength: jax.Array,
+    counts: jax.Array,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    Π [1 − s K(d − ℓ Δx)] over the seeds that count, with s the strength of
+    each seed: 0 where a seed of strength 1 lies within r_acc, 1 where every
+    seed that counts lies farther than r_acc + ℓ Δx. With the activations as
+    strengths this is f_prox, with strength 1 and the distances from the
+    home cell it is f_home.
+
+    Args:
+        distance_squared: The squared distance d² to each seed, shape
+            (num_positions, num_slots).
+        strength: The strength s of each seed, shape (num_slots,).
+        counts: Whether each seed counts, shape (num_positions, num_slots).
+        config: The simulation configuration.
+
+    Returns:
+        The factor, shape (num_positions,).
+    """
+    sink_particle_config = config.sink_particle_config
+    spatial_width = sink_particle_config.spatial_width_in_cells * config.grid_spacing
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
+    shifted_radial_weight = _radial_weight(
+        distance_squared,
+        accretion_radius + spatial_width,
+        spatial_width,
+    )
+    return jnp.prod(
+        jnp.where(counts, 1.0 - strength[None, :] * shifted_radial_weight, 1.0),
+        axis=-1,
+    )
+
+
+def _creation_factors(
+    checks: SlotChecks,
+    proximity: jax.Array,
+    home: jax.Array,
+    config: SimulationConfig,
+) -> CreationFactors:
+    """
+    The factors of the creation weight of a set of seeds.
+
+    Args:
+        checks: The quantities of the checks at every seed.
+        proximity: f_prox of every seed.
+        home: f_home of every seed.
+        config: The simulation configuration.
+
+    Returns:
+        The factors.
+    """
+    check_width = config.sink_particle_config.check_width
+    return CreationFactors(
+        density=_smooth_step(checks.density_ratio - 1.0, check_width),
+        converging_flow=jnp.prod(
+            1.0 - _smooth_step(-checks.converging_velocity, check_width),
+            axis=-1,
+        ),
+        potential_minimum=1.0 - _smooth_step(checks.potential_height, check_width),
+        jeans_instability=_smooth_step(checks.jeans_ratio - 1.0, check_width),
+        bound_state=_smooth_step(checks.bound_ratio - 1.0, check_width),
+        proximity=proximity,
+        home=home,
+    )
+
+
+def _creation_weight(
+    checks: SlotChecks,
+    factors: CreationFactors,
+) -> jax.Array:
+    """
+    The creation weight w, the product of the factors; 0 for a seed without
+    a cell to read its values from.
+
+    Args:
+        checks: The quantities of the checks at every seed.
+        factors: The factors of every seed.
+
+    Returns:
+        w, shape (num_positions,).
+    """
+    return jnp.where(
+        checks.has_cells,
+        factors.density
+        * factors.converging_flow
+        * factors.potential_minimum
+        * factors.jeans_instability
+        * factors.bound_state
+        * factors.proximity
+        * factors.home,
+        0.0,
+    )
+
+
+# -------------------------------------------------------------
+# ===================== ↑ Creation weight ↑ ===================
+# -------------------------------------------------------------
+
+# -------------------------------------------------------------
+# ================ ↓ Cells of the inactive seeds ↓ ============
+# -------------------------------------------------------------
+
+
+def _cells_without_weight(
+    sink_particles: SinkParticles,
+    grid_shape: tuple,
+    config: SimulationConfig,
+) -> FIELD_TYPE:
+    """
+    Boolean mask of the cells whose inactive seed has f_prox = 0 or
+    f_home = 0: the cells within r_acc of a seed of activation 1, and the
+    home cells of the active seeds that lie within r_acc of their home cell.
+
+    Args:
+        sink_particles: The sink particles.
+        grid_shape: The shape of a (padded) field.
+        config: The simulation configuration.
+
+    Returns:
+        The mask, with shape ``grid_shape``.
+    """
+    sink_particle_config = config.sink_particle_config
+    spatial_width = sink_particle_config.spatial_width_in_cells * config.grid_spacing
+    accretion_radius = sink_particle_config.accretion_radius_in_cells * config.grid_spacing
+
+    def is_within_accretion_radius(distance_squared):
+        """Whether K(d − ℓ Δx) = 1, the same test as ``_exclusion_factor``."""
+        return (
+            _radial_weight(
+                distance_squared,
+                accretion_radius + spatial_width,
+                spatial_width,
+            )
+            >= 1.0
+        )
+
+    is_active = sink_particles.activation > 0.0
+    is_full_sink = sink_particles.activation >= 1.0
+
+    neighbourhood = _slot_neighbourhood(sink_particles.position, grid_shape, config)
+    near_full_sink = (
+        is_full_sink[:, None]
+        & neighbourhood.is_real_cell
+        & is_within_accretion_radius(neighbourhood.distance_squared)
+    )
+    mask = jnp.zeros(grid_shape, dtype=bool).at[neighbourhood.cell_indices].max(
+        near_full_sink
+    )
+
+    home_indices, home_interior_index, home_is_real_cell = _interior_cell_indices(
+        sink_particles.home_cell,
+        grid_shape,
+        config,
+    )
+    home_centers = (home_interior_index + 0.5) * config.grid_spacing
+    near_home = (
+        is_active
+        & home_is_real_cell
+        & is_within_accretion_radius(
+            jnp.sum(
+                _minimum_image(home_centers - sink_particles.position, config) ** 2,
+                axis=-1,
+            )
+        )
+    )
+    return mask.at[home_indices].max(near_home)
+
+
+# -------------------------------------------------------------
+# ================ ↑ Cells of the inactive seeds ↑ ============
+# -------------------------------------------------------------
 
 
 @partial(jax.jit, static_argnames=["config", "registered_variables"])
@@ -199,14 +750,17 @@ def _form_sink_particles(
     registered_variables: RegisteredVariables,
 ) -> tuple[SinkParticles, jax.Array]:
     """
-    Create new sink particles where the gas passes all creation checks.
+    Raise the activation of every active seed to its creation weight, and
+    store the inactive seeds whose weight is above 0 in free slots.
 
-    A new sink is placed at the centre of its cell with zero mass, and with the
-    centre-of-mass velocity (Eq. 12) of the gas in its control volume. It gets
-    its mass from the accretion step that follows. The starting velocity only
-    sets the frame of the first accretion checks; FLASH starts from zero
-    velocity, which would judge a clump moving as a whole in a different frame
-    than the creation checks below.
+    An active seed gets w at its position, with its own mass added to its
+    density, and a ← max(a, w). An inactive seed sits at the centre of its
+    cell with no mass. When its weight is above 0 it takes the next free
+    slot, with activation w, its cell as home cell, the number of active
+    seeds of that home cell as generation, and the centre-of-mass velocity
+    of its control volume (Eq. 12). It gets its mass from the accretion step
+    that follows. All weights use the activations the seeds had before this
+    call.
 
     Args:
         primitive_state: The (padded) primitive state after the hydro update.
@@ -217,257 +771,183 @@ def _form_sink_particles(
 
     Returns:
         ``(sink_particles, num_active_sinks)``: the sink particles with the new
-        sinks appended, and the number of active slots including the new
-        (still massless) sinks.
+        activations and the new seeds appended, and the number of active
+        slots including the new (still massless) seeds.
     """
-
     sink_particle_config = config.sink_particle_config
-    grid_spacing = config.grid_spacing
-    cell_volume = grid_spacing**3
-    accretion_radius = sink_particle_config.accretion_radius_in_cells * grid_spacing
-
-    density = primitive_state[registered_variables.density_index]
-    velocity = jnp.stack(
-        [
-            primitive_state[registered_variables.velocity_index.x],
-            primitive_state[registered_variables.velocity_index.y],
-            primitive_state[registered_variables.velocity_index.z],
-        ],
-        axis=-1,
-    )
-
-    # The density threshold (Federrath et al. 2010, Eq. 32) depends on the
-    # local sound speed, so it is evaluated in every cell.
-    sound_speed_squared = _sound_speed_squared(
-        primitive_state,
-        config,
-        params,
-        registered_variables,
-    )
-    density_threshold = _density_threshold(
-        sound_speed_squared,
-        config,
-        params,
-    )
-
-    # The gravitational potential of the gas (plus any external potential),
-    # from a Poisson solve on the updated density. The hydro update computes it
-    # internally but does not return it, and for intermediate states only.
-    gravitational_potential = _compute_total_potential(
-        density,
-        grid_spacing,
-        config,
-        params,
-        registered_variables,
-        params.gravitational_constant,
-    )
-    offsets = _control_volume_offsets(config)
-
-    # -------------------------------------------------------------
-    # =============== ↓ Stage 1: grid-wide checks ↓ ===============
-    # -------------------------------------------------------------
-
-    # Density threshold check (Section 2.2.1), converging flow check
-    # (Section 2.2.3) and gravitational potential minimum check (Section
-    # 2.2.4). Ghost cells are excluded, as they only mirror physical cells or
-    # hold boundary values. The converging flow check reads their velocity,
-    # since these ±1 neighbours are what the hydro solver sees at the boundary;
-    # the potential check does not count them as gas.
-    candidate_mask = (
-        (density > density_threshold)
-        & _converging_flow_mask(velocity)
-        & _potential_minimum_mask(
-            _fill_potential_ghost_cells(gravitational_potential, config),
-            offsets,
-        )
-        & _interior_mask(density, config)
-    )
-
-    # -------------------------------------------------------------
-    # =============== ↑ Stage 1: grid-wide checks ↑ ===============
-    # -------------------------------------------------------------
-
-    # -------------------------------------------------------------
-    # =========== ↓ Stage 2: control-volume checks ↓ ==============
-    # -------------------------------------------------------------
-
-    # JIT needs fixed array sizes, so the candidate cells are collected into a
-    # list of fixed length; unused entries are marked as invalid.
+    max_num_sinks = sink_particle_config.max_num_sinks
     max_num_candidates = sink_particle_config.max_num_candidates
+    check_width = sink_particle_config.check_width
+    grid_spacing = config.grid_spacing
+
+    cells = _cell_quantities(
+        primitive_state,
+        sink_particles,
+        config,
+        params,
+        registered_variables,
+    )
+    grid_shape = cells.density.shape
+    activation = sink_particles.activation
+    is_active = activation > 0.0
+
+    # -------------------------------------------------------------
+    # ============== ↓ Weights of the active seeds ↓ ==============
+    # -------------------------------------------------------------
+
+    slot_checks = _slot_checks(
+        _slot_neighbourhood(sink_particles.position, grid_shape, config),
+        sink_particles.mass,
+        cells,
+        config,
+    )
+    is_other_active_seed = is_active[None, :] & ~jnp.eye(max_num_sinks, dtype=bool)
+    slot_proximity = _exclusion_factor(
+        _separation_squared(sink_particles.position, sink_particles.position, config),
+        activation,
+        is_other_active_seed,
+        config,
+    )
+
+    # The earlier seeds of each seed's home cell: active, with the same home
+    # cell and a lower generation.
+    home_cell = sink_particles.home_cell
+    generation = sink_particles.generation
+    is_earlier_seed_of_home = (
+        is_active[None, :]
+        & jnp.all(home_cell[None, :, :] == home_cell[:, None, :], axis=-1)
+        & (generation[None, :] < generation[:, None])
+    )
+    slot_home = _exclusion_factor(
+        _separation_squared(
+            (home_cell + 0.5) * grid_spacing,
+            sink_particles.position,
+            config,
+        ),
+        jnp.ones_like(activation),
+        is_earlier_seed_of_home,
+        config,
+    )
+
+    slot_weight = _creation_weight(
+        slot_checks,
+        _creation_factors(slot_checks, slot_proximity, slot_home, config),
+    )
+    new_activation = jnp.where(is_active, jnp.maximum(activation, slot_weight), 0.0)
+
+    # -------------------------------------------------------------
+    # ============== ↑ Weights of the active seeds ↑ ==============
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ========= ↓ Stage 1: cells where w can be above 0 ↓ =========
+    # -------------------------------------------------------------
+
+    # The listing only decides where weights are computed, and every cell left
+    # out has w = 0, so it carries no derivative.
+    grid_cells = jax.lax.stop_gradient(cells)
+    density_factor = _smooth_step(
+        _safe_divide(grid_cells.density, grid_cells.density_threshold) - 1.0,
+        check_width,
+    )
+    converging_flow_factor = jnp.prod(
+        1.0 - _smooth_step(-grid_cells.converging_velocity, check_width),
+        axis=0,
+    )
+    candidate_mask = (
+        _interior_mask(grid_cells.density, config)
+        & (density_factor > 0.0)
+        & (converging_flow_factor > 0.0)
+        & ~_cells_without_weight(
+            jax.lax.stop_gradient(sink_particles),
+            grid_shape,
+            config,
+        )
+    )
+
+    # JIT needs fixed array sizes, so the cells are collected into a list of
+    # fixed length; unused entries are marked as invalid.
     candidate_indices, num_candidates_found = _collect_candidates(
         candidate_mask,
         max_num_candidates,
     )
     candidate_is_valid = jnp.arange(max_num_candidates) < num_candidates_found
 
-    # Cell indices of every candidate's control volume. Cells past a
-    # non-periodic boundary get zero volume, and so zero mass, which removes
-    # them from every sum below.
-    control_volume_indices, _, is_real_cell = _interior_cell_indices(
-        candidate_indices[:, None, :] - config.num_ghost_cells + offsets[None, :, :],
-        density.shape,
+    # -------------------------------------------------------------
+    # ========= ↑ Stage 1: cells where w can be above 0 ↑ =========
+    # -------------------------------------------------------------
+
+    # -------------------------------------------------------------
+    # ========== ↓ Stage 2: weights of the listed seeds ↓ =========
+    # -------------------------------------------------------------
+
+    # The inactive seed of each listed cell sits at the cell centre. Unused
+    # entries of the list point at the corner of the padded grid; their
+    # weight is set to 0.
+    candidate_cell = candidate_indices - config.num_ghost_cells
+    candidate_positions = (candidate_cell + 0.5) * grid_spacing
+    candidate_checks = _slot_checks(
+        _slot_neighbourhood(candidate_positions, grid_shape, config),
+        jnp.zeros(max_num_candidates, dtype=candidate_positions.dtype),
+        cells,
         config,
     )
-    cell_volume_in_volume = jnp.where(is_real_cell, cell_volume, 0.0)
-
-    # Fields over the control volumes, shape (num_candidates, num_offsets),
-    # with a trailing vector axis for the velocity.
-    density_in_volume = density[control_volume_indices]
-    velocity_in_volume = velocity[control_volume_indices]
-    cell_mass_in_volume = density_in_volume * cell_volume_in_volume
-    gas_mass_in_volume = jnp.sum(cell_mass_in_volume, axis=-1)
-
-    # Centre of the candidate cells, and the centre-of-mass velocity of the
-    # gas in their control volumes (Eq. 12). Unused entries of the list point
-    # at the corner of the padded grid, where a control volume can hold no
-    # real cell and so no mass.
-    candidate_positions = (candidate_indices - config.num_ghost_cells + 0.5) * grid_spacing
-    safe_gas_mass_in_volume = jnp.where(
-        gas_mass_in_volume > 0.0,
-        gas_mass_in_volume,
-        1.0,
+    distance_squared_to_seeds = _separation_squared(
+        candidate_positions,
+        sink_particles.position,
+        config,
     )
-    center_of_mass_velocity = jnp.einsum(
-        "ck,ckd->cd",
-        cell_mass_in_volume,
-        velocity_in_volume,
-    ) / safe_gas_mass_in_volume[:, None]
-
-    # Proximity check (Section 2.2.7): no new sink within r_acc of an existing
-    # sink. Along periodic axes the separation is taken to the nearest
-    # periodic copy of the sink (minimum-image convention), as in Federrath's
-    # FLASH code. Only active slots are compared: empty slots sit at the
-    # origin, where they would otherwise block candidates.
-    is_periodic, box_length = _periodic_box(config)
-    separation = candidate_positions[:, None, :] - sink_particles.position[None, :, :]
-    separation = jnp.where(
-        is_periodic,
-        separation - box_length * jnp.round(separation / box_length),
-        separation,
+    candidate_proximity = _exclusion_factor(
+        distance_squared_to_seeds,
+        activation,
+        jnp.broadcast_to(is_active[None, :], distance_squared_to_seeds.shape),
+        config,
     )
-    distance_to_sink = jnp.linalg.norm(separation, axis=-1)
-    sink_is_active = sink_particles.activation > 0.0
-    sink_within_accretion_radius = jnp.logical_and(
-        distance_to_sink <= accretion_radius,
-        sink_is_active[None, :],
-    )
-    far_from_existing_sinks = jnp.logical_not(
-        jnp.any(sink_within_accretion_radius, axis=-1)
-    )
-
-    # Jeans instability check (Section 2.2.5): the gravitational energy of the
-    # gas in the control volume must exceed twice its thermal energy plus its
-    # magnetic energy, |E_grav| > 2 E_th + E_mag.
-    #   - E_th = ½ Σ M c_s² (Eq. 5).
-    #   - E_grav = −Σ M (φ_max − φ), with φ_max the largest potential in the
-    #     control volume, as in Federrath's FLASH code. Measuring φ from its
-    #     maximum removes the part of the potential that is constant across
-    #     the volume, which the gas outside the control volume contributes.
-    #   - E_mag = ½ Σ |B|² ΔV (Eq. 9, with the magnetic energy density ½ B²
-    #     of astronomix's field units instead of the paper's B² / 8π).
-    sound_speed_squared_in_volume = sound_speed_squared[control_volume_indices]
-    thermal_energy = 0.5 * jnp.sum(
-        cell_mass_in_volume * sound_speed_squared_in_volume,
+    # Every active seed of a listed cell activated before its inactive seed.
+    is_seed_of_cell = is_active[None, :] & jnp.all(
+        home_cell[None, :, :] == candidate_cell[:, None, :],
         axis=-1,
     )
-
-    potential_in_volume = gravitational_potential[control_volume_indices]
-    maximum_potential_in_volume = jnp.max(
-        jnp.where(is_real_cell, potential_in_volume, -jnp.inf),
-        axis=-1,
-        keepdims=True,
+    candidate_home = _exclusion_factor(
+        distance_squared_to_seeds,
+        jnp.ones_like(activation),
+        is_seed_of_cell,
+        config,
     )
-    potential_below_maximum = jnp.where(
-        is_real_cell,
-        maximum_potential_in_volume - potential_in_volume,
+    candidate_weight = jnp.where(
+        candidate_is_valid,
+        _creation_weight(
+            candidate_checks,
+            _creation_factors(
+                candidate_checks,
+                candidate_proximity,
+                candidate_home,
+                config,
+            ),
+        ),
         0.0,
     )
-    gravitational_energy_magnitude = jnp.sum(
-        cell_mass_in_volume * potential_below_maximum,
-        axis=-1,
-    )
-
-    if config.mhd:
-        magnetic_field_squared = (
-            primitive_state[registered_variables.magnetic_index.x] ** 2
-            + primitive_state[registered_variables.magnetic_index.y] ** 2
-            + primitive_state[registered_variables.magnetic_index.z] ** 2
-        )
-        magnetic_energy = 0.5 * jnp.sum(
-            magnetic_field_squared[control_volume_indices] * cell_volume_in_volume,
-            axis=-1,
-        )
-    else:
-        magnetic_energy = jnp.zeros_like(thermal_energy)
-
-    jeans_unstable = (
-        gravitational_energy_magnitude > 2.0 * thermal_energy + magnetic_energy
-    )
-
-    # Bound state check (Section 2.2.6): the total energy of the gas in the
-    # control volume must be negative, E_grav + E_th + E_kin + E_mag < 0, with
-    # E_kin = ½ Σ M |v − v_cm|² the kinetic energy relative to the
-    # centre-of-mass motion (Eq. 11).
-    velocity_relative_to_center_of_mass = (
-        velocity_in_volume - center_of_mass_velocity[:, None, :]
-    )
-    kinetic_energy = 0.5 * jnp.sum(
-        cell_mass_in_volume
-        * jnp.sum(velocity_relative_to_center_of_mass**2, axis=-1),
-        axis=-1,
-    )
-    bound = (
-        -gravitational_energy_magnitude
-        + thermal_energy
-        + kinetic_energy
-        + magnetic_energy
-        < 0.0
-    )
-
-    candidate_cell_indices = tuple(candidate_indices.T)
-    candidate_passes = (
-        candidate_is_valid
-        & far_from_existing_sinks
-        & jeans_unstable
-        & bound
-    )
-
-    # Proximity among the new sinks (Section 2.2.7): several nearby cells can
-    # pass every check in the same call, e.g. when the potential minimum is
-    # shared by equivalent cells (the potential check is not strict). Only
-    # candidates at least r_acc apart are kept, the deepest potential first.
-    candidate_passes = _select_separated_candidates(
-        candidate_passes,
-        candidate_positions,
-        gravitational_potential[candidate_cell_indices],
-        accretion_radius,
-        is_periodic,
-        box_length,
-    )
+    is_new_seed = candidate_weight > 0.0
 
     # -------------------------------------------------------------
-    # =========== ↑ Stage 2: control-volume checks ↑ ==============
+    # ========== ↑ Stage 2: weights of the listed seeds ↑ =========
     # -------------------------------------------------------------
 
     # -------------------------------------------------------------
-    # ================= ↓ Appending new sinks ↓ ===================
+    # ================= ↓ Storing new seeds ↓ =====================
     # -------------------------------------------------------------
 
-    # Sinks are only appended, so the active slots are contiguous at the
-    # front. Each passing candidate gets the next free slot; failing
-    # candidates get the out-of-range slot max_num_sinks. With mode="drop",
-    # writes to an out-of-range slot are discarded, which also discards new
-    # sinks once every slot is taken. A new sink is a full sink (activation
-    # 1) whose home cell is its own cell, and the first of that cell
-    # (generation 0).
-    max_num_sinks = sink_particle_config.max_num_sinks
-    num_existing_sinks = jnp.sum(sink_particles.activation > 0.0)
+    # Activations never drop, so the active slots stay contiguous at the
+    # front. Each new seed gets the next free slot; the other entries get the
+    # out-of-range slot max_num_sinks. With mode="drop", writes to an
+    # out-of-range slot are discarded, which also discards new seeds once
+    # every slot is taken.
+    num_existing_sinks = jnp.sum(is_active)
     slot = jnp.where(
-        candidate_passes,
-        num_existing_sinks + jnp.cumsum(candidate_passes) - 1,
+        is_new_seed,
+        num_existing_sinks + jnp.cumsum(is_new_seed) - 1,
         max_num_sinks,
     )
-
     sink_particles = SinkParticles(
         mass=sink_particles.mass.at[slot].set(0.0, mode="drop"),
         position=sink_particles.position.at[slot].set(
@@ -475,49 +955,49 @@ def _form_sink_particles(
             mode="drop",
         ),
         velocity=sink_particles.velocity.at[slot].set(
-            center_of_mass_velocity,
+            candidate_checks.center_of_mass_velocity,
             mode="drop",
         ),
-        activation=sink_particles.activation.at[slot].set(1.0, mode="drop"),
-        home_cell=sink_particles.home_cell.at[slot].set(
-            (candidate_indices - config.num_ghost_cells).astype(
-                sink_particles.home_cell.dtype
-            ),
+        activation=new_activation.at[slot].set(candidate_weight, mode="drop"),
+        home_cell=home_cell.at[slot].set(
+            candidate_cell.astype(home_cell.dtype),
             mode="drop",
         ),
-        generation=sink_particles.generation.at[slot].set(0, mode="drop"),
+        generation=generation.at[slot].set(
+            jnp.sum(is_seed_of_cell, axis=-1).astype(generation.dtype),
+            mode="drop",
+        ),
     )
-    num_new_sinks = jnp.sum(candidate_passes)
-    num_active_sinks = jnp.minimum(num_existing_sinks + num_new_sinks, max_num_sinks)
+    num_new_seeds = jnp.sum(is_new_seed)
+    num_active_sinks = jnp.minimum(num_existing_sinks + num_new_seeds, max_num_sinks)
 
-    # Candidates beyond max_num_candidates are only skipped for this step:
-    # they are still above the threshold at the next step and are checked
-    # then, so a warning is enough. A new sink without a free slot would be
-    # lost, leaving its gas above the threshold on the grid, so the run stops
-    # with an error instead (a host callback that raises aborts the jitted
-    # computation).
+    # Cells beyond max_num_candidates are only skipped for this step, a
+    # jump in their weights from w to 0, so a warning is printed. A new seed
+    # without a free slot would be lost, leaving its gas to collapse without
+    # one, so the run stops with an error instead (a host callback that
+    # raises aborts the jitted computation).
     jax.lax.cond(
         num_candidates_found > max_num_candidates,
         lambda: jax.debug.print(
-            "WARNING: {} sink particle candidates found, only the first {} "
-            "are checked this step (increase max_num_candidates).",
+            "WARNING: {} cells may form sink particles, only the first {} are "
+            "checked this step (increase max_num_candidates).",
             num_candidates_found,
             max_num_candidates,
         ),
         lambda: None,
     )
     jax.lax.cond(
-        num_existing_sinks + num_new_sinks > max_num_sinks,
+        num_existing_sinks + num_new_seeds > max_num_sinks,
         lambda: jax.debug.callback(
             _raise_sink_slots_full,
-            num_existing_sinks + num_new_sinks - max_num_sinks,
+            num_existing_sinks + num_new_seeds - max_num_sinks,
             max_num_sinks,
         ),
         lambda: None,
     )
 
     # -------------------------------------------------------------
-    # ================= ↑ Appending new sinks ↑ ===================
+    # ================= ↑ Storing new seeds ↑ =====================
     # -------------------------------------------------------------
 
     return sink_particles, num_active_sinks

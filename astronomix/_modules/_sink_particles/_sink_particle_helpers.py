@@ -1,14 +1,16 @@
 """
 Helpers shared by the sink particle modules: the slot arrays (empty slots,
 padding of the sinks passed into a run, the error when the slots run out),
-the control volume of the creation checks, the squared sound speed and the
-density threshold (Federrath et al. 2010, ApJ 713, 269, Eq. 32), the mapping
-of cell indices across the box boundaries, and the fixed-length list of
-candidate cells.
+the cell offsets of a control volume and of the cells within reach of a
+sink, the squared sound speed and the density threshold (Federrath et al.
+2010, ApJ 713, 269, Eq. 32), the mapping of cell indices across the box
+boundaries, the fixed-length list of cells, and the energies of the gas in a
+control volume.
 """
 
 # general
 import inspect
+from typing import NamedTuple
 
 # numerics
 import numpy as np
@@ -37,7 +39,6 @@ from astronomix._pallas_helpers import _current_pallas_mesh
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
-    GHOST_CELLS,
     IDEAL_GAS,
     PERIODIC_BOUNDARY,
     STATE_TYPE,
@@ -51,7 +52,6 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 
 # astronomix functions
 from astronomix._fluid_equations._equation_of_state import sound_speed_squared
-from astronomix._geometry.boundaries import _axis_slice, _periodic_boundaries
 
 
 def _raise_sink_slots_full(num_discarded, max_num_sinks):
@@ -189,6 +189,36 @@ def _control_volume_offsets(config: SimulationConfig) -> np.ndarray:
     ).reshape(-1, 3)
     inside_control_volume = np.sum(offsets**2, axis=-1) <= radius_in_cells**2
     return offsets[inside_control_volume]
+
+
+def _accretion_offsets(config: SimulationConfig) -> np.ndarray:
+    """
+    Integer cell offsets (i, j, k), from the cell containing a sink, of every
+    cell that can lie within the accretion radius of that sink.
+
+    A sink can sit anywhere inside its cell, at most √3/2 cells from the cell
+    centre, so the offsets are those with i² + j² + k² ≤ (r_acc/Δx + √3/2)².
+    Whether a cell is actually within r_acc is checked per sink. The offsets
+    are computed with NumPy at trace time, since they only depend on the
+    static configuration.
+
+    Args:
+        config: The simulation configuration.
+
+    Returns:
+        The offsets, shape (num_offsets, 3), with (0, 0, 0) among them.
+    """
+    reach_in_cells = (
+        config.sink_particle_config.accretion_radius_in_cells + 0.5 * np.sqrt(3.0)
+    )
+    max_offset = int(np.floor(reach_in_cells))
+    offset_range = np.arange(-max_offset, max_offset + 1)
+    offsets = np.stack(
+        np.meshgrid(offset_range, offset_range, offset_range, indexing="ij"),
+        axis=-1,
+    ).reshape(-1, 3)
+    within_reach = np.sum(offsets**2, axis=-1) <= reach_in_cells**2
+    return offsets[within_reach]
 
 
 def _sound_speed_squared(
@@ -384,50 +414,6 @@ def _interior_cell_indices(
     return cell_indices, interior_index, is_real_cell
 
 
-def _fill_potential_ghost_cells(
-    gravitational_potential: FIELD_TYPE,
-    config: SimulationConfig,
-) -> FIELD_TYPE:
-    """
-    Overwrite the ghost cells of the potential for the potential-minimum check,
-    so that a control volume only compares real cells.
-
-    Along a periodic axis the ghost cells get periodic copies of the interior
-    potential. Along a non-periodic axis they get +∞, which can never be the
-    minimum; this includes the ghost cells that also lie beyond a periodic axis.
-
-    Args:
-        gravitational_potential: The (padded) gravitational potential.
-        config: The simulation configuration.
-
-    Returns:
-        The potential with its ghost cells overwritten.
-    """
-    if config.boundary_handling != GHOST_CELLS:
-        return gravitational_potential
-
-    num_ghost_cells = config.num_ghost_cells
-    num_axes = gravitational_potential.ndim
-    is_periodic, _ = _periodic_box(config)
-    for axis in range(num_axes):
-        if is_periodic[axis]:
-            gravitational_potential = _periodic_boundaries(
-                gravitational_potential,
-                num_ghost_cells,
-                axis=axis,
-            )
-        else:
-            left_ghost_cells = _axis_slice(axis, 0, num_ghost_cells, num_axes)
-            right_ghost_cells = _axis_slice(axis, -num_ghost_cells, None, num_axes)
-            gravitational_potential = (
-                gravitational_potential.at[left_ghost_cells]
-                .set(jnp.inf)
-                .at[right_ghost_cells]
-                .set(jnp.inf)
-            )
-    return gravitational_potential
-
-
 def _collect_candidates(
     candidate_mask: jax.Array,
     max_num_candidates: int,
@@ -524,3 +510,94 @@ def _collect_candidates(
         out_specs=(PartitionSpec(), PartitionSpec()),
         **_NO_REPLICATION_CHECK,
     )(candidate_mask)
+
+
+class ControlVolumeEnergies(NamedTuple):
+    """The centre-of-mass velocity and the energies of the gas in control
+    volumes, each with the leading shape of the volumes."""
+
+    #: The centre-of-mass velocity (Eq. 12), with a trailing vector axis.
+    center_of_mass_velocity: jax.Array
+
+    #: The thermal energy E_th = ½ Σ M c_s² (Eq. 5).
+    thermal_energy: jax.Array
+
+    #: The kinetic energy relative to the centre-of-mass motion,
+    #: E_kin = ½ Σ M |v − v_cm|² (Eq. 11).
+    kinetic_energy: jax.Array
+
+    #: The magnetic energy E_mag = ½ Σ |B|² ΔV (Eq. 9, with the magnetic energy
+    #: density ½ B² of astronomix's field units instead of the paper's B² / 8π).
+    magnetic_energy: jax.Array
+
+    #: The magnitude of the gravitational energy, |E_grav| = Σ M (φ_ref − φ).
+    gravitational_energy_magnitude: jax.Array
+
+
+def _control_volume_energies(
+    cell_mass: jax.Array,
+    cell_volume: jax.Array,
+    velocity: jax.Array,
+    sound_speed_squared: jax.Array,
+    magnetic_field_squared,
+    potential_depth: jax.Array,
+) -> ControlVolumeEnergies:
+    """
+    The centre-of-mass velocity and the energies of the gas in control
+    volumes, for the Jeans instability and bound state checks (Federrath et
+    al. 2010, Sections 2.2.5 and 2.2.6).
+
+    Each cell enters with a mass and a volume, so that a cell outside a volume
+    (mass and volume 0) or one counted with a weight drops out of every sum.
+    The gravitational energy is measured from a reference potential φ_ref, the
+    largest potential in the volume in Federrath's FLASH code: measuring from
+    it removes the part of the potential that is constant across the volume,
+    which the gas outside the volume contributes.
+
+    Args:
+        cell_mass: The gas mass M of each cell, shape (..., num_cells).
+        cell_volume: The volume of each cell, shape (..., num_cells), for the
+            magnetic energy.
+        velocity: The gas velocity of each cell, shape (..., num_cells, 3).
+        sound_speed_squared: c_s² of each cell, shape (..., num_cells).
+        magnetic_field_squared: |B|² of each cell, shape (..., num_cells), or
+            ``None`` without a magnetic field.
+        potential_depth: φ_ref − φ of each cell, shape (..., num_cells).
+
+    Returns:
+        The centre-of-mass velocity and the energies of each volume. A volume
+        without gas has the centre-of-mass velocity 0.
+    """
+    gas_mass = jnp.sum(cell_mass, axis=-1)
+    safe_gas_mass = jnp.where(gas_mass > 0.0, gas_mass, 1.0)
+    center_of_mass_velocity = (
+        jnp.einsum("...k,...kd->...d", cell_mass, velocity) / safe_gas_mass[..., None]
+    )
+
+    thermal_energy = 0.5 * jnp.sum(cell_mass * sound_speed_squared, axis=-1)
+
+    velocity_relative_to_center_of_mass = (
+        velocity - center_of_mass_velocity[..., None, :]
+    )
+    kinetic_energy = 0.5 * jnp.sum(
+        cell_mass * jnp.sum(velocity_relative_to_center_of_mass**2, axis=-1),
+        axis=-1,
+    )
+
+    if magnetic_field_squared is None:
+        magnetic_energy = jnp.zeros_like(thermal_energy)
+    else:
+        magnetic_energy = 0.5 * jnp.sum(
+            magnetic_field_squared * cell_volume,
+            axis=-1,
+        )
+
+    gravitational_energy_magnitude = jnp.sum(cell_mass * potential_depth, axis=-1)
+
+    return ControlVolumeEnergies(
+        center_of_mass_velocity=center_of_mass_velocity,
+        thermal_energy=thermal_energy,
+        kinetic_energy=kinetic_energy,
+        magnetic_energy=magnetic_energy,
+        gravitational_energy_magnitude=gravitational_energy_magnitude,
+    )
