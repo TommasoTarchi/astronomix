@@ -83,9 +83,9 @@ from astronomix._modules._turbulence_driving import (
     update_interval,
     velocity_dispersion,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_formation import _form_sink_particles
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
-    _form_sink_particles,
     _pad_sink_particles,
 )
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas

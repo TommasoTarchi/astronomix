@@ -239,9 +239,9 @@ def _check_no_full_grid_all_gather():
         _sink_potential,
     )
     from astronomix._modules._gravity._gravity import _compute_total_potential
-    from astronomix._modules._sink_particles._sink_particle_formation import (
+    from astronomix._modules._sink_particles._sink_particle_formation import _form_sink_particles
+    from astronomix._modules._sink_particles._sink_particle_helpers import (
         _empty_sink_particles,
-        _form_sink_particles,
     )
     from astronomix import NATIVE_JAX
     from astronomix._pallas_helpers import pallas_mesh_context

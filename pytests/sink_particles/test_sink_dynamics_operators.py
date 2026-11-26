@@ -93,7 +93,7 @@ from astronomix._modules._sink_particles._sink_particle_dynamics import (
     _sink_potential,
     _tsc_weights,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
     _pad_sink_particles,
 )

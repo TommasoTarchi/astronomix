@@ -59,7 +59,7 @@ from astronomix._modules._gravity._gravity import (
 from astronomix._modules._gravity._poisson_solver import (
     _compute_gravitational_potential,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _interior_cell_indices,
     _periodic_box,
 )

@@ -32,7 +32,7 @@ from astronomix.option_classes.simulation_config import (
 from astronomix.option_classes.simulation_params import SimulationParams
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_formation import _periodic_box
+from astronomix._modules._sink_particles._sink_particle_helpers import _periodic_box
 from astronomix.data_classes.simulation_helper_data import get_helper_data
 from astronomix.initial_condition_generation.construct_primitive_state import (
     construct_primitive_state,

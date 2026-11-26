@@ -22,7 +22,7 @@ import jax.numpy as jnp
 
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
     _polytropic_resolved_density,
 )

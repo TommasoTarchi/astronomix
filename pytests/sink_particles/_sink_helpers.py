@@ -38,9 +38,9 @@ from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
     SinkFormationSettings,
     setup_sink_formation,
 )
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_formation import _form_sink_particles
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _empty_sink_particles,
-    _form_sink_particles,
     _pad_sink_particles,
 )
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas

@@ -26,11 +26,11 @@ import jax.numpy as jnp
 from astronomix.option_classes.simulation_config import BoundarySettings
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_formation import (
+from astronomix._modules._sink_particles._sink_particle_formation import _form_sink_particles
+from astronomix._modules._sink_particles._sink_particle_helpers import (
     _control_volume_offsets,
     _density_threshold,
     _empty_sink_particles,
-    _form_sink_particles,
     _sound_speed_squared,
 )
 from astronomix.time_stepping.time_integration import _prepare_padded_state
