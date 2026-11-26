@@ -1891,6 +1891,26 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 f"beyond the ghost layer of num_ghost_cells = "
                 f"{config.num_ghost_cells} cells."
             )
+        # Written as "not (inside the range)" so that NaN is rejected too.
+        sink_particle_config = config.sink_particle_config
+        if not sink_particle_config.check_width >= 0.0:
+            raise ValueError(
+                f"check_width = {sink_particle_config.check_width} must be ≥ 0."
+            )
+        if not 0.0 <= sink_particle_config.spatial_width_in_cells <= 1.0:
+            raise ValueError(
+                f"spatial_width_in_cells = {sink_particle_config.spatial_width_in_cells} "
+                "must lie in [0, 1]."
+            )
+        if not sink_particle_config.sharing_sharpness > 0.0:
+            raise ValueError(
+                f"sharing_sharpness = {sink_particle_config.sharing_sharpness} must be > 0."
+            )
+        if not sink_particle_config.position_update_mass >= 0.0:
+            raise ValueError(
+                f"position_update_mass = {sink_particle_config.position_update_mass} "
+                "must be ≥ 0."
+            )
 
     return config
 

@@ -26,8 +26,10 @@ present; its absence on load is reported as ``driving_state = None``), its key
 as raw key data (``jax.random.key_data`` -> a plain uint32 array tensorstore
 can serialise), rebuilt with ``jax.random.wrap_key_data`` on load. It holds
 modes, not grid cells, and is restored replicated. The sink particles are
-written as the sub-tree ``sink_particles`` (mass, position, velocity), only
-when present; their absence on load is reported as ``None``.
+written as the sub-tree ``sink_particles`` (every field of ``SinkParticles``),
+only when present; their absence on load is reported as ``None``. A
+checkpoint holding only mass, position and velocity restores with the other
+fields ``None``, which the run fills in.
 """
 
 # general

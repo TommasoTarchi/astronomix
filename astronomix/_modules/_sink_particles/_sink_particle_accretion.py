@@ -100,7 +100,7 @@ def _accrete_gas(
     Args:
         primitive_state: The (padded) primitive state.
         sink_particles: The sink particles, including the new massless ones.
-        num_active_sinks: The number of filled slots, including the new sinks.
+        num_active_sinks: The number of active slots, including the new sinks.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -155,8 +155,8 @@ def _accrete_gas(
     # -------------------------------------------------------------
 
     # Each sink gathers the cells around the cell that contains it, giving
-    # arrays of shape (max_num_sinks, num_offsets). The filled slots are
-    # contiguous at the front, so the active sinks are the first ones.
+    # arrays of shape (max_num_sinks, num_offsets). The active slots are
+    # contiguous at the front, so they are the first ones.
     max_num_sinks = sink_particle_config.max_num_sinks
     sink_is_active = jnp.arange(max_num_sinks) < num_active_sinks
 
@@ -355,7 +355,7 @@ def _accrete_gas(
         new_position,
     )
 
-    sink_particles = SinkParticles(
+    sink_particles = sink_particles._replace(
         mass=new_mass,
         position=new_position,
         velocity=sink_particles.velocity + velocity_shift,

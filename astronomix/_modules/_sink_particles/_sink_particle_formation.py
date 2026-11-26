@@ -97,7 +97,7 @@ def _empty_sink_particles(
     dtype,
 ) -> SinkParticles:
     """
-    Create sink particle arrays with every slot empty (zero mass).
+    Create sink particle arrays with every slot empty: every field is zero.
 
     Args:
         config: The simulation configuration; supplies the number of slots.
@@ -111,6 +111,9 @@ def _empty_sink_particles(
         mass=jnp.zeros((max_num_sinks,), dtype=dtype),
         position=jnp.zeros((max_num_sinks, 3), dtype=dtype),
         velocity=jnp.zeros((max_num_sinks, 3), dtype=dtype),
+        activation=jnp.zeros((max_num_sinks,), dtype=dtype),
+        home_cell=jnp.zeros((max_num_sinks, 3), dtype=jnp.int32),
+        generation=jnp.zeros((max_num_sinks,), dtype=jnp.int32),
     )
 
 
@@ -119,20 +122,28 @@ def _pad_sink_particles(
     config: SimulationConfig,
 ) -> SinkParticles:
     """
-    Append empty slots (zero mass) to sink particles with fewer slots than
-    ``max_num_sinks``, e.g. sinks restored from a checkpoint of a run with
-    fewer slots. Filled slots stay at the front.
+    Bring the sink particles passed into a run to the layout the run uses:
+    fill in the fields left as ``None`` and append empty slots up to
+    ``max_num_sinks``.
+
+    Sinks placed by hand, or restored from a checkpoint that holds only mass,
+    position and velocity, have no ``activation``, ``home_cell`` or
+    ``generation``. A slot with mass gets activation 1, the cell containing
+    its position as home cell and generation 0; a slot with zero mass is
+    empty. Slots are appended e.g. to sinks restored from a checkpoint of a
+    run with fewer slots; the given slots stay at the front.
 
     Args:
         sink_particles: The sink particles passed into the run.
-        config: The simulation configuration; supplies the number of slots.
+        config: The simulation configuration; supplies the number of slots
+            and the grid spacing.
 
     Returns:
-        Sink particles with ``max_num_sinks`` slots.
+        Sink particles with every field set and ``max_num_sinks`` slots.
 
     Raises:
         ValueError: If the sink particles have more slots than
-            ``max_num_sinks``; dropping slots could drop filled ones.
+            ``max_num_sinks``; dropping slots could drop active ones.
     """
     max_num_sinks = config.sink_particle_config.max_num_sinks
     num_slots = sink_particles.mass.shape[0]
@@ -141,6 +152,27 @@ def _pad_sink_particles(
             f"{num_slots} sink particle slots passed in, but max_num_sinks is "
             f"{max_num_sinks}. Increase max_num_sinks in SinkParticleConfig."
         )
+
+    mass = jnp.asarray(sink_particles.mass)
+    activation = sink_particles.activation
+    if activation is None:
+        activation = (mass > 0.0).astype(mass.dtype)
+    is_active = jnp.asarray(activation) > 0.0
+    home_cell = sink_particles.home_cell
+    if home_cell is None:
+        containing_cell = jnp.floor(
+            jnp.asarray(sink_particles.position) / config.grid_spacing
+        ).astype(jnp.int32)
+        home_cell = jnp.where(is_active[:, None], containing_cell, 0)
+    generation = sink_particles.generation
+    if generation is None:
+        generation = jnp.zeros((num_slots,), dtype=jnp.int32)
+    sink_particles = sink_particles._replace(
+        activation=activation,
+        home_cell=home_cell,
+        generation=generation,
+    )
+
     num_missing_slots = max_num_sinks - num_slots
     return jax.tree.map(
         lambda field: jnp.pad(
@@ -669,7 +701,7 @@ def _form_sink_particles(
 
     Returns:
         ``(sink_particles, num_active_sinks)``: the sink particles with the new
-        sinks appended, and the number of filled slots including the new
+        sinks appended, and the number of active slots including the new
         (still massless) sinks.
     """
 
@@ -788,8 +820,8 @@ def _form_sink_particles(
     # Proximity check (Section 2.2.7): no new sink within r_acc of an existing
     # sink. Along periodic axes the separation is taken to the nearest
     # periodic copy of the sink (minimum-image convention), as in Federrath's
-    # FLASH code. Only filled slots are compared: empty slots have zero mass
-    # and sit at the origin, where they would otherwise block candidates.
+    # FLASH code. Only active slots are compared: empty slots sit at the
+    # origin, where they would otherwise block candidates.
     is_periodic, box_length = _periodic_box(config)
     separation = candidate_positions[:, None, :] - sink_particles.position[None, :, :]
     separation = jnp.where(
@@ -798,10 +830,10 @@ def _form_sink_particles(
         separation,
     )
     distance_to_sink = jnp.linalg.norm(separation, axis=-1)
-    sink_is_filled = sink_particles.mass > 0.0
+    sink_is_active = sink_particles.activation > 0.0
     sink_within_accretion_radius = jnp.logical_and(
         distance_to_sink <= accretion_radius,
-        sink_is_filled[None, :],
+        sink_is_active[None, :],
     )
     far_from_existing_sinks = jnp.logical_not(
         jnp.any(sink_within_accretion_radius, axis=-1)
@@ -905,14 +937,15 @@ def _form_sink_particles(
     # ================= ↓ Appending new sinks ↓ ===================
     # -------------------------------------------------------------
 
-    # Sinks are only appended, so the filled slots are contiguous at the
+    # Sinks are only appended, so the active slots are contiguous at the
     # front. Each passing candidate gets the next free slot; failing
     # candidates get the out-of-range slot max_num_sinks. With mode="drop",
     # writes to an out-of-range slot are discarded, which also discards new
-    # sinks once every slot is taken. New sinks are massless until the
-    # accretion step, so the filled slots are counted here and passed on.
+    # sinks once every slot is taken. A new sink is a full sink (activation
+    # 1) whose home cell is its own cell, and the first of that cell
+    # (generation 0).
     max_num_sinks = sink_particle_config.max_num_sinks
-    num_existing_sinks = jnp.sum(sink_particles.mass > 0.0)
+    num_existing_sinks = jnp.sum(sink_particles.activation > 0.0)
     slot = jnp.where(
         candidate_passes,
         num_existing_sinks + jnp.cumsum(candidate_passes) - 1,
@@ -929,6 +962,14 @@ def _form_sink_particles(
             center_of_mass_velocity,
             mode="drop",
         ),
+        activation=sink_particles.activation.at[slot].set(1.0, mode="drop"),
+        home_cell=sink_particles.home_cell.at[slot].set(
+            (candidate_indices - config.num_ghost_cells).astype(
+                sink_particles.home_cell.dtype
+            ),
+            mode="drop",
+        ),
+        generation=sink_particles.generation.at[slot].set(0, mode="drop"),
     )
     num_new_sinks = jnp.sum(candidate_passes)
     num_active_sinks = jnp.minimum(num_existing_sinks + num_new_sinks, max_num_sinks)

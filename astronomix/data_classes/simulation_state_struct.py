@@ -25,9 +25,13 @@ class SinkParticles(NamedTuple):
     Sink particle data in fixed-size arrays.
 
     JIT requires array sizes known at compile time, so the arrays always have
-    ``config.sink_particle_config.max_num_sinks`` slots. Sinks are only ever
-    appended, so the filled slots are contiguous at the front; a slot is
-    empty when its mass is zero.
+    ``config.sink_particle_config.max_num_sinks`` slots. A slot is active when
+    its activation is above zero and empty otherwise. Sinks are only ever
+    appended, so the active slots are contiguous at the front.
+
+    ``activation``, ``home_cell`` and ``generation`` may be left as ``None``
+    in sinks passed into a run; the run fills them in (see
+    ``finalize_state``).
     """
 
     #: Sink masses, shape (max_num_sinks,).
@@ -38,6 +42,19 @@ class SinkParticles(NamedTuple):
 
     #: Sink velocities, shape (max_num_sinks, 3).
     velocity: jax.Array
+
+    #: How far each slot has turned into a sink, from 0 (empty) to 1 (a full
+    #: sink), shape (max_num_sinks,).
+    activation: Union[jax.Array, NoneType] = None
+
+    #: The cell each slot's sink formed in, as integer indices counted from
+    #: the first interior cell (⌊x / Δx⌋ for a position x in that cell),
+    #: shape (max_num_sinks, 3). 0 in empty slots.
+    home_cell: Union[jax.Array, NoneType] = None
+
+    #: The number of sinks that formed in the same home cell before this one,
+    #: shape (max_num_sinks,). 0 in empty slots.
+    generation: Union[jax.Array, NoneType] = None
 
 
 class StateStruct(NamedTuple):
@@ -72,10 +89,14 @@ def finalize_state(
         primitive_state: The primitive state array.
         sink_particles: Sinks that already exist when the run starts, e.g. the
             final sinks of an earlier run or sinks placed by hand: arrays
-            ``mass`` (N,), ``position`` (N, 3) and ``velocity`` (N, 3), where a
-            slot with zero mass is empty. N may be smaller than
-            ``max_num_sinks`` (empty slots are appended when the run starts)
-            but not larger. ``None`` starts the run without sinks. A restart
+            ``mass`` (N,), ``position`` (N, 3) and ``velocity`` (N, 3), and
+            optionally ``activation``, ``home_cell`` and ``generation``. Left
+            as ``None``, these are filled in when the run starts: a slot with
+            mass gets activation 1, the cell containing its position as home
+            cell and generation 0, and a slot with zero mass is empty. N may
+            be smaller than ``max_num_sinks`` (empty slots are appended when
+            the run starts) but not larger. ``None`` starts the run without
+            sinks. A restart
             from disk does not need it: the restored sinks come with the
             ``restart_state`` of ``restart_from_latest_checkpoint``.
 

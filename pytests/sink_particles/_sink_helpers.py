@@ -24,6 +24,7 @@ from astronomix import (
     SimulationConfig,
     SimulationParams,
     SinkParticleConfig,
+    SinkParticles,
 )
 from astronomix.option_classes.simulation_config import StaticIntVector
 
@@ -40,6 +41,7 @@ from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
     _form_sink_particles,
+    _pad_sink_particles,
 )
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
 
@@ -197,18 +199,33 @@ def _form_sinks_once(state, config, params, registered_variables, sink_particles
     return sink_particles
 
 
-def _one_sink_at(position, config, dtype):
-    """Sink particles with a single (unit-mass) sink at ``position``."""
-    sink_particles = _empty_sink_particles(config, dtype)
-    return sink_particles._replace(
-        mass=sink_particles.mass.at[0].set(1.0),
-        position=sink_particles.position.at[0].set(jnp.array(position)),
+def _sinks_at(positions, masses, config, dtype):
+    """Sink particles with sinks at rest of the given masses at the given
+    positions, in the first slots. They are given by mass, position and
+    velocity, as sinks are passed into a run, and ``_pad_sink_particles``
+    fills in the other fields."""
+    num_sinks = len(masses)
+    empty = _empty_sink_particles(config, dtype)
+    return _pad_sink_particles(
+        SinkParticles(
+            mass=empty.mass.at[:num_sinks].set(jnp.asarray(masses, dtype=dtype)),
+            position=empty.position.at[:num_sinks].set(
+                jnp.asarray(positions, dtype=dtype)
+            ),
+            velocity=empty.velocity,
+        ),
+        config,
     )
 
 
+def _one_sink_at(position, config, dtype):
+    """Sink particles with a single (unit-mass) sink at ``position``."""
+    return _sinks_at([position], [1.0], config, dtype)
+
+
 def _num_sinks(sink_particles):
-    """The number of filled sink slots."""
-    return int(jnp.sum(sink_particles.mass > 0.0))
+    """The number of active sink slots."""
+    return int(jnp.sum(sink_particles.activation > 0.0))
 
 
 def _gas_mass_and_momentum(primitive_state, registered_variables):

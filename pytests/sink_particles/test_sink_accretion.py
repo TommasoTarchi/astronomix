@@ -39,6 +39,7 @@ from _sink_helpers import (
     _polytropic_setup,
     _setup,
     _sink_at_clump_center,
+    _sinks_at,
     _update_sinks_once,
     _with_linear_velocity,
 )
@@ -285,14 +286,14 @@ def test_accretion_most_bound_sink():
     # equally far from both. The heavy sink binds those cells more strongly.
     heavy_sink_mass = 5.0
     light_sink_mass = 0.05
-    sink_particles = _empty_sink_particles(config, dtype)
-    sink_particles = sink_particles._replace(
-        mass=sink_particles.mass.at[0].set(heavy_sink_mass).at[1].set(light_sink_mass),
-        position=sink_particles.position.at[0].set(
-            jnp.array([CLUMP_CENTER - 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
-        ).at[1].set(
-            jnp.array([CLUMP_CENTER + 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER])
-        ),
+    sink_particles = _sinks_at(
+        [
+            [CLUMP_CENTER - 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER],
+            [CLUMP_CENTER + 2 * CELL_SIZE, CLUMP_CENTER, CLUMP_CENTER],
+        ],
+        [heavy_sink_mass, light_sink_mass],
+        config,
+        dtype,
     )
 
     new_primitive_state, new_sink_particles = _update_sinks_once(
@@ -331,10 +332,12 @@ def test_accretion_tie_break():
     # Two equal sinks at rest at the same position: they share the inner cell
     # and bind every other cell with exactly the same energy.
     sink_mass = 0.5
-    sink_particles = _sink_at_clump_center(sink_mass, config, dtype)
-    sink_particles = sink_particles._replace(
-        mass=sink_particles.mass.at[1].set(sink_mass),
-        position=sink_particles.position.at[1].set(sink_particles.position[0]),
+    clump_center = [CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER]
+    sink_particles = _sinks_at(
+        [clump_center, clump_center],
+        [sink_mass, sink_mass],
+        config,
+        dtype,
     )
 
     new_primitive_state, new_sink_particles = _update_sinks_once(

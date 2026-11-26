@@ -58,3 +58,28 @@ class SinkParticleConfig(NamedTuple):
     #: al. (2010), Section 4.2.1, use r_acc = 2.5 grid cells. With ghost cells,
     #: its integer part must not exceed num_ghost_cells.
     accretion_radius_in_cells: float = 2.5
+
+    #: Width ω of the smooth steps that replace the yes/no creation and
+    #: accretion checks, in units of each check's own margin (e.g. ρ / ρ_res − 1
+    #: for the density check). A check contributes 0 below its threshold and 1
+    #: beyond threshold + ω. 0 gives the hard checks. Must be ≥ 0.
+    check_width: float = 0.1
+
+    #: Width ℓ, in cells, over which spatial weights pass from 1 to 0: the edge
+    #: of the accretion radius, the passage from a cell to its neighbour, and
+    #: the softening of a sink's potential in the accretion bound check. 0
+    #: gives sharp edges. Must lie in [0, 1].
+    spatial_width_in_cells: float = 0.5
+
+    #: Sharpness β of the sharing of a cell's gas between the seeds that can
+    #: accrete it: each seed's share is weighted by e^(−β η), with η the
+    #: specific energy of the gas relative to the seed in units of c_s². As
+    #: β → ∞ the most bound seed takes it all. Must be > 0; ``float("inf")``
+    #: is allowed.
+    sharing_sharpness: float = 10.0
+
+    #: Mass ε, in units of ρ_res ΔV, added to a seed's mass in the
+    #: denominator of its position update, so that a seed that has accreted
+    #: little moves little. 0 moves a seed to the centre of mass of itself and
+    #: the accreted gas. Must be ≥ 0.
+    position_update_mass: float = 0.01

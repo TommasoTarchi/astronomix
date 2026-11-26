@@ -435,7 +435,7 @@ def _check_disk_restart(directory):
         np.asarray(final_state.primitive_state),
     )
     for name, restarted_field, final_field in zip(
-        ("mass", "position", "velocity"),
+        restarted_state.sink_particles._fields,
         restarted_state.sink_particles,
         final_state.sink_particles,
     ):

@@ -95,6 +95,7 @@ from astronomix._modules._sink_particles._sink_particle_dynamics import (
 )
 from astronomix._modules._sink_particles._sink_particle_formation import (
     _empty_sink_particles,
+    _pad_sink_particles,
 )
 from astronomix.test_setups.self_gravity.sink_particle_formation3D import (
     SinkFormationSettings,
@@ -202,10 +203,13 @@ def _sinks(masses, positions, config, velocities=None):
     if velocities is None:
         velocities = np.zeros((num_sinks, 3))
     sink_particles = _empty_sink_particles(config, jnp.float64)
-    return SinkParticles(
-        mass=sink_particles.mass.at[:num_sinks].set(jnp.asarray(masses)),
-        position=sink_particles.position.at[:num_sinks].set(jnp.asarray(positions)),
-        velocity=sink_particles.velocity.at[:num_sinks].set(jnp.asarray(velocities)),
+    return _pad_sink_particles(
+        SinkParticles(
+            mass=sink_particles.mass.at[:num_sinks].set(jnp.asarray(masses)),
+            position=sink_particles.position.at[:num_sinks].set(jnp.asarray(positions)),
+            velocity=sink_particles.velocity.at[:num_sinks].set(jnp.asarray(velocities)),
+        ),
+        config,
     )
 
 

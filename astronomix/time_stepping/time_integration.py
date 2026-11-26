@@ -294,7 +294,7 @@ def time_integration(
             With sink particles on, the callable is also given the sinks,
             as the keyword argument ``sink_particles`` (a
             :class:`SinkParticles` with all ``max_num_sinks`` slots; empty
-            slots have zero mass), so it must accept it.
+            slots have zero activation), so it must accept it.
         sharding: The sharding to use for the padded helper data. If None,
                   no sharding is applied.
         restart_state: An optional :class:`LoopState` providing the state of

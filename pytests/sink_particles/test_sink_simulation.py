@@ -270,17 +270,15 @@ def test_snapshot_callback_receives_sinks():
     after, and at the last call the sinks the run returns."""
     calls = []
 
-    def record_on_host(time, mass, position, velocity):
-        calls.append(
-            (float(time), np.asarray(mass), np.asarray(position), np.asarray(velocity))
-        )
+    def record_on_host(time, *fields):
+        calls.append((float(time), *(np.asarray(field) for field in fields)))
 
     def snapshot_callable(time, primitive_state, registered_variables, sink_particles):
         jax.debug.callback(record_on_host, time, *sink_particles, ordered=True)
 
     final_state = _run_with_snapshot_callback(True, snapshot_callable)
 
-    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, _, _ in calls]
+    num_sinks = [int(np.sum(mass > 0.0)) for _, mass, *_ in calls]
     assert len(calls) >= 5
     assert num_sinks[0] == 0
     assert all(count == 1 for count in num_sinks[1:])
