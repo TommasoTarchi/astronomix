@@ -62,6 +62,16 @@ SETTINGS = SinkFormationSettings(
     overdensity_center=(CLUMP_CENTER, CLUMP_CENTER, CLUMP_CENTER),
 )
 
+#: The ``SinkParticleConfig`` widths of the hard limit, in which every smooth
+#: check is the yes/no check of Federrath et al. (2010) and a cell within
+#: reach of several sinks goes to the one it is most bound to.
+HARD_LIMIT = dict(
+    check_width=0.0,
+    spatial_width_in_cells=0.0,
+    sharing_sharpness=float("inf"),
+    position_update_mass=0.0,
+)
+
 
 def _setup(
     settings=SETTINGS,
@@ -105,12 +115,13 @@ POLYTROPIC_EXPONENT = 1.4
 POLYTROPIC_NUM_CELLS = 16
 
 
-def _polytropic_setup(density):
+def _polytropic_setup(density, **sink_particle_options):
     """A uniform polytropic gas at rest of the given density, with
     self-gravity and sink particles on.
 
     Args:
         density: The density of the gas.
+        **sink_particle_options: Further ``SinkParticleConfig`` fields.
 
     Returns:
         ``(primitive_state, config, params, registered_variables)``, with the
@@ -129,7 +140,10 @@ def _polytropic_setup(density):
         boundary_settings=BoundarySettings(periodic, periodic, periodic),
         gravity_config=GravityConfig(self_gravity=True),
         state_struct=True,
-        sink_particle_config=SinkParticleConfig(sink_particles=True),
+        sink_particle_config=SinkParticleConfig(
+            sink_particles=True,
+            **sink_particle_options,
+        ),
     )
     params = SimulationParams(
         polytropic_constant=POLYTROPIC_CONSTANT,

@@ -6,6 +6,7 @@ Section 2.3: the mass, position and velocity of a new sink after its first
 accretion, the conservation of mass and momentum (with and without a magnetic
 field), the bound and radial velocity checks, the choice of a single sink
 for each accreted cell, and the density at which a polytropic gas is left.
+Every test runs at the hard limit of the smooth checks (``HARD_LIMIT``).
 """
 
 # ==== GPU selection ====
@@ -23,7 +24,6 @@ import jax.numpy as jnp
 # astronomix functions
 from astronomix._modules._sink_particles._sink_particle_accretion import _accrete_gas
 from astronomix._modules._sink_particles._sink_particle_helpers import (
-    _empty_sink_particles,
     _polytropic_resolved_density,
 )
 
@@ -31,11 +31,13 @@ from astronomix._modules._sink_particles._sink_particle_helpers import (
 from _sink_helpers import (
     CELL_SIZE,
     CLUMP_CENTER,
+    HARD_LIMIT,
     SETTINGS,
     _density_threshold,
     _gas_mass_and_momentum,
     _num_accreted_cells,
     _num_sinks,
+    _one_sink_at,
     _polytropic_setup,
     _setup,
     _sink_at_clump_center,
@@ -51,7 +53,7 @@ def test_new_sink_accretion():
     centre-of-mass velocity of the accreted gas. The accreted cells are left at
     the threshold with an unchanged sound speed; the other cells are
     untouched."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(**HARD_LIMIT)
 
     # Give the gas a uniform bulk velocity, which the sink must inherit as its
     # centre-of-mass velocity.
@@ -130,6 +132,7 @@ def test_accretion_conservation(mhd):
     state, config, params, registered_variables = _setup(
         settings=SETTINGS._replace(magnetic_field_z=1.0),
         mhd=mhd,
+        **HARD_LIMIT,
     )
 
     # Gas falling toward the clump centre on top of a bulk motion, and an
@@ -201,7 +204,7 @@ def _accrete_around_sink_at_rest(velocity_gradient):
     Returns:
         The number of cells that lost gas.
     """
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(**HARD_LIMIT)
     state = _with_linear_velocity(
         state,
         registered_variables,
@@ -278,7 +281,7 @@ def test_no_accretion_of_gas_moving_away():
 def test_accretion_most_bound_sink():
     """A cell within reach of several sinks is accreted once, by the sink it
     is most strongly bound to (Section 2.3)."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(**HARD_LIMIT)
     dtype = state.primitive_state.dtype
 
     # Two sinks at rest, 2 cells on either side of the clump centre along x:
@@ -326,7 +329,7 @@ def test_accretion_most_bound_sink():
 def test_accretion_tie_break():
     """A cell for which several sinks tie exactly is accreted once, by the
     sink in the lowest slot."""
-    state, config, params, registered_variables = _setup()
+    state, config, params, registered_variables = _setup(**HARD_LIMIT)
     dtype = state.primitive_state.dtype
 
     # Two equal sinks at rest at the same position: they share the inner cell
@@ -370,16 +373,13 @@ def test_polytropic_accretion_leaves_cells_at_resolved_density():
     _, config, params, _ = _polytropic_setup(1.0)
     resolved_density = float(_polytropic_resolved_density(config, params))
     primitive_state, config, params, registered_variables = _polytropic_setup(
-        10.0 * resolved_density
+        10.0 * resolved_density,
+        **HARD_LIMIT,
     )
     dtype = primitive_state.dtype
 
-    # A sink at rest at the centre of cell (8, 8, 8).
-    sink_particles = _empty_sink_particles(config, dtype)
-    sink_particles = sink_particles._replace(
-        mass=sink_particles.mass.at[0].set(1.0),
-        position=sink_particles.position.at[0].set(8.5 * config.grid_spacing),
-    )
+    # A unit-mass sink at rest at the centre of cell (8, 8, 8).
+    sink_particles = _one_sink_at((8.5 * config.grid_spacing,) * 3, config, dtype)
 
     def accrete(primitive_state, sink_particles):
         return _accrete_gas(
