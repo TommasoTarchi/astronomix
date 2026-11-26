@@ -3,7 +3,8 @@ Smooth accretion at the default widths: everything a sink takes from the gas
 vanishes with its activation. A massless seed off the centre of the clump
 accretes once at activations 0, 10⁻⁶, 10⁻³ and 1; the accreted mass scales
 with the activation, the position shift goes to 0 with it, and mass and
-momentum are conserved at every activation.
+momentum are conserved at every activation, including the momentum the
+seed exchanges with the gas when its velocity is tied to that of the gas.
 """
 
 # general

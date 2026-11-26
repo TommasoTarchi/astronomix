@@ -21,6 +21,9 @@ taken from the cell, and shared between the sinks with a softmax of
 sharpness β that favours the sink the gas is most bound to. Mass and linear
 momentum are conserved (Appendix B).
 
+After accretion, the velocity of every forming seed is tied to that of the
+gas of its cells (``_couple_to_gas``), which also conserves momentum.
+
 With every width at its hard limit (ω = ℓ = ε = 0, β = ∞), a cell passes or
 fails each check as in the hard scheme, a sink of activation 1 takes the
 whole excess of a cell that passes, and a cell within reach of several sinks
@@ -56,6 +59,7 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._modules._sink_particles._sink_particle_dynamics import _couple_to_gas
 from astronomix._modules._sink_particles._sink_particle_formation import (
     CellQuantities,
     SlotNeighbourhood,
@@ -317,7 +321,8 @@ def _accrete_gas(
     cell weights. The mass ε ρ_res ΔV keeps a sink with almost no mass from
     jumping to the centre of mass of the first gas it accretes. A slot that
     takes nothing keeps its position and velocity, also when its mass is 0.
-    The position is wrapped back along periodic axes.
+    The position is wrapped back along periodic axes. Then the velocity of
+    every forming seed is tied to that of its gas (``_couple_to_gas``).
 
     Args:
         primitive_state: The (padded) primitive state.
@@ -449,4 +454,4 @@ def _accrete_gas(
     # ==================== ↑ Sink update ↑ ========================
     # -------------------------------------------------------------
 
-    return primitive_state, sink_particles
+    return _couple_to_gas(primitive_state, sink_particles, config, registered_variables)

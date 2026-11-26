@@ -18,6 +18,12 @@ The sinks move with a kick-drift-kick leapfrog (Gong & Ostriker 2013, Section
 2.4), once per hydro step, and adaptive steps keep a sink from moving more than
 half a cell per step (Federrath et al. 2010, ApJ 713, 269, Eq. 22).
 
+A forming seed, of activation 0 < a < 1, moves in proportion to its
+activation: it drifts by a v Δt, and after the accretion of each step its
+velocity is tied to that of the gas of its TSC cells, with weight 1 − a. As
+a → 0 the seed stops moving and its velocity tends to that of its gas; at
+a = 1 both are the plain sink leapfrog.
+
 The TSC cells follow the gas boundaries: they wrap around periodic axes and end
 at the edge of the box on non-periodic ones. Where the Poisson solve treats the
 box differently, a sink within reach of the edge (4 cells, 2 with VL2) feels
@@ -362,8 +368,10 @@ def _drift(
     config: SimulationConfig,
 ) -> SinkParticles:
     """
-    Drift the sinks, x ← x + v Δt, in the active slots, and wrap them back into
-    the box along periodic axes. Empty slots stay where they are.
+    Drift the sinks, x ← x + a v Δt, in the active slots, and wrap them back
+    into the box along periodic axes: a forming seed moves in proportion to
+    its activation a, a sink (a = 1) by v Δt. Empty slots stay where they
+    are.
 
     Along a non-periodic axis a sink may leave the box. It keeps its slot, and
     a warning is printed for every active slot that goes from inside to
@@ -384,7 +392,10 @@ def _drift(
     box_length = jnp.asarray(box_length, dtype=position.dtype)
     is_active = sink_particles.activation > 0.0
 
-    drifted_position = position + sink_particles.velocity * time_step
+    drifted_position = (
+        position
+        + sink_particles.activation[:, None] * sink_particles.velocity * time_step
+    )
     wrapped_position = jnp.mod(drifted_position, box_length)
     # A position just below zero can round to exactly L, the same point as 0.
     wrapped_position = jnp.where(
@@ -414,6 +425,90 @@ def _drift(
     )
 
     return sink_particles._replace(position=new_position)
+
+
+def _couple_to_gas(
+    primitive_state: STATE_TYPE,
+    sink_particles: SinkParticles,
+    config: SimulationConfig,
+    registered_variables: RegisteredVariables,
+) -> tuple[STATE_TYPE, SinkParticles]:
+    """
+    Tie the velocity of every forming seed to the gas of its TSC cells,
+
+        u ← u + (1 − a) (u_cm − u),
+        u_cm = (m u + Σ W ρ v ΔV) / (m + Σ W ρ ΔV),
+
+    with a the activation, m the mass and u the velocity of the seed, and W
+    its TSC weights: u_cm is the centre-of-mass velocity of the seed and the
+    gas of its cells, so a seed that holds more mass than that gas barely
+    drags it. The momentum the seed gains is taken from the same cells in
+    proportion to W ρ, which lowers the velocity of each by the same amount
+    times W; momentum is conserved, and the kinetic energy the coupling
+    removes is not given back to the gas.
+
+    A sink (a = 1) and its cells are left exactly as they are, and so are
+    the empty slots. As a → 0 the seed's mass goes to 0 with it, and its
+    velocity tends to the mean velocity of its gas.
+
+    Args:
+        primitive_state: The (padded) primitive state.
+        sink_particles: The sink particles.
+        config: The simulation configuration.
+        registered_variables: The registered variables.
+
+    Returns:
+        ``(primitive_state, sink_particles)`` after the coupling.
+    """
+    cell_volume = config.grid_spacing**3
+    density = primitive_state[registered_variables.density_index]
+    velocity_rows = (
+        registered_variables.velocity_index.x,
+        registered_variables.velocity_index.y,
+        registered_variables.velocity_index.z,
+    )
+    velocity = sink_particles.velocity
+    activation = sink_particles.activation
+
+    cell_indices, weights = _tsc_weights(sink_particles.position, density.shape, config)
+    gas_mass = weights * density[cell_indices] * cell_volume
+    gas_velocity = jnp.stack(
+        [primitive_state[row][cell_indices] for row in velocity_rows],
+        axis=-1,
+    )
+    total_gas_mass = jnp.sum(gas_mass, axis=-1)
+    total_mass = sink_particles.mass + total_gas_mass
+
+    # u_cm − u = Σ W ρ ΔV (v − u) / (m + Σ W ρ ΔV). The inner wheres keep the
+    # divisions away from zero, so that neither gives a non-finite value, in
+    # derivatives either.
+    has_mass = total_mass > 0.0
+    relative_center_of_mass_velocity = jnp.sum(
+        gas_mass[..., None] * (gas_velocity - velocity[:, None, :]),
+        axis=1,
+    ) / jnp.where(has_mass, total_mass, 1.0)[:, None]
+    velocity_change = jnp.where(
+        ((activation > 0.0) & has_mass)[:, None],
+        (1.0 - activation)[:, None] * relative_center_of_mass_velocity,
+        0.0,
+    )
+
+    has_gas = total_gas_mass > 0.0
+    gas_velocity_change = jnp.where(
+        has_gas[:, None, None],
+        -(sink_particles.mass[:, None] * velocity_change)[:, None, :]
+        * weights[..., None]
+        / jnp.where(has_gas, total_gas_mass, 1.0)[:, None, None],
+        0.0,
+    )
+    gas_velocity_change = jnp.zeros(
+        density.shape + (3,),
+        dtype=density.dtype,
+    ).at[cell_indices].add(gas_velocity_change)
+    for axis, row in enumerate(velocity_rows):
+        primitive_state = primitive_state.at[row].add(gas_velocity_change[..., axis])
+
+    return primitive_state, sink_particles._replace(velocity=velocity + velocity_change)
 
 
 def _sink_time_step(
