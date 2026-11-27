@@ -53,10 +53,10 @@ class SinkParticleConfig(NamedTuple):
     max_num_sinks: int = 256
 
     #: Length of the list of cells whose inactive seed can get a creation
-    #: weight above 0: the interior cells that pass the density and
-    #: converging-flow checks and are not blocked by a sink or by an earlier
-    #: seed of their cell. Only these get the checks that need a control
-    #: volume (potential minimum, Jeans instability, bound state). Cells
+    #: weight above 0: the interior cells that pass the density,
+    #: converging-flow and potential-minimum checks and are not blocked by a
+    #: sink or by an earlier seed of their cell. Only these get the checks
+    #: that need a control volume (Jeans instability, bound state). Cells
     #: beyond this number are skipped for that step, with a warning.
     max_num_candidates: int = 128
 

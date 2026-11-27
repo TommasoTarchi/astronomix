@@ -19,6 +19,9 @@ autocvd(num_gpus=1)
 # testing
 import pytest
 
+# numerics
+import numpy as np
+
 # jax
 import jax.numpy as jnp
 
@@ -26,13 +29,21 @@ import jax.numpy as jnp
 from astronomix.option_classes.simulation_config import BoundarySettings
 
 # astronomix functions
-from astronomix._modules._sink_particles._sink_particle_formation import _form_sink_particles
+from astronomix._modules._sink_particles._sink_particle_formation import (
+    _cell_quantities,
+    _form_sink_particles,
+    _may_pass_potential_minimum,
+    _slot_checks,
+    _slot_neighbourhood,
+)
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _control_volume_offsets,
     _density_threshold,
     _empty_sink_particles,
+    _interior_mask,
     _sound_speed_squared,
 )
+from astronomix._modules._sink_particles._sink_particle_smoothing import _smooth_step
 from astronomix.time_stepping.time_integration import _prepare_padded_state
 
 # sink particle test helpers
@@ -361,6 +372,63 @@ def test_control_volume_at_open_boundary():
     expected_velocity_x = jnp.sum(density * velocity_x) / jnp.sum(density)
 
     assert jnp.allclose(sink_particles.velocity[0, 0], expected_velocity_x)
+
+
+@pytest.mark.parametrize(
+    "widths",
+    [pytest.param(HARD_LIMIT, id="hard_limit"), pytest.param({}, id="default_widths")],
+)
+def test_potential_minimum_selection_lists_every_seed_with_weight(widths):
+    """The potential-minimum check on the whole grid, which narrows the list
+    of cells that may form sinks, keeps every cell whose seed has f_φ > 0 in
+    ``_slot_checks``, so that the list changes no weight; and of the 57 clump
+    cells above the density threshold it keeps only the centre.
+
+    Args:
+        widths: The widths of the smooth checks.
+    """
+    state, config, params, registered_variables = _setup(**widths)
+    primitive_state = _prepare_padded_state(
+        state.primitive_state,
+        config,
+        params,
+        registered_variables,
+    )
+    cells = _cell_quantities(
+        primitive_state,
+        _empty_sink_particles(config, primitive_state.dtype),
+        config,
+        params,
+        registered_variables,
+    )
+    interior_cells = np.argwhere(np.asarray(_interior_mask(cells.density, config)))
+    cell_centers = jnp.asarray(
+        (interior_cells - config.num_ghost_cells + 0.5) * config.grid_spacing,
+        dtype=primitive_state.dtype,
+    )
+    checks = _slot_checks(
+        _slot_neighbourhood(cell_centers, primitive_state.shape[1:], config),
+        jnp.zeros(cell_centers.shape[0], dtype=primitive_state.dtype),
+        cells,
+        config,
+    )
+    potential_minimum_factor = np.asarray(
+        1.0 - _smooth_step(checks.potential_height, config.sink_particle_config.check_width)
+    )
+    index = tuple(interior_cells.T)
+    is_listed = np.asarray(_may_pass_potential_minimum(cells, config))[index]
+
+    is_missed = (potential_minimum_factor > 0.0) & ~is_listed
+    assert not is_missed.any(), (
+        f"{int(is_missed.sum())} cells with f_φ > 0 are left out of the list, the first at "
+        f"interior index {interior_cells[np.argmax(is_missed)] - config.num_ghost_cells}"
+    )
+    is_dense = np.asarray(cells.density > cells.density_threshold)[index]
+    num_dense_listed = int(np.sum(is_dense & is_listed))
+    assert num_dense_listed == 1, (
+        f"{num_dense_listed} of the {int(is_dense.sum())} cells above the density threshold "
+        "pass the potential-minimum check on the grid, not the centre alone"
+    )
 
 
 def test_error_when_sink_slots_full():

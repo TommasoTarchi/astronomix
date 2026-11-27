@@ -31,11 +31,12 @@ previous step in f_prox, so seeds that pass in the same step do not hold
 each other back.
 
 The weights of the inactive seeds are computed only where they can be above
-0. f_ρ, f_conv, f_prox and f_home need no control volume: the interior cells
-where all four are above 0 are listed, in a list of fixed length, and only
-the listed cells get the factors that need a control volume. A cell leaving
-or entering the list has w = 0, so the list changes no result unless it is
-full.
+0. f_ρ, f_conv, f_prox and f_home need no control volume, and f_φ is also
+computed on the whole grid, with a slack for rounding: the interior cells
+where all five can be above 0 are listed, in a list of fixed length, and only
+the listed cells get the factors that need a control volume, f_φ again among
+them. A cell leaving or entering the list has w = 0, so the list changes no
+result unless it is full.
 
 With every width at its hard limit (ω = ℓ = 0), each factor is a hard check
 of Federrath et al. (2010), and a seed becomes a full sink in the first step
@@ -52,6 +53,9 @@ uniform grid, so every cell is already on the highest level of refinement.
 # general
 from functools import partial
 
+# numerics
+import numpy as np
+
 # typing
 from types import NoneType
 from typing import NamedTuple, Union
@@ -63,6 +67,7 @@ import jax.numpy as jnp
 # astronomix constants
 from astronomix.option_classes.simulation_config import (
     FIELD_TYPE,
+    GHOST_CELLS,
     STATE_TYPE,
 )
 
@@ -73,12 +78,14 @@ from astronomix.option_classes.simulation_params import SimulationParams
 from astronomix.variable_registry.registered_variables import RegisteredVariables
 
 # astronomix functions
+from astronomix._geometry.boundaries import _axis_slice, _periodic_boundaries
 from astronomix._modules._gravity._gravity import _compute_total_potential
 from astronomix._modules._sink_particles._sink_particle_dynamics import _sink_density
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _accretion_offsets,
     _collect_candidates,
     _control_volume_energies,
+    _control_volume_offsets,
     _density_threshold,
     _interior_cell_indices,
     _interior_mask,
@@ -667,6 +674,185 @@ def _creation_weight(
 # -------------------------------------------------------------
 
 # -------------------------------------------------------------
+# =============== ↓ Potential minimum on the grid ↓ ===========
+# -------------------------------------------------------------
+
+#: How much looser the grid-wide potential-minimum check of the cell
+#: selection is than f_φ > 0, which holds for a potential height h < ω (h ≤ 0
+#: at ω = 0). The grid and ``_slot_checks`` sum the soft minimum in different
+#: orders, so their heights differ by rounding, a small multiple of the float
+#: precision times |φ| / c_s². A cell is listed where h is at most ω plus
+#: these shares of ω and of |φ| / c_s²; a listed cell with h ≥ ω has f_φ = 0
+#: and so w = 0.
+POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS = 1.0
+POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS = 1e-4
+
+
+def _fill_potential_ghost_cells(
+    gravitational_potential: FIELD_TYPE,
+    config: SimulationConfig,
+) -> FIELD_TYPE:
+    """
+    Overwrite the ghost cells of the potential for the potential-minimum check,
+    so that a control volume only compares real cells.
+
+    Along a periodic axis the ghost cells get periodic copies of the interior
+    potential. Along a non-periodic axis they get +∞, which marks them as
+    cells past the edge; this includes the ghost cells that also lie beyond a
+    periodic axis.
+
+    Args:
+        gravitational_potential: The (padded) gravitational potential.
+        config: The simulation configuration.
+
+    Returns:
+        The potential with its ghost cells overwritten.
+    """
+    if config.boundary_handling != GHOST_CELLS:
+        return gravitational_potential
+
+    num_ghost_cells = config.num_ghost_cells
+    num_axes = gravitational_potential.ndim
+    is_periodic, _ = _periodic_box(config)
+    for axis in range(num_axes):
+        if is_periodic[axis]:
+            gravitational_potential = _periodic_boundaries(
+                gravitational_potential,
+                num_ghost_cells,
+                axis=axis,
+            )
+        else:
+            left_ghost_cells = _axis_slice(axis, 0, num_ghost_cells, num_axes)
+            right_ghost_cells = _axis_slice(axis, -num_ghost_cells, None, num_axes)
+            gravitational_potential = (
+                gravitational_potential.at[left_ghost_cells]
+                .set(jnp.inf)
+                .at[right_ghost_cells]
+                .set(jnp.inf)
+            )
+    return gravitational_potential
+
+
+def _potential_height_on_grid(
+    potential: FIELD_TYPE,
+    sound_speed_squared: FIELD_TYPE,
+    config: SimulationConfig,
+) -> FIELD_TYPE:
+    """
+    (φ − min_T φ) / c_s² in every cell, with the soft minimum over the cell's
+    control volume weighted by K, at the temperature ω c_s² of the cell: the
+    potential height of ``_slot_checks`` for a seed at a cell centre.
+
+    Cells past a non-periodic edge are left out. The values are meaningful in
+    interior cells only.
+
+    Args:
+        potential: The (padded) potential.
+        sound_speed_squared: The (padded) c_s².
+        config: The simulation configuration.
+
+    Returns:
+        The potential height, with the shape of the potential.
+    """
+    sink_particle_config = config.sink_particle_config
+    check_width = sink_particle_config.check_width
+    accretion_radius_in_cells = sink_particle_config.accretion_radius_in_cells
+    spatial_width_in_cells = sink_particle_config.spatial_width_in_cells
+
+    # The control volume, with the radial weight K of each offset, computed
+    # with NumPy at trace time as in ``_radial_weight``; offsets of weight 0
+    # are dropped.
+    offsets = _control_volume_offsets(config)
+    if spatial_width_in_cells == 0.0:
+        radial_weights = np.ones(offsets.shape[0])
+    else:
+        distance_in_cells = np.sqrt(np.sum(offsets**2, axis=-1))
+        scaled = np.clip(
+            (accretion_radius_in_cells - distance_in_cells) / spatial_width_in_cells,
+            0.0,
+            1.0,
+        )
+        radial_weights = scaled * scaled * (3.0 - 2.0 * scaled)
+    offsets = offsets[radial_weights > 0.0]
+    radial_weights = radial_weights[radial_weights > 0.0]
+
+    filled_potential = _fill_potential_ghost_cells(potential, config)
+
+    def at_offset(offset):
+        """The filled potential of the cell at ``offset`` from each cell."""
+        shifted = filled_potential
+        for axis in range(3):
+            if offset[axis] != 0:
+                # Shifting by −offset brings the value at cell + offset.
+                shifted = _shift(shifted, -int(offset[axis]), axis)
+        return shifted
+
+    minimum = filled_potential
+    for offset in offsets:
+        minimum = jnp.minimum(minimum, at_offset(offset))
+    minimum = jnp.where(jnp.isfinite(minimum), minimum, 0.0)
+
+    if check_width > 0.0:
+        temperature = check_width * sound_speed_squared
+        safe_temperature = jnp.where(temperature > 0.0, temperature, 1.0)
+        weighted_sum = jnp.zeros_like(potential)
+        normalization = jnp.zeros_like(potential)
+        for offset, radial_weight in zip(offsets, radial_weights):
+            shifted = at_offset(offset)
+            is_real = jnp.isfinite(shifted)
+            value = jnp.where(is_real, shifted, minimum)
+            weight = jnp.where(
+                is_real,
+                radial_weight * jnp.exp(-(value - minimum) / safe_temperature),
+                0.0,
+            )
+            weighted_sum = weighted_sum + weight * value
+            normalization = normalization + weight
+        minimum = jnp.where(
+            temperature > 0.0,
+            _safe_divide(weighted_sum, normalization),
+            minimum,
+        )
+
+    return _safe_divide(potential - minimum, sound_speed_squared)
+
+
+def _may_pass_potential_minimum(
+    cells: CellQuantities,
+    config: SimulationConfig,
+) -> FIELD_TYPE:
+    """
+    Boolean mask of the cells whose inactive seed can have f_φ > 0, from the
+    potential height on the grid, with the slack of
+    ``POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS`` and
+    ``POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS``.
+
+    Args:
+        cells: The cell quantities.
+        config: The simulation configuration.
+
+    Returns:
+        The mask, with the shape of the potential; meaningful in interior
+        cells only.
+    """
+    check_width = config.sink_particle_config.check_width
+    potential_height = _potential_height_on_grid(
+        cells.potential,
+        cells.sound_speed_squared,
+        config,
+    )
+    slack = POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS * check_width + (
+        POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS
+        * _safe_divide(jnp.abs(cells.potential), cells.sound_speed_squared)
+    )
+    return potential_height <= check_width + slack
+
+
+# -------------------------------------------------------------
+# =============== ↑ Potential minimum on the grid ↑ ===========
+# -------------------------------------------------------------
+
+# -------------------------------------------------------------
 # ================ ↓ Cells of the inactive seeds ↓ ============
 # -------------------------------------------------------------
 
@@ -858,6 +1044,7 @@ def _form_sink_particles(
         _interior_mask(grid_cells.density, config)
         & (density_factor > 0.0)
         & (converging_flow_factor > 0.0)
+        & _may_pass_potential_minimum(grid_cells, config)
         & ~_cells_without_weight(
             jax.lax.stop_gradient(sink_particles),
             grid_shape,
