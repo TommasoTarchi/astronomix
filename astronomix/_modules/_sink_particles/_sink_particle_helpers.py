@@ -96,6 +96,7 @@ def _empty_sink_particles(
         activation=jnp.zeros((max_num_sinks,), dtype=dtype),
         home_cell=jnp.zeros((max_num_sinks, 3), dtype=jnp.int32),
         generation=jnp.zeros((max_num_sinks,), dtype=jnp.int32),
+        home_claim=jnp.zeros((max_num_sinks,), dtype=dtype),
     )
 
 
@@ -109,11 +110,12 @@ def _pad_sink_particles(
     ``max_num_sinks``.
 
     Sinks placed by hand, or restored from a checkpoint that holds only mass,
-    position and velocity, have no ``activation``, ``home_cell`` or
-    ``generation``. A slot with mass gets activation 1, the cell containing
-    its position as home cell and generation 0; a slot with zero mass is
-    empty. Slots are appended e.g. to sinks restored from a checkpoint of a
-    run with fewer slots; the given slots stay at the front.
+    position and velocity, have no ``activation``, ``home_cell``,
+    ``generation`` or ``home_claim``. A slot with mass gets activation 1, the
+    cell containing its position as home cell, generation 0 and home claim 1;
+    a slot with zero mass is empty. Slots are appended e.g. to sinks restored
+    from a checkpoint of a run with fewer slots; the given slots stay at the
+    front.
 
     Args:
         sink_particles: The sink particles passed into the run.
@@ -149,10 +151,14 @@ def _pad_sink_particles(
     generation = sink_particles.generation
     if generation is None:
         generation = jnp.zeros((num_slots,), dtype=jnp.int32)
+    home_claim = sink_particles.home_claim
+    if home_claim is None:
+        home_claim = is_active.astype(mass.dtype)
     sink_particles = sink_particles._replace(
         activation=activation,
         home_cell=home_cell,
         generation=generation,
+        home_claim=home_claim,
     )
 
     num_missing_slots = max_num_sinks - num_slots

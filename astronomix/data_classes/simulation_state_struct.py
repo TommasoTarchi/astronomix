@@ -26,11 +26,12 @@ class SinkParticles(NamedTuple):
 
     JIT requires array sizes known at compile time, so the arrays always have
     ``config.sink_particle_config.max_num_sinks`` slots. A slot is active when
-    its activation is above zero and empty otherwise. Sinks are only ever
-    appended, so the active slots are contiguous at the front.
+    its activation is above zero and empty otherwise. A seed that has merged
+    completely into another one leaves its slot empty, so active and empty
+    slots can alternate.
 
-    ``activation``, ``home_cell`` and ``generation`` may be left as ``None``
-    in sinks passed into a run; the run fills them in (see
+    ``activation``, ``home_cell``, ``generation`` and ``home_claim`` may be
+    left as ``None`` in sinks passed into a run; the run fills them in (see
     ``finalize_state``).
     """
 
@@ -55,6 +56,11 @@ class SinkParticles(NamedTuple):
     #: The number of sinks that formed in the same home cell before this one,
     #: shape (max_num_sinks,). 0 in empty slots.
     generation: Union[jax.Array, NoneType] = None
+
+    #: The strength with which each slot keeps its home cell from forming
+    #: another seed, from 1 (the whole seed is still in the slot) to 0 (it
+    #: has merged into other seeds), shape (max_num_sinks,). 0 in empty slots.
+    home_claim: Union[jax.Array, NoneType] = None
 
 
 class StateStruct(NamedTuple):
@@ -90,10 +96,11 @@ def finalize_state(
         sink_particles: Sinks that already exist when the run starts, e.g. the
             final sinks of an earlier run or sinks placed by hand: arrays
             ``mass`` (N,), ``position`` (N, 3) and ``velocity`` (N, 3), and
-            optionally ``activation``, ``home_cell`` and ``generation``. Left
-            as ``None``, these are filled in when the run starts: a slot with
-            mass gets activation 1, the cell containing its position as home
-            cell and generation 0, and a slot with zero mass is empty. N may
+            optionally ``activation``, ``home_cell``, ``generation`` and
+            ``home_claim``. Left as ``None``, these are filled in when the run
+            starts: a slot with mass gets activation 1, the cell containing
+            its position as home cell, generation 0 and home claim 1, and a
+            slot with zero mass is empty. N may
             be smaller than ``max_num_sinks`` (empty slots are appended when
             the run starts) but not larger. ``None`` starts the run without
             sinks. A restart

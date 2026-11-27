@@ -351,7 +351,7 @@ def test_control_volume_at_open_boundary():
     )
 
     # Formation alone, since accretion changes the velocity of the sink.
-    sink_particles, num_active_sinks = _form_sink_particles(
+    sink_particles = _form_sink_particles(
         primitive_state,
         _empty_sink_particles(config, primitive_state.dtype),
         config,
@@ -359,7 +359,9 @@ def test_control_volume_at_open_boundary():
         registered_variables,
     )
 
-    assert num_active_sinks == 1
+    assert _num_sinks(sink_particles) == 1, (
+        f"the clump formed {_num_sinks(sink_particles)} sinks instead of 1"
+    )
     sink_cell_x = int(sink_particles.position[0, 0] / CELL_SIZE)
     offsets = _control_volume_offsets(config)
     assert sink_cell_x + int(offsets[:, 0].min()) < 0, (

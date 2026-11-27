@@ -1911,6 +1911,10 @@ def finalize_config(config: SimulationConfig, state_shape) -> SimulationConfig:
                 f"position_update_mass = {sink_particle_config.position_update_mass} "
                 "must be ≥ 0."
             )
+        if not 0.0 <= sink_particle_config.merging_width < 1.0:
+            raise ValueError(
+                f"merging_width = {sink_particle_config.merging_width} must lie in [0, 1)."
+            )
 
     return config
 

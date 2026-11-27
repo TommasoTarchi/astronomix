@@ -84,7 +84,6 @@ def _accrete_at_each_activation():
         results[activation] = _accrete_gas(
             primitive_state,
             seed._replace(activation=seed.activation.at[0].set(activation)),
-            jnp.asarray(1),
             config,
             params,
             registered_variables,

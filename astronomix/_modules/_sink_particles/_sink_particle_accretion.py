@@ -299,7 +299,6 @@ def _shares(
 def _accrete_gas(
     primitive_state: STATE_TYPE,
     sink_particles: SinkParticles,
-    num_active_sinks: jax.Array,
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
@@ -327,8 +326,7 @@ def _accrete_gas(
     Args:
         primitive_state: The (padded) primitive state.
         sink_particles: The sink particles, including the new massless ones.
-        num_active_sinks: The number of active slots, at the front of the
-            arrays, including the new sinks. Later slots take no gas.
+            Empty slots take no gas.
         config: The simulation configuration.
         params: The simulation parameters.
         registered_variables: The registered variables.
@@ -355,8 +353,7 @@ def _accrete_gas(
         config,
         params,
     )
-    slot_is_active = jnp.arange(sink_particles.mass.shape[0]) < num_active_sinks
-    weight = jnp.where(slot_is_active[:, None], weight, 0.0)
+    weight = jnp.where(sink_particles.activation[:, None] > 0.0, weight, 0.0)
 
     excess = (
         jnp.maximum(

@@ -304,7 +304,7 @@ def _check_no_full_grid_all_gather():
                 registered_variables,
             ).compile(),
         }
-        new_sinks, num_active_sinks = form(
+        new_sinks = form(
             primitive_state,
             sink_particles,
             config,
@@ -314,7 +314,6 @@ def _check_no_full_grid_all_gather():
         programs["accretion"] = accrete.lower(
             primitive_state,
             new_sinks,
-            num_active_sinks,
             config,
             params,
             registered_variables,

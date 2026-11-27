@@ -385,7 +385,6 @@ def test_polytropic_accretion_leaves_cells_at_resolved_density():
         return _accrete_gas(
             primitive_state,
             sink_particles,
-            jnp.asarray(1),
             config,
             params,
             registered_variables,

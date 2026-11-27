@@ -19,8 +19,9 @@ The factors of seed s, at position y_s, are
     f_J    = step_ω(|E_grav| / (2 E_th + E_mag) − 1),
     f_b    = step_ω(|E_grav| / (E_th + E_kin + E_mag) − 1),
     f_prox = Π_{s' ≠ s} [1 − a_s' K(|y_s' − y_s| − ℓ Δx)],
-    f_home = Π_{s'} [1 − K(|y_s' − x_c(s)| − ℓ Δx)], over the seeds s' that
-             activated before s in its home cell c(s),
+    f_home = Π_{s'} [1 − c_s' K(|y_s' − x_c(s)| − ℓ Δx)], over the seeds s'
+             that activated before s in its home cell c(s), with c_s' the
+             claim of s' on its home cell,
 
 each exactly 0 where its hard check fails. A cell quantity is read at y_s
 with the cell weights h, and the control volume holds the gas within r_acc
@@ -38,9 +39,13 @@ the listed cells get the factors that need a control volume, f_φ again among
 them. A cell leaving or entering the list has w = 0, so the list changes no
 result unless it is full.
 
-With every width at its hard limit (ω = ℓ = 0), each factor is a hard check
-of Federrath et al. (2010), and a seed becomes a full sink in the first step
-its cell passes them all.
+After the activations and the new seeds, every seed merges into the more
+active seeds within its reach (``_sink_particle_merging.py``), giving up its
+claim on its home cell with what it gives.
+
+With every width at its hard limit (ω = ℓ = δ = 0), each factor is a hard
+check of Federrath et al. (2010), a seed becomes a full sink in the first
+step its cell passes them all, and no seed merges.
 
 Only gas in interior cells counts. A control volume wraps around periodic
 axes and ends at the edge of the box on non-periodic axes. Reflective walls
@@ -93,6 +98,7 @@ from astronomix._modules._sink_particles._sink_particle_helpers import (
     _raise_sink_slots_full,
     _sound_speed_squared,
 )
+from astronomix._modules._sink_particles._sink_particle_merging import _merge_seeds
 from astronomix._modules._sink_particles._sink_particle_smoothing import (
     _cell_weights,
     _radial_weight,
@@ -581,8 +587,8 @@ def _exclusion_factor(
     Π [1 − s K(d − ℓ Δx)] over the seeds that count, with s the strength of
     each seed: 0 where a seed of strength 1 lies within r_acc, 1 where every
     seed that counts lies farther than r_acc + ℓ Δx. With the activations as
-    strengths this is f_prox, with strength 1 and the distances from the
-    home cell it is f_home.
+    strengths this is f_prox, with the claims on the home cell as strengths
+    and the distances from the home cell it is f_home.
 
     Args:
         distance_squared: The squared distance d² to each seed, shape
@@ -865,7 +871,8 @@ def _cells_without_weight(
     """
     Boolean mask of the cells whose inactive seed has f_prox = 0 or
     f_home = 0: the cells within r_acc of a seed of activation 1, and the
-    home cells of the active seeds that lie within r_acc of their home cell.
+    home cells of the seeds with their whole claim on it that lie within
+    r_acc of it.
 
     Args:
         sink_particles: The sink particles.
@@ -890,7 +897,6 @@ def _cells_without_weight(
             >= 1.0
         )
 
-    is_active = sink_particles.activation > 0.0
     is_full_sink = sink_particles.activation >= 1.0
 
     neighbourhood = _slot_neighbourhood(sink_particles.position, grid_shape, config)
@@ -910,7 +916,7 @@ def _cells_without_weight(
     )
     home_centers = (home_interior_index + 0.5) * config.grid_spacing
     near_home = (
-        is_active
+        (sink_particles.home_claim >= 1.0)
         & home_is_real_cell
         & is_within_accretion_radius(
             jnp.sum(
@@ -934,19 +940,20 @@ def _form_sink_particles(
     config: SimulationConfig,
     params: SimulationParams,
     registered_variables: RegisteredVariables,
-) -> tuple[SinkParticles, jax.Array]:
+) -> SinkParticles:
     """
-    Raise the activation of every active seed to its creation weight, and
-    store the inactive seeds whose weight is above 0 in free slots.
+    Raise the activation of every active seed to its creation weight, store
+    the inactive seeds whose weight is above 0 in free slots, and merge every
+    seed into the more active seeds within its reach.
 
     An active seed gets w at its position, with its own mass added to its
     density, and a ← max(a, w). An inactive seed sits at the centre of its
     cell with no mass. When its weight is above 0 it takes the next free
     slot, with activation w, its cell as home cell, the number of active
-    seeds of that home cell as generation, and the centre-of-mass velocity
-    of its control volume (Eq. 12). It gets its mass from the accretion step
-    that follows. All weights use the activations the seeds had before this
-    call.
+    seeds of that home cell as generation, its whole claim on that cell, and
+    the centre-of-mass velocity of its control volume (Eq. 12). It gets its
+    mass from the merging and from the accretion step that follows. All
+    weights use the activations the seeds had before this call.
 
     Args:
         primitive_state: The (padded) primitive state after the hydro update.
@@ -956,9 +963,8 @@ def _form_sink_particles(
         registered_variables: The registered variables.
 
     Returns:
-        ``(sink_particles, num_active_sinks)``: the sink particles with the new
-        activations and the new seeds appended, and the number of active
-        slots including the new (still massless) seeds.
+        The sink particles with the new activations, the new seeds and the
+        merged seeds.
     """
     sink_particle_config = config.sink_particle_config
     max_num_sinks = sink_particle_config.max_num_sinks
@@ -1010,7 +1016,7 @@ def _form_sink_particles(
             sink_particles.position,
             config,
         ),
-        jnp.ones_like(activation),
+        sink_particles.home_claim,
         is_earlier_seed_of_home,
         config,
     )
@@ -1097,7 +1103,7 @@ def _form_sink_particles(
     )
     candidate_home = _exclusion_factor(
         distance_squared_to_seeds,
-        jnp.ones_like(activation),
+        sink_particles.home_claim,
         is_seed_of_cell,
         config,
     )
@@ -1124,15 +1130,15 @@ def _form_sink_particles(
     # ================= ↓ Storing new seeds ↓ =====================
     # -------------------------------------------------------------
 
-    # Activations never drop, so the active slots stay contiguous at the
-    # front. Each new seed gets the next free slot; the other entries get the
+    # Each new seed gets the next free slot; the other entries get the
     # out-of-range slot max_num_sinks. With mode="drop", writes to an
     # out-of-range slot are discarded, which also discards new seeds once
     # every slot is taken.
-    num_existing_sinks = jnp.sum(is_active)
+    free_slots = jnp.nonzero(~is_active, size=max_num_sinks, fill_value=max_num_sinks)[0]
+    new_seed_rank = jnp.cumsum(is_new_seed) - 1
     slot = jnp.where(
-        is_new_seed,
-        num_existing_sinks + jnp.cumsum(is_new_seed) - 1,
+        is_new_seed & (new_seed_rank < max_num_sinks),
+        free_slots[jnp.clip(new_seed_rank, 0, max_num_sinks - 1)],
         max_num_sinks,
     )
     sink_particles = SinkParticles(
@@ -1154,9 +1160,10 @@ def _form_sink_particles(
             jnp.sum(is_seed_of_cell, axis=-1).astype(generation.dtype),
             mode="drop",
         ),
+        home_claim=sink_particles.home_claim.at[slot].set(1.0, mode="drop"),
     )
     num_new_seeds = jnp.sum(is_new_seed)
-    num_active_sinks = jnp.minimum(num_existing_sinks + num_new_seeds, max_num_sinks)
+    num_free_slots = jnp.sum(~is_active)
 
     # Cells beyond max_num_candidates are only skipped for this step, a
     # jump in their weights from w to 0, so a warning is printed. A new seed
@@ -1174,10 +1181,10 @@ def _form_sink_particles(
         lambda: None,
     )
     jax.lax.cond(
-        num_existing_sinks + num_new_seeds > max_num_sinks,
+        num_new_seeds > num_free_slots,
         lambda: jax.debug.callback(
             _raise_sink_slots_full,
-            num_existing_sinks + num_new_seeds - max_num_sinks,
+            num_new_seeds - num_free_slots,
             max_num_sinks,
         ),
         lambda: None,
@@ -1187,4 +1194,13 @@ def _form_sink_particles(
     # ================= ↑ Storing new seeds ↑ =====================
     # -------------------------------------------------------------
 
-    return sink_particles, num_active_sinks
+    position = sink_particles.position
+    return _merge_seeds(
+        sink_particles,
+        _minimum_image(position[None, :, :] - position[:, None, :], config),
+        _read_at_positions(
+            cells.density_threshold,
+            _slot_neighbourhood(position, grid_shape, config),
+        ),
+        config,
+    )

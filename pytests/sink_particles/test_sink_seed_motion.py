@@ -3,8 +3,8 @@ A forming seed moves in proportion to its activation and keeps the velocity
 of the gas around it; a sink of activation 1 moves as before. A Gaussian
 clump below the density threshold, so that nothing forms or accretes, moves
 with a uniform velocity for a few fixed steps, with a seed of activation
-10⁻³ and a sink of activation 1, both at rest at the clump centre at the
-start.
+10⁻³ at rest at the clump centre and a sink of activation 1 at rest away
+from it at the start.
 """
 
 # general
@@ -53,6 +53,12 @@ NUM_STEPS = 10
 SEED_ACTIVATION = 1e-3
 SEED_MASS = 1e-6
 
+#: The distance of the sink from the seed along x, in cells: beyond the
+#: reach r_acc + ℓ Δx = 3 cells of the merging, so that the seed does not
+#: merge into the sink, and 5 clump widths from the clump centre, where the
+#: seed stays and the gas keeps its uniform velocity by symmetry.
+SINK_OFFSET_IN_CELLS = 8.0
+
 #: The mass of the sink of activation 1 (slot 0). The gravity between a sink
 #: and the moving gas conserves momentum only up to terms that grow with the
 #: sink mass, about 3 × 10⁻¹² of the total momentum for this mass.
@@ -92,10 +98,11 @@ def _run():
 
     empty = _empty_sink_particles(config, primitive_state.dtype)
     center = jnp.full((3,), CLUMP_CENTER, dtype=primitive_state.dtype)
+    sink_position = center.at[0].add(SINK_OFFSET_IN_CELLS * CELL_SIZE)
     sink_particles = _pad_sink_particles(
         SinkParticles(
             mass=empty.mass.at[0].set(SINK_MASS).at[1].set(SEED_MASS),
-            position=empty.position.at[0].set(center).at[1].set(center),
+            position=empty.position.at[0].set(sink_position).at[1].set(center),
             velocity=empty.velocity,
             activation=empty.activation.at[0].set(1.0).at[1].set(SEED_ACTIVATION),
         ),
@@ -172,8 +179,8 @@ def test_weak_seed_moves_with_the_gas_in_proportion_to_its_activation():
 
 def test_sink_is_not_dragged_by_the_gas():
     """The sink of activation 1 starts at rest and is not coupled to the gas:
-    only the gravity of the clump moving away from it changes its velocity,
-    which stays below 1 % of the gas velocity."""
+    only the gravity of the clump changes its velocity, which stays below 1 %
+    of the gas velocity."""
     initial_state, final_state, _, _ = _run()
     gas_speed = np.linalg.norm(GAS_VELOCITY)
     sink_velocity = np.asarray(final_state.sink_particles.velocity[0])

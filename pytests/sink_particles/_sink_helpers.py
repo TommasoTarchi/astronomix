@@ -70,6 +70,7 @@ HARD_LIMIT = dict(
     spatial_width_in_cells=0.0,
     sharing_sharpness=float("inf"),
     position_update_mass=0.0,
+    merging_width=0.0,
 )
 
 
@@ -184,7 +185,7 @@ def _update_sinks_once(state, config, params, registered_variables, sink_particl
     """
     if sink_particles is None:
         sink_particles = _empty_sink_particles(config, state.primitive_state.dtype)
-    sink_particles, num_active_sinks = _form_sink_particles(
+    sink_particles = _form_sink_particles(
         state.primitive_state,
         sink_particles,
         config,
@@ -194,7 +195,6 @@ def _update_sinks_once(state, config, params, registered_variables, sink_particl
     return _accrete_gas(
         state.primitive_state,
         sink_particles,
-        num_active_sinks,
         config,
         params,
         registered_variables,

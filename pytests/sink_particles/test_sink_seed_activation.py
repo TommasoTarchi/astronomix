@@ -90,7 +90,7 @@ def _form_at(peak_overdensity):
     clump of the given peak overdensity, starting from no seeds."""
     state_at, config, params, registered_variables = _clump()
     primitive_state = state_at(peak_overdensity)
-    sink_particles, _ = _form_sink_particles(
+    sink_particles = _form_sink_particles(
         primitive_state,
         _empty_sink_particles(config, primitive_state.dtype),
         config,

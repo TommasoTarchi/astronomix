@@ -5,7 +5,8 @@ Sink particles grow from seeds, one in every cell, whose activation rises
 from 0 to 1 with smooth versions of the creation checks of Federrath et al.
 (2010), ApJ 713, 269, Section 2.2, and they accrete the gas above the density
 threshold within their accretion radius (Section 2.3), in proportion to their
-activation. The widths of the smooth checks are set here; at their hard
+activation. A seed merges into a more active seed within its accretion
+radius. The widths of the smooth checks are set here; at their hard
 limit the checks are those of the paper. The density threshold is derived
 from the Jeans length resolution (Eq. 32 of the paper).
 They move with a kick-drift-kick leapfrog, once per hydro step, and all their
@@ -45,8 +46,9 @@ class SinkParticleConfig(NamedTuple):
     sink_particles: bool = False
 
     #: Size of the sink particle arrays. JIT requires fixed array sizes, so
-    #: this many slots are allocated up front; every seed whose activation
-    #: has ever exceeded 0 holds one. When a new seed would need more slots,
+    #: this many slots are allocated up front; every seed of activation above
+    #: 0 holds one, until it has merged completely into another seed. When a
+    #: new seed would need more slots,
     #: the run stops with an error. Sinks passed into a run, or
     #: restored from a checkpoint, with fewer slots get empty slots appended;
     #: with more slots, the run does not start.
@@ -90,3 +92,10 @@ class SinkParticleConfig(NamedTuple):
     #: little moves little. 0 moves a seed to the centre of mass of itself and
     #: the accreted gas. Must be ≥ 0.
     position_update_mass: float = 0.01
+
+    #: Width δ of the merging of a seed into a more active one within its
+    #: accretion radius: a seed of activation a merges into one of activation
+    #: a' at a fraction per step that rises from 0 at a = a' to 1 at
+    #: a ≤ (1 − δ) a'. 0 merges any less active seed completely. Must lie in
+    #: [0, 1).
+    merging_width: float = 0.1
