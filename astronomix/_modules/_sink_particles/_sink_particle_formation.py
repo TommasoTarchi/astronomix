@@ -16,7 +16,8 @@ The factors of seed s, at position y_s, are
     f_ρ    = step_ω(ρ_s / ρ_res − 1), the seed's mass added to its density,
     f_conv = Π_k [1 − step_ω(−δ_k)], the six converging-flow velocities,
     f_φ    = 1 − step_ω((φ_s − min φ) / c_s²), with min φ the lowest
-             potential within r_acc of y_s,
+             potential within r_acc of y_s, both without the potential of
+             the seed's own mass,
     f_J    = step_ω(|E_grav| / (2 E_th + E_mag) − 1),
     f_b    = step_ω(|E_grav| / (E_th + E_kin + E_mag) − 1),
     f_prox = Π_{s' ≠ s} [1 − a_s' K(|y_s' − y_s| − ℓ Δx)],
@@ -89,7 +90,11 @@ from astronomix.variable_registry.registered_variables import RegisteredVariable
 # astronomix functions
 from astronomix._geometry.boundaries import _axis_slice, _periodic_boundaries
 from astronomix._modules._gravity._gravity import _compute_total_potential
-from astronomix._modules._sink_particles._sink_particle_dynamics import _sink_density
+from astronomix._modules._gravity._poisson_solver import _compute_gravitational_potential
+from astronomix._modules._sink_particles._sink_particle_dynamics import (
+    _sink_density,
+    _tsc_weights,
+)
 from astronomix._modules._sink_particles._sink_particle_helpers import (
     _accretion_offsets,
     _collect_candidates,
@@ -146,6 +151,12 @@ class CellQuantities(NamedTuple):
     #: |B|², or ``None`` without a magnetic field.
     magnetic_field_squared: Union[FIELD_TYPE, NoneType] = None
 
+    #: The self-gravity potential of a unit mass in the middle cell of the
+    #: grid. The Poisson solve is linear and does not depend on where a mass
+    #: sits, so a mass m in a cell c has m times this potential, shifted from
+    #: the middle cell to c.
+    unit_mass_potential: Union[FIELD_TYPE, NoneType] = None
+
 
 def _gas_quantities(
     primitive_state: STATE_TYPE,
@@ -195,8 +206,8 @@ def _cell_quantities(
     registered_variables: RegisteredVariables,
 ) -> CellQuantities:
     """
-    The cell quantities of the creation checks, with one Poisson solve of the
-    gas density plus the seeds' masses.
+    The cell quantities of the creation checks, with two Poisson solves: of
+    the gas density plus the seeds' masses, and of a unit mass.
 
     Along each axis d, the converging-flow check compares the cell with its
     neighbours at ±1: δ = (v_d(0) − v_d(+1)) / c_s and (v_d(−1) − v_d(0)) / c_s,
@@ -247,10 +258,19 @@ def _cell_quantities(
             + primitive_state[registered_variables.magnetic_index.z] ** 2
         )
 
+    middle_cell = tuple(size // 2 for size in density.shape)
+    unit_mass_potential = _compute_gravitational_potential(
+        jnp.zeros_like(density).at[middle_cell].set(1.0 / config.grid_spacing**3),
+        config.grid_spacing,
+        config,
+        params.gravitational_constant,
+    )
+
     return cells._replace(
         potential=potential,
         converging_velocity=jnp.stack(converging_velocity),
         magnetic_field_squared=magnetic_field_squared,
+        unit_mass_potential=unit_mass_potential,
     )
 
 
@@ -287,6 +307,9 @@ class SlotNeighbourhood(NamedTuple):
 
     #: The cell weight h of each cell.
     cell_weight: jax.Array
+
+    #: The positions, shape (num_positions, 3).
+    position: jax.Array
 
 
 def _minimum_image(
@@ -369,6 +392,7 @@ def _slot_neighbourhood(
         distance_squared=distance_squared,
         radial_weight=radial_weight,
         cell_weight=cell_weight,
+        position=position,
     )
 
 
@@ -420,7 +444,7 @@ class SlotChecks(NamedTuple):
     converging_velocity: jax.Array
 
     #: (φ − min φ) / c_s², the height above the lowest potential of the
-    #: control volume.
+    #: control volume, both without the potential of the seed's own mass.
     potential_height: jax.Array
 
     #: |E_grav| / (2 E_th + E_mag).
@@ -457,6 +481,49 @@ def _read_at_positions(
     )
 
 
+def _own_potential(
+    neighbourhood: SlotNeighbourhood,
+    mass: jax.Array,
+    unit_mass_potential: FIELD_TYPE,
+    config: SimulationConfig,
+) -> jax.Array:
+    """
+    The potential of the seed at each position at the cells around it: its
+    mass spread over its 27 TSC cells, as in the Poisson solve of
+    ``_cell_quantities``, each share with the potential of a unit mass at the
+    offset of the cell from it.
+
+    Args:
+        neighbourhood: The cells around each position.
+        mass: The mass of the seed at each position, shape (num_positions,).
+        unit_mass_potential: The potential of a unit mass in the middle cell
+            of the (padded) grid.
+        config: The simulation configuration.
+
+    Returns:
+        The potential, shape (num_positions, num_offsets).
+    """
+    grid_shape = unit_mass_potential.shape
+    is_periodic, _ = _periodic_box(config)
+    tsc_indices, tsc_weights = _tsc_weights(neighbourhood.position, grid_shape, config)
+    unit_index = []
+    for axis in range(3):
+        offset = neighbourhood.cell_indices[axis][:, :, None] - tsc_indices[axis][:, None, :]
+        if is_periodic[axis]:
+            # Along a periodic axis both sets of cells wrap around the
+            # interior, so the offset is taken to its nearest periodic copy.
+            num_interior_cells = grid_shape[axis] - 2 * config.num_ghost_cells
+            offset = (
+                jnp.mod(offset + num_interior_cells // 2, num_interior_cells)
+                - num_interior_cells // 2
+            )
+        unit_index.append(grid_shape[axis] // 2 + offset)
+    return mass[:, None] * jnp.sum(
+        tsc_weights[:, None, :] * unit_mass_potential[tuple(unit_index)],
+        axis=-1,
+    )
+
+
 def _slot_checks(
     neighbourhood: SlotNeighbourhood,
     mass: jax.Array,
@@ -469,13 +536,14 @@ def _slot_checks(
     A cell quantity q is read at a position as Σ h q / Σ h. The control
     volume holds the gas within r_acc, each cell with the mass M = K ρ ΔV;
     its gravitational energy is measured from the soft maximum of the
-    potential, at the temperature ω c_s² with c_s² read at the position, and
-    the potential height from the lowest potential of the cells with K > 0.
+    potential, at the temperature ω c_s² with c_s² read at the position. The
+    potential height is measured from the lowest potential of the cells with
+    K > 0, on the potential without that of the seed's own mass.
 
     Args:
         neighbourhood: The cells around each position.
-        mass: The mass of the seed at each position, added to its density,
-            shape (num_positions,).
+        mass: The mass of the seed at each position, added to its density
+            and left out of its potential height, shape (num_positions,).
         cells: The cell quantities.
         config: The simulation configuration.
 
@@ -493,15 +561,26 @@ def _slot_checks(
     density = read(cells.density) + mass / cell_volume
     density_threshold = read(cells.density_threshold)
     sound_speed_squared = read(cells.sound_speed_squared)
-    potential = read(cells.potential)
     converging_velocity = jnp.stack(
         [read(component) for component in cells.converging_velocity],
         axis=-1,
     )
 
+    # The potential-minimum check leaves out the seed's own mass, which would
+    # otherwise make the minimum it is tested against.
     potential_in_reach = cells.potential[cell_indices]
+    potential_without_seed = potential_in_reach - _own_potential(
+        neighbourhood,
+        mass,
+        cells.unit_mass_potential,
+        config,
+    )
+    potential = _safe_divide(
+        jnp.sum(neighbourhood.cell_weight * potential_without_seed, axis=-1),
+        jnp.sum(neighbourhood.cell_weight, axis=-1),
+    )
     minimum_potential = jnp.min(
-        jnp.where(radial_weight > 0.0, potential_in_reach, jnp.inf),
+        jnp.where(radial_weight > 0.0, potential_without_seed, jnp.inf),
         axis=-1,
     )
     minimum_potential = jnp.where(jnp.isfinite(minimum_potential), minimum_potential, 0.0)

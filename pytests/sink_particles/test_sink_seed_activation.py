@@ -10,6 +10,9 @@ is active and every activation is exactly 0; above it, one seed at the
 centre has an activation that rises continuously from 0 to 1 across the band
 of the Jeans factor, and inside the band ``jax.grad`` of that activation
 agrees with a finite difference.
+
+In the same clump, the potential-minimum check of a seed with mass is made
+on the potential without the seed's own mass.
 """
 
 # general
@@ -57,6 +60,13 @@ LARGEST_ACTIVATION_STEP = 0.3
 
 #: The step of the central finite difference, in overdensity.
 FINITE_DIFFERENCE_STEP = 1e-3
+
+#: Two seeds near the clump centre: the one whose potential height is
+#: checked, off the cell centres, and another within its reach, whose mass
+#: stays in the potential. Each: offset from the centre of the central cell
+#: in cells, mass, activation.
+CHECKED_SEED = ((0.3, 0.2, -0.1), 0.05, 0.5)
+OTHER_SEED = ((1.5, 0.0, 0.0), 0.03, 0.3)
 
 
 @cache
@@ -209,3 +219,45 @@ def test_activation_gradient_matches_finite_difference():
                 f"finite difference {finite_difference}"
             ),
         )
+
+
+def test_potential_height_leaves_out_the_seeds_own_mass():
+    """The potential height of a seed with mass, with its own potential
+    subtracted from that of the gas and both seeds, equals the height on a
+    Poisson solve without its mass, the other seed's mass kept in both; with
+    its own mass kept, the height would differ."""
+    state_at, config, params, registered_variables = _clump()
+    primitive_state = state_at(JEANS_SCAN[len(JEANS_SCAN) // 2])
+    dtype = primitive_state.dtype
+    center = (jnp.asarray(CENTER_CELL, dtype=dtype) + 0.5) * CELL_SIZE
+    seeds = _empty_sink_particles(config, dtype)
+    for slot, (offset, mass, activation) in enumerate((CHECKED_SEED, OTHER_SEED)):
+        seeds = seeds._replace(
+            mass=seeds.mass.at[slot].set(mass),
+            position=seeds.position.at[slot].set(
+                center + jnp.asarray(offset, dtype=dtype) * CELL_SIZE
+            ),
+            activation=seeds.activation.at[slot].set(activation),
+        )
+    neighbourhood = _slot_neighbourhood(seeds.position[:1], primitive_state.shape[1:], config)
+
+    def potential_height(sink_particles, checked_mass):
+        cells = _cell_quantities(primitive_state, sink_particles, config, params, registered_variables)
+        checks = _slot_checks(neighbourhood, jnp.asarray([checked_mass], dtype=dtype), cells, config)
+        return float(checks.potential_height[0])
+
+    subtracted = potential_height(seeds, CHECKED_SEED[1])
+    without_seed = potential_height(seeds._replace(mass=seeds.mass.at[0].set(0.0)), 0.0)
+    kept = potential_height(seeds, 0.0)
+
+    np.testing.assert_allclose(
+        subtracted,
+        without_seed,
+        rtol=1e-9,
+        atol=1e-10,
+        err_msg="the potential height of the seed differs from that on a solve without its mass",
+    )
+    assert abs(kept - without_seed) > 1e-3, (
+        f"the seed's own mass changes its potential height by only {abs(kept - without_seed):.2e}, "
+        "so the test does not tell the two apart"
+    )
