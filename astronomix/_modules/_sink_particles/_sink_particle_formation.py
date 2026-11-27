@@ -15,7 +15,8 @@ The factors of seed s, at position y_s, are
 
     f_ρ    = step_ω(ρ_s / ρ_res − 1), the seed's mass added to its density,
     f_conv = Π_k [1 − step_ω(−δ_k)], the six converging-flow velocities,
-    f_φ    = 1 − step_ω((φ_s − min_T φ) / c_s²),
+    f_φ    = 1 − step_ω((φ_s − min φ) / c_s²), with min φ the lowest
+             potential within r_acc of y_s,
     f_J    = step_ω(|E_grav| / (2 E_th + E_mag) − 1),
     f_b    = step_ω(|E_grav| / (E_th + E_kin + E_mag) − 1),
     f_prox = Π_{s' ≠ s} [1 − a_s' K(|y_s' − y_s| − ℓ Δx)],
@@ -25,8 +26,11 @@ The factors of seed s, at position y_s, are
 
 each exactly 0 where its hard check fails. A cell quantity is read at y_s
 with the cell weights h, and the control volume holds the gas within r_acc
-of y_s with the radial weights K; the soft minimum and maximum have the
-temperature ω c_s². The potential φ is that of the gas, of the seeds and of
+of y_s with the radial weights K, and its gravitational energy is measured
+from the soft maximum of the potential at the temperature ω c_s². Only the
+deepest cell of a control volume passes the potential-minimum check fully;
+f_φ falls to 0 over ω c_s² above it. The potential φ is that of the gas, of
+the seeds and of
 any external field. All activations are updated together, with those of the
 previous step in f_prox, so seeds that pass in the same step do not hold
 each other back.
@@ -105,7 +109,6 @@ from astronomix._modules._sink_particles._sink_particle_smoothing import (
     _safe_divide,
     _smooth_step,
     _soft_maximum,
-    _soft_minimum,
 )
 from astronomix._stencil_operations._stencil_operations import _shift
 
@@ -416,7 +419,7 @@ class SlotChecks(NamedTuple):
     #: The six converging-flow velocities δ_k, shape (num_positions, 6).
     converging_velocity: jax.Array
 
-    #: (φ − min_T φ) / c_s², the height above the potential minimum of the
+    #: (φ − min φ) / c_s², the height above the lowest potential of the
     #: control volume.
     potential_height: jax.Array
 
@@ -466,8 +469,8 @@ def _slot_checks(
     A cell quantity q is read at a position as Σ h q / Σ h. The control
     volume holds the gas within r_acc, each cell with the mass M = K ρ ΔV;
     its gravitational energy is measured from the soft maximum of the
-    potential, and the soft minimum and maximum have the temperature ω c_s²,
-    with c_s² read at the position.
+    potential, at the temperature ω c_s² with c_s² read at the position, and
+    the potential height from the lowest potential of the cells with K > 0.
 
     Args:
         neighbourhood: The cells around each position.
@@ -497,12 +500,11 @@ def _slot_checks(
     )
 
     potential_in_reach = cells.potential[cell_indices]
-    minimum_potential = _soft_minimum(
-        potential_in_reach,
-        radial_weight,
-        check_width,
-        sound_speed_squared,
+    minimum_potential = jnp.min(
+        jnp.where(radial_weight > 0.0, potential_in_reach, jnp.inf),
+        axis=-1,
     )
+    minimum_potential = jnp.where(jnp.isfinite(minimum_potential), minimum_potential, 0.0)
     maximum_potential = _soft_maximum(
         potential_in_reach,
         radial_weight,
@@ -685,12 +687,10 @@ def _creation_weight(
 
 #: How much looser the grid-wide potential-minimum check of the cell
 #: selection is than f_φ > 0, which holds for a potential height h < ω (h ≤ 0
-#: at ω = 0). The grid and ``_slot_checks`` sum the soft minimum in different
-#: orders, so their heights differ by rounding, a small multiple of the float
-#: precision times |φ| / c_s². A cell is listed where h is at most ω plus
-#: these shares of ω and of |φ| / c_s²; a listed cell with h ≥ ω has f_φ = 0
-#: and so w = 0.
-POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS = 1.0
+#: at ω = 0), as a share of |φ| / c_s². The grid and ``_slot_checks`` take
+#: the same minimum, but ``_slot_checks`` reads φ and c_s² at the cell centre
+#: with the cell weights, so their heights can differ by rounding. A listed
+#: cell with h ≥ ω has f_φ = 0 and so w = 0.
 POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS = 1e-4
 
 
@@ -745,9 +745,9 @@ def _potential_height_on_grid(
     config: SimulationConfig,
 ) -> FIELD_TYPE:
     """
-    (φ − min_T φ) / c_s² in every cell, with the soft minimum over the cell's
-    control volume weighted by K, at the temperature ω c_s² of the cell: the
-    potential height of ``_slot_checks`` for a seed at a cell centre.
+    (φ − min φ) / c_s² in every cell, with the minimum over the cells of
+    its control volume with K > 0: the potential height of ``_slot_checks``
+    for a seed at a cell centre.
 
     Cells past a non-periodic edge are left out. The values are meaningful in
     interior cells only.
@@ -761,26 +761,14 @@ def _potential_height_on_grid(
         The potential height, with the shape of the potential.
     """
     sink_particle_config = config.sink_particle_config
-    check_width = sink_particle_config.check_width
     accretion_radius_in_cells = sink_particle_config.accretion_radius_in_cells
-    spatial_width_in_cells = sink_particle_config.spatial_width_in_cells
 
-    # The control volume, with the radial weight K of each offset, computed
-    # with NumPy at trace time as in ``_radial_weight``; offsets of weight 0
-    # are dropped.
+    # The control volume; with an edge of width ℓ > 0, K is 0 at r_acc itself
+    # (``_radial_weight``), so offsets at that distance are dropped.
     offsets = _control_volume_offsets(config)
-    if spatial_width_in_cells == 0.0:
-        radial_weights = np.ones(offsets.shape[0])
-    else:
+    if sink_particle_config.spatial_width_in_cells > 0.0:
         distance_in_cells = np.sqrt(np.sum(offsets**2, axis=-1))
-        scaled = np.clip(
-            (accretion_radius_in_cells - distance_in_cells) / spatial_width_in_cells,
-            0.0,
-            1.0,
-        )
-        radial_weights = scaled * scaled * (3.0 - 2.0 * scaled)
-    offsets = offsets[radial_weights > 0.0]
-    radial_weights = radial_weights[radial_weights > 0.0]
+        offsets = offsets[distance_in_cells < accretion_radius_in_cells]
 
     filled_potential = _fill_potential_ghost_cells(potential, config)
 
@@ -798,28 +786,6 @@ def _potential_height_on_grid(
         minimum = jnp.minimum(minimum, at_offset(offset))
     minimum = jnp.where(jnp.isfinite(minimum), minimum, 0.0)
 
-    if check_width > 0.0:
-        temperature = check_width * sound_speed_squared
-        safe_temperature = jnp.where(temperature > 0.0, temperature, 1.0)
-        weighted_sum = jnp.zeros_like(potential)
-        normalization = jnp.zeros_like(potential)
-        for offset, radial_weight in zip(offsets, radial_weights):
-            shifted = at_offset(offset)
-            is_real = jnp.isfinite(shifted)
-            value = jnp.where(is_real, shifted, minimum)
-            weight = jnp.where(
-                is_real,
-                radial_weight * jnp.exp(-(value - minimum) / safe_temperature),
-                0.0,
-            )
-            weighted_sum = weighted_sum + weight * value
-            normalization = normalization + weight
-        minimum = jnp.where(
-            temperature > 0.0,
-            _safe_divide(weighted_sum, normalization),
-            minimum,
-        )
-
     return _safe_divide(potential - minimum, sound_speed_squared)
 
 
@@ -830,7 +796,6 @@ def _may_pass_potential_minimum(
     """
     Boolean mask of the cells whose inactive seed can have f_φ > 0, from the
     potential height on the grid, with the slack of
-    ``POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS`` and
     ``POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS``.
 
     Args:
@@ -847,9 +812,9 @@ def _may_pass_potential_minimum(
         cells.sound_speed_squared,
         config,
     )
-    slack = POTENTIAL_HEIGHT_SLACK_IN_CHECK_WIDTHS * check_width + (
-        POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS
-        * _safe_divide(jnp.abs(cells.potential), cells.sound_speed_squared)
+    slack = POTENTIAL_HEIGHT_SLACK_IN_POTENTIALS * _safe_divide(
+        jnp.abs(cells.potential),
+        cells.sound_speed_squared,
     )
     return potential_height <= check_width + slack
 

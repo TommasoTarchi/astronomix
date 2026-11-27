@@ -7,7 +7,9 @@ with and without a magnetic field, bound state, proximity to existing
 sinks), one sink from a clump centred between cells, the limit on the number
 of sink slots, the wrapping of a new sink's position into a periodic box, the
 control volume at an open boundary, and the density threshold of a polytropic
-gas. Every test runs at the hard limit of the smooth checks (``HARD_LIMIT``).
+gas. The tests run at the hard limit of the smooth checks (``HARD_LIMIT``),
+except those of the potential-minimum check, which also run with the default
+widths.
 """
 
 # ==== GPU selection ====
@@ -430,6 +432,80 @@ def test_potential_minimum_selection_lists_every_seed_with_weight(widths):
     assert num_dense_listed == 1, (
         f"{num_dense_listed} of the {int(is_dense.sum())} cells above the density threshold "
         "pass the potential-minimum check on the grid, not the centre alone"
+    )
+
+
+#: The peak overdensity of a shallow clump, whose potential rises by less
+#: than ω c_s² from its centre over the next cells, so that their f_φ lies
+#: inside the band.
+SHALLOW_PEAK_OVERDENSITY = 10.0
+
+
+def test_potential_minimum_factor_falls_from_the_deepest_cell():
+    """With the default widths, f_φ of a seed at a cell centre is
+    1 − step_ω((φ − min φ) / c_s²), with min φ the lowest potential of the
+    cells within r_acc: 1 at the deepest cell, the centre of a shallow clump,
+    and falling to 0 over ω c_s² above it in the cells along x whose control
+    volume holds the centre."""
+    state, config, params, registered_variables = _setup(
+        settings=SETTINGS._replace(peak_overdensity=SHALLOW_PEAK_OVERDENSITY)
+    )
+    primitive_state = _prepare_padded_state(
+        state.primitive_state,
+        config,
+        params,
+        registered_variables,
+    )
+    cells = _cell_quantities(
+        primitive_state,
+        _empty_sink_particles(config, primitive_state.dtype),
+        config,
+        params,
+        registered_variables,
+    )
+    check_width = config.sink_particle_config.check_width
+    accretion_radius_in_cells = config.sink_particle_config.accretion_radius_in_cells
+
+    center = int(CLUMP_CENTER / CELL_SIZE)
+    interior_cells = np.array([(center + offset, center, center) for offset in range(6)])
+    checks = _slot_checks(
+        _slot_neighbourhood(
+            jnp.asarray((interior_cells + 0.5) * CELL_SIZE, dtype=primitive_state.dtype),
+            primitive_state.shape[1:],
+            config,
+        ),
+        jnp.zeros(len(interior_cells), dtype=primitive_state.dtype),
+        cells,
+        config,
+    )
+    factor = np.asarray(1.0 - _smooth_step(checks.potential_height, check_width))
+
+    # The same factor from the grid potential, with the minimum over the cells
+    # strictly within r_acc, where K > 0.
+    potential = np.asarray(cells.potential)
+    sound_speed_squared = np.asarray(cells.sound_speed_squared)
+    offsets = _control_volume_offsets(config)
+    offsets = offsets[np.sum(offsets**2, axis=-1) < accretion_radius_in_cells**2]
+    expected = []
+    for cell in interior_cells + config.num_ghost_cells:
+        lowest = min(potential[tuple(cell + offset)] for offset in offsets)
+        height = (potential[tuple(cell)] - lowest) / sound_speed_squared[tuple(cell)]
+        scaled = np.clip(height / check_width, 0.0, 1.0)
+        expected.append(1.0 - scaled * scaled * (3.0 - 2.0 * scaled))
+
+    np.testing.assert_allclose(
+        factor,
+        expected,
+        atol=1e-4,
+        err_msg="f_φ at the cell centres differs from 1 − step_ω((φ − min φ) / c_s²)",
+    )
+    assert factor[0] == 1.0, f"the deepest cell, the clump centre, has f_φ = {factor[0]}, not 1"
+    assert np.any((factor > 0.0) & (factor < 1.0)), (
+        f"no cell along x lies inside the band of f_φ, so the test checks no ramp: {factor}"
+    )
+    holds_center = np.arange(len(interior_cells)) < accretion_radius_in_cells
+    assert np.all(np.diff(factor[holds_center]) <= 0.0), (
+        f"f_φ does not fall away from the centre within r_acc of it: {factor[holds_center]}"
     )
 
 
